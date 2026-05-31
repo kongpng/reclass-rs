@@ -1,0 +1,55 @@
+********* Start testing of TestDefaultClassFooter *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestDefaultClassFooter::initTestCase()
+
+=== tab 0 (UnnamedClass0) — 18 lines ===
+  L14 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L15 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L16 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L17 : "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+
+=== tab 1 (UnnamedClass1) — 18 lines ===
+  L14 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L15 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L16 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L17 : "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+
+=== tab 2 (UnnamedClass2) — 18 lines ===
+  L14 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L15 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L16 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L17 : "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+tab 0: 2nd-to-last="     hex64     ........   00 00 00 00 00 00 00 00"
+tab 0: last      ="};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+tab 1: 2nd-to-last="     hex64     ........   00 00 00 00 00 00 00 00"
+tab 1: last      ="};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+tab 2: 2nd-to-last="     hex64     ........   00 00 00 00 00 00 00 00"
+tab 2: last      ="};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+PASS   : TestDefaultClassFooter::footerStaysCleanAcrossMultipleNewTabs()
+
+=== editor after applyDocument tab 0 ===
+  sci lines: 18, compose lines: 18
+  sci last2:    "     hex64     ........   00 00 00 00 00 00 00 00" | "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+  compose last2: "     hex64     ........   00 00 00 00 00 00 00 00" | "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+
+=== editor after applyDocument tab 1 ===
+  sci lines: 18, compose lines: 18
+  sci last2:    "     hex64     ........   00 00 00 00 00 00 00 00" | "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+  compose last2: "     hex64     ........   00 00 00 00 00 00 00 00" | "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+
+=== editor after applyDocument tab 2 ===
+  sci lines: 18, compose lines: 18
+  sci last2:    "     hex64     ........   00 00 00 00 00 00 00 00" | "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+  compose last2: "     hex64     ........   00 00 00 00 00 00 00 00" | "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+PASS   : TestDefaultClassFooter::editorTextMatchesComposeAcrossSequentialApplies()
+
+=== after apply→setCmdRow→apply cycle ===
+  L14 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L15 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L16 : "     hex64     ........   00 00 00 00 00 00 00 00"
+  L17 : "};  +1 +10h +100h +1000h Trim Top  // 0x80 (128)"
+PASS   : TestDefaultClassFooter::footerSurvivesSetCommandRowThenRefresh()
+PASS   : TestDefaultClassFooter::cleanupTestCase()
+Totals: 5 passed, 0 failed, 0 skipped, 0 blacklisted, 16ms
+********* Finished testing of TestDefaultClassFooter *********
+EXIT_CODE=0

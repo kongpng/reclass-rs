@@ -1,0 +1,14 @@
+********* Start testing of TestChips *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestChips::initTestCase()
+PASS   : TestChips::enumChipFiresAndCanBeSuppressed()
+PASS   : TestChips::typeHintChipFiresAsOverlay()
+PASS   : TestChips::rttiChipFiresAndCanBeSuppressed()
+PASS   : TestChips::commentChipFiresAndCanBeSuppressed()
+PASS   : TestChips::multilineCommentStaysOnOneLine()
+PASS   : TestChips::chipsAppearInDefinedOrder()
+PASS   : TestChips::chipSpansMatchRenderedText()
+PASS   : TestChips::cleanupTestCase()
+Totals: 9 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms
+********* Finished testing of TestChips *********
+EXIT_CODE=0

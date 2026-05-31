@@ -1,0 +1,118 @@
+# Single `reclass` package — a faithful Rust + GPUI port of Reclass
+# (github.com/IChooseYou/Reclass, MIT). NOT a Cargo workspace: the C++ app
+# links everything into one executable and its `src/` is cleanly layered, so the
+# port mirrors that layering as modules inside one package (see ARCHITECTURE.md
+# §2 — the subsystem crates of the diagram become the top-level `src/` modules).
+#
+# Portable headless logic builds with `--no-default-features`; the GPUI UI is
+# isolated behind the default `ui` feature (the only thing that pulls gpui).
+
+[package]
+name = "reclass"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "A structured-data / struct-layout editor — Rust + GPUI port of Reclass."
+repository = "https://github.com/IChooseYou/Reclass"
+default-run = "reclass"
+
+# ── The app binary (src/main.cpp). Re-exported default feature set incl. ui. ──
+[[bin]]
+name = "reclass"
+path = "src/main.rs"
+
+# ── stdio <-> local-socket MCP shim (tools/rcx-mcp-stdio.cpp). Standalone. ──
+[[bin]]
+name = "reclass-mcp-bridge"
+path = "src/bin/reclass-mcp-bridge.rs"
+required-features = ["mcp"]
+
+[lib]
+name = "reclass"
+path = "src/lib.rs"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Features (ARCHITECTURE.md §8). Off `ui` ⇒ headless engine build (logic-only).
+# ─────────────────────────────────────────────────────────────────────────────
+[features]
+default = ["ui", "imports", "disasm", "symbols", "mcp"]
+
+# The whole GPUI UI surface. The ONLY feature that pulls gpui/gpui-component.
+ui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
+
+# Source / ReClass-XML import+export, PDB import, and PE-debug extraction.
+# pdb2/object are pure Rust ⇒ build on all OSes.
+imports = ["dep:quick-xml", "dep:regex", "dep:zerocopy", "dep:object", "dep:pdb2"]
+
+# x86/x64 disassembly + hex dump (replaces fadec). Pure Rust.
+disasm = ["dep:iced-x86"]
+
+# RTTI walkers / demanglers / name providers + MS symbol-server download.
+symbols = ["dep:cpp_demangle", "dep:msvc-demangler", "dep:regex", "dep:reqwest", "dep:directories"]
+
+# JSON-RPC 2.0 MCP server over a local socket.
+mcp = ["dep:interprocess"]
+
+# OUT-OF-SCOPE live OS sources extension point + libloading loader. Off by
+# default: stubs only, so the package builds on Linux without them.
+native-plugins = ["dep:libloading"]
+
+# Optional parallel scanner (rayon). Off by default: the scanner falls back to
+# a serial scan so `--no-default-features` stays lean. (ARCHITECTURE.md §3.)
+scanner-parallel = ["dep:rayon"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependencies. Versions per _design/crate_selection.md (verified 2026-05-31).
+# ─────────────────────────────────────────────────────────────────────────────
+[dependencies]
+# core model + serde (.rcx) — always on.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ahash = "0.8"
+indexmap = { version = "2", features = ["serde"] }
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+half = "2"
+
+# CLI + logging for the bin.
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File data source (memmap2) — built-in benign provider.
+memmap2 = "0.9"
+
+# ── feature-gated (optional) ──
+# disasm — pure Rust x86/x64 decoder+formatter (replaces fadec).
+iced-x86 = { version = "1", optional = true }
+# scanner — optional parallel value/pattern search (QtConcurrent → rayon).
+rayon = { version = "1", optional = true }
+quick-xml = { version = "0.40", optional = true }
+regex = { version = "1", optional = true }
+zerocopy = { version = "0.8", optional = true, features = ["derive"] }
+object = { version = "0.39", optional = true }
+pdb2 = { version = "0.10", optional = true }
+cpp_demangle = { version = "0.5", optional = true }
+msvc-demangler = { version = "0.11", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }
+directories = { version = "6", optional = true }
+interprocess = { version = "2", optional = true }
+libloading = { version = "0.9", optional = true }
+
+# ── UI (gpui) — unpinned git, SAME source form as gpui-component (§7). ──
+# Do NOT add `rev=` to gpui/gpui_platform; reproducibility = committed Cargo.lock.
+[dependencies.gpui]
+git = "https://github.com/zed-industries/zed"
+optional = true
+
+[dependencies.gpui_platform]
+git = "https://github.com/zed-industries/zed"
+features = ["font-kit", "x11", "wayland", "runtime_shaders"]
+optional = true
+
+[dependencies.gpui-component]
+git = "https://github.com/longbridge/gpui-component"
+rev = "bd4174e4991eef4c0900cb6dfb7143e0889f5dd9"
+optional = true

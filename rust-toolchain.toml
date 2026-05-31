@@ -1,0 +1,8 @@
+# gpui builds on both Zed's pinned stable 1.95.0 and our nightly cargo 1.97
+# (2026-04) — see _design/gpui_cookbook.md §1.3. We pin Zed's stable channel to
+# match the framework exactly; bump to nightly only if an edition-2024 / feature
+# gate error surfaces.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy", "rust-src"]

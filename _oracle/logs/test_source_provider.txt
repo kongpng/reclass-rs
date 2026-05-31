@@ -1,0 +1,85 @@
+********* Start testing of TestSourceProvider *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestSourceProvider::initTestCase()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testAttachViaPluginPreservesBaseAddress() This plugin does not support grabbing the keyboard
+PASS   : TestSourceProvider::testAttachViaPluginPreservesBaseAddress()
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderReadsCorrectData() This plugin does not support grabbing the keyboard
+PASS   : TestSourceProvider::testProviderReadsCorrectData()
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderDataIsNotPEHeader() This plugin does not support grabbing the keyboard
+PASS   : TestSourceProvider::testProviderDataIsNotPEHeader()
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderRegistryRegisterAndFind() This plugin does not support grabbing the keyboard
+PASS   : TestSourceProvider::testProviderRegistryRegisterAndFind()
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support raise()
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testProviderRegistryUnregister() ProviderRegistry: Provider not found: "testprocessmemory"
+PASS   : TestSourceProvider::testProviderRegistryUnregister()
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support raise()
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support raise()
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support raise()
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testSourceMenuIconsLoad() ProviderRegistry: Provider not found: "testprocessmemory"
+PASS   : TestSourceProvider::testSourceMenuIconsLoad()
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support raise()
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support raise()
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support raise()
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testMenuActionIconVisibility() ProviderRegistry: Provider not found: "testprocessmemory"
+PASS   : TestSourceProvider::testMenuActionIconVisibility()
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support raise()
+QWARN  : TestSourceProvider::testSelectSourceUpdatesBaseAddress() This plugin does not support grabbing the keyboard
+PASS   : TestSourceProvider::testSelectSourceUpdatesBaseAddress()
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support raise()
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support grabbing the keyboard
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support raise()
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support propagateSizeHints()
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support raise()
+QWARN  : TestSourceProvider::testDllFileNameInProviderInfo() This plugin does not support grabbing the keyboard
+PASS   : TestSourceProvider::testDllFileNameInProviderInfo()
+PASS   : TestSourceProvider::cleanupTestCase()
+Totals: 11 passed, 0 failed, 0 skipped, 0 blacklisted, 57ms
+********* Finished testing of TestSourceProvider *********
+EXIT_CODE=0

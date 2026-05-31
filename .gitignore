@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# NOTE: Cargo.lock IS committed (binary workspace + pinned gpui git deps for
+# reproducibility — see _design/gpui_component_cookbook.md §3). Do not ignore it.

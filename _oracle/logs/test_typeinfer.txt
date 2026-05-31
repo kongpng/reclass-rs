@@ -1,0 +1,29 @@
+********* Start testing of TestTypeInfer *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestTypeInfer::initTestCase()
+PASS   : TestTypeInfer::nullPtr()
+PASS   : TestTypeInfer::zeroLen()
+PASS   : TestTypeInfer::allZeros8()
+PASS   : TestTypeInfer::allZeros4()
+PASS   : TestTypeInfer::allZeros2()
+PASS   : TestTypeInfer::hex64_floatPair()
+PASS   : TestTypeInfer::hex64_intPair()
+PASS   : TestTypeInfer::hex64_utf8()
+PASS   : TestTypeInfer::hex64_pointer()
+PASS   : TestTypeInfer::hex32_float()
+PASS   : TestTypeInfer::hex32_int_monotonic()
+PASS   : TestTypeInfer::hex16_uint()
+PASS   : TestTypeInfer::hex8_uint()
+PASS   : TestTypeInfer::formatHint_single()
+PASS   : TestTypeInfer::formatHint_split()
+PASS   : TestTypeInfer::denormalRejected()
+PASS   : TestTypeInfer::bench_singleCall()
+RESULT : TestTypeInfer::bench_singleCall():
+     0.00022 msecs per iteration (total: 58, iterations: 262144)
+PASS   : TestTypeInfer::bench_batchRefresh()
+RESULT : TestTypeInfer::bench_batchRefresh():
+     0.037 msecs per iteration (total: 76, iterations: 2048)
+PASS   : TestTypeInfer::cleanupTestCase()
+Totals: 20 passed, 0 failed, 0 skipped, 0 blacklisted, 542ms
+********* Finished testing of TestTypeInfer *********
+EXIT_CODE=0

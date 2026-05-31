@@ -1,0 +1,21 @@
+********* Start testing of TestTheme *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestTheme::initTestCase()
+FAIL!  : TestTheme::builtInThemes() Compared values are not the same
+   Actual   (warm->selection)  : #ff3a2a3a
+   Expected (QColor("#21213A")): #ff21213a
+   Loc: [/tmp/reclass_oracle/tests/test_theme.cpp(37)]
+PASS   : TestTheme::jsonRoundTrip()
+PASS   : TestTheme::jsonRoundTripWarm()
+FAIL!  : TestTheme::fromJsonMissingFields() '!t.markerError.isValid()' returned FALSE. ()
+   Loc: [/tmp/reclass_oracle/tests/test_theme.cpp(89)]
+FAIL!  : TestTheme::themeManagerHasBuiltIns() Compared values are not the same
+   Actual   (all[0].name)            : "Long Night"
+   Expected (QString("Reclass Dark")): "Reclass Dark"
+   Loc: [/tmp/reclass_oracle/tests/test_theme.cpp(96)]
+PASS   : TestTheme::themeManagerSwitch()
+PASS   : TestTheme::themeManagerCRUD()
+PASS   : TestTheme::cleanupTestCase()
+Totals: 6 passed, 3 failed, 0 skipped, 0 blacklisted, 32ms
+********* Finished testing of TestTheme *********
+EXIT_CODE=3

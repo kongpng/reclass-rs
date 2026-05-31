@@ -1,0 +1,11 @@
+********* Start testing of TestOverlayNullRtti *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestOverlayNullRtti::initTestCase()
+PASS   : TestOverlayNullRtti::nullTypedPointerEmitsNameClassChip()
+PASS   : TestOverlayNullRtti::nullVoidPointerEmitsNameClassChip()
+PASS   : TestOverlayNullRtti::nullHex64DoesNotGetChip()
+PASS   : TestOverlayNullRtti::showRttiOffSuppressesNullChip()
+PASS   : TestOverlayNullRtti::cleanupTestCase()
+Totals: 6 passed, 0 failed, 0 skipped, 0 blacklisted, 0ms
+********* Finished testing of TestOverlayNullRtti *********
+EXIT_CODE=0

@@ -1,0 +1,17 @@
+********* Start testing of TestExportXml *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestExportXml::initTestCase()
+PASS   : TestExportXml::exportEmptyTree()
+PASS   : TestExportXml::exportSingleStruct()
+PASS   : TestExportXml::exportPointerRef()
+PASS   : TestExportXml::exportEmbeddedStruct()
+PASS   : TestExportXml::exportArray()
+PASS   : TestExportXml::exportTextNodes()
+PASS   : TestExportXml::exportVectors()
+PASS   : TestExportXml::exportHexCollapse()
+PASS   : TestExportXml::exportMultiClass()
+PASS   : TestExportXml::roundTripImportExport()
+PASS   : TestExportXml::cleanupTestCase()
+Totals: 12 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms
+********* Finished testing of TestExportXml *********
+EXIT_CODE=0

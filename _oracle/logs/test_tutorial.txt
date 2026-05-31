@@ -1,0 +1,24 @@
+********* Start testing of TutorialTest *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TutorialTest::initTestCase()
+PASS   : TutorialTest::editorDemoComposesWithRcxEditorAsViewRoot()
+PASS   : TutorialTest::hex64BaselineLightsUp()
+PASS   : TutorialTest::initialClassRoundTripsThroughJson()
+PASS   : TutorialTest::emptyInitialClassNotSerialized()
+PASS   : TutorialTest::abiTagSetOnItaniumWalk()
+SKIP   : TutorialTest::walkRealItaniumVtableInOwnProcess() self-process probe is Windows-only
+   Loc: [/tmp/reclass_oracle/tests/test_tutorial.cpp(367)]
+SKIP   : TutorialTest::walkRealQtObjectVtableInOwnProcess() self-process probe is Windows-only
+   Loc: [/tmp/reclass_oracle/tests/test_tutorial.cpp(410)]
+SKIP   : TutorialTest::walkRealMultiInheritanceVtableInOwnProcess() self-process probe is Windows-only
+   Loc: [/tmp/reclass_oracle/tests/test_tutorial.cpp(456)]
+SKIP   : TutorialTest::typedPointerComposeOnRealQtObject() self-process probe is Windows-only
+   Loc: [/tmp/reclass_oracle/tests/test_tutorial.cpp(502)]
+SKIP   : TutorialTest::rttiHintFiresWhenComposingThroughSnapshotProvider() self-process probe is Windows-only
+   Loc: [/tmp/reclass_oracle/tests/test_tutorial.cpp(578)]
+SKIP   : TutorialTest::typedPointerComposeWithSymbolsEnabled() self-process probe is Windows-only
+   Loc: [/tmp/reclass_oracle/tests/test_tutorial.cpp(660)]
+PASS   : TutorialTest::cleanupTestCase()
+Totals: 7 passed, 0 failed, 6 skipped, 0 blacklisted, 1ms
+********* Finished testing of TutorialTest *********
+EXIT_CODE=0

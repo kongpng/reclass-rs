@@ -1,0 +1,25 @@
+********* Start testing of TestRtti *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestRtti::initTestCase()
+PASS   : TestRtti::demangleBasic()
+PASS   : TestRtti::demangleNested()
+PASS   : TestRtti::demangleMalformed()
+PASS   : TestRtti::walkSyntheticRtti()
+PASS   : TestRtti::walkRejectsBadSignature()
+PASS   : TestRtti::walkRejectsHugeBaseCount()
+PASS   : TestRtti::textReportFormat()
+PASS   : TestRtti::msvcAbiTagged()
+PASS   : TestRtti::demangleItaniumSimple()
+PASS   : TestRtti::demangleItaniumNested()
+PASS   : TestRtti::demangleItaniumStdShorthand()
+PASS   : TestRtti::demangleItaniumPassthrough()
+PASS   : TestRtti::walkSyntheticItanium()
+PASS   : TestRtti::walkSyntheticItaniumNested()
+PASS   : TestRtti::rejectsImplausibleOffsetToTop()
+PASS   : TestRtti::rejectsNonItaniumNameString()
+SKIP   : TestRtti::smokeTestRealBinary() real-binary smoke is Windows-only (Itanium ABI elsewhere)
+   Loc: [/tmp/reclass_oracle/tests/test_rtti.cpp(217)]
+PASS   : TestRtti::cleanupTestCase()
+Totals: 18 passed, 0 failed, 1 skipped, 0 blacklisted, 1ms
+********* Finished testing of TestRtti *********
+EXIT_CODE=0

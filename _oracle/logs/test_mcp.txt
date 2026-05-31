@@ -1,0 +1,25 @@
+********* Start testing of TestMcp *********
+Config: Using QtTest library 6.10.3, Qt 6.10.3 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.0.1 20260321 (Red Hat 16.0.1-0)), fedora 44
+PASS   : TestMcp::initTestCase()
+PASS   : TestMcp::singleClient_initialize()
+PASS   : TestMcp::singleClient_toolsList()
+PASS   : TestMcp::singleClient_unknownMethod()
+FAIL!  : TestMcp::multiClient_bothInitialize() Compared values are not the same
+   Actual   (m_srv->clientCount()): 1
+   Expected (2)                   : 2
+   Loc: [/tmp/reclass_oracle/tests/test_mcp.cpp(204)]
+PASS   : TestMcp::multiClient_disconnectOne()
+PASS   : TestMcp::multiClient_notificationBroadcast()
+PASS   : TestMcp::multiClient_serialRequests()
+PASS   : TestMcp::allDisconnect_serverSurvives()
+PASS   : TestMcp::protocol_invalidJson()
+PASS   : TestMcp::protocol_missingMethod()
+PASS   : TestMcp::protocol_notificationsIgnored()
+PASS   : TestMcp::toolsCall_unknownTool()
+PASS   : TestMcp::toolsCall_missingToolName()
+PASS   : TestMcp::toolsCall_reconnect()
+PASS   : TestMcp::toolsCall_reconnect_otherClientUnaffected()
+PASS   : TestMcp::cleanupTestCase()
+Totals: 16 passed, 1 failed, 0 skipped, 0 blacklisted, 2405ms
+********* Finished testing of TestMcp *********
+EXIT_CODE=1

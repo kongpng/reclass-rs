@@ -1,0 +1,22 @@
+[▸] source▾  0x0  struct Untitled {
+     uint32_t  Data_0     0x0                                                                                             
+     uint32_t  Data_1     0x0                                                                                             
+};  +1 +10h +100h +1000h Trim Top  // 0x8 (8)
+ ▸ _EPROCESS eprocess 
+ ▸ _KPROCESS kprocess 
+ ▸ _DISPATC… dispatcher_header 
+ ▸ _MMSUPPO… mmsupport_full 
+ ▸ _MMSUPPO… mmsupport_instance 
+ ▸ _MMSUPPO… mmsupport_shared 
+ ▸ _MMSUPPO… mmsupport_flags 
+ ▸ _ALPC_PR… alpc_context 
+ ▸ _PS_DYNA… dynamic_ranges 
+ ▸ _LIST_EN… list_entry 
+ ▸ _PS_PROT… ps_protection 
+ ▸ _SE_AUDI… se_audit_info 
+ ▸ _RTL_AVL… rtl_avl_tree 
+ ▸ _UNICODE… unicode_string 
+ ▸ _EX_FAST… ex_fast_ref 
+ ▸ _EX_RUND… ex_rundown_ref 
+ ▸ _EX_PUSH… ex_push_lock 
+ ▸ _SINGLE_… single_list_entry 

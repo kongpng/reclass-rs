@@ -1,0 +1,7 @@
+# gpui-component pulls C++ deps (tree-sitter etc.) that need libstdc++ at the
+# link step. Fedora ships the linker symlink libstdc++.so under
+# /usr/lib/gcc/x86_64-redhat-linux/<ver>/, not /usr/lib64 — point the linker
+# there so `cargo build` links without an explicit LIBRARY_PATH env var.
+# (See _design/gpui_component_cookbook.md §4.) Linux-only; harmless elsewhere.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "/usr/lib/gcc/x86_64-redhat-linux/16"]
