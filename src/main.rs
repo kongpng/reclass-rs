@@ -64,12 +64,16 @@ fn log_cli(cli: &Cli) {
 fn run(cli: Cli) {
     let options = cli.into_startup_options();
     // gpui-component setup pattern (gpui_component_cookbook.md §4, build-verified):
-    // build the platform application, init gpui-component, then open the main
-    // window — optionally opening the CLI project once the window is up.
-    gpui_platform::application().run(move |cx: &mut gpui::App| {
-        gpui_component::init(cx); // REQUIRED before using any component.
-        reclass::ui::open_main_window_with(cx, options);
-    });
+    // build the platform application, register the gpui-component icon asset
+    // source (so `IconName` SVGs resolve — without it they render as empty
+    // boxes), init gpui-component, then open the main window — optionally opening
+    // the CLI project once the window is up.
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx: &mut gpui::App| {
+            gpui_component::init(cx); // REQUIRED before using any component.
+            reclass::ui::open_main_window_with(cx, options);
+        });
 }
 
 #[cfg(not(feature = "ui"))]

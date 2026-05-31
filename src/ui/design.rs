@@ -273,6 +273,163 @@ pub mod color {
     }
 }
 
+/// Curated icon helpers — the small, named set of [`gpui_component::Icon`]s the
+/// Reclass surfaces actually need, each pinned to a verified
+/// [`IconName`](gpui_component::IconName) variant and pre-styled with a sensible
+/// default size/color from [`tokens`].
+///
+/// WHY a curated layer (not raw `IconName`): `IconName` exposes ~100 Lucide
+/// variants whose names don't match our DOMAIN words (a struct field is a
+/// `Frame`, a pointer is an `ArrowRight`, an array is a `LayoutDashboard`…).
+/// Centralizing the mapping here means (a) surfaces speak in domain terms,
+/// (b) the icon→variant choice is reviewed in ONE place, and (c) every icon
+/// gets a consistent default tint/size. Each fn documents the exact `IconName`
+/// it maps to so the choice is auditable.
+///
+/// Every variant referenced here is backed by a real SVG in the
+/// `gpui-component-assets` bundle (registered in `main.rs` via
+/// `application().with_assets(gpui_component_assets::Assets)`); without that
+/// asset source these would render as empty boxes.
+///
+/// Default styling: icons render at the UI body size ([`tokens::font::UI_MD`],
+/// ~16px → gpui-component's `medium`) unless a caller resizes via the
+/// [`Sizable`](gpui_component::Sizable) trait, and are left UNtinted so they
+/// inherit the parent's text color — except the few semantic-status helpers
+/// ([`info`], [`success`]) which carry an intrinsic tint. Callers may always
+/// override with `.text_color(..)` / `.with_size(..)`.
+pub mod icon {
+    use gpui_component::{Icon, IconName};
+
+    /// Disclosure triangle pointing right (a collapsed tree node).
+    /// Maps to [`IconName::ChevronRight`].
+    pub fn chevron_right() -> Icon {
+        Icon::new(IconName::ChevronRight)
+    }
+
+    /// Disclosure triangle pointing down (an expanded tree node).
+    /// Maps to [`IconName::ChevronDown`].
+    pub fn chevron_down() -> Icon {
+        Icon::new(IconName::ChevronDown)
+    }
+
+    /// A struct / object / class node — a framed container.
+    /// Maps to [`IconName::Frame`].
+    pub fn struct_() -> Icon {
+        Icon::new(IconName::Frame)
+    }
+
+    /// Alias of [`struct_`] for surfaces that speak in "object" terms.
+    /// Maps to [`IconName::Frame`].
+    pub fn object() -> Icon {
+        Icon::new(IconName::Frame)
+    }
+
+    /// A pointer member (dereferenceable address → an arrow to the target).
+    /// Maps to [`IconName::ArrowRight`].
+    pub fn pointer() -> Icon {
+        Icon::new(IconName::ArrowRight)
+    }
+
+    /// An array member (a grid of repeated cells).
+    /// Maps to [`IconName::LayoutDashboard`].
+    pub fn array() -> Icon {
+        Icon::new(IconName::LayoutDashboard)
+    }
+
+    /// A raw hex / byte cell (the hex-bytes column).
+    /// Maps to [`IconName::MemoryStick`].
+    pub fn hex() -> Icon {
+        Icon::new(IconName::MemoryStick)
+    }
+
+    /// A scalar value leaf (a single small mark).
+    /// Maps to [`IconName::Dash`].
+    pub fn value() -> Icon {
+        Icon::new(IconName::Dash)
+    }
+
+    /// A function / method member (code).
+    /// Maps to [`IconName::SquareTerminal`].
+    pub fn function() -> Icon {
+        Icon::new(IconName::SquareTerminal)
+    }
+
+    /// An enum member (a list of named cases).
+    /// Maps to [`IconName::Menu`].
+    pub fn enum_() -> Icon {
+        Icon::new(IconName::Menu)
+    }
+
+    /// A search affordance (the find bar / quick-open).
+    /// Maps to [`IconName::Search`].
+    pub fn search() -> Icon {
+        Icon::new(IconName::Search)
+    }
+
+    /// A scan affordance (the value/pattern scanner — a search variant).
+    /// Maps to [`IconName::Search`].
+    pub fn scan() -> Icon {
+        Icon::new(IconName::Search)
+    }
+
+    /// A refresh / re-scan action (circular arrow).
+    /// Maps to [`IconName::Redo`].
+    pub fn refresh() -> Icon {
+        Icon::new(IconName::Redo)
+    }
+
+    /// A close / dismiss action (the ✕ glyph).
+    /// Maps to [`IconName::Close`].
+    pub fn close() -> Icon {
+        Icon::new(IconName::Close)
+    }
+
+    /// An add / new action (the ＋ glyph).
+    /// Maps to [`IconName::Plus`].
+    pub fn plus() -> Icon {
+        Icon::new(IconName::Plus)
+    }
+
+    /// A data source / backing store (the document's data provider).
+    /// Maps to [`IconName::HardDrive`].
+    pub fn source() -> Icon {
+        Icon::new(IconName::HardDrive)
+    }
+
+    /// Alias of [`source`] for surfaces that speak in "database" terms.
+    /// Maps to [`IconName::HardDrive`].
+    pub fn database() -> Icon {
+        Icon::new(IconName::HardDrive)
+    }
+
+    /// A confirm / done / enabled mark (the ✓ glyph).
+    /// Maps to [`IconName::Check`].
+    pub fn check() -> Icon {
+        Icon::new(IconName::Check)
+    }
+
+    /// A settings / preferences affordance (the gear).
+    /// Maps to [`IconName::Settings`].
+    pub fn settings() -> Icon {
+        Icon::new(IconName::Settings)
+    }
+
+    /// An informational marker, tinted with the brand accent.
+    /// Maps to [`IconName::Info`] (tinted via [`super::color::accent`]).
+    pub fn info(cx: &gpui::App) -> Icon {
+        use gpui::Styled as _;
+        Icon::new(IconName::Info).text_color(super::color::accent(cx))
+    }
+
+    /// A success / OK status marker, tinted green.
+    /// Maps to [`IconName::CircleCheck`] (tinted via the theme `success`).
+    pub fn success(cx: &gpui::App) -> Icon {
+        use gpui::Styled as _;
+        use gpui_component::ActiveTheme as _;
+        Icon::new(IconName::CircleCheck).text_color(cx.theme().success)
+    }
+}
+
 // ── Reusable surface builders (keep chrome DRY + consistent) ─────────────────
 
 /// A panel header strip: the small bold title row at the top of a dockable

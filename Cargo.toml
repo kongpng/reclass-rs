@@ -39,7 +39,10 @@ path = "src/lib.rs"
 default = ["ui", "imports", "disasm", "symbols", "mcp"]
 
 # The whole GPUI UI surface. The ONLY feature that pulls gpui/gpui-component.
-ui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
+# `gpui-component-assets` is part of it: it bundles the SVG icon assets that back
+# `gpui_component::IconName`, registered via `application().with_assets(...)` in
+# main.rs — without it `IconName` variants render as empty boxes (no SVG source).
+ui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-component-assets"]
 
 # Source / ReClass-XML import+export, PDB import, and PE-debug extraction.
 # pdb2/object are pure Rust ⇒ build on all OSes.
@@ -117,6 +120,15 @@ features = ["font-kit", "x11", "wayland", "runtime_shaders"]
 optional = true
 
 [dependencies.gpui-component]
+git = "https://github.com/longbridge/gpui-component"
+rev = "bd4174e4991eef4c0900cb6dfb7143e0889f5dd9"
+optional = true
+
+# The SVG icon asset bundle for gpui-component (crate `gpui_component_assets`,
+# same git repo + rev as gpui-component). Registered via
+# `application().with_assets(gpui_component_assets::Assets)` so `IconName`
+# variants resolve to real SVGs. ui-gated so `--no-default-features` stays clean.
+[dependencies.gpui-component-assets]
 git = "https://github.com/longbridge/gpui-component"
 rev = "bd4174e4991eef4c0900cb6dfb7143e0889f5dd9"
 optional = true
