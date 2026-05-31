@@ -482,10 +482,14 @@ impl Render for MainWindow {
 pub fn open_main_window(cx: &mut App) {
     let theme_manager = ThemeRegistryGlobal::get(cx);
 
-    // Register the editor-surface + inline-field + start-page key bindings.
+    // Register the editor-surface + inline-field + start-page key bindings, plus
+    // the dialog/popup contexts (command palette + find bar; the dialogs/pickers
+    // are opened through the `Root` overlay and own their own key contexts).
     let mut bindings = super::editor::editor_key_bindings();
     bindings.extend(super::editor::inline_edit::field_key_bindings());
     bindings.extend(super::startpage::start_page_key_bindings());
+    bindings.extend(super::commandpalette::command_palette_key_bindings());
+    bindings.extend(super::findbar::find_bar_key_bindings());
     cx.bind_keys(bindings);
 
     cx.spawn(async move |cx| {

@@ -24,15 +24,27 @@
 //! and panels can be filled in by the next workflows; the editor grid and real
 //! dialogs are deliberately NOT implemented here. Gated behind the `ui` feature.
 
+pub mod commandpalette;
+pub mod contextmenu;
 pub mod dialogs;
 pub mod docks;
 pub mod editor;
+pub mod enumpicker;
+pub mod findbar;
+pub mod fuzzy;
+pub mod gotoaddress;
+pub mod hextoolbar;
+pub mod messagebox;
+pub mod optionsdialog;
 pub mod panels;
+pub mod sourcechooser;
 pub mod startpage;
 pub mod state;
 pub mod tabs;
 pub mod theme_apply;
 pub mod titlebar;
+pub mod tooltip;
+pub mod typeselectorpopup;
 pub mod window;
 pub mod workspace;
 

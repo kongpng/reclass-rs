@@ -446,6 +446,25 @@ impl ThemeRegistryGlobal {
         }
         cx.global::<ThemeRegistryGlobal>().0.clone()
     }
+
+    /// The current resolved [`Theme`](crate::theme::Theme), read-only.
+    ///
+    /// For views that tint from our theme's *semantic* colors (e.g. the type
+    /// selector's per-group accents, which gpui-component's `ThemeColor` does not
+    /// model) during `render` (a `&App` context). Returns a clone of the active
+    /// theme, or [`Theme::default`](crate::theme::Theme::default) if the global is
+    /// not yet installed (it always is after `gpui_component::init`).
+    pub fn current(cx: &gpui::App) -> crate::theme::Theme {
+        if cx.has_global::<ThemeRegistryGlobal>() {
+            cx.global::<ThemeRegistryGlobal>()
+                .0
+                .borrow()
+                .current()
+                .clone()
+        } else {
+            crate::theme::Theme::default()
+        }
+    }
 }
 
 /// Apply our [`Theme`] to the global gpui-component theme and refresh.
