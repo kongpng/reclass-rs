@@ -1684,12 +1684,14 @@ fn chip_spans_match_rendered_text() {
     assert!(checked);
 }
 
-// `chipsAppearInDefinedOrder` + `rttiChipFiresAndCanBeSuppressed` +
-// `typeHintChipFiresAsOverlay` depend on the RTTI walker (`symbols` feature)
-// and `infer_types` (`typeinfer` workflow), neither available in this isolated
-// headless build. Faithful ports kept for the integrator to enable.
+// `chipsAppearInDefinedOrder` + `rttiChipFiresAndCanBeSuppressed` depend on the
+// RTTI walker (`symbols` feature), not available in this isolated headless
+// build. Faithful ports kept for the integrator to enable.
+//
+// `typeHintChipFiresAsOverlay` only needs `infer_types` (the `typeinfer`
+// module, now implemented), so it runs unconditionally — it never reads any
+// vtable. (`test_chips.cpp:176-212`.)
 #[test]
-#[ignore = "needs symbols (walkRtti) + typeinfer; both skeleton in this build"]
 fn type_hint_chip_fires_as_overlay() {
     let mut tree = NodeTree::new();
     tree.base_address = K_STRUCT_BASE;
@@ -1701,6 +1703,8 @@ fn type_hint_chip_fires_as_overlay() {
     let root_id = tree.nodes[ri].id;
     tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
     let mut data = vec![0u8; (K_STRUCT_BASE + 16) as usize];
+    // Plant two int32s side by side — inferTypes treats this as int32×2 with
+    // strong confidence.
     data[K_STRUCT_BASE as usize..K_STRUCT_BASE as usize + 4].copy_from_slice(&14i32.to_le_bytes());
     data[K_STRUCT_BASE as usize + 4..K_STRUCT_BASE as usize + 8]
         .copy_from_slice(&20i32.to_le_bytes());
@@ -1711,6 +1715,12 @@ fn type_hint_chip_fires_as_overlay() {
     let c = first_chip(&r, ChipKind::TypeHint).expect("typehint chip");
     assert!(c.start_col >= 0);
     assert!(c.end_col > c.start_col);
+    // Chip text must be plain (no brackets) — the inline pill, not "[int32×2]".
+    assert!(
+        !c.text.contains('['),
+        "chip text should be plain: {}",
+        c.text
+    );
     assert!(!c.type_hint_kinds.is_empty());
 }
 
