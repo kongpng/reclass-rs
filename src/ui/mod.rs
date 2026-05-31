@@ -50,4 +50,4 @@ pub mod typeselectorpopup;
 pub mod window;
 pub mod workspace;
 
-pub use window::{open_main_window, MainWindow};
+pub use window::{open_main_window, open_main_window_with, MainWindow, StartupOptions};

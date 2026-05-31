@@ -398,11 +398,156 @@ impl MainWindow {
                 // imports workflows; for now dismiss so the user reaches the editor.
                 self.dismiss_start_page(cx);
             }
-            StartPageEvent::FileSelected(_path) => {
-                // `project_open(path)` lands with the project-lifecycle workflow.
+            StartPageEvent::FileSelected(path) => {
+                // The C++ start-page recent-file click → `project_open(path)`
+                // (app-shell §13). Dismiss the splash + load the `.rcx` into the
+                // active document via the controller/imports lifecycle.
                 self.dismiss_start_page(cx);
+                self.open_project(std::path::Path::new(&path), None, window, cx);
             }
         }
+    }
+
+    // ── Document lifecycle (the C++ `project_open` / `loadData`; app-shell §8) ──
+
+    /// Open a `.rcx` project into the **active** document tab (the C++
+    /// `project_open(path)`; main.cpp:6370). Loads the tree via the controller's
+    /// [`RcxDocument::load`](crate::controller::RcxDocument::load) (the forgiving
+    /// 8-step JSON load), optionally attaches a binary data source
+    /// (`loadData(dataPath)`), refreshes the editor, then syncs the window state:
+    /// the tab title (from the file stem, the C++ `rootName`), the data-source
+    /// icon, and the workspace tree. The start page is dismissed so the user
+    /// lands on the loaded document.
+    ///
+    /// `.xml` paths are routed through the ReClass-XML importer
+    /// ([`crate::imports::import_reclass_xml`]) when the `imports` feature is on;
+    /// every other extension is treated as native `.rcx` JSON. Returns `true` on
+    /// a successful load (the tab now shows the project), `false` otherwise (the
+    /// existing document is left untouched — the C++ "refuse rather than show a
+    /// placeholder", controller.cpp:201).
+    pub fn open_project(
+        &mut self,
+        path: &std::path::Path,
+        data_path: Option<&std::path::Path>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::controller::RcxDocument;
+
+        // Build the document from disk. ReClass-XML imports go through the XML
+        // importer (when compiled in); `.rcx`/`.json`/anything else is the native
+        // forgiving JSON load. On any failure we leave the current doc untouched.
+        let mut doc = RcxDocument::new();
+        let is_xml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("xml"))
+            .unwrap_or(false);
+
+        let loaded = if is_xml {
+            self.load_reclass_xml(path, &mut doc)
+        } else {
+            doc.load(path)
+        };
+        if !loaded {
+            tracing::warn!(path = %path.display(), "open_project: load failed — keeping current document");
+            return false;
+        }
+        doc.file_path = Some(path.to_path_buf());
+
+        // Optionally attach the binary data source (`--data` / saved source).
+        if let Some(dp) = data_path {
+            doc.load_data_file(dp);
+        }
+        let source = Self::source_for_doc(&doc);
+
+        // Push the loaded document into the active editor (the C++ rebinds the
+        // active tab's controller). The editor recomposes + picks a view root.
+        let Some(active_id) = self.active_doc_id(cx) else {
+            return false;
+        };
+        if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+            editor.update(cx, |ed, cx| ed.set_document(doc, cx));
+        }
+
+        // Sync the tab title (file stem ≈ the C++ `rootName`) + source icon into
+        // both the document area and the window state.
+        let title = Self::title_for_path(path);
+        self.document_area.update(cx, |area, cx| {
+            area.set_title(active_id, title.clone(), cx);
+            area.set_source(active_id, source.clone(), cx);
+        });
+        self.state.set_title(active_id, title);
+        self.state.set_source(active_id, source);
+
+        // Refresh the workspace tree from the freshly loaded document + dismiss
+        // the start page so the user lands on the document.
+        self.rebuild_workspace(cx);
+        self.dismiss_start_page(cx);
+        cx.notify();
+        true
+    }
+
+    /// Load a ReClass-XML file into `doc.tree` (the C++ `import_reclass_xml`
+    /// path). Gated on the `imports` feature; without it, XML opens fail
+    /// gracefully (returns `false`).
+    #[cfg(feature = "imports")]
+    fn load_reclass_xml(
+        &self,
+        path: &std::path::Path,
+        doc: &mut crate::controller::RcxDocument,
+    ) -> bool {
+        match crate::imports::import_reclass_xml(path, 8) {
+            Ok(tree) => {
+                doc.tree = tree;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "import_reclass_xml failed");
+                false
+            }
+        }
+    }
+
+    #[cfg(not(feature = "imports"))]
+    fn load_reclass_xml(
+        &self,
+        _path: &std::path::Path,
+        _doc: &mut crate::controller::RcxDocument,
+    ) -> bool {
+        tracing::warn!("ReClass-XML import requires the `imports` feature");
+        false
+    }
+
+    /// The active document id, preferring the `DocumentArea` (the source of truth
+    /// for tab ordering) and falling back to [`AppState`].
+    fn active_doc_id(&self, cx: &Context<Self>) -> Option<DocId> {
+        self.document_area
+            .read(cx)
+            .active_entry()
+            .map(|e| e.id)
+            .or_else(|| self.state.active_id())
+    }
+
+    /// Map a loaded document's provider/data path to the UI [`DataSource`]
+    /// summary (the tab source-icon; app-shell §8 `refreshDocTabSourceIcon`).
+    fn source_for_doc(doc: &crate::controller::RcxDocument) -> super::state::DataSource {
+        use super::state::{DataSource, SourceKind};
+        match &doc.data_path {
+            Some(p) => DataSource::new(SourceKind::File, p.to_string_lossy().into_owned()),
+            None => DataSource::none(),
+        }
+    }
+
+    /// The tab title for an opened project file — its stem (the C++ titles a tab
+    /// by the file/struct name; here the file stem is the stable, faithful
+    /// choice and matches `updateWindowTitle`). Falls back to `"Untitled"`.
+    fn title_for_path(path: &std::path::Path) -> String {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Untitled".to_string())
     }
 
     /// Switch the active theme by index and re-apply it (themes.md §4.4
@@ -477,9 +622,41 @@ impl Render for MainWindow {
     }
 }
 
-/// Open the main application window. Called from `main.rs` inside
-/// `gpui_platform::application().run(...)`, after `gpui_component::init(cx)`.
+/// Startup options for the application window — the CLI-derived launch state
+/// (`src/main.rs`). Mirrors the C++ `main()` positional-argument + `--data`
+/// handling: an optional `.rcx`/`.xml` project to open and an optional binary
+/// data file to attach (app-shell §13; main.cpp:8774 `project_open(path)`).
+///
+/// Defaulting all fields gives the plain "launch to start page" behaviour
+/// ([`StartupOptions::default`]), so [`open_main_window`] is `with` + defaults.
+#[derive(Clone, Debug, Default)]
+pub struct StartupOptions {
+    /// A project file (`.rcx` native JSON or `.xml` ReClass-XML) to open on
+    /// launch, loaded into the initial document tab.
+    pub project: Option<std::path::PathBuf>,
+    /// A binary file to attach as the document's data source (`loadData`).
+    pub data: Option<std::path::PathBuf>,
+}
+
+/// Open the main application window with no startup project (launch to the start
+/// page). Called from `main.rs` inside `gpui_platform::application().run(...)`,
+/// after `gpui_component::init(cx)`.
 pub fn open_main_window(cx: &mut App) {
+    open_main_window_with(cx, StartupOptions::default());
+}
+
+/// Open the main application window, optionally opening a project / attaching a
+/// data source on launch ([`StartupOptions`]). This is the entry point the
+/// binary calls with the parsed CLI; the no-arg [`open_main_window`] delegates
+/// here with defaults.
+///
+/// Registers the global key bindings (editor surface + inline fields + start
+/// page + command palette + find bar), opens the `Root`-wrapped [`MainWindow`],
+/// and — if a project path was given — drives the document-open lifecycle
+/// ([`MainWindow::open_project`]) so the window comes up already showing the
+/// loaded project (the C++ `QMetaObject::invokeMethod(... project_open ...)`
+/// after `window.show()`; main.cpp:8774).
+pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     let theme_manager = ThemeRegistryGlobal::get(cx);
 
     // Register the editor-surface + inline-field + start-page key bindings, plus
@@ -493,10 +670,24 @@ pub fn open_main_window(cx: &mut App) {
     cx.bind_keys(bindings);
 
     cx.spawn(async move |cx| {
-        let _ = cx.open_window(WindowOptions::default(), |window, cx| {
+        let window_handle = cx.open_window(WindowOptions::default(), |window, cx| {
             let view = cx.new(|cx| MainWindow::new(theme_manager.clone(), window, cx));
             cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
         });
+
+        // After the window is up, open the CLI-requested project (if any) into
+        // the initial tab — the C++ deferred `project_open(path)` after show.
+        if let (Ok(handle), Some(project)) = (window_handle, options.project) {
+            let data = options.data;
+            let _ = handle.update(cx, move |root, window, cx| {
+                let main = root.view().clone();
+                if let Ok(main) = main.downcast::<MainWindow>() {
+                    main.update(cx, |mw, cx| {
+                        mw.open_project(&project, data.as_deref(), window, cx);
+                    });
+                }
+            });
+        }
     })
     .detach();
 }

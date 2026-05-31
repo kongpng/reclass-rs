@@ -115,6 +115,55 @@ LIBRARY_PATH=/usr/lib/gcc/x86_64-redhat-linux/16 cargo build
 Windows uses native DirectX 11 (no Vulkan/wgpu/fontconfig) — these Linux libs
 are not needed there.
 
+## Running
+
+The default build produces the GUI app at `target/debug/reclass`. It opens a
+GPUI window (titlebar + docks + document tabs + the bespoke editor surface +
+workspace/scanner panels + theme) and runs the event loop.
+
+```sh
+# Launch to the start page (no project).
+./target/debug/reclass
+
+# Open a Reclass project on launch (.rcx native JSON, or .xml ReClass-XML).
+./target/debug/reclass path/to/project.rcx
+
+# Open a project AND attach a binary file as its data source.
+./target/debug/reclass path/to/project.rcx --data path/to/dump.bin
+
+# CLI help / version (work without a display).
+./target/debug/reclass --help
+./target/debug/reclass --version
+```
+
+The positional `PROJECT` is loaded into the initial document tab once the window
+is up (the C++ deferred `project_open(path)` after `window.show()`); `--data`
+attaches a binary file as the document's data source. A `.xml` path is routed
+through the ReClass-XML importer, anything else through the native `.rcx` JSON
+loader; an unreadable/non-project file is refused and the blank document is kept.
+
+Logging honours `RUST_LOG` (defaults to `info`), so the document-lifecycle trace
+is visible out of the box:
+
+```sh
+RUST_LOG=debug ./target/debug/reclass demo.rcx
+```
+
+> **Display required for the GUI.** The window needs a Wayland or X11 display;
+> on a headless box run it under a virtual display, e.g.
+> `xvfb-run ./target/debug/reclass`. The `--help` / `--version` paths and the
+> whole test suite run without a display.
+
+A release build (`cargo build --release`) puts the binary at
+`target/release/reclass`.
+
+The MCP stdio bridge is a separate binary (built with the `mcp` feature):
+
+```sh
+cargo build --bin reclass-mcp-bridge --no-default-features --features mcp
+./target/debug/reclass-mcp-bridge        # relays stdio ↔ the app's local socket
+```
+
 ## UI dependency note (the one real footgun)
 
 gpui is git-only and gpui-component depends on gpui as an **unpinned** git ref.
