@@ -7,9 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::core::{
-    is_hex_node, is_pointer_kind, BitfieldMember, Node, NodeKind, NodeTree,
-};
+use crate::core::{is_hex_node, is_pointer_kind, BitfieldMember, Node, NodeKind, NodeTree};
 
 /// `enum class CodeFormat : int` (`generator.h:11-18`).
 #[repr(i32)]
@@ -455,7 +453,13 @@ fn emit_field(ctx: &GenContext, node: &Node, depth: i32, base_offset: i32) -> St
         NodeKind::Vec3 => format!("{}{} {}[3];{}", ind, ctx.c_type(NodeKind::Float), name, oc),
         NodeKind::Vec4 => format!("{}{} {}[4];{}", ind, ctx.c_type(NodeKind::Float), name, oc),
         NodeKind::Mat4x4 => {
-            format!("{}{} {}[4][4];{}", ind, ctx.c_type(NodeKind::Float), name, oc)
+            format!(
+                "{}{} {}[4][4];{}",
+                ind,
+                ctx.c_type(NodeKind::Float),
+                name,
+                oc
+            )
         }
         NodeKind::UTF8 => format!(
             "{}{} {}[{}];{}",
@@ -789,8 +793,7 @@ fn emit_struct(ctx: &mut GenContext, struct_id: u64) {
         kw = "struct".to_string();
     }
 
-    ctx.output
-        .push_str(&format!("{} {}\n{{\n", kw, type_name));
+    ctx.output.push_str(&format!("{} {}\n{{\n", kw, type_name));
 
     emit_struct_body(ctx, struct_id, kw == "union", 1, 0);
 
@@ -844,7 +847,10 @@ fn emit_rust_field(ctx: &GenContext, node: &Node, depth: i32, base_offset: i32) 
             }
         }
         NodeKind::FuncPtr32 | NodeKind::FuncPtr64 => {
-            format!("{}pub {}: Option<unsafe extern \"C\" fn()>,{}", ind, name, oc)
+            format!(
+                "{}pub {}: Option<unsafe extern \"C\" fn()>,{}",
+                ind, name, oc
+            )
         }
         _ => format!("{}pub {}: {},{}", ind, name, ctx.rust_type(node.kind), oc),
     }
@@ -1153,8 +1159,7 @@ fn emit_defines_for_struct(ctx: &mut GenContext, struct_id: u64, prefix: &str, b
 
     // Enum with members.
     if kw == "enum" && !node.enum_members.is_empty() {
-        ctx.output
-            .push_str(&format!("// {} (enum)\n", type_name));
+        ctx.output.push_str(&format!("// {} (enum)\n", type_name));
         for m in &node.enum_members {
             ctx.output.push_str(&format!(
                 "#define {}_{} {}\n",
@@ -1168,16 +1173,10 @@ fn emit_defines_for_struct(ctx: &mut GenContext, struct_id: u64, prefix: &str, b
     }
 
     let struct_size = ctx.tree.struct_span(struct_id);
-    ctx.output.push_str(&format!(
-        "// {} (0x{:X} bytes)\n",
-        type_name, struct_size
-    ));
+    ctx.output
+        .push_str(&format!("// {} (0x{:X} bytes)\n", type_name, struct_size));
 
-    let mut children: Vec<usize> = ctx
-        .child_map
-        .get(&struct_id)
-        .cloned()
-        .unwrap_or_default();
+    let mut children: Vec<usize> = ctx.child_map.get(&struct_id).cloned().unwrap_or_default();
     children.sort_by_key(|&a| ctx.tree.nodes[a].offset);
 
     for ci in children {
@@ -1450,7 +1449,13 @@ fn emit_csharp_struct(ctx: &mut GenContext, struct_id: u64) {
 // ═══════════════════════════════════════════════════════════════════
 
 /// The `emitPadField` lambda inside `emitPythonStructBody` (`generator.cpp:1140-1146`).
-fn emit_pad_field_py(ctx: &mut GenContext, ind: &str, base_offset: i32, rel_offset: i32, size: i32) {
+fn emit_pad_field_py(
+    ctx: &mut GenContext,
+    ind: &str,
+    base_offset: i32,
+    rel_offset: i32,
+    size: i32,
+) {
     if size <= 0 {
         return;
     }
@@ -1574,15 +1579,18 @@ fn emit_python_struct_body(ctx: &mut GenContext, struct_id: u64, is_union: bool,
         } else {
             // Primitive fields.
             match child.kind {
-                NodeKind::Vec2 => ctx
-                    .output
-                    .push_str(&format!("{}(\"{}\", ctypes.c_float * 2),{}\n", ind, name, oc)),
-                NodeKind::Vec3 => ctx
-                    .output
-                    .push_str(&format!("{}(\"{}\", ctypes.c_float * 3),{}\n", ind, name, oc)),
-                NodeKind::Vec4 => ctx
-                    .output
-                    .push_str(&format!("{}(\"{}\", ctypes.c_float * 4),{}\n", ind, name, oc)),
+                NodeKind::Vec2 => ctx.output.push_str(&format!(
+                    "{}(\"{}\", ctypes.c_float * 2),{}\n",
+                    ind, name, oc
+                )),
+                NodeKind::Vec3 => ctx.output.push_str(&format!(
+                    "{}(\"{}\", ctypes.c_float * 3),{}\n",
+                    ind, name, oc
+                )),
+                NodeKind::Vec4 => ctx.output.push_str(&format!(
+                    "{}(\"{}\", ctypes.c_float * 4),{}\n",
+                    ind, name, oc
+                )),
                 NodeKind::Mat4x4 => ctx.output.push_str(&format!(
                     "{}(\"{}\", (ctypes.c_float * 4) * 4),{}\n",
                     ind, name, oc
@@ -2198,9 +2206,7 @@ pub fn render_code_tree(
             render_csharp_tree(tree, root_struct_id, type_aliases, emit_asserts)
         }
         CodeFormat::PythonCtypes => render_python_tree(tree, root_struct_id),
-        CodeFormat::CppHeader => {
-            render_cpp_tree(tree, root_struct_id, type_aliases, emit_asserts)
-        }
+        CodeFormat::CppHeader => render_cpp_tree(tree, root_struct_id, type_aliases, emit_asserts),
     }
 }
 

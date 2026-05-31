@@ -417,7 +417,11 @@ pub fn fmt_pointer64(v: u64) -> String {
 /// then Qt lowercases the exponent marker (`e`). Used by `fmtDouble`/`fmtFloat16`.
 fn qstring_number_g(v: f64, precision: i32) -> String {
     // C `%g`: precision 0 is treated as 1.
-    let p = if precision <= 0 { 1 } else { precision as usize };
+    let p = if precision <= 0 {
+        1
+    } else {
+        precision as usize
+    };
     // Rust's `{:e}` / `{:.*e}` mirror C `%e` (lowercase 'e', sign on exponent,
     // at least 2 exponent digits is NOT guaranteed in Rust — but `%g` chooses
     // between %e and %f, and after trailing-zero stripping the exact exponent
@@ -1489,10 +1493,7 @@ pub fn validate_value(kind: NodeKind, text: &str) -> String {
                 if *c == ' ' && is_multi_byte_hex {
                     continue;
                 }
-                if !c.is_ascii_digit()
-                    && !('a'..='f').contains(c)
-                    && !('A'..='F').contains(c)
-                {
+                if !c.is_ascii_digit() && !('a'..='f').contains(c) && !('A'..='F').contains(c) {
                     return format!("invalid hex '{c}'");
                 }
             }
@@ -1583,7 +1584,13 @@ pub fn extract_bits(
 
 /// `fmt::fmtBitfieldMember(name, bitWidth, value, depth, nameW)`
 /// (`format.cpp:929-934`).
-pub fn fmt_bitfield_member(name: &str, bit_width: u8, value: u64, depth: i32, name_w: i32) -> String {
+pub fn fmt_bitfield_member(
+    name: &str,
+    bit_width: u8,
+    value: u64,
+    depth: i32,
+    name_w: i32,
+) -> String {
     let ind = indent(depth);
     format!(
         "{ind}{} : {bit_width} = {value}",
@@ -2013,7 +2020,10 @@ mod tests {
     #[test]
     fn test_array_and_pointer_type_name() {
         assert_eq!(array_type_name(NodeKind::UInt32, 16, ""), "uint32_t[16]");
-        assert_eq!(array_type_name(NodeKind::Struct, 2, "Material"), "Material[2]");
+        assert_eq!(
+            array_type_name(NodeKind::Struct, 2, "Material"),
+            "Material[2]"
+        );
         assert_eq!(pointer_type_name(NodeKind::Pointer64, ""), "void*");
         assert_eq!(
             pointer_type_name(NodeKind::Pointer64, "StructName"),

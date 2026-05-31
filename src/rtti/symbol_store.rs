@@ -189,10 +189,13 @@ impl SymbolStore {
     /// RTTI-only set (`pdb_path=""`) if the module is absent.
     pub fn add_rtti_hits(&mut self, module_name: &str, hits: &[(String, u32)]) {
         let canonical = self.resolve_alias(module_name);
-        let set = self.modules.entry(canonical.clone()).or_insert_with(|| PdbSymbolSet {
-            module_name: canonical.clone(),
-            ..Default::default()
-        });
+        let set = self
+            .modules
+            .entry(canonical.clone())
+            .or_insert_with(|| PdbSymbolSet {
+                module_name: canonical.clone(),
+                ..Default::default()
+            });
         for (name, rva) in hits {
             if set.name_to_rva.contains_key(name) {
                 continue;
@@ -484,7 +487,9 @@ mod tests {
         // no provider -> "".
         assert_eq!(s.get_symbol_for_address(0x4000_0200, None), "");
         // unattached module (base 0) -> "".
-        let prov0 = TestProvider { bases: HashMap::new() };
+        let prov0 = TestProvider {
+            bases: HashMap::new(),
+        };
         assert_eq!(s.get_symbol_for_address(0x4000_0200, Some(&prov0)), "");
     }
 

@@ -85,11 +85,7 @@ impl ThemeManager {
     /// themes, resolves the fallback selection (a name containing "VS2022",
     /// else the first built-in), reads the persisted `"theme"` key, and selects
     /// the matching theme (else index 0).
-    pub fn new(
-        settings: Box<dyn SettingsStore>,
-        builtin_dir: PathBuf,
-        user_dir: PathBuf,
-    ) -> Self {
+    pub fn new(settings: Box<dyn SettingsStore>, builtin_dir: PathBuf, user_dir: PathBuf) -> Self {
         let mut m = ThemeManager {
             builtin: Vec::new(),
             builtin_defaults: Vec::new(),
@@ -414,9 +410,15 @@ impl ThemeManager {
             if index < self.builtin_defaults.len()
                 && self.builtin[index].to_json() != self.builtin_defaults[index].to_json()
             {
-                return Some(self.user_dir.join(theme_filename(&self.builtin[index].name)));
+                return Some(
+                    self.user_dir
+                        .join(theme_filename(&self.builtin[index].name)),
+                );
             }
-            return Some(self.builtin_dir.join(theme_filename(&self.builtin[index].name)));
+            return Some(
+                self.builtin_dir
+                    .join(theme_filename(&self.builtin[index].name)),
+            );
         }
         let ui = index - self.builtin.len();
         if ui >= self.user.len() {
@@ -497,7 +499,11 @@ mod tests {
             next_unique()
         ));
         let _ = std::fs::create_dir_all(&user_dir);
-        let m = ThemeManager::new(Box::new(MemSettings::new()), fixtures_dir(), user_dir.clone());
+        let m = ThemeManager::new(
+            Box::new(MemSettings::new()),
+            fixtures_dir(),
+            user_dir.clone(),
+        );
         (m, user_dir)
     }
 
@@ -731,11 +737,7 @@ mod tests {
     #[test]
     fn user_override_by_name() {
         let (mut m, user_dir) = mk_manager();
-        let warm_idx = m
-            .themes()
-            .iter()
-            .position(|t| t.name == "Warm")
-            .unwrap();
+        let warm_idx = m.themes().iter().position(|t| t.name == "Warm").unwrap();
         let len_before = m.themes().len();
 
         // Write a user JSON named "Warm" with a changed background.

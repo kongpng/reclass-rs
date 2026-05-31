@@ -16,7 +16,7 @@
 use std::fmt::Write as _;
 
 use iced_x86::{
-    Decoder, DecoderOptions, Formatter, IntelFormatter, Instruction, MemorySizeOptions,
+    Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, MemorySizeOptions,
 };
 
 /// `QString disassemble(const QByteArray& bytes, uint64_t baseAddr, int bitness, int maxBytes = 128)`
@@ -292,7 +292,12 @@ mod tests {
     fn disasm64_call_rel() {
         // test_disasm.cpp:45-49 — target = 0x1000 + 5 + 0x100 = 0x1105
         assert_eq!(
-            mnemonic(&disassemble(&[0xe8, 0x00, 0x01, 0x00, 0x00], 0x1000, 64, 128)),
+            mnemonic(&disassemble(
+                &[0xe8, 0x00, 0x01, 0x00, 0x00],
+                0x1000,
+                64,
+                128
+            )),
             "call 0x1105"
         );
     }
@@ -529,7 +534,7 @@ mod tests {
         let mut mem = vec![0u8; 1024];
         w64(&mut mem, 0x00, 0x80); // root vptr -> 0x80
         w64(&mut mem, 0x80, 0x100); // vtable -> func @ 0x100
-        // code @ 0x100: sub rsp, 0x28; nop; ret
+                                    // code @ 0x100: sub rsp, 0x28; nop; ret
         mem[0x100] = 0x48;
         mem[0x101] = 0x83;
         mem[0x102] = 0xec;
@@ -572,7 +577,7 @@ mod tests {
         w64(&mut mem, 0x000, 0x100); // __vptr
         w64(&mut mem, 0x100, 0x1000); // vtable[0] -> func0
         w64(&mut mem, 0x108, 0x1800); // vtable[1] -> func1
-        // func0: push rbp; mov rbp, rsp; sub rsp, 0x20; ret
+                                      // func0: push rbp; mov rbp, rsp; sub rsp, 0x20; ret
         mem[0x1000..0x1009]
             .copy_from_slice(&[0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0xc3]);
         // func1: xor eax, eax; ret

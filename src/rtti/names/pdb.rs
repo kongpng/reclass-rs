@@ -96,7 +96,11 @@ impl NameProvider for PdbNameProvider {
             None => (rest, ""),
         };
         let humanized = humanize_symbol_name(sym);
-        let shown: &str = if humanized.is_empty() { sym } else { &humanized };
+        let shown: &str = if humanized.is_empty() {
+            sym
+        } else {
+            &humanized
+        };
         format!("{prefix}{shown}{suffix}")
     }
 
@@ -190,7 +194,11 @@ mod tests {
         {
             let mut store = SymbolStore::global().lock().unwrap();
             store.unload_module("pnp_test");
-            store.add_module("pnp_test.dll", "/x/pnp_test.pdb", &[("sym".to_owned(), 0x40)]);
+            store.add_module(
+                "pnp_test.dll",
+                "/x/pnp_test.pdb",
+                &[("sym".to_owned(), 0x40)],
+            );
         }
         let p = PdbNameProvider;
 
@@ -213,7 +221,10 @@ mod tests {
         assert_eq!(found.address, 0x5000_0000 + 0x40);
 
         // cleanup.
-        SymbolStore::global().lock().unwrap().unload_module("pnp_test");
+        SymbolStore::global()
+            .lock()
+            .unwrap()
+            .unload_module("pnp_test");
     }
 
     // ── PdbTypeProvider address-less + kind mapping ──
@@ -266,6 +277,9 @@ mod tests {
         // reverse lookups inert.
         assert_eq!(p.name_for(0, None), "");
 
-        SymbolStore::global().lock().unwrap().unload_module("ptp_test");
+        SymbolStore::global()
+            .lock()
+            .unwrap()
+            .unload_module("ptp_test");
     }
 }

@@ -483,28 +483,95 @@ fn k_system() -> &'static HashSet<&'static str> {
     SET.get_or_init(|| {
         [
             // Windows core
-            "kernel32", "kernelbase", "ntdll", "win32u", "user32", "gdi32",
-            "gdi32full", "advapi32", "shell32", "shlwapi", "shcore",
-            "combase", "ole32", "oleaut32", "rpcrt4", "sechost", "sspicli",
-            "msvcrt", "ucrtbase", "msvcp140", "vcruntime140", "vcruntime140_1",
-            "msvcp_win", "bcrypt", "bcryptprimitives", "cryptbase", "crypt32",
-            "imm32", "dwmapi", "uxtheme", "comdlg32", "comctl32", "winmm",
-            "ws2_32", "iphlpapi", "wininet", "winhttp", "psapi", "version",
-            "wldap32", "secur32", "msasn1", "wintrust", "kernel.appcore",
-            "twinapi", "twinapi.appcore", "windows.storage", "wintypes",
-            "profapi", "dnsapi", "userenv", "setupapi", "cfgmgr32", "devobj",
-            "powrprof", "atl", "atl120", "atl140", "msvcr120", "msvcp120",
+            "kernel32",
+            "kernelbase",
+            "ntdll",
+            "win32u",
+            "user32",
+            "gdi32",
+            "gdi32full",
+            "advapi32",
+            "shell32",
+            "shlwapi",
+            "shcore",
+            "combase",
+            "ole32",
+            "oleaut32",
+            "rpcrt4",
+            "sechost",
+            "sspicli",
+            "msvcrt",
+            "ucrtbase",
+            "msvcp140",
+            "vcruntime140",
+            "vcruntime140_1",
+            "msvcp_win",
+            "bcrypt",
+            "bcryptprimitives",
+            "cryptbase",
+            "crypt32",
+            "imm32",
+            "dwmapi",
+            "uxtheme",
+            "comdlg32",
+            "comctl32",
+            "winmm",
+            "ws2_32",
+            "iphlpapi",
+            "wininet",
+            "winhttp",
+            "psapi",
+            "version",
+            "wldap32",
+            "secur32",
+            "msasn1",
+            "wintrust",
+            "kernel.appcore",
+            "twinapi",
+            "twinapi.appcore",
+            "windows.storage",
+            "wintypes",
+            "profapi",
+            "dnsapi",
+            "userenv",
+            "setupapi",
+            "cfgmgr32",
+            "devobj",
+            "powrprof",
+            "atl",
+            "atl120",
+            "atl140",
+            "msvcr120",
+            "msvcp120",
             // Qt 6 core libs
-            "qt6core", "qt6gui", "qt6widgets", "qt6concurrent", "qt6network",
-            "qt6printsupport", "qt6svg", "qt6dbus", "qt6xml",
+            "qt6core",
+            "qt6gui",
+            "qt6widgets",
+            "qt6concurrent",
+            "qt6network",
+            "qt6printsupport",
+            "qt6svg",
+            "qt6dbus",
+            "qt6xml",
             // Linux
-            "ld-linux-x86-64.so", "libc.so", "libc.so.6", "libdl.so",
-            "libpthread.so", "librt.so", "libm.so", "libstdc++.so",
+            "ld-linux-x86-64.so",
+            "libc.so",
+            "libc.so.6",
+            "libdl.so",
+            "libpthread.so",
+            "librt.so",
+            "libm.so",
+            "libstdc++.so",
             "libgcc_s.so",
             // macOS
-            "libsystem_kernel.dylib", "libsystem_c.dylib", "libsystem_pthread.dylib",
-            "libsystem_malloc.dylib", "libsystem_platform.dylib",
-            "libc++.1.dylib", "libobjc.A.dylib", "dyld",
+            "libsystem_kernel.dylib",
+            "libsystem_c.dylib",
+            "libsystem_pthread.dylib",
+            "libsystem_malloc.dylib",
+            "libsystem_platform.dylib",
+            "libc++.1.dylib",
+            "libobjc.A.dylib",
+            "dyld",
         ]
         .into_iter()
         .collect()
@@ -529,8 +596,7 @@ pub fn is_system_module(module_name: &str) -> bool {
             Some(d) if d > 0 => {
                 let suffix = &stem[d + 1..];
                 // Qt toInt() returns 0 on non-numeric; numeric arm requires >0.
-                let numeric =
-                    suffix.chars().count() <= 3 && suffix.parse::<i32>().unwrap_or(0) > 0;
+                let numeric = suffix.chars().count() <= 3 && suffix.parse::<i32>().unwrap_or(0) > 0;
                 let strippable = suffix == "dll"
                     || suffix == "exe"
                     || suffix == "dylib"
@@ -769,8 +835,8 @@ pub fn run_scan_in_regions(
     } else {
         pattern_len
     };
-    let has_range = (req.start_address != 0 || req.end_address != 0)
-        && req.end_address > req.start_address;
+    let has_range =
+        (req.start_address != 0 || req.end_address != 0) && req.end_address > req.start_address;
 
     // BMH eligibility: pattern ≥4 bytes, no wildcards, alignment 1.
     let mut bmh_eligible = !is_capture && pattern_len >= 4 && alignment == 1;
@@ -1230,10 +1296,7 @@ pub fn run_rescan(
             }
 
             // Delta compare (IncreasedBy / DecreasedBy).
-            if has_delta
-                && !results[idx].previous_value.is_empty()
-                && !filter_pattern.is_empty()
-            {
+            if has_delta && !results[idx].previous_value.is_empty() && !filter_pattern.is_empty() {
                 let prev = &results[idx].previous_value;
                 let sz = prev.len().min(filter_pattern.len());
                 if results[idx].scan_value.len() >= sz {
@@ -1295,7 +1358,11 @@ fn delta_check(
             let p = <$t>::from_le_bytes(prev[..$w].try_into().unwrap());
             let d = <$t>::from_le_bytes(delta[..$w].try_into().unwrap());
             let c = <$t>::from_le_bytes(cur[..$w].try_into().unwrap());
-            let expected = if inc { p.wrapping_add(d) } else { p.wrapping_sub(d) };
+            let expected = if inc {
+                p.wrapping_add(d)
+            } else {
+                p.wrapping_sub(d)
+            };
             c == expected
         }};
     }

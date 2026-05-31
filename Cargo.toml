@@ -49,7 +49,7 @@ imports = ["dep:quick-xml", "dep:regex", "dep:zerocopy", "dep:object", "dep:pdb2
 disasm = ["dep:iced-x86"]
 
 # RTTI walkers / demanglers / name providers + MS symbol-server download.
-symbols = ["dep:cpp_demangle", "dep:msvc-demangler", "dep:regex", "dep:reqwest", "dep:directories"]
+symbols = ["dep:cpp_demangle", "dep:msvc-demangler", "dep:regex", "dep:reqwest"]
 
 # JSON-RPC 2.0 MCP server over a local socket.
 mcp = ["dep:interprocess"]
@@ -84,6 +84,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # File data source (memmap2) — built-in benign provider.
 memmap2 = "0.9"
 
+# Config / cache dirs (QStandardPaths). Always-on: the theme manager resolves
+# the user theme dir (AppDataLocation); `symbols` additionally uses it for the
+# SymbolCache. Pure Rust, tiny — no reason to feature-gate.
+directories = "6"
+
 # ── feature-gated (optional) ──
 # disasm — pure Rust x86/x64 decoder+formatter (replaces fadec).
 iced-x86 = { version = "1", optional = true }
@@ -97,7 +102,6 @@ pdb2 = { version = "0.10", optional = true }
 cpp_demangle = { version = "0.5", optional = true }
 msvc-demangler = { version = "0.11", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }
-directories = { version = "6", optional = true }
 interprocess = { version = "2", optional = true }
 libloading = { version = "0.9", optional = true }
 

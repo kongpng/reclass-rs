@@ -156,7 +156,16 @@ fn sync_rescan(
 ) -> Vec<ScanResult> {
     let abort = AtomicBool::new(false);
     run_rescan(
-        prov, seed, read_size, cond, vt, pat, msk, pat2, &abort, &NullObserver,
+        prov,
+        seed,
+        read_size,
+        cond,
+        vt,
+        pat,
+        msk,
+        pat2,
+        &abort,
+        &NullObserver,
     )
 }
 
@@ -1015,7 +1024,10 @@ fn scan_address_range_with_regions() {
     let mut data = vec![0u8; 4096];
     data[1000] = 0xBB;
     data[2000] = 0xBB;
-    let regions = vec![region(1000, 16, true, true, false, ""), region(2000, 16, true, true, false, "")];
+    let regions = vec![
+        region(1000, 16, true, true, false, ""),
+        region(2000, 16, true, true, false, ""),
+    ];
     let prov = TestRegionProvider::new(data, regions);
     let req = ScanRequest {
         pattern: vec![0xBB],
@@ -1061,7 +1073,10 @@ fn scan_constrain_regions_multiple_ranges() {
     let req = ScanRequest {
         pattern: vec![0xBB],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 0, end: 8 }, AddressRange { start: 16, end: 24 }],
+        constrain_regions: vec![
+            AddressRange { start: 0, end: 8 },
+            AddressRange { start: 16, end: 24 },
+        ],
         ..Default::default()
     };
     let r = sync_scan(&prov, &req);
@@ -1080,7 +1095,10 @@ fn scan_constrain_regions_intersects_provider_regions() {
     let req = ScanRequest {
         pattern: vec![0xCC],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 150, end: 250 }],
+        constrain_regions: vec![AddressRange {
+            start: 150,
+            end: 250,
+        }],
         ..Default::default()
     };
     let r = sync_scan(&prov, &req);
@@ -1095,7 +1113,10 @@ fn scan_constrain_regions_no_overlap() {
     let req = ScanRequest {
         pattern: vec![0xEE],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 100, end: 200 }],
+        constrain_regions: vec![AddressRange {
+            start: 100,
+            end: 200,
+        }],
         ..Default::default()
     };
     assert_eq!(sync_scan(&prov, &req).len(), 0);
@@ -1106,7 +1127,10 @@ fn scan_constrain_regions_gap_between_regions() {
     let mut data = vec![0u8; 64];
     data[10] = 0xDD;
     data[35] = 0xDD;
-    let regions = vec![region(0, 16, true, true, false, ""), region(32, 16, true, true, false, "")];
+    let regions = vec![
+        region(0, 16, true, true, false, ""),
+        region(32, 16, true, true, false, ""),
+    ];
     let prov = TestRegionProvider::new(data, regions);
     let req = ScanRequest {
         pattern: vec![0xDD],
@@ -1130,7 +1154,10 @@ fn scan_constrain_regions_partial_region_overlap() {
     let req = ScanRequest {
         pattern: vec![0xAB],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 150, end: 250 }],
+        constrain_regions: vec![AddressRange {
+            start: 150,
+            end: 250,
+        }],
         ..Default::default()
     };
     let r = sync_scan(&prov, &req);
@@ -1151,7 +1178,10 @@ fn scan_constrain_regions_mixed_module_and_anonymous() {
     let req = ScanRequest {
         pattern: vec![0xCC],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 0x0, end: 0x10000 }],
+        constrain_regions: vec![AddressRange {
+            start: 0x0,
+            end: 0x10000,
+        }],
         ..Default::default()
     };
     let r = sync_scan(&prov, &req);
@@ -1184,7 +1214,10 @@ fn scan_constrain_regions_adjacent_regions() {
     let mut data = vec![0u8; 32];
     data[12] = 0xEF;
     data[20] = 0xEF;
-    let regions = vec![region(0, 16, true, true, false, ""), region(16, 16, true, true, false, "")];
+    let regions = vec![
+        region(0, 16, true, true, false, ""),
+        region(16, 16, true, true, false, ""),
+    ];
     let prov = TestRegionProvider::new(data, regions);
     let req = ScanRequest {
         pattern: vec![0xEF],
@@ -1212,7 +1245,10 @@ fn scan_constrain_regions_writable_filter_preserved() {
         pattern: vec![0xBB],
         mask: vec![0xFF],
         filter_writable: true,
-        constrain_regions: vec![AddressRange { start: 0x1000, end: 0x3000 }],
+        constrain_regions: vec![AddressRange {
+            start: 0x1000,
+            end: 0x3000,
+        }],
         ..Default::default()
     };
     let r = sync_scan(&prov, &req);
@@ -1283,7 +1319,10 @@ fn scan_constrain_regions_with_start_end_address() {
     let req = ScanRequest {
         pattern: vec![0xDD],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 0, end: 16 }, AddressRange { start: 24, end: 32 }],
+        constrain_regions: vec![
+            AddressRange { start: 0, end: 16 },
+            AddressRange { start: 24, end: 32 },
+        ],
         start_address: 8,
         end_address: 28,
         ..Default::default()
@@ -1319,7 +1358,10 @@ fn scan_constrain_regions_non_zero_base() {
     let req = ScanRequest {
         pattern: vec![0xFF],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 0x8000, end: 0x9000 }],
+        constrain_regions: vec![AddressRange {
+            start: 0x8000,
+            end: 0x9000,
+        }],
         ..Default::default()
     };
     let r = sync_scan(&prov, &req);
@@ -1361,7 +1403,10 @@ fn scan_constrain_regions_overlapping_constraints() {
     let req = ScanRequest {
         pattern: vec![0xCC],
         mask: vec![0xFF],
-        constrain_regions: vec![AddressRange { start: 4, end: 20 }, AddressRange { start: 12, end: 28 }],
+        constrain_regions: vec![
+            AddressRange { start: 4, end: 20 },
+            AddressRange { start: 12, end: 28 },
+        ],
         ..Default::default()
     };
     assert_eq!(sync_scan(&prov, &req).len(), 3);
@@ -1451,7 +1496,10 @@ fn scan_constrain_regions_match_at_region_boundaries() {
     let mut data = vec![0u8; 32];
     data[15] = 0x77;
     data[16] = 0x77;
-    let regions = vec![region(0, 16, true, true, false, ""), region(16, 16, true, true, false, "")];
+    let regions = vec![
+        region(0, 16, true, true, false, ""),
+        region(16, 16, true, true, false, ""),
+    ];
     let prov = TestRegionProvider::new(data, regions);
     let req = ScanRequest {
         pattern: vec![0x77],
@@ -1495,10 +1543,16 @@ fn scan_constrained(
         pattern: pat,
         mask,
         alignment,
-        constrain_regions: vec![AddressRange { start: c_start, end: c_end }],
+        constrain_regions: vec![AddressRange {
+            start: c_start,
+            end: c_end,
+        }],
         ..Default::default()
     };
-    sync_scan(&prov, &req).into_iter().map(|r| r.address).collect()
+    sync_scan(&prov, &req)
+        .into_iter()
+        .map(|r| r.address)
+        .collect()
 }
 
 #[test]
@@ -1600,7 +1654,10 @@ fn scan_int32_multiple_positions_in_constrained_region() {
         data[off..off + 4].copy_from_slice(&v);
     }
     let (pat, mask) = serialize_value(ValueType::UInt32, "0xCAFEBABE").unwrap();
-    assert_eq!(scan_constrained(data, pat, mask, 4, 32, 96), vec![32, 60, 92]);
+    assert_eq!(
+        scan_constrained(data, pat, mask, 4, 32, 96),
+        vec![32, 60, 92]
+    );
 }
 
 #[test]
@@ -1611,7 +1668,10 @@ fn scan_pattern_multiple_positions_in_constrained_region() {
         data[off + 1] = 0xBB;
     }
     let (pat, mask) = parse_signature("AA BB").unwrap();
-    assert_eq!(scan_constrained(data, pat, mask, 1, 16, 80), vec![16, 50, 78]);
+    assert_eq!(
+        scan_constrained(data, pat, mask, 1, 16, 80),
+        vec![16, 50, 78]
+    );
 }
 
 #[test]
@@ -1946,7 +2006,15 @@ fn adaptive_chunk_large_region() {
     let sz = 3 * 1024 * 1024usize;
     let mut data = vec![0u8; sz];
     data[sz - 1024..sz - 1020].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
-    let regs = vec![region_ty(0, sz as u64, true, true, false, "", RegionType::Private)];
+    let regs = vec![region_ty(
+        0,
+        sz as u64,
+        true,
+        true,
+        false,
+        "",
+        RegionType::Private,
+    )];
     let prov = TestRegionProvider::new(data, regs);
     let (pat, mask) = serialize_value(ValueType::UInt32, "0xCAFEBABE").unwrap();
     let req = ScanRequest {
@@ -1968,7 +2036,15 @@ fn bmh_path_parity() {
     let needle = b"MAGIC!!!";
     data[1234..1242].copy_from_slice(needle);
     data[5000..5008].copy_from_slice(needle);
-    let regs = vec![region_ty(0, 8192, true, true, false, "", RegionType::Private)];
+    let regs = vec![region_ty(
+        0,
+        8192,
+        true,
+        true,
+        false,
+        "",
+        RegionType::Private,
+    )];
     let prov = TestRegionProvider::new(data, regs);
 
     let req_bmh = ScanRequest {
@@ -2194,7 +2270,16 @@ fn e2e_find_mutate_revalidate() {
     let seed2 = sync_scan(&prov, &req);
     assert_eq!(seed2.len(), 1);
     prov.write_at(8, &1500i32.to_le_bytes());
-    let changed = sync_rescan(&prov, seed2, 4, ScanCondition::Changed, ValueType::Int32, &[], &[], &[]);
+    let changed = sync_rescan(
+        &prov,
+        seed2,
+        4,
+        ScanCondition::Changed,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
     assert_eq!(changed.len(), 1);
     assert_eq!(changed[0].address, 8);
 
@@ -2202,14 +2287,32 @@ fn e2e_find_mutate_revalidate() {
     prov.write_at(8, &1234i32.to_le_bytes());
     let seed3 = sync_scan(&prov, &req);
     prov.write_at(8, &1500i32.to_le_bytes());
-    let inc = sync_rescan(&prov, seed3, 4, ScanCondition::Increased, ValueType::Int32, &[], &[], &[]);
+    let inc = sync_rescan(
+        &prov,
+        seed3,
+        4,
+        ScanCondition::Increased,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
     assert_eq!(inc.len(), 1);
 
     // Step 6: Decreased rescan → empty.
     prov.write_at(8, &1234i32.to_le_bytes());
     let seed4 = sync_scan(&prov, &req);
     prov.write_at(8, &1500i32.to_le_bytes());
-    let dec = sync_rescan(&prov, seed4, 4, ScanCondition::Decreased, ValueType::Int32, &[], &[], &[]);
+    let dec = sync_rescan(
+        &prov,
+        seed4,
+        4,
+        ScanCondition::Decreased,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
     assert_eq!(dec.len(), 0);
 
     // Step 7: BiggerThan 5000 first scan → only 9999/50000.
@@ -2250,7 +2353,16 @@ fn e2e_find_mutate_revalidate() {
 #[test]
 fn rescan_empty_seed() {
     let prov = crate::provider::BufferProvider::new(vec![0u8; 16], "x");
-    let out = sync_rescan(&prov, vec![], 4, ScanCondition::ExactValue, ValueType::Int32, &[], &[], &[]);
+    let out = sync_rescan(
+        &prov,
+        vec![],
+        4,
+        ScanCondition::ExactValue,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
     assert_eq!(out.len(), 0);
 }
 
@@ -2287,7 +2399,10 @@ fn engine_scan_empty_pattern() {
     // ExactValue + empty pattern → error emitted synchronously, no finished.
     eng.start(prov, ScanRequest::default(), obs.clone());
     eng.wait();
-    assert_eq!(obs.error.lock().unwrap().as_slice(), &["Empty pattern".to_string()]);
+    assert_eq!(
+        obs.error.lock().unwrap().as_slice(),
+        &["Empty pattern".to_string()]
+    );
     assert!(obs.finished.lock().unwrap().is_none());
 }
 
@@ -2313,8 +2428,10 @@ fn engine_scan_mask_size_mismatch() {
 
 #[test]
 fn engine_scan_finished_and_is_running() {
-    let prov: Arc<dyn Provider + Send + Sync> =
-        Arc::new(crate::provider::BufferProvider::new(vec![0u8; 256 * 1024], ""));
+    let prov: Arc<dyn Provider + Send + Sync> = Arc::new(crate::provider::BufferProvider::new(
+        vec![0u8; 256 * 1024],
+        "",
+    ));
     let obs = Arc::new(TestObserver::default());
     let mut eng = ScanEngine::new();
     assert!(!eng.is_running());
@@ -2331,8 +2448,10 @@ fn engine_scan_finished_and_is_running() {
 
 #[test]
 fn engine_scan_progress_emitted() {
-    let prov: Arc<dyn Provider + Send + Sync> =
-        Arc::new(crate::provider::BufferProvider::new(vec![0u8; 512 * 1024], ""));
+    let prov: Arc<dyn Provider + Send + Sync> = Arc::new(crate::provider::BufferProvider::new(
+        vec![0u8; 512 * 1024],
+        "",
+    ));
     let obs = Arc::new(TestObserver::default());
     let mut eng = ScanEngine::new();
     let req = ScanRequest {
@@ -2349,8 +2468,10 @@ fn engine_scan_progress_emitted() {
 
 #[test]
 fn engine_scan_abort() {
-    let prov: Arc<dyn Provider + Send + Sync> =
-        Arc::new(crate::provider::BufferProvider::new(vec![0u8; 1024 * 1024], ""));
+    let prov: Arc<dyn Provider + Send + Sync> = Arc::new(crate::provider::BufferProvider::new(
+        vec![0u8; 1024 * 1024],
+        "",
+    ));
     let obs = Arc::new(TestObserver::default());
     let mut eng = ScanEngine::new();
     let req = ScanRequest {
@@ -2433,7 +2554,15 @@ fn fast_scan_alignment_values() {
         data[off..off + 4].copy_from_slice(&needle);
         off += 4;
     }
-    let regs = vec![region_ty(0, 256, true, true, false, "", RegionType::Private)];
+    let regs = vec![region_ty(
+        0,
+        256,
+        true,
+        true,
+        false,
+        "",
+        RegionType::Private,
+    )];
     for (alignment, expected) in [(1, 64), (4, 64), (8, 32), (16, 16), (32, 8), (64, 4)] {
         let prov = TestRegionProvider::new(data.clone(), regs.clone());
         let (pat, mask) = serialize_value(ValueType::UInt32, "0xCAFEBABE").unwrap();
@@ -2446,7 +2575,11 @@ fn fast_scan_alignment_values() {
             value_size: 4,
             ..Default::default()
         };
-        assert_eq!(sync_scan(&prov, &req).len(), expected, "alignment {alignment}");
+        assert_eq!(
+            sync_scan(&prov, &req).len(),
+            expected,
+            "alignment {alignment}"
+        );
     }
 }
 
@@ -2492,7 +2625,15 @@ fn condition_value_type_matrix() {
             write_val(&mut data, t, 0, 100);
             write_val(&mut data, t, sz, 50);
             write_val(&mut data, t, 2 * sz, 50);
-            let regs = vec![region_ty(0, data.len() as u64, true, true, false, "", RegionType::Private)];
+            let regs = vec![region_ty(
+                0,
+                data.len() as u64,
+                true,
+                true,
+                false,
+                "",
+                RegionType::Private,
+            )];
             let prov = TestRegionProvider::new(data, regs);
             let (pat, mask) = serialize_value(t, value).unwrap();
             let req = ScanRequest {
@@ -2591,7 +2732,15 @@ fn address_range_alignment() {
         data[off..off + 4].copy_from_slice(&needle);
         off += 32;
     }
-    let regs = vec![region_ty(0, 1024, true, true, false, "", RegionType::Private)];
+    let regs = vec![region_ty(
+        0,
+        1024,
+        true,
+        true,
+        false,
+        "",
+        RegionType::Private,
+    )];
     let cases: [(i32, u64, usize); 7] = [
         (4, 1024, 32),
         (4, 512, 16),

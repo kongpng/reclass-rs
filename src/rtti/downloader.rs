@@ -216,9 +216,7 @@ impl SymbolDownloader {
             return;
         }
 
-        let dir = cache_dir()
-            .join(&pdb_name)
-            .join(format!("{guid}{age:x}"));
+        let dir = cache_dir().join(&pdb_name).join(format!("{guid}{age:x}"));
         if let Err(e) = std::fs::create_dir_all(&dir) {
             on_event(DownloadEvent::Finished {
                 module_name,

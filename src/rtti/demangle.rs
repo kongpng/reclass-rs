@@ -50,11 +50,7 @@ pub fn demangle_rtti_name(mangled: &str) -> String {
 
     // rtti.cpp:65 — skip the 2-char prefix ('A' kind char + class-kind V/U/W/X).
     // Robust char-boundary computation of the body start.
-    let body_start = s
-        .char_indices()
-        .nth(2)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
+    let body_start = s.char_indices().nth(2).map(|(i, _)| i).unwrap_or(s.len());
     let body = &s[body_start..];
 
     // rtti.cpp:66-67 — terminator "@@".

@@ -149,8 +149,14 @@ fn parse_value_hex32() {
 // testParseValueBool (test_format.cpp:165-179)
 #[test]
 fn parse_value_bool() {
-    assert_eq!(fmt::parse_value_kind(NodeKind::Bool, "true").unwrap(), vec![1]);
-    assert_eq!(fmt::parse_value_kind(NodeKind::Bool, "false").unwrap(), vec![0]);
+    assert_eq!(
+        fmt::parse_value_kind(NodeKind::Bool, "true").unwrap(),
+        vec![1]
+    );
+    assert_eq!(
+        fmt::parse_value_kind(NodeKind::Bool, "false").unwrap(),
+        vec![0]
+    );
     assert!(fmt::parse_value_kind(NodeKind::Bool, "banana").is_none());
 }
 
@@ -158,10 +164,16 @@ fn parse_value_bool() {
 #[test]
 fn parse_value_overflow() {
     assert!(fmt::parse_value_kind(NodeKind::UInt8, "300").is_none());
-    assert_eq!(fmt::parse_value_kind(NodeKind::UInt8, "255").unwrap()[0], 255);
+    assert_eq!(
+        fmt::parse_value_kind(NodeKind::UInt8, "255").unwrap()[0],
+        255
+    );
     assert!(fmt::parse_value_kind(NodeKind::Int8, "200").is_none());
     assert!(fmt::parse_value_kind(NodeKind::Int8, "-129").is_none());
-    assert_eq!(fmt::parse_value_kind(NodeKind::Int8, "-128").unwrap()[0] as i8, -128);
+    assert_eq!(
+        fmt::parse_value_kind(NodeKind::Int8, "-128").unwrap()[0] as i8,
+        -128
+    );
     assert!(fmt::parse_value_kind(NodeKind::UInt16, "70000").is_none());
     assert!(fmt::parse_value_kind(NodeKind::Hex8, "1FF").is_none());
     assert!(fmt::parse_value_kind(NodeKind::Hex16, "1FFFF").is_none());
@@ -170,8 +182,14 @@ fn parse_value_overflow() {
 // testSignedHexRoundTrip (test_format.cpp:237-273)
 #[test]
 fn signed_hex_round_trip() {
-    assert_eq!(fmt::parse_value_kind(NodeKind::Int8, "0xFF").unwrap()[0] as i8, -1);
-    assert_eq!(fmt::parse_value_kind(NodeKind::Int8, "0x80").unwrap()[0] as i8, -128);
+    assert_eq!(
+        fmt::parse_value_kind(NodeKind::Int8, "0xFF").unwrap()[0] as i8,
+        -1
+    );
+    assert_eq!(
+        fmt::parse_value_kind(NodeKind::Int8, "0x80").unwrap()[0] as i8,
+        -128
+    );
     let b = fmt::parse_value_kind(NodeKind::Int16, "0xFFFF").unwrap();
     assert_eq!(i16::from_le_bytes(b.try_into().unwrap()), -1);
     let b = fmt::parse_value_kind(NodeKind::Int32, "0xFFFFFFFF").unwrap();
@@ -215,7 +233,9 @@ fn editable_value_basic() {
 // testParseValueEmptyString (test_format.cpp:312-322)
 #[test]
 fn parse_value_empty_string() {
-    assert!(fmt::parse_value_kind(NodeKind::UTF8, "").unwrap().is_empty());
+    assert!(fmt::parse_value_kind(NodeKind::UTF8, "")
+        .unwrap()
+        .is_empty());
     assert!(fmt::parse_value_kind(NodeKind::Int32, "").is_none());
 }
 

@@ -33,7 +33,11 @@ fn fresh_user_dir() -> PathBuf {
 }
 
 fn manager() -> ThemeManager {
-    ThemeManager::new(Box::new(MemSettings::new()), fixtures_dir(), fresh_user_dir())
+    ThemeManager::new(
+        Box::new(MemSettings::new()),
+        fixtures_dir(),
+        fresh_user_dir(),
+    )
 }
 
 #[test]

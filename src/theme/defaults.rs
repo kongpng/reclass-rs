@@ -15,7 +15,10 @@ pub const DEFAULT_THEMES: &[(&str, &str); 8] = &[
     ("mid.json", include_str!("defaults/mid.json")),
     ("modern.json", include_str!("defaults/modern.json")),
     ("phosphor.json", include_str!("defaults/phosphor.json")),
-    ("reclass_dark.json", include_str!("defaults/reclass_dark.json")),
+    (
+        "reclass_dark.json",
+        include_str!("defaults/reclass_dark.json"),
+    ),
     ("tw.json", include_str!("defaults/tw.json")),
     ("vs.json", include_str!("defaults/vs.json")),
     ("warm.json", include_str!("defaults/warm.json")),

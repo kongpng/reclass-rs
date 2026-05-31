@@ -249,7 +249,11 @@ pub fn walk_rtti(
     }
     let bca_addr = rtti_resolve(bca_field, image_base, pointer_size);
     // 32-bit RVA on x64; ptr on x86.
-    let entry_size: u64 = if pointer_size == 8 { 4 } else { pointer_size as u64 };
+    let entry_size: u64 = if pointer_size == 8 {
+        4
+    } else {
+        pointer_size as u64
+    };
 
     // 8. base-class array.
     for i in 0..num_bases {
@@ -440,12 +444,7 @@ pub fn walk_rtti_itanium(
 
     // 8. first real char must be a mangle marker.
     let c0 = name_bytes[validate_off];
-    if !(c0.is_ascii_digit()
-        || c0 == b'N'
-        || c0 == b'S'
-        || c0 == b'P'
-        || c0 == b'K'
-        || c0 == b'R')
+    if !(c0.is_ascii_digit() || c0 == b'N' || c0 == b'S' || c0 == b'P' || c0 == b'K' || c0 == b'R')
     {
         info.error = "__name doesn't start with Itanium mangle marker".to_owned();
         return info;
@@ -596,7 +595,11 @@ mod tests {
         wq(&mut data, K_IMAGE_BASE + VT - 8, K_IMAGE_BASE + TI);
         // 5 method ptrs + null terminator.
         for i in 0..5u64 {
-            wq(&mut data, K_IMAGE_BASE + VT + i * 8, K_IMAGE_BASE + 0x100 + i * 0x10);
+            wq(
+                &mut data,
+                K_IMAGE_BASE + VT + i * 8,
+                K_IMAGE_BASE + 0x100 + i * 0x10,
+            );
         }
         wq(&mut data, K_IMAGE_BASE + VT + 5 * 8, 0);
         // type_info: vtable_ptr at +0, name_ptr at +8.

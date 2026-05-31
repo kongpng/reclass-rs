@@ -10,9 +10,7 @@
 #![cfg(feature = "symbols")]
 
 use reclass::provider::{BufferProvider, ModuleEntry, Provider};
-use reclass::rtti::{
-    demangle_itanium_name, demangle_rtti_name, walk_rtti, walk_rtti_itanium,
-};
+use reclass::rtti::{demangle_itanium_name, demangle_rtti_name, walk_rtti, walk_rtti_itanium};
 
 const K_IMAGE_BASE: u64 = 0x10000;
 
@@ -36,7 +34,11 @@ fn build_synthetic_msvc_rtti() -> Vec<u8> {
 
     wq(&mut buf, vtable - 8, K_IMAGE_BASE + col as u64);
     for i in 0..5usize {
-        wq(&mut buf, vtable + i * 8, K_IMAGE_BASE + 0x100 + i as u64 * 0x10);
+        wq(
+            &mut buf,
+            vtable + i * 8,
+            K_IMAGE_BASE + 0x100 + i as u64 * 0x10,
+        );
     }
     wq(&mut buf, vtable + 5 * 8, 0);
 
@@ -108,7 +110,11 @@ fn build_itanium(mangled: &str) -> Vec<u8> {
     wq(&mut d, K_IMAGE_BASE + VT - 16, 0);
     wq(&mut d, K_IMAGE_BASE + VT - 8, K_IMAGE_BASE + TI);
     for i in 0..5u64 {
-        wq(&mut d, K_IMAGE_BASE + VT + i * 8, K_IMAGE_BASE + 0x100 + i * 0x10);
+        wq(
+            &mut d,
+            K_IMAGE_BASE + VT + i * 8,
+            K_IMAGE_BASE + 0x100 + i * 0x10,
+        );
     }
     wq(&mut d, K_IMAGE_BASE + VT + 5 * 8, 0);
     wq(&mut d, K_IMAGE_BASE + TI, K_IMAGE_BASE + TIVT);
@@ -165,7 +171,10 @@ fn walk_synthetic_rtti() {
     assert_eq!(info.vtable.len(), 5);
     for i in 0..5usize {
         assert_eq!(info.vtable[i].slot, i as i32);
-        assert_eq!(info.vtable[i].address, K_IMAGE_BASE + 0x100 + i as u64 * 0x10);
+        assert_eq!(
+            info.vtable[i].address,
+            K_IMAGE_BASE + 0x100 + i as u64 * 0x10
+        );
     }
 }
 

@@ -225,11 +225,7 @@ mod tests {
         ];
         for (input, expected) in cases {
             let c = Color::parse(input).unwrap();
-            assert_eq!(
-                c.lighter_130().to_hex(),
-                *expected,
-                "lighter_130({input})"
-            );
+            assert_eq!(c.lighter_130().to_hex(), *expected, "lighter_130({input})");
         }
     }
 

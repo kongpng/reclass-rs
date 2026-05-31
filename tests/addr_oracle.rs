@@ -140,15 +140,13 @@ fn complex_expr() {
 
 #[test]
 fn identifiers() {
-    let mk = || {
-        AddressParserCallbacks {
-            resolve_identifier: Some(Box::new(|name: &str| match name {
-                "base" => (0x140000000, true),
-                "e_lfanew" => (0xE8, true),
-                _ => (0, false),
-            })),
-            ..Default::default()
-        }
+    let mk = || AddressParserCallbacks {
+        resolve_identifier: Some(Box::new(|name: &str| match name {
+            "base" => (0x140000000, true),
+            "e_lfanew" => (0xE8, true),
+            _ => (0, false),
+        })),
+        ..Default::default()
     };
     let cbs = mk();
     assert_eq!(

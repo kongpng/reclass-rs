@@ -64,7 +64,11 @@ fn evaluate_formula(formula: &str, prov: Option<&dyn Provider>, ptr_size: i32) -
             SymbolStore::global().lock().unwrap().resolve(name, Some(p))
         }));
     }
-    let result = AddressParser::evaluate(formula, if ptr_size != 0 { ptr_size } else { 8 }, Some(&cbs));
+    let result = AddressParser::evaluate(
+        formula,
+        if ptr_size != 0 { ptr_size } else { 8 },
+        Some(&cbs),
+    );
     if result.ok {
         result.value
     } else {

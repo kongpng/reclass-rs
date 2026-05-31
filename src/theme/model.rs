@@ -67,37 +67,192 @@ pub struct ThemeFieldMeta {
 /// Order is load-bearing for the editor row layout / section grouping.
 /// `kThemeFieldCount` == 31.
 pub const THEME_FIELDS: &[ThemeFieldMeta] = &[
-    ThemeFieldMeta { key: "background",     label: "Background",     group: "Chrome",       id: FieldId::Background },
-    ThemeFieldMeta { key: "backgroundAlt",  label: "Background Alt",  group: "Chrome",       id: FieldId::BackgroundAlt },
-    ThemeFieldMeta { key: "surface",        label: "Surface",         group: "Chrome",       id: FieldId::Surface },
-    ThemeFieldMeta { key: "border",         label: "Border",          group: "Chrome",       id: FieldId::Border },
-    ThemeFieldMeta { key: "borderFocused",  label: "Border Focused",  group: "Chrome",       id: FieldId::BorderFocused },
-    ThemeFieldMeta { key: "button",         label: "Button",          group: "Chrome",       id: FieldId::Button },
-    ThemeFieldMeta { key: "text",           label: "Text",            group: "Text",         id: FieldId::Text },
-    ThemeFieldMeta { key: "textDim",        label: "Text Dim",        group: "Text",         id: FieldId::TextDim },
-    ThemeFieldMeta { key: "textMuted",      label: "Text Muted",      group: "Text",         id: FieldId::TextMuted },
-    ThemeFieldMeta { key: "textFaint",      label: "Text Faint",      group: "Text",         id: FieldId::TextFaint },
-    ThemeFieldMeta { key: "hover",          label: "Hover",           group: "Interactive",  id: FieldId::Hover },
-    ThemeFieldMeta { key: "selected",       label: "Selected",        group: "Interactive",  id: FieldId::Selected },
-    ThemeFieldMeta { key: "selection",      label: "Selection",       group: "Interactive",  id: FieldId::Selection },
-    ThemeFieldMeta { key: "syntaxKeyword",  label: "Keyword",         group: "Syntax",       id: FieldId::SyntaxKeyword },
-    ThemeFieldMeta { key: "syntaxNumber",   label: "Number",          group: "Syntax",       id: FieldId::SyntaxNumber },
-    ThemeFieldMeta { key: "syntaxString",   label: "String",          group: "Syntax",       id: FieldId::SyntaxString },
-    ThemeFieldMeta { key: "syntaxComment",  label: "Comment",         group: "Syntax",       id: FieldId::SyntaxComment },
-    ThemeFieldMeta { key: "syntaxPreproc",  label: "Preprocessor",    group: "Syntax",       id: FieldId::SyntaxPreproc },
-    ThemeFieldMeta { key: "syntaxType",     label: "Type",            group: "Syntax",       id: FieldId::SyntaxType },
-    ThemeFieldMeta { key: "indHoverSpan",   label: "Hover Span",      group: "Indicators",   id: FieldId::IndHoverSpan },
-    ThemeFieldMeta { key: "indCmdPill",     label: "Cmd Pill",        group: "Indicators",   id: FieldId::IndCmdPill },
-    ThemeFieldMeta { key: "indDataChanged", label: "Data Changed",    group: "Indicators",   id: FieldId::IndDataChanged },
-    ThemeFieldMeta { key: "indHeatCold",    label: "Heat Cold",       group: "Indicators",   id: FieldId::IndHeatCold },
-    ThemeFieldMeta { key: "indHeatWarm",    label: "Heat Warm",       group: "Indicators",   id: FieldId::IndHeatWarm },
-    ThemeFieldMeta { key: "indHeatHot",     label: "Heat Hot",        group: "Indicators",   id: FieldId::IndHeatHot },
-    ThemeFieldMeta { key: "indHintGreen",   label: "Hint Green",      group: "Indicators",   id: FieldId::IndHintGreen },
-    ThemeFieldMeta { key: "indRttiHint",    label: "RTTI Hint",       group: "Indicators",   id: FieldId::IndRttiHint },
-    ThemeFieldMeta { key: "markerPtr",      label: "Pointer",         group: "Markers",      id: FieldId::MarkerPtr },
-    ThemeFieldMeta { key: "markerCycle",    label: "Cycle",           group: "Markers",      id: FieldId::MarkerCycle },
-    ThemeFieldMeta { key: "markerError",    label: "Error",           group: "Markers",      id: FieldId::MarkerError },
-    ThemeFieldMeta { key: "focusGlow",      label: "Focus Glow",      group: "Presentation", id: FieldId::FocusGlow },
+    ThemeFieldMeta {
+        key: "background",
+        label: "Background",
+        group: "Chrome",
+        id: FieldId::Background,
+    },
+    ThemeFieldMeta {
+        key: "backgroundAlt",
+        label: "Background Alt",
+        group: "Chrome",
+        id: FieldId::BackgroundAlt,
+    },
+    ThemeFieldMeta {
+        key: "surface",
+        label: "Surface",
+        group: "Chrome",
+        id: FieldId::Surface,
+    },
+    ThemeFieldMeta {
+        key: "border",
+        label: "Border",
+        group: "Chrome",
+        id: FieldId::Border,
+    },
+    ThemeFieldMeta {
+        key: "borderFocused",
+        label: "Border Focused",
+        group: "Chrome",
+        id: FieldId::BorderFocused,
+    },
+    ThemeFieldMeta {
+        key: "button",
+        label: "Button",
+        group: "Chrome",
+        id: FieldId::Button,
+    },
+    ThemeFieldMeta {
+        key: "text",
+        label: "Text",
+        group: "Text",
+        id: FieldId::Text,
+    },
+    ThemeFieldMeta {
+        key: "textDim",
+        label: "Text Dim",
+        group: "Text",
+        id: FieldId::TextDim,
+    },
+    ThemeFieldMeta {
+        key: "textMuted",
+        label: "Text Muted",
+        group: "Text",
+        id: FieldId::TextMuted,
+    },
+    ThemeFieldMeta {
+        key: "textFaint",
+        label: "Text Faint",
+        group: "Text",
+        id: FieldId::TextFaint,
+    },
+    ThemeFieldMeta {
+        key: "hover",
+        label: "Hover",
+        group: "Interactive",
+        id: FieldId::Hover,
+    },
+    ThemeFieldMeta {
+        key: "selected",
+        label: "Selected",
+        group: "Interactive",
+        id: FieldId::Selected,
+    },
+    ThemeFieldMeta {
+        key: "selection",
+        label: "Selection",
+        group: "Interactive",
+        id: FieldId::Selection,
+    },
+    ThemeFieldMeta {
+        key: "syntaxKeyword",
+        label: "Keyword",
+        group: "Syntax",
+        id: FieldId::SyntaxKeyword,
+    },
+    ThemeFieldMeta {
+        key: "syntaxNumber",
+        label: "Number",
+        group: "Syntax",
+        id: FieldId::SyntaxNumber,
+    },
+    ThemeFieldMeta {
+        key: "syntaxString",
+        label: "String",
+        group: "Syntax",
+        id: FieldId::SyntaxString,
+    },
+    ThemeFieldMeta {
+        key: "syntaxComment",
+        label: "Comment",
+        group: "Syntax",
+        id: FieldId::SyntaxComment,
+    },
+    ThemeFieldMeta {
+        key: "syntaxPreproc",
+        label: "Preprocessor",
+        group: "Syntax",
+        id: FieldId::SyntaxPreproc,
+    },
+    ThemeFieldMeta {
+        key: "syntaxType",
+        label: "Type",
+        group: "Syntax",
+        id: FieldId::SyntaxType,
+    },
+    ThemeFieldMeta {
+        key: "indHoverSpan",
+        label: "Hover Span",
+        group: "Indicators",
+        id: FieldId::IndHoverSpan,
+    },
+    ThemeFieldMeta {
+        key: "indCmdPill",
+        label: "Cmd Pill",
+        group: "Indicators",
+        id: FieldId::IndCmdPill,
+    },
+    ThemeFieldMeta {
+        key: "indDataChanged",
+        label: "Data Changed",
+        group: "Indicators",
+        id: FieldId::IndDataChanged,
+    },
+    ThemeFieldMeta {
+        key: "indHeatCold",
+        label: "Heat Cold",
+        group: "Indicators",
+        id: FieldId::IndHeatCold,
+    },
+    ThemeFieldMeta {
+        key: "indHeatWarm",
+        label: "Heat Warm",
+        group: "Indicators",
+        id: FieldId::IndHeatWarm,
+    },
+    ThemeFieldMeta {
+        key: "indHeatHot",
+        label: "Heat Hot",
+        group: "Indicators",
+        id: FieldId::IndHeatHot,
+    },
+    ThemeFieldMeta {
+        key: "indHintGreen",
+        label: "Hint Green",
+        group: "Indicators",
+        id: FieldId::IndHintGreen,
+    },
+    ThemeFieldMeta {
+        key: "indRttiHint",
+        label: "RTTI Hint",
+        group: "Indicators",
+        id: FieldId::IndRttiHint,
+    },
+    ThemeFieldMeta {
+        key: "markerPtr",
+        label: "Pointer",
+        group: "Markers",
+        id: FieldId::MarkerPtr,
+    },
+    ThemeFieldMeta {
+        key: "markerCycle",
+        label: "Cycle",
+        group: "Markers",
+        id: FieldId::MarkerCycle,
+    },
+    ThemeFieldMeta {
+        key: "markerError",
+        label: "Error",
+        group: "Markers",
+        id: FieldId::MarkerError,
+    },
+    ThemeFieldMeta {
+        key: "focusGlow",
+        label: "Focus Glow",
+        group: "Presentation",
+        id: FieldId::FocusGlow,
+    },
 ];
 
 /// `struct Theme` (`theme.h:8-58`). `Default` (all `None`, empty name) equals
@@ -414,22 +569,14 @@ mod tests {
     fn focus_glow_derivation() {
         // border_focused present, focusGlow absent → focus_glow == border_focused.
         let v = serde_json::json!({ "name": "T", "borderFocused": "#888888" });
-        assert_eq!(
-            Theme::from_json(&v).focus_glow,
-            Color::parse("#888888")
-        );
+        assert_eq!(Theme::from_json(&v).focus_glow, Color::parse("#888888"));
         // Neither → #4fc3f7.
         let v = serde_json::json!({ "name": "T" });
-        assert_eq!(
-            Theme::from_json(&v).focus_glow,
-            Color::parse("#4fc3f7")
-        );
+        assert_eq!(Theme::from_json(&v).focus_glow, Color::parse("#4fc3f7"));
         // Explicit focusGlow kept (phosphor ships #28cdb2).
-        let v = serde_json::json!({ "name": "T", "borderFocused": "#888888", "focusGlow": "#28cdb2" });
-        assert_eq!(
-            Theme::from_json(&v).focus_glow,
-            Color::parse("#28cdb2")
-        );
+        let v =
+            serde_json::json!({ "name": "T", "borderFocused": "#888888", "focusGlow": "#28cdb2" });
+        assert_eq!(Theme::from_json(&v).focus_glow, Color::parse("#28cdb2"));
     }
 
     #[test]
