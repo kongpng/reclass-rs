@@ -514,7 +514,6 @@ mod view {
     pub struct CommandPalette {
         model: PaletteModel,
         input: Entity<InputState>,
-        focus_handle: FocusHandle,
         _subscription: Subscription,
     }
 
@@ -544,7 +543,6 @@ mod view {
             CommandPalette {
                 model,
                 input,
-                focus_handle: cx.focus_handle(),
                 _subscription: subscription,
             }
         }
@@ -552,6 +550,16 @@ mod view {
         /// Read-only access to the model (tests / wiring).
         pub fn model(&self) -> &PaletteModel {
             &self.model
+        }
+
+        /// Focus the query input so the very first keystroke types into the
+        /// palette (the blocker fix: without this the host focuses the view's
+        /// handle, keystrokes fall through to the window's global shortcuts, and
+        /// fuzzy filtering never runs). The host calls this right after opening
+        /// the modal; we also expose the same handle through [`Focusable`] so
+        /// `window.focus(&palette.focus_handle(cx))` lands on the input too.
+        pub fn focus_input(&self, window: &mut Window, cx: &mut App) {
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
         }
 
         fn on_down(&mut self, _: &PaletteDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -577,11 +585,47 @@ mod view {
                 cx.emit(PaletteEvent::Trigger(cmd));
             }
         }
+
+        /// Intercept the navigation/confirm/cancel keys in the **capture** phase
+        /// (before the focused query `Input` consumes them for cursor movement).
+        /// The input owns focus so typing filters, but Up/Down move the selected
+        /// row, Enter triggers, Esc dismisses — exactly the C++ `eventFilter`
+        /// that forwarded these from the line-edit to the list (§8). Returns
+        /// `true` when handled so the caller stops propagation.
+        fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            match key {
+                "down" | "pagedown" => {
+                    self.model.move_down();
+                    cx.notify();
+                    true
+                }
+                "up" | "pageup" => {
+                    self.model.move_up();
+                    cx.notify();
+                    true
+                }
+                "enter" => {
+                    if let Some(cmd) = self.model.activate_current() {
+                        cx.emit(PaletteEvent::Trigger(cmd));
+                    }
+                    true
+                }
+                "escape" => {
+                    cx.emit(PaletteEvent::Cancel);
+                    true
+                }
+                _ => false,
+            }
+        }
     }
 
     impl Focusable for CommandPalette {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
+        /// Delegate to the query input's focus handle so the host's
+        /// `window.focus(&palette.focus_handle(cx))` focuses the *input* (not an
+        /// inert wrapper handle) — typed characters then reach the palette
+        /// instead of falling through to the window's global shortcuts.
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.input.read(cx).focus_handle(cx)
         }
     }
 
@@ -667,13 +711,22 @@ mod view {
 
             gpui_component::v_flex()
                 .id("rcx-command-palette")
-                .track_focus(&self.focus_handle)
                 .key_context("RcxCommandPalette")
+                // Capture-phase key handling: the query input owns focus (so
+                // typing filters), so Up/Down/Enter/Esc reach it first and would
+                // otherwise move the text cursor. Intercept them here, before the
+                // input, to drive list navigation / confirm / cancel.
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                    if this.handle_nav_key(ev.keystroke.key.as_str(), cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .on_action(cx.listener(Self::on_down))
                 .on_action(cx.listener(Self::on_up))
                 .on_action(cx.listener(Self::on_confirm))
                 .on_action(cx.listener(Self::on_cancel))
-                .w(px(580.))
+                .w_full()
+                .max_w(px(600.))
                 .max_h(px(460.))
                 .bg(color::elevated_bg(cx))
                 .rounded(px(tokens::radius::XL))

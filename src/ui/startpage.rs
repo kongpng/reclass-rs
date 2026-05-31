@@ -460,8 +460,15 @@ impl Render for StartPage {
             .collect();
 
         // The welcome surface: a full-window content-bg backdrop, with a single
-        // centered, comfortably-proportioned column (Zed's welcome tab) — a brand
-        // header, the action list, then the recent-files block under a divider.
+        // horizontally-centered, comfortably-proportioned column (Zed's welcome
+        // tab) — a brand header, the action list, then the recent-files block
+        // under a divider.
+        //
+        // Centering is done in two layers so the column lands dead-center on a
+        // wide window (and never hugs the left third): the backdrop is a flex
+        // column that `items_center`s its child on the cross (horizontal) axis,
+        // and the content column itself caps its width and `mx_auto`s — the
+        // belt-and-braces Zed welcome-tab recipe so a stray grow can't bias it.
         div()
             .id("rcx-start-page")
             .track_focus(&self.focus_handle)
@@ -478,8 +485,10 @@ impl Render for StartPage {
             .p(px(tokens::space::XXL))
             .child(
                 gpui_component::v_flex()
+                    .flex_none()
                     .w(px(560.))
                     .max_w_full()
+                    .mx_auto()
                     .gap(px(tokens::space::XXL))
                     // ── Brand header ──
                     .child(

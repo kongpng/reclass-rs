@@ -10,15 +10,19 @@
 //! - [`LayoutPreset`] — the two-mode workspace toggle enum (`titlebar.h:15-18`),
 //! - [`title_case`] / [`upper_case`] — the menu-title transform
 //!   (`setMenuBarTitleCase`, `titlebar.cpp:222-253`), unit-tested headlessly,
-//! - [`render_titlebar`] — assembles the bar contents (app label, a menu-button
-//!   row placeholder, stretch, the layout-toggle pair, the view-mode toggle, and
-//!   the document title) into a [`TitleBar`]; the full menu bar + Linux
-//!   tool-buttons land with the menu workflow.
+//! - [`render_titlebar`] — assembles the bar contents (app label, the in-window
+//!   menu bar, stretch, the document title, and the workspace **sidebar toggle**)
+//!   into a [`TitleBar`].
 //!
-//! The toggle pair and view-mode toggle emit their intent by calling back into
-//! the owning [`MainWindow`](super::window::MainWindow) (the C++
-//! `layoutPresetSelected` signal → `applyLayoutPreset`); rendering takes plain
-//! closures so this module stays decoupled from the window type.
+//! The **view-mode** switch (Reclass ⇄ Code) is deliberately NOT here: it lives
+//! as a "Reclass | Code" *segmented control* at the bottom of the document area
+//! (`tabs::DocumentArea::render_view_toggle`; PIC5). A duplicate titlebar copy
+//! was inconsistent dead UI and has been removed.
+//!
+//! The sidebar toggle emits its intent by calling back into the owning
+//! [`MainWindow`](super::window::MainWindow) (the C++ `layoutPresetSelected`
+//! signal → `applyLayoutPreset`); rendering takes a plain closure so this module
+//! stays decoupled from the window type.
 //!
 //! Gated behind the `ui` feature.
 
@@ -28,7 +32,6 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, TitleBar};
 
 use super::menubar::MenuBar;
-use super::state::ViewMode;
 
 /// The two-mode workspace layout toggle (`enum LayoutPreset`, `titlebar.h:15-18`).
 ///
@@ -106,12 +109,12 @@ pub fn title_case(title: &str) -> String {
     out
 }
 
-/// One small chrome glyph button used in the titlebar (the workspace-toggle pair
-/// and the view-mode toggle). The C++ painted these as custom flat checkable
-/// buttons with a 2px bottom accent when checked; here a ghost [`Button`] with a
-/// `selected`/accent state reproduces the look. The click closure carries the
-/// toggle's intent. Kept as the canonical chrome-toggle recipe (the inline
-/// toggles below mirror it); retained for the icon-button workflow.
+/// One small chrome glyph button used in the titlebar (the workspace/sidebar
+/// toggle). The C++ painted these as custom flat checkable buttons with a 2px
+/// bottom accent when checked; here a ghost [`Button`] with a `selected`/accent
+/// state reproduces the look. The click closure carries the toggle's intent.
+/// Kept as the canonical chrome-toggle recipe (the inline sidebar toggle mirrors
+/// it); retained for the icon-button workflow.
 #[allow(dead_code)]
 fn chrome_toggle(
     id: &'static str,
@@ -130,33 +133,33 @@ fn chrome_toggle(
 }
 
 /// Assemble the titlebar contents into a [`TitleBar`] (app-shell §5 layout:
-/// app label · menu bar · stretch · view-mode toggle · sidebar toggle ·
-/// document title). The window controls (min/max/close) are supplied by the
-/// gpui-component [`TitleBar`] itself.
+/// app label · menu bar · stretch · document title · sidebar toggle). The window
+/// controls (min/max/close) are supplied by the gpui-component [`TitleBar`]
+/// itself.
 ///
-/// Callbacks (plain `Fn`s so the titlebar stays decoupled from `MainWindow`):
-/// - `on_layout` — a workspace-toggle button was clicked (the C++
+/// The **view-mode** switch is NOT in the titlebar: PIC5 shows it as a
+/// "Reclass | Code" *segmented control* pinned to the bottom of the document
+/// area (rendered by `tabs::DocumentArea::render_view_toggle`). Having a second
+/// titlebar copy was inconsistent dead UI, so this bar carries only the sidebar
+/// (workspace) toggle.
+///
+/// Callback (a plain `Fn` so the titlebar stays decoupled from `MainWindow`):
+/// - `on_layout` — the workspace-toggle button was clicked (the C++
 ///   `layoutPresetSelected`); receives the chosen [`LayoutPreset`].
-/// - `on_view_mode` — the view-mode toggle was clicked; receives the *requested*
-///   [`ViewMode`] (the opposite of the current one).
 ///
-/// `preset` / `view_mode` are the current states (drive the checked styling);
+/// `preset` is the current workspace state (drives the toggle's checked styling);
 /// `doc_title` is the active document's display title (the right-aligned label);
 /// `menubar` is the in-window menu-bar entity (rendered as a child so its
 /// dropdowns open from the bar).
-#[allow(clippy::too_many_arguments)]
 pub fn render_titlebar(
     preset: LayoutPreset,
-    view_mode: ViewMode,
     doc_title: impl Into<SharedString>,
     has_doc: bool,
     menubar: Entity<MenuBar>,
     on_layout: impl Fn(LayoutPreset, &mut Window, &mut App) + 'static,
-    on_view_mode: impl Fn(ViewMode, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> TitleBar {
     let on_layout = std::rc::Rc::new(on_layout);
-    let on_view_mode = std::rc::Rc::new(on_view_mode);
 
     // App label (the C++ bold "Reclass" `m_appLabel`).
     let app_label = div()
@@ -176,35 +179,22 @@ pub fn render_titlebar(
         } else {
             LayoutPreset::Workspace
         };
+        let icon = if sidebar_open {
+            IconName::PanelLeftClose
+        } else {
+            IconName::PanelLeftOpen
+        };
         Button::new("toggle-sidebar")
             .ghost()
             .small()
             .selected(sidebar_open)
-            .child("\u{258C}") // ▌ left panel
+            .child(Icon::new(icon))
             .tooltip(if sidebar_open {
                 "Hide workspace"
             } else {
                 "Show workspace"
             })
             .on_click(move |_e, w, cx| cb(next, w, cx))
-    };
-
-    // View-mode toggle (tree ⇄ rendered C/C++). A single button labelled with the
-    // *current* mode that, when clicked, requests the other mode.
-    let requested = view_mode.toggled();
-    let view_btn = {
-        let cb = on_view_mode.clone();
-        Button::new("view-mode")
-            .ghost()
-            .small()
-            .label(view_mode.label())
-            .tooltip(match view_mode {
-                ViewMode::Tree => "Switch to rendered C/C++",
-                ViewMode::Rendered => "Switch to tree view",
-            })
-            .when(has_doc, |b| {
-                b.on_click(move |_e, w, cx| cb(requested, w, cx))
-            })
     };
 
     let title: SharedString = doc_title.into();
@@ -235,7 +225,6 @@ pub fn render_titlebar(
                             .child(title.clone()),
                     )
                 })
-                .child(view_btn)
                 .child(sidebar_btn),
         )
 }

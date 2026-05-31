@@ -108,17 +108,40 @@ pub struct FieldChild {
     pub type_name: String,
     /// The member's field name.
     pub field_name: String,
+    /// The member's byte offset within its parent struct (`Node.offset`).
+    /// Rendered as a muted `+0xNN` prefix so nested rows are distinguishable
+    /// at a glance instead of reading as a flat list of identical gray rows
+    /// (the editor's address column on a collapsed struct's members).
+    pub offset: i32,
 }
 
 impl FieldChild {
     /// The combined display string (`"TypeName fieldName"`; the C++
     /// `childDisplay`). Trailing space is trimmed when the field is unnamed.
+    ///
+    /// NOTE: this is the **filter/label** string and must stay byte-identical to
+    /// the C++ `childDisplay` (the headless tests + `model_to_tree_items` assert
+    /// it). The offset is shown only in the rich-rendered row, never folded into
+    /// this string.
     pub fn display(&self) -> String {
         if self.field_name.is_empty() {
             self.type_name.clone()
         } else {
             format!("{} {}", self.type_name, self.field_name)
         }
+    }
+}
+
+/// Format a member offset as the editor-style `+0xNN` address chip (uppercase
+/// hex, no leading zeros — matching the editor gutter's compact relative
+/// offsets). Pure + unit-tested.
+fn format_field_offset(offset: i32) -> String {
+    // Negative offsets should not occur for laid-out members, but render them
+    // safely (sign before the `0x`) rather than as a huge unsigned hex.
+    if offset < 0 {
+        format!("-0x{:X}", -(offset as i64))
+    } else {
+        format!("+0x{:X}", offset)
     }
 }
 
@@ -300,6 +323,7 @@ impl WorkspaceModel {
                 id: m.id,
                 type_name: member_type_name(m),
                 field_name: m.name.clone(),
+                offset: m.offset,
             });
         }
         let count = children.len();
@@ -450,9 +474,13 @@ enum RowMetaKind {
         field_count: usize,
         viewed: bool,
     },
-    /// A struct field child: `type_name` in the syntax-type tint, `field_name`
-    /// muted (the C++ child paint path).
+    /// A struct field child: a muted `+0xNN` offset chip (the editor's address
+    /// column, brought onto collapsed nested rows so they are not a flat list
+    /// of identical gray rows), then `type_name` in the syntax-type tint and
+    /// `field_name` muted (the C++ child paint path). No live value preview —
+    /// the workspace model carries only the `NodeTree`, not a memory source.
     Field {
+        offset: i32,
         type_name: String,
         field_name: String,
     },
@@ -485,6 +513,7 @@ fn model_to_row_meta(model: &WorkspaceModel) -> HashMap<SharedString, RowMetaKin
                     meta.insert(
                         SharedString::from(format!("field-{}-{}", t.id, child.id)),
                         RowMetaKind::Field {
+                            offset: child.offset,
                             type_name: child.type_name.clone(),
                             field_name: child.field_name.clone(),
                         },
@@ -822,8 +851,13 @@ fn render_row(
             ListItem::new(ix).w_full().child(row).map(strip_row_padding)
         }
 
-        // ── Struct field child: "Type field" with syntax tints ──────────────
+        // ── Struct field child: "+0xNN  Type field" with syntax tints ───────
+        // The leading offset chip is the editor's address column carried onto
+        // the collapsed nested rows (QA fix): a fixed-width, right-aligned,
+        // faint `+0xNN` so a long struct's members read as a real layout, not a
+        // flat list of identical gray rows.
         Some(RowMetaKind::Field {
+            offset,
             type_name,
             field_name,
         }) => {
@@ -832,10 +866,14 @@ fn render_row(
                 .h(px(22.0))
                 .pl(indent + px(tokens::space::LG))
                 .pr(px(tokens::space::XS))
-                .gap(px(tokens::space::XS))
+                .gap(px(tokens::space::SM))
                 .items_center()
                 .text_size(px(tokens::font::UI_SM))
                 .min_w_0()
+                // Offset chip — faint, right-aligned in a fixed gutter so the
+                // type names line up regardless of offset magnitude (the
+                // editor's `offset_hex_digits`-aligned address column).
+                .child(field_offset_chip(*offset, cx))
                 .child(
                     div()
                         .flex_none()
@@ -926,6 +964,25 @@ fn type_badge(badge: TypeBadge, viewed: bool, cx: &App) -> impl IntoElement {
         .child(badge.letter().to_string())
 }
 
+/// The leading offset chip on a struct field child row — a faint, fixed-width,
+/// right-aligned `+0xNN` in the editor's address tint (`syntax_address`). The
+/// fixed width keeps every nested member's type name aligned in a column (the
+/// editor gutter behaviour) so a deep struct reads as a layout. Monospace so the
+/// hex digits are uniform-width.
+fn field_offset_chip(offset: i32, cx: &App) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(44.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .text_size(px(tokens::font::UI_XS))
+        .font_family(tokens::font::MONO_FAMILY)
+        .text_color(color::syntax_address(cx))
+        .child(SharedString::from(format_field_offset(offset)))
+}
+
 /// The trailing member-count pill — a muted, low-contrast right-aligned chip
 /// (the C++ count pill on `surface` bg). Hidden for empty types.
 fn count_pill(count: usize, cx: &App) -> impl IntoElement {
@@ -948,8 +1005,8 @@ mod tests {
     // expansion and overflow the type-recursion budget (see lib.rs note).
     use super::DocId;
     use super::{
-        model_to_tree_items, nav_item_id, parse_nav_item_id, TypeBadge, WorkspaceDoc,
-        WorkspaceModel, WorkspaceRow,
+        format_field_offset, model_to_tree_items, nav_item_id, parse_nav_item_id, TypeBadge,
+        WorkspaceDoc, WorkspaceModel, WorkspaceRow,
     };
     use crate::core::{Node, NodeKind, NodeTree};
 
@@ -1095,6 +1152,21 @@ mod tests {
         assert_eq!(fields, vec!["health", "stamina", "xp"]);
         // Field child display = "Type name".
         assert_eq!(player.children[0].display(), "Int32 health");
+        // Each child carries its member offset (for the nested-row offset chip),
+        // in offset-sorted order: health@0, stamina@8, xp@12.
+        let offsets: Vec<i32> = player.children.iter().map(|c| c.offset).collect();
+        assert_eq!(offsets, vec![0, 8, 12]);
+    }
+
+    #[test]
+    fn format_field_offset_is_compact_hex() {
+        // Editor-style `+0xNN`, uppercase, no leading zeros.
+        assert_eq!(format_field_offset(0), "+0x0");
+        assert_eq!(format_field_offset(8), "+0x8");
+        assert_eq!(format_field_offset(16), "+0x10");
+        assert_eq!(format_field_offset(0x1A0), "+0x1A0");
+        // Negative offsets (should not occur, but render safely with a sign).
+        assert_eq!(format_field_offset(-8), "-0x8");
     }
 
     #[test]

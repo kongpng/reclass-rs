@@ -656,6 +656,57 @@ pub fn effective_widths(lm: &LineMeta) -> (i32, i32) {
     (g.type_column_width, g.name_column_width)
 }
 
+/// The left address/offset gutter text for a row — the Rust analogue of the C++
+/// `reformatMargins` per-line text (editor-surface.md §5 `applyLineAttributes` /
+/// `reformatMargins`), computed at *render* time from the row's resolved address
+/// rather than trusting a precomputed string.
+///
+/// Two modes, matching reclass:
+/// - **Relative** (`relative == true`, the default when no live memory source is
+///   attached, PIC5): `"+<HEX>"` of `offset_addr - base_address`, right-justified
+///   to `hex_digits` so every row's main text starts at the same column. This is
+///   the reclass default the screenshots show (`+0 +8 +10 +18 …`) and avoids the
+///   bug where a base-only absolute address repeats on every row.
+/// - **Absolute** (`relative == false`, a live source is attached, PIC1): the full
+///   uppercase hex address, zero-padded to `hex_digits` (`7FF60BF02B80 …`).
+///
+/// Continuation/member rows render the `"·"` middle-dot marker (the row belongs to
+/// the line above). `hex_digits <= 0` yields an empty gutter.
+///
+/// Pure (no gpui), unit-tested below.
+pub fn fmt_margin_text(
+    offset_addr: u64,
+    base_address: u64,
+    hex_digits: i32,
+    is_continuation: bool,
+    relative: bool,
+) -> String {
+    if hex_digits <= 0 {
+        return String::new();
+    }
+    if is_continuation {
+        // The continuation marker, right-aligned in the gutter like a real row.
+        return "·".to_string();
+    }
+    if relative {
+        // Relative offset from the view base: "+<HEX>" (no 0x, uppercase), e.g.
+        // `+0 +8 +10 +18`. The "+" eats one of the `hex_digits` slots so the
+        // column still lines up with the absolute mode's width.
+        let rel = offset_addr.wrapping_sub(base_address);
+        let body = format!("{rel:X}");
+        let pad = (hex_digits as usize).saturating_sub(1 + body.len());
+        format!("{}+{body}", " ".repeat(pad))
+    } else {
+        // Absolute address, zero-padded uppercase hex (PIC1).
+        let body = format!("{offset_addr:X}");
+        if body.len() < hex_digits as usize {
+            format!("{}{body}", "0".repeat(hex_digits as usize - body.len()))
+        } else {
+            body
+        }
+    }
+}
+
 // Small extension to chain a span fallback when invalid.
 trait ColumnSpanExt {
     fn valid_or(self, f: impl FnOnce() -> ColumnSpan) -> ColumnSpan;
@@ -962,6 +1013,49 @@ mod tests {
         let text = "fnptr64       event           0x7ff60baa84c0";
         let runs = style_runs(&lm, text, 14, 22);
         assert!(runs.iter().any(|r| r.role == SpanRole::FnPtr));
+    }
+
+    #[test]
+    fn margin_relative_offsets_increment_per_row() {
+        // PIC5: no live source → relative "+<hex>" offsets from the base. Each row
+        // carries a distinct address, so the gutter must differ per row (the bug
+        // was every row repeating the base address).
+        let base = 0xFFFF_8000_0000_0000u64;
+        let r0 = fmt_margin_text(base, base, 8, false, true);
+        let r8 = fmt_margin_text(base + 0x8, base, 8, false, true);
+        let r10 = fmt_margin_text(base + 0x10, base, 8, false, true);
+        assert!(r0.trim_start().ends_with("+0"), "got {r0:?}");
+        assert!(r8.trim_start().ends_with("+8"), "got {r8:?}");
+        assert!(r10.trim_start().ends_with("+10"), "got {r10:?}");
+        // Distinct per row (the regression guard).
+        assert_ne!(r0, r8);
+        assert_ne!(r8, r10);
+        // Right-justified to the column width.
+        assert_eq!(r0.chars().count(), 8);
+        assert_eq!(r10.chars().count(), 8);
+    }
+
+    #[test]
+    fn margin_absolute_addresses_when_source_attached() {
+        // PIC1: a live source → full uppercase hex address, distinct per row.
+        let base = 0x7FF6_0BF0_2B80u64;
+        let a0 = fmt_margin_text(base, base, 12, false, false);
+        let a8 = fmt_margin_text(base + 0x8, base, 12, false, false);
+        assert_eq!(a0, "7FF60BF02B80");
+        assert_eq!(a8, "7FF60BF02B88");
+        assert_ne!(a0, a8);
+    }
+
+    #[test]
+    fn margin_continuation_is_the_dot_marker() {
+        assert_eq!(fmt_margin_text(0x40, 0, 8, true, true), "·");
+        assert_eq!(fmt_margin_text(0x40, 0, 8, true, false), "·");
+    }
+
+    #[test]
+    fn margin_empty_when_no_digits() {
+        assert_eq!(fmt_margin_text(0x40, 0, 0, false, true), "");
+        assert_eq!(fmt_margin_text(0x40, 0, -1, false, false), "");
     }
 
     #[test]

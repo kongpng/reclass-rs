@@ -106,6 +106,11 @@ pub struct RcxEditor {
     hovered_line: Option<usize>,
     /// `m_lastTabTarget` — persists across edit-begins so Tab continues the cycle.
     last_tab_target: Option<EditTarget>,
+    /// `m_relativeOffsets` (editor.h:244) — the address-margin mode. **Defaults to
+    /// `true`** (relative `"+<HEX>"` offsets, PIC4/PIC5), matching the C++; the
+    /// user toggles to absolute addresses (PIC1/PIC2) via the margin double-click /
+    /// context menu. Purely-visual editor state, so it lives on the view.
+    relative_offsets: bool,
     /// Measured monospace cell metrics (updated each frame from the font).
     metrics: CellMetrics,
     scroll: UniformListScrollHandle,
@@ -135,6 +140,7 @@ impl RcxEditor {
             byte_sel: ByteSelection::new(),
             hovered_line: None,
             last_tab_target: None,
+            relative_offsets: true,
             metrics: CellMetrics::new(8.0, 16.0),
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
@@ -180,6 +186,22 @@ impl RcxEditor {
         &self.byte_sel
     }
 
+    /// Whether the address margin shows relative `"+<HEX>"` offsets (the reclass
+    /// default) vs absolute addresses (`m_relativeOffsets`).
+    pub fn relative_offsets(&self) -> bool {
+        self.relative_offsets
+    }
+
+    /// `setRelativeOffsets(rel)` (editor.h:115) — switch the margin between
+    /// relative offsets (PIC4/PIC5) and absolute addresses (PIC1/PIC2). The margin
+    /// double-click / context menu calls this in a later input-wiring workflow.
+    pub fn set_relative_offsets(&mut self, relative: bool, cx: &mut Context<Self>) {
+        if self.relative_offsets != relative {
+            self.relative_offsets = relative;
+            cx.notify();
+        }
+    }
+
     // ── Row text helpers ──
 
     /// Slice line `idx`'s text out of the composed document via `line_starts`
@@ -209,6 +231,27 @@ impl RcxEditor {
         self.controller.last_result().meta.get(idx)
     }
 
+    /// Row text as an owned `String`, with the **command row substituted** by the
+    /// controller's live [`build_command_row`](RcxController::build_command_row).
+    ///
+    /// The composed line-0 text is a fixed `"[▸] source▾  0x0  struct Untitled {"`
+    /// stub; the real root struct name (`_EPROCESS`), keyword (`struct`/`class`),
+    /// data-source label, and base address live on the controller. Since every
+    /// command-row span helper (`command_row_*_span`) is a pure text scan for the
+    /// `▾` arrow / `0x` / `struct ` keyword / ` {`, swapping in the live string
+    /// keeps the exact `[▸] <src>▾  <addr>  <kw> <name> {` shape, so hit-testing,
+    /// span coloring, and inline-edit all resolve against the same text the painter
+    /// renders. Non-command rows fall through to the sliced composed text.
+    fn line_text_owned(&self, idx: usize) -> String {
+        if self
+            .line_meta(idx)
+            .is_some_and(|lm| lm.line_kind == LineKind::CommandRow)
+        {
+            return self.controller.build_command_row();
+        }
+        self.line_text(idx).to_string()
+    }
+
     // ── Click routing (editor-surface.md §9) ──
 
     /// Handle a left mouse press on row `line` at pixel-relative X `rel_x`.
@@ -229,7 +272,7 @@ impl RcxEditor {
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
-        let text = self.line_text(line).to_string();
+        let text = self.line_text_owned(line);
         let (type_w, name_w) = geometry::effective_widths(&lm);
         let hit = hit_test::hit_test_row(&lm, &text, rel_x, self.metrics, type_w, name_w);
 
@@ -321,7 +364,7 @@ impl RcxEditor {
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
-        let text = self.line_text(line).to_string();
+        let text = self.line_text_owned(line);
         let (type_w, name_w) = geometry::effective_widths(&lm);
         let span = geometry::resolved_span_for(&lm, &text, target, type_w, name_w);
         if !span.valid || span.end <= span.start {
@@ -537,7 +580,7 @@ impl RcxEditor {
     /// Build the `RowPaint` for line `idx`: text + colored runs + overlays.
     fn build_row_paint(&self, idx: usize, palette: EditorPalette) -> RowPaint {
         let lm = self.line_meta(idx).cloned().unwrap_or_default();
-        let text = self.line_text(idx).to_string();
+        let text = self.line_text_owned(idx);
         let (type_w, name_w) = geometry::effective_widths(&lm);
         let runs = geometry::style_runs(&lm, &text, type_w, name_w);
 
@@ -668,23 +711,41 @@ impl RcxEditor {
             gpui::transparent_black()
         });
 
-        // Address/offset margin — the Zed-gutter left column (PIC1/PIC5's muted
+        // Address/offset margin — the Zed-gutter left column (PIC4/PIC5's muted
         // "+0 +8 +10 …" address column). Fixed width from `offset_hex_digits` so
-        // EVERY row's main text starts at the same column; `lm.offset_text` is
-        // pre-padded + right-justified by compose (continuation rows render the
-        // "·" marker, header/footer blank). Low-contrast gutter: a hair-darker bg,
-        // muted blue-gray digits, right-aligned with a small trailing pad.
-        let addr_cols = self
-            .controller
-            .last_result()
-            .layout
-            .offset_hex_digits
-            .max(0) as f32;
-        if addr_cols > 0.0 {
+        // EVERY row's main text starts at the same column. The *value* is computed
+        // here per-row from the row's resolved `offset_addr` (NOT a precomputed
+        // string that repeated the base on every row): relative `"+<HEX>"` offsets
+        // from the view base in `m_relativeOffsets` mode (the reclass default,
+        // PIC4/PIC5), or full absolute addresses when toggled (PIC1/PIC2). Compose's
+        // own blank-vs-filled policy is preserved (footers / element-separators /
+        // static-body lines stay blank) by only rendering rows whose composed
+        // `offset_text` is non-blank. Low-contrast gutter: a hair-darker bg, muted
+        // blue-gray digits, right-aligned with a small trailing pad.
+        let layout = &self.controller.last_result().layout;
+        let addr_cols = layout.offset_hex_digits.max(0);
+        let base_address = layout.base_address;
+        // `m_relativeOffsets` — relative `"+<HEX>"` offsets by default (PIC4/PIC5),
+        // absolute addresses when the user toggles (PIC1/PIC2).
+        let relative = self.relative_offsets;
+        if addr_cols > 0 {
+            // Preserve compose's per-row decision of whether this row carries an
+            // offset (footers / separators are blank there).
+            let margin_text = if lm.offset_text.trim().is_empty() {
+                String::new()
+            } else {
+                geometry::fmt_margin_text(
+                    lm.offset_addr,
+                    base_address,
+                    addr_cols,
+                    lm.is_continuation,
+                    relative,
+                )
+            };
             row = row.child(
                 div()
                     .flex_shrink_0()
-                    .w(px((addr_cols + 2.0) * self.metrics.cell_width))
+                    .w(px((addr_cols as f32 + 2.0) * self.metrics.cell_width))
                     .h(px(self.metrics.line_height))
                     .flex()
                     .flex_row()
@@ -693,7 +754,7 @@ impl RcxEditor {
                     .pr(px(self.metrics.cell_width))
                     .bg(palette.gutter_bg)
                     .text_color(palette.gutter_fg)
-                    .child(SharedString::from(lm.offset_text.trim_end().to_string())),
+                    .child(SharedString::from(margin_text)),
             );
         }
 
@@ -918,6 +979,78 @@ mod tests {
         let result = c.last_result();
         assert_eq!(result.meta[0].line_kind, LineKind::CommandRow);
         assert_eq!(result.meta[0].node_id, K_COMMAND_ROW_ID);
+    }
+
+    #[test]
+    fn command_row_override_uses_real_struct_name() {
+        // Issue 3: the composed command-row stub says "struct Untitled"; the editor
+        // substitutes `controller.build_command_row()`, which carries the real
+        // struct type name. Verify (a) the live string names the real struct and
+        // NOT "Untitled", and (b) the command-row span helpers resolve the class
+        // name against that live string (so hit-testing stays consistent with what
+        // the editor paints).
+        use crate::compose::{command_row_root_name_span, command_row_root_type_span};
+        let c = editor_with_struct();
+        let row = c.build_command_row();
+        assert!(row.contains("Player"), "row={row:?}");
+        assert!(!row.contains("Untitled"), "row={row:?}");
+        // The composed line-0 stub, by contrast, is the placeholder.
+        assert!(c
+            .last_result()
+            .text
+            .lines()
+            .next()
+            .unwrap()
+            .contains("Untitled"));
+        // Spans resolve on the live string.
+        let name = command_row_root_name_span(&row);
+        assert!(name.valid, "root-name span must resolve on the live row");
+        let chars: Vec<char> = row.chars().collect();
+        let got: String = chars[name.start as usize..name.end as usize]
+            .iter()
+            .collect();
+        assert_eq!(got, "Player");
+        // The keyword span resolves too ("struct"/"class").
+        assert!(command_row_root_type_span(&row).valid);
+    }
+
+    #[test]
+    fn relative_offsets_default_on_and_margin_increments() {
+        // Issue 2: the margin must increment per row (not repeat the base) and
+        // default to relative "+<HEX>" offsets. We test the pure formatter against
+        // the controller's real per-row addresses.
+        use super::geometry::fmt_margin_text;
+        let c = editor_with_struct();
+        let result = c.last_result();
+        let base = result.layout.base_address;
+        let digits = result.layout.offset_hex_digits;
+        // Collect the rendered relative margin for each data row that carries an
+        // offset, and confirm they are not all identical (the regression).
+        let mut margins = Vec::new();
+        for lm in &result.meta {
+            if lm.line_kind == LineKind::Field && !lm.offset_text.trim().is_empty() {
+                margins.push(fmt_margin_text(
+                    lm.offset_addr,
+                    base,
+                    digits,
+                    lm.is_continuation,
+                    true,
+                ));
+            }
+        }
+        assert!(
+            margins.len() >= 2,
+            "need ≥2 field rows; got {}",
+            margins.len()
+        );
+        let all_same = margins.iter().all(|m| m == &margins[0]);
+        assert!(!all_same, "margins must differ per row: {margins:?}");
+        // The first field is at relative +0.
+        assert!(
+            margins[0].trim_start().ends_with("+0"),
+            "first={:?}",
+            margins[0]
+        );
     }
 
     #[test]

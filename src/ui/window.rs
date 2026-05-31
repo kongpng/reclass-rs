@@ -4,8 +4,9 @@
 //! document tabs, §10 docks, §13 start page). Composes:
 //!
 //! - the custom frameless [`TitleBar`](gpui_component::TitleBar) (app-shell §5)
-//!   assembled by [`super::titlebar::render_titlebar`]: app label, the workspace
-//!   layout-toggle pair, and the dual view-mode toggle,
+//!   assembled by [`super::titlebar::render_titlebar`]: app label, the in-window
+//!   menu bar, the document title, and the workspace sidebar toggle (the
+//!   view-mode switch is the document area's bottom segmented control),
 //! - a [`DockArea`] holding the MDI document-tab center
 //!   ([`DocumentArea`](super::tabs::DocumentArea)) + the workspace dock
 //!   ([`WorkspacePanel`](super::workspace::WorkspacePanel)) + a scanner dock,
@@ -72,6 +73,13 @@ pub struct MainWindow {
     /// Live subscription to the currently-open command-palette modal — kept so its
     /// Trigger/Cancel events fire while shown (a dropped subscription stops them).
     palette_sub: Option<Subscription>,
+    /// Observations of the open editors — one per tab. The editor entities own
+    /// the selection; they `cx.notify()` themselves on a row click but do NOT
+    /// emit up to us, so without these the bottom status bar (computed in
+    /// [`MainWindow::render`]) would stay stale after a selection. Each
+    /// observation re-renders the window so [`StatusInfo::for_controller`] re-runs
+    /// against the fresh selection. Rebuilt whenever the tab set changes.
+    editor_observers: Vec<Subscription>,
 }
 
 impl MainWindow {
@@ -154,8 +162,12 @@ impl MainWindow {
             layout_preset,
             theme_manager,
             palette_sub: None,
+            editor_observers: Vec::new(),
         };
 
+        // Observe the initial editor(s) so a row selection re-renders the window
+        // (and thus refreshes the status bar; see [`Self::observe_editors`]).
+        win.observe_editors(cx);
         // Rebuild the workspace model from the seeded document, then show the
         // start page over the workspace (the C++ deferred `showStartPage`).
         win.rebuild_workspace(cx);
@@ -199,8 +211,20 @@ impl MainWindow {
         ));
         let palette_for_modal = palette.clone();
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog.child(palette_for_modal.clone())
+            // Center a Zed-style picker: a ~600px card anchored in the top third
+            // over a dimming scrim (the dialog's default `overlay`). The palette
+            // renders its own elevated card + header, so suppress the dialog's
+            // chrome (close button + inner padding) and let it size the card.
+            dialog
+                .w(px(600.))
+                .margin_top(px(120.))
+                .close_button(false)
+                .child(palette_for_modal.clone())
         });
+        // Focus the palette's query input (its `Focusable` handle delegates to the
+        // input) so the first keystroke types into the palette instead of falling
+        // through to the window's global shortcuts. `open_dialog` focuses its own
+        // handle first, so this runs last and wins.
         window.focus(&focus, cx);
         cx.notify();
     }
@@ -231,6 +255,7 @@ impl MainWindow {
                 });
                 self.state.open_document("Untitled");
                 self.rebuild_workspace(cx);
+                self.observe_editors(cx);
             }
             "file.welcome" => self.show_start_page(window, cx),
 
@@ -381,16 +406,43 @@ impl MainWindow {
                 // The center opened a fresh tab (`project_new`); mirror it.
                 self.state.open_document("Untitled");
                 self.rebuild_workspace(cx);
+                // The tab set grew — re-observe so the new editor's selections
+                // refresh the status bar.
+                self.observe_editors(cx);
             }
             DocAreaEvent::Closed(id) => {
                 self.state.close_document(id);
                 self.rebuild_workspace(cx);
+                self.observe_editors(cx);
             }
             DocAreaEvent::ViewModeChanged(id, mode) => {
                 self.state.set_view_mode(id, mode);
             }
         }
         cx.notify();
+    }
+
+    /// (Re)subscribe an observation to every open editor so a row selection
+    /// re-renders the window — which re-runs [`StatusInfo::for_controller`] and
+    /// repaints the bottom status bar with the live `Root.field  +0xNN` readout.
+    ///
+    /// The editors own the selection and `cx.notify()` themselves on a click but
+    /// do not emit up to the window; an `observe` bridges that so a nested-entity
+    /// change forces our (sibling) status bar to refresh. Called on construction
+    /// and whenever the tab set changes (new/closed document); the previous
+    /// observations are dropped (and thus unsubscribed) by reassigning the `Vec`.
+    fn observe_editors(&mut self, cx: &mut Context<Self>) {
+        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        self.editor_observers = editors
+            .into_iter()
+            .map(|editor| cx.observe(&editor, |_this, _editor, cx| cx.notify()))
+            .collect();
     }
 
     /// Activate a document in `AppState` by id (best-effort: the document area is
@@ -526,6 +578,7 @@ impl MainWindow {
                 });
                 self.state.open_document("Untitled");
                 self.rebuild_workspace(cx);
+                self.observe_editors(cx);
             }
             StartPageEvent::Card(_) => {
                 // Open project / import paths land with the project-lifecycle +
@@ -706,19 +759,20 @@ impl Render for MainWindow {
         let notification_layer = Root::render_notification_layer(window, cx);
 
         // The active document's title for the titlebar (app-shell §6
-        // `updateWindowTitle`), and the current view mode for the toggle.
+        // `updateWindowTitle`).
         let doc_title = self
             .state
             .active_tab()
             .map(|t| t.title.clone())
             .unwrap_or_else(|| "Reclass".to_string());
         let has_doc = !self.state.is_empty();
-        let view_mode = self.state.active_view_mode();
         let preset = self.layout_preset;
 
-        // The custom titlebar (app-shell §5) with the workspace + view-mode
-        // toggles. The toggle callbacks re-enter this entity via a weak handle
-        // (the idiomatic `App`-scoped closure ⇄ entity bridge).
+        // The custom titlebar (app-shell §5) with the workspace (sidebar) toggle.
+        // The view-mode switch is the "Reclass | Code" segmented control at the
+        // bottom of the document area (`tabs::DocumentArea::render_view_toggle`),
+        // not a titlebar control (PIC5). The toggle callback re-enters this entity
+        // via a weak handle (the idiomatic `App`-scoped closure ⇄ entity bridge).
         let this = cx.entity().downgrade();
         let layout_cb = {
             let this = this.clone();
@@ -726,20 +780,12 @@ impl Render for MainWindow {
                 let _ = this.update(app, |me, cx| me.apply_layout_preset(p, window, cx));
             }
         };
-        let view_cb = {
-            let this = this.clone();
-            move |m: ViewMode, window: &mut Window, app: &mut App| {
-                let _ = this.update(app, |me, cx| me.set_active_view_mode(m, window, cx));
-            }
-        };
         let titlebar: TitleBar = titlebar::render_titlebar(
             preset,
-            view_mode,
             doc_title,
             has_doc,
             self.menubar.clone(),
             layout_cb,
-            view_cb,
             cx,
         );
 
@@ -765,21 +811,26 @@ impl Render for MainWindow {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::open_command_palette))
+            // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
             .child(titlebar)
-            // The content column: the docking workspace + the start-page overlay.
-            // Wrapped so the status bar is a sibling pinned to the window bottom
-            // and the overlay only covers the content area (not the status bar).
+            // ── Row 2: the content column — the docking workspace + the
+            // start-page overlay. `flex_1 min_h_0` makes it take all the space
+            // *between* the titlebar and the status bar; `overflow_hidden` clips
+            // the dock (incl. the collapsed bottom-scanner header) strictly to
+            // this box so it can NEVER bleed over / displace the status bar below.
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     // The docking workspace: center document tabs + side docks.
                     .child(div().size_full().child(self.dock_area.clone()))
                     // The start-page overlay (over the workspace while shown).
                     .when_some(self.start_page.clone(), |this, page| this.child(page)),
             )
-            // The bottom status bar (app-shell §11) — a thin chrome strip.
+            // ── Row 3: the bottom status bar (app-shell §11) — a thin chrome strip
+            // pinned to the very bottom, never shrunk by the flex content above.
             .child(status_bar)
             // Overlay layers.
             .children(sheet_layer)
@@ -847,8 +898,21 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     bindings.push(KeyBinding::new("f1", OpenCommandPalette, Some("RcxWindow")));
     cx.bind_keys(bindings);
 
+    // Run borderless: request CLIENT-side decorations so the OS/window-manager
+    // (openbox under Xvfb, GNOME/KDE, …) suppresses its own server-side title
+    // bar and the app's frameless `TitleBar` is the ONLY chrome — matching the
+    // C++ `Qt::FramelessWindowHint` `TitleBarWidget` (titlebar.cpp; app-shell §5).
+    // Without this, openbox draws a second (blue gradient) title bar above ours,
+    // stealing ~22px and overlapping the top-right view-toggle hit area. On X11
+    // gpui sets the `_MOTIF_WM_HINTS` no-decorations hint; gpui-component's
+    // `TitleBar` also only renders its min/max/close controls when client-decorated.
+    let window_options = WindowOptions {
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    };
+
     cx.spawn(async move |cx| {
-        let window_handle = cx.open_window(WindowOptions::default(), |window, cx| {
+        let window_handle = cx.open_window(window_options, |window, cx| {
             window.set_window_title("Reclass");
             let view = cx.new(|cx| MainWindow::new(theme_manager.clone(), window, cx));
             cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))

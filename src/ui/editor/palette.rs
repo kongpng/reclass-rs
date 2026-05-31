@@ -82,12 +82,16 @@ impl EditorPalette {
             fnptr_fg: t.blue,
             name_fg: t.foreground,
             // Resolved field values (the `0x7ff60baa84c0` pointer/address column)
-            // read green in the reclass screenshots (PIC1) — One Dark string green.
-            value_fg: t.green,
+            // render in the warm One Dark **number/orange** hue in the reclass
+            // screenshots (PIC1 measures ≈ `#d19a66`, the `markerCycle`/`warning`
+            // role), not green — green is reserved for comments/symbols.
+            value_fg: t.warning,
             dim: t.muted_foreground,
             keyword: t.magenta,
             class_name: t.blue,
-            number: t.yellow_light,
+            // Base address / numeric literal — the true One Dark orange `#d19a66`
+            // (`warning` ← `markerCycle`), matching the command-row address in PIC1.
+            number: t.warning,
             ascii: with_alpha(t.green, 0.75),
             comment_green: t.green_light,
             type_hint: t.muted_foreground,

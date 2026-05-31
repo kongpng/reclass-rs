@@ -4,42 +4,43 @@
 //! Port of the C++ `FlatStatusBar` + `setAppStatus` node readout (`main.cpp`):
 //! a borderless bar showing the active node's context. On selecting a field the
 //! C++ built "`StructName.fieldName`" + a dim "`  +0xNN`" offset suffix
-//! (`MainWindow::nodeSelected`, main.cpp:3023); the screenshots show
-//! "`UnnamedClass0.field_20  +0x20`" (PIC5) and the richer hover form
-//! "`FuncPtr64 qt_metacast  offset: 0x0010  size: 8 bytes`" (PIC3). This module
-//! reproduces both from the editor's controller state.
+//! (`MainWindow::nodeSelected`, main.cpp:3023/3062); PIC5 shows exactly that:
+//! "`UnnamedClass0.field_20  +0x20`". This module reproduces that always-on
+//! selection readout. (The richer "`offset: 0x.. size: N bytes`" spelling in
+//! PIC3 is the editor's *hover* line, a separate surface, not this bar.)
 //!
 //! ## Split: gpui-free model + thin render
 //! [`StatusInfo`] is a pure, unit-tested builder over a [`NodeTree`] + the
 //! controller's selected-id set; it mirrors the C++ "walk to root → `Type`,
-//! `Root.field`, `N selected`, offset, size" logic exactly. The render path
+//! `Root.field`, `N selected`, `+0xNN`" logic exactly. The render path
 //! ([`render_status_bar`]) only lays the resulting `path` / `detail` strings out
 //! in Zed status-bar chrome (thin bar, top 1px border, `UI_XS` muted text).
 //!
 //! Follows the shared Zed design system ([`crate::ui::design`]; spec §5.12):
 //! `chrome_bg`, top 1px `border`, ~22px tall, `UI_XS` `text_muted`, a flex row
-//! with the node path on the left and the offset/size detail on the right.
+//! with the node path on the left and the offset detail + source readout on the
+//! right.
 //!
 //! Gated behind the `ui` feature.
 
 use std::collections::HashSet;
 
 use crate::controller::RcxController;
-use crate::core::{kind_meta, size_for_kind, NodeKind, NodeTree};
+use crate::core::{kind_meta, NodeKind, NodeTree};
 
 /// The resolved status-bar readout for the active node selection — the pure
 /// product of [`StatusInfo::for_controller`] / [`StatusInfo::from_tree`].
 ///
 /// `path` is the left-aligned primary string (`Root.field`, a root name, or
-/// "`N nodes selected`"); `detail` is the right-aligned dim string (the offset
-/// and, for a single leaf, the byte size — the C++ "`  +0xNN`" plus the PIC3
-/// "`offset: 0x.. size: N bytes`" form). Both empty ⇒ nothing selected (the bar
+/// "`N nodes selected`"); `detail` is the right-aligned dim offset suffix —
+/// the C++ "`  +0xNN`" form (`main.cpp:3062`) shown in PIC5
+/// ("`UnnamedClass0.field_20  +0x20`"). Both empty ⇒ nothing selected (the bar
 /// shows only the source readout).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct StatusInfo {
     /// Left primary: "StructName.fieldName", a root type name, or "N nodes selected".
     pub path: String,
-    /// Right detail: "+0x20" / "offset: 0x0010  size: 8 bytes" (empty if none).
+    /// Right detail: the dim offset suffix "+0x20" (empty when nothing selected).
     pub detail: String,
 }
 
@@ -65,7 +66,7 @@ impl StatusInfo {
     /// Mirrors `MainWindow::nodeSelected` (main.cpp:3023):
     /// - `> 1` selected → "`TypeName ×N`" (the primary's type), no detail.
     /// - root node → its own name/struct-type-name, detail = "`+0xNN`".
-    /// - nested node → "`Root.field`", detail = "`+0xNN`" (+ size for a leaf).
+    /// - nested node → "`Root.field`", detail = "`+0xNN`".
     pub fn from_tree(
         tree: &NodeTree,
         selected: &HashSet<u64>,
@@ -110,19 +111,12 @@ impl StatusInfo {
             node.name.clone()
         };
 
-        // Detail: the offset (always) + the byte size for a sized leaf. The C++
-        // dim suffix is "  +0xNN"; the PIC3 hover form spells it "offset: 0x..
-        // size: N bytes". We render the spelled-out, information-dense form.
-        let mut detail = format!("+0x{:02X}", node.offset);
-        let sz = size_for_kind(node.kind);
-        if sz > 0 {
-            detail = format!(
-                "offset: 0x{:04X}  size: {} byte{}",
-                node.offset,
-                sz,
-                if sz == 1 { "" } else { "s" }
-            );
-        }
+        // Detail: the dim offset suffix. The C++ `nodeSelected` → `setAppStatus`
+        // emits exactly "  +0xNN" (`main.cpp:3062`), which is what PIC5 shows
+        // ("UnnamedClass0.field_20  +0x20"). We reproduce that compact form here;
+        // the richer "offset: 0x.. size: N bytes" spelling is the editor's hover
+        // line (PIC3), not this always-on selection readout.
+        let detail = format!("+0x{:02X}", node.offset);
 
         StatusInfo { path, detail }
     }
@@ -287,12 +281,12 @@ mod tests {
 
     #[test]
     fn nested_field_shows_root_dot_field_and_offset() {
-        // PIC5: "UnnamedClass0.field_20  +0x20".
+        // PIC5: "UnnamedClass0.field_20  +0x20" — the compact C++ `nodeSelected`
+        // dim suffix (`main.cpp:3062`), not the editor hover spelling.
         let (tree, _root, field) = fixture();
         let info = StatusInfo::from_tree(&tree, &sel(&[field]), default_type_name);
         assert_eq!(info.path, "UnnamedClass0.field_20");
-        // Int32 is a sized leaf → spelled-out detail with the offset + size.
-        assert_eq!(info.detail, "offset: 0x0020  size: 4 bytes");
+        assert_eq!(info.detail, "+0x20");
     }
 
     #[test]
@@ -322,20 +316,20 @@ mod tests {
     }
 
     #[test]
-    fn single_byte_field_uses_singular_byte() {
+    fn nonzero_offset_renders_compact_hex_suffix() {
         let mut tree = NodeTree::new();
         let n = Node {
             kind: NodeKind::Int8,
             name: "b".into(),
             parent_id: 0,
-            offset: 0,
+            offset: 0xAB,
             ..Node::default()
         };
         let i = tree.add_node(n);
         let id = tree.nodes[i].id;
         let info = StatusInfo::from_tree(&tree, &sel(&[id]), default_type_name);
-        // Int8 is sized 1 → "1 byte" (singular).
-        assert_eq!(info.detail, "offset: 0x0000  size: 1 byte");
+        // The compact "+0xNN" form, upper-case hex, min 2 digits (the C++ suffix).
+        assert_eq!(info.detail, "+0xAB");
     }
 
     #[test]

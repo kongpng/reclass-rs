@@ -502,7 +502,7 @@ mod view {
     use gpui_component::table::{
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
-    use gpui_component::{Disableable as _, Sizable as _};
+    use gpui_component::{Disableable as _, IconName, Sizable as _};
 
     use super::{
         filter_rows, split_address_dim, value_type_entries, CondEntry, ScanRow, ScannerForm,
@@ -967,14 +967,16 @@ mod view {
     /// with a trailing chevron, sitting in the toolbar like the reclass scan-type
     /// / type / scan combos. Built on a gpui-component `Button` (which is
     /// `Selectable` — the bound `Popover::trigger` requires) so it inherits the
-    /// themed control look + the open/selected highlight.
+    /// themed control look + the open/selected highlight. The trailing chevron is
+    /// a real `ChevronDown` icon (Zed combo affordance) rather than a glyph.
     fn dropdown_trigger(id: impl Into<SharedString>, text: impl Into<SharedString>) -> Button {
         let id: SharedString = id.into();
         let text: SharedString = text.into();
         Button::new(SharedString::from(format!("scanner-trig-{id}")))
             .outline()
             .small()
-            .label(format!("{text}  ▾"))
+            .label(text)
+            .icon(IconName::ChevronDown)
     }
 
     impl Render for ScannerPanel {
@@ -1079,16 +1081,10 @@ mod view {
                     }
                 });
 
-            // ── Status line: muted "N results" / "Copied ..." ──
-            let status_text = if self.status.is_empty() {
-                if has_results {
-                    String::new()
-                } else {
-                    "No results".to_string()
-                }
-            } else {
-                self.status.clone()
-            };
+            // ── Status line: muted "N results" / "Copied ..." (the C++ result
+            // count line). Blank before the first scan; the scan path always sets
+            // `status` afterwards, so an empty status means "nothing scanned yet". ──
+            let status_text = self.status.clone();
 
             gpui_component::v_flex()
                 .id("rcx-scanner-panel")
@@ -1099,19 +1095,64 @@ mod view {
                 // ── Panel header (uppercase muted title strip) ──
                 .child(crate::ui::design::panel_header("Scanner", cx))
                 .child(
-                    // ── Search controls cluster ──
+                    // ── Search controls cluster (the reclass scanner toolbar) ──
                     gpui_component::v_flex()
                         .gap(px(tokens::space::MD))
                         .p(px(tokens::space::LG))
-                        // Row 1: scan-type / value-type / alignment dropdowns.
+                        // Row 1: scan-type / value-type / alignment dropdowns on
+                        // the left; Scan / Re-scan / Reset right-aligned (PIC3/PIC6
+                        // put the action buttons at the toolbar's trailing edge).
                         .child(
                             gpui_component::h_flex()
+                                .w_full()
                                 .gap(px(tokens::space::MD))
                                 .flex_wrap()
                                 .items_center()
-                                .child(cond_popover)
-                                .when(vis.type_enabled, |row| row.child(type_popover))
-                                .when(vis.type_enabled, |row| row.child(align_popover)),
+                                .justify_between()
+                                .child(
+                                    gpui_component::h_flex()
+                                        .gap(px(tokens::space::MD))
+                                        .flex_wrap()
+                                        .items_center()
+                                        .child(cond_popover)
+                                        .when(vis.type_enabled, |row| row.child(type_popover))
+                                        .when(vis.type_enabled, |row| row.child(align_popover)),
+                                )
+                                .child(
+                                    gpui_component::h_flex()
+                                        .gap(px(tokens::space::SM))
+                                        .items_center()
+                                        .child(
+                                            Button::new("scanner-scan")
+                                                .primary()
+                                                .small()
+                                                .icon(IconName::Search)
+                                                .label("Scan")
+                                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                                    this.run_scan(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("scanner-rescan")
+                                                .small()
+                                                .icon(IconName::Redo)
+                                                .label("Re-scan")
+                                                .disabled(!has_results)
+                                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                                    this.run_scan(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("scanner-reset")
+                                                .ghost()
+                                                .small()
+                                                .label("Reset")
+                                                .disabled(!has_results)
+                                                .on_click(
+                                                    cx.listener(|this, _e, _w, cx| this.reset(cx)),
+                                                ),
+                                        ),
+                                ),
                         )
                         // Row 2: Pattern:/Value: label + compact input(s).
                         .child(
@@ -1174,37 +1215,6 @@ mod view {
                                             this.toggle_struct_only(*on, cx)
                                         })),
                                 ),
-                        )
-                        // Row 4: primary Scan + secondary Re-scan + Reset.
-                        .child(
-                            gpui_component::h_flex()
-                                .gap(px(tokens::space::MD))
-                                .items_center()
-                                .child(
-                                    Button::new("scanner-scan")
-                                        .primary()
-                                        .small()
-                                        .label("⌕  Scan")
-                                        .on_click(
-                                            cx.listener(|this, _e, _w, cx| this.run_scan(cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("scanner-rescan")
-                                        .small()
-                                        .label("↻  Re-scan")
-                                        .disabled(!has_results)
-                                        .on_click(
-                                            cx.listener(|this, _e, _w, cx| this.run_scan(cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("scanner-reset")
-                                        .ghost()
-                                        .small()
-                                        .label("Reset")
-                                        .on_click(cx.listener(|this, _e, _w, cx| this.reset(cx))),
-                                ),
                         ),
                 )
                 // ── Post-scan filter + status ──
@@ -1246,14 +1256,16 @@ mod view {
                         .child(
                             Button::new("scanner-goto")
                                 .small()
-                                .label("→  Go to Address")
+                                .icon(IconName::ArrowRight)
+                                .label("Go to Address")
                                 .disabled(!has_selection)
                                 .on_click(cx.listener(|this, _e, _w, cx| this.go_to_selected(cx))),
                         )
                         .child(
                             Button::new("scanner-copy")
                                 .small()
-                                .label("⧉  Copy Address")
+                                .icon(IconName::Copy)
+                                .label("Copy Address")
                                 .disabled(!has_selection)
                                 .on_click(cx.listener(|this, _e, _w, cx| this.copy_selected(cx))),
                         ),

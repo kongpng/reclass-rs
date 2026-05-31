@@ -37,7 +37,7 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::dock::{Panel, PanelControl, PanelEvent, TitleStyle};
 use gpui_component::{Icon, IconName};
 
 use super::design::{color, tokens};
@@ -542,10 +542,35 @@ impl Panel for DocumentArea {
         "DocumentArea"
     }
 
+    /// The center document area must NOT show a dock-panel tab/title of its own —
+    /// reclass (PIC1/PIC2/PIC5) and Zed both show a *single* tab row, and that row
+    /// is the per-document strip rendered inside the panel body
+    /// ([`render_tab_strip`](Self::render_tab_strip)), not the surrounding
+    /// `DockArea` panel-tab. gpui-component's `TabPanel` always reserves a fixed
+    /// title-bar strip for a single-panel center; we can't remove that strip from
+    /// here, but we strip every scrap of chrome out of it so it reads as the same
+    /// surface as the editor below (no "Documents" label, no active-tab underline,
+    /// no zoom/menu button) — leaving the per-document strip as the only visible
+    /// tab row. The bar's bg is blended to `content_bg` (see [`Self::title_style`]).
     fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // The dock-tab title for the area itself; the per-document strip lives
-        // inside the panel body.
-        SharedString::from("Documents")
+        // An empty, zero-content title — no "Documents" text, no tab underline.
+        div()
+    }
+
+    /// Blend the (unavoidable, gpui-component-fixed) single-panel title strip into
+    /// the document surface so it carries no visible chrome of its own — the only
+    /// tab row the user sees is the per-document strip in the body.
+    fn title_style(&self, cx: &App) -> Option<TitleStyle> {
+        Some(TitleStyle {
+            background: color::content_bg(cx),
+            foreground: color::text(cx),
+        })
+    }
+
+    /// No zoom/menu affordance on the center panel — it would re-introduce dock
+    /// chrome on the row we are deliberately keeping chrome-less.
+    fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
+        None
     }
 
     fn closable(&self, _cx: &App) -> bool {
