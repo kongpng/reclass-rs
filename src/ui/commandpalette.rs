@@ -246,7 +246,7 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::item("Split View Below", "Ctrl+\\", "view.split"),
                 N::item("Unsplit View", "Ctrl+Shift+\\", "view.unsplit"),
                 N::Separator,
-                N::item("Memory Scanner", "Ctrl+Shift+S", "view.scanner"),
+                N::item("Memory Scanner", "Ctrl+Shift+M", "view.scanner"),
                 N::item("Symbols", "Ctrl+Shift+Y", "view.symbols"),
                 N::item("Bookmarks", "Ctrl+Shift+B", "view.bookmarks"),
                 N::Separator,
