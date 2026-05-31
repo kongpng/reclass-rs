@@ -1,0 +1,619 @@
+{
+    "baseAddress": "FFFFCA8010000000",
+    "nextId": "3002",
+    "nodes": [
+        {
+            "id": "100",
+            "kind": "Struct",
+            "name": "list_entry",
+            "structTypeName": "_LIST_ENTRY",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "101",
+            "kind": "Pointer64",
+            "name": "Flink",
+            "offset": 0,
+            "parentId": "100",
+            "refId": "100",
+            "collapsed": true
+        },
+        {
+            "id": "102",
+            "kind": "Pointer64",
+            "name": "Blink",
+            "offset": 8,
+            "parentId": "100",
+            "refId": "100",
+            "collapsed": true
+        },
+        {
+            "id": "200",
+            "kind": "Struct",
+            "name": "balanced_node",
+            "structTypeName": "_RTL_BALANCED_NODE",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "210",
+            "kind": "Struct",
+            "name": "",
+            "classKeyword": "union",
+            "offset": 0,
+            "parentId": "200",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "211",
+            "kind": "Pointer64",
+            "name": "Left",
+            "offset": 0,
+            "parentId": "210",
+            "refId": "200",
+            "collapsed": true
+        },
+        {
+            "id": "212",
+            "kind": "Pointer64",
+            "name": "Right",
+            "offset": 8,
+            "parentId": "210",
+            "refId": "200",
+            "collapsed": true
+        },
+        {
+            "id": "220",
+            "kind": "Struct",
+            "name": "",
+            "classKeyword": "union",
+            "offset": 16,
+            "parentId": "200",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "221",
+            "kind": "UInt64",
+            "name": "ParentValue",
+            "offset": 0,
+            "parentId": "220"
+        },
+        {
+            "id": "300",
+            "kind": "Struct",
+            "name": "mmpte",
+            "structTypeName": "_MMPTE",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "301",
+            "kind": "Struct",
+            "name": "u",
+            "classKeyword": "union",
+            "offset": 0,
+            "parentId": "300",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "302",
+            "kind": "UInt64",
+            "name": "Long",
+            "offset": 0,
+            "parentId": "301"
+        },
+        {
+            "id": "303",
+            "kind": "Struct",
+            "name": "Hard",
+            "structTypeName": "_MMPTE_HARDWARE",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "400",
+            "collapsed": true
+        },
+        {
+            "id": "304",
+            "kind": "Struct",
+            "name": "Proto",
+            "structTypeName": "_MMPTE_PROTOTYPE",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "600",
+            "collapsed": true
+        },
+        {
+            "id": "305",
+            "kind": "Struct",
+            "name": "Soft",
+            "structTypeName": "_MMPTE_SOFTWARE",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "500",
+            "collapsed": true
+        },
+        {
+            "id": "306",
+            "kind": "Struct",
+            "name": "Trans",
+            "structTypeName": "_MMPTE_TRANSITION",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "700",
+            "collapsed": true
+        },
+        {
+            "id": "307",
+            "kind": "Struct",
+            "name": "Subsect",
+            "structTypeName": "_MMPTE_SUBSECTION",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "800",
+            "collapsed": true
+        },
+        {
+            "id": "308",
+            "kind": "Struct",
+            "name": "TimeStamp",
+            "structTypeName": "_MMPTE_TIMESTAMP",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "900",
+            "collapsed": true
+        },
+        {
+            "id": "309",
+            "kind": "Struct",
+            "name": "List",
+            "structTypeName": "_MMPTE_LIST",
+            "offset": 0,
+            "parentId": "301",
+            "refId": "1000",
+            "collapsed": true
+        },
+        {
+            "id": "400",
+            "kind": "Struct",
+            "name": "mmpte_hardware",
+            "structTypeName": "_MMPTE_HARDWARE",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "401",
+            "kind": "Hex64",
+            "name": "Valid:1 Dirty1:1 Owner:1 WriteThrough:1 CacheDisable:1 Accessed:1 Dirty:1 LargePage:1 Global:1 CopyOnWrite:1 Unused:1 Write:1 PageFrameNumber:40 ReservedForSoftware:4 WsleAge:4 WsleProtection:3 NoExecute:1",
+            "offset": 0,
+            "parentId": "400"
+        },
+        {
+            "id": "500",
+            "kind": "Struct",
+            "name": "mmpte_software",
+            "structTypeName": "_MMPTE_SOFTWARE",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "501",
+            "kind": "Hex64",
+            "name": "Valid:1 PageFileReserved:1 PageFileAllocated:1 ColdPage:1 SwizzleBit:1 Protection:5 Prototype:1 Transition:1 PageFileLow:4 UsedPageTableEntries:10 ShadowStack:1 OnStandbyLookaside:1 Unused:4 PageFileHigh:32",
+            "offset": 0,
+            "parentId": "500"
+        },
+        {
+            "id": "600",
+            "kind": "Struct",
+            "name": "mmpte_prototype",
+            "structTypeName": "_MMPTE_PROTOTYPE",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "601",
+            "kind": "Hex64",
+            "name": "Valid:1 DemandFillProto:1 HiberVerifyConverted:1 ReadOnly:1 SwizzleBit:1 Protection:5 Prototype:1 Combined:1 Unused1:4 ProtoAddress:48",
+            "offset": 0,
+            "parentId": "600"
+        },
+        {
+            "id": "700",
+            "kind": "Struct",
+            "name": "mmpte_transition",
+            "structTypeName": "_MMPTE_TRANSITION",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "701",
+            "kind": "Hex64",
+            "name": "Valid:1 Write:1 OnStandbyLookaside:1 IoTracker:1 SwizzleBit:1 Protection:5 Prototype:1 Transition:1 PageFrameNumber:40 Unused:12",
+            "offset": 0,
+            "parentId": "700"
+        },
+        {
+            "id": "800",
+            "kind": "Struct",
+            "name": "mmpte_subsection",
+            "structTypeName": "_MMPTE_SUBSECTION",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "801",
+            "kind": "Hex64",
+            "name": "Valid:1 Unused0:2 OnStandbyLookaside:1 SwizzleBit:1 Protection:5 Prototype:1 ColdPage:1 Unused2:3 ExecutePrivilege:1 SubsectionAddress:48",
+            "offset": 0,
+            "parentId": "800"
+        },
+        {
+            "id": "900",
+            "kind": "Struct",
+            "name": "mmpte_timestamp",
+            "structTypeName": "_MMPTE_TIMESTAMP",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "901",
+            "kind": "Hex64",
+            "name": "MustBeZero:1 Unused:3 SwizzleBit:1 Protection:5 Prototype:1 Transition:1 PageFileLow:4 Reserved:16 GlobalTimeStamp:32",
+            "offset": 0,
+            "parentId": "900"
+        },
+        {
+            "id": "1000",
+            "kind": "Struct",
+            "name": "mmpte_list",
+            "structTypeName": "_MMPTE_LIST",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1001",
+            "kind": "Hex64",
+            "name": "Valid:1 OneEntry:1 filler0:2 SwizzleBit:1 Protection:5 Prototype:1 Transition:1 filler1:13 NextEntry:39",
+            "offset": 0,
+            "parentId": "1000"
+        },
+        {
+            "id": "1100",
+            "kind": "Struct",
+            "name": "mipfnflink",
+            "structTypeName": "_MIPFNFLINK",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1101",
+            "kind": "Hex64",
+            "name": "Flink",
+            "offset": 0,
+            "parentId": "1100"
+        },
+        {
+            "id": "1200",
+            "kind": "Struct",
+            "name": "mipfnblink",
+            "structTypeName": "_MIPFNBLINK",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1201",
+            "kind": "Hex64",
+            "name": "Blink",
+            "offset": 0,
+            "parentId": "1200"
+        },
+        {
+            "id": "1300",
+            "kind": "Struct",
+            "name": "mmpfnentry1",
+            "structTypeName": "_MMPFNENTRY1",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1301",
+            "kind": "Hex8",
+            "name": "Flags",
+            "offset": 0,
+            "parentId": "1300"
+        },
+        {
+            "id": "1400",
+            "kind": "Struct",
+            "name": "mmpfnentry3",
+            "structTypeName": "_MMPFNENTRY3",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1401",
+            "kind": "Hex8",
+            "name": "Flags",
+            "offset": 0,
+            "parentId": "1400"
+        },
+        {
+            "id": "1500",
+            "kind": "Struct",
+            "name": "mi_pfn_flags",
+            "structTypeName": "_MI_PFN_FLAGS",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1501",
+            "kind": "Hex32",
+            "name": "Flags",
+            "offset": 0,
+            "parentId": "1500"
+        },
+        {
+            "id": "1600",
+            "kind": "Struct",
+            "name": "mi_pfn_flags4",
+            "structTypeName": "_MI_PFN_FLAGS4",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1601",
+            "kind": "Hex64",
+            "name": "Flags",
+            "offset": 0,
+            "parentId": "1600"
+        },
+        {
+            "id": "1700",
+            "kind": "Struct",
+            "name": "mi_pfn_flags5",
+            "structTypeName": "_MI_PFN_FLAGS5",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": true
+        },
+        {
+            "id": "1701",
+            "kind": "Hex32",
+            "name": "Flags",
+            "offset": 0,
+            "parentId": "1700"
+        },
+        {
+            "id": "2000",
+            "kind": "Struct",
+            "name": "mmpfn",
+            "structTypeName": "_MMPFN",
+            "offset": 0,
+            "parentId": "0",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "2001",
+            "kind": "Struct",
+            "name": "",
+            "classKeyword": "union",
+            "offset": 0,
+            "parentId": "2000",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "2010",
+            "kind": "Struct",
+            "name": "ListEntry",
+            "structTypeName": "_LIST_ENTRY",
+            "offset": 0,
+            "parentId": "2001",
+            "refId": "100",
+            "collapsed": true
+        },
+        {
+            "id": "2011",
+            "kind": "Struct",
+            "name": "TreeNode",
+            "structTypeName": "_RTL_BALANCED_NODE",
+            "offset": 0,
+            "parentId": "2001",
+            "refId": "200",
+            "collapsed": true
+        },
+        {
+            "id": "2012",
+            "kind": "Struct",
+            "name": "",
+            "offset": 0,
+            "parentId": "2001",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "2013",
+            "kind": "Struct",
+            "name": "u1",
+            "structTypeName": "_MIPFNFLINK",
+            "offset": 0,
+            "parentId": "2012",
+            "refId": "1100",
+            "collapsed": true
+        },
+        {
+            "id": "2014",
+            "kind": "Struct",
+            "name": "",
+            "classKeyword": "union",
+            "offset": 8,
+            "parentId": "2012",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "2015",
+            "kind": "Pointer64",
+            "name": "PteAddress",
+            "offset": 0,
+            "parentId": "2014",
+            "refId": "300",
+            "collapsed": true
+        },
+        {
+            "id": "2016",
+            "kind": "UInt64",
+            "name": "PteLong",
+            "offset": 0,
+            "parentId": "2014"
+        },
+        {
+            "id": "2017",
+            "kind": "Struct",
+            "name": "OriginalPte",
+            "structTypeName": "_MMPTE",
+            "offset": 16,
+            "parentId": "2012",
+            "refId": "300",
+            "collapsed": true
+        },
+        {
+            "id": "2020",
+            "kind": "Struct",
+            "name": "u2",
+            "structTypeName": "_MIPFNBLINK",
+            "offset": 24,
+            "parentId": "2000",
+            "refId": "1200",
+            "collapsed": true
+        },
+        {
+            "id": "2030",
+            "kind": "Struct",
+            "name": "u3",
+            "classKeyword": "union",
+            "offset": 32,
+            "parentId": "2000",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "2031",
+            "kind": "Struct",
+            "name": "",
+            "offset": 0,
+            "parentId": "2030",
+            "refId": "0",
+            "collapsed": false
+        },
+        {
+            "id": "2032",
+            "kind": "UInt16",
+            "name": "ReferenceCount",
+            "offset": 0,
+            "parentId": "2031"
+        },
+        {
+            "id": "2033",
+            "kind": "Struct",
+            "name": "e1",
+            "structTypeName": "_MMPFNENTRY1",
+            "offset": 2,
+            "parentId": "2031",
+            "refId": "1300",
+            "collapsed": true
+        },
+        {
+            "id": "2034",
+            "kind": "Struct",
+            "name": "e4",
+            "structTypeName": "_MI_PFN_FLAGS",
+            "offset": 0,
+            "parentId": "2030",
+            "refId": "1500",
+            "collapsed": true
+        },
+        {
+            "id": "2040",
+            "kind": "Struct",
+            "name": "u5",
+            "structTypeName": "_MI_PFN_FLAGS5",
+            "offset": 36,
+            "parentId": "2000",
+            "refId": "1700",
+            "collapsed": true
+        },
+        {
+            "id": "2050",
+            "kind": "Struct",
+            "name": "u4",
+            "structTypeName": "_MI_PFN_FLAGS4",
+            "offset": 40,
+            "parentId": "2000",
+            "refId": "1600",
+            "collapsed": true
+        },
+        {
+            "arrayLen": 1,
+            "collapsed": true,
+            "elementKind": "UInt8",
+            "id": "3000",
+            "kind": "Hex64",
+            "name": "",
+            "offset": 16,
+            "parentId": "2000",
+            "refId": "0",
+            "strLen": 64
+        },
+        {
+            "arrayLen": 1,
+            "collapsed": true,
+            "elementKind": "UInt8",
+            "id": "3001",
+            "kind": "Hex16",
+            "name": "",
+            "offset": 34,
+            "parentId": "2000",
+            "refId": "0",
+            "strLen": 64
+        }
+    ]
+}
