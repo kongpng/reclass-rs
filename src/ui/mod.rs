@@ -37,6 +37,8 @@ pub mod hextoolbar;
 pub mod messagebox;
 pub mod optionsdialog;
 pub mod panels;
+pub mod processpicker;
+pub mod scannerpanel;
 pub mod sourcechooser;
 pub mod startpage;
 pub mod state;
