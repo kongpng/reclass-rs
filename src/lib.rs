@@ -19,6 +19,13 @@
 //! the live OS process / kernel / remote / WinDbg sources are documented stubs
 //! in [`provider::native`] (out of scope for this port).
 
+// gpui's element/builder types are deeply nested generics; some `#[test]` macro
+// expansions in the UI modules brush against the default 128 type-recursion
+// budget. The editor test modules avoid the `gpui::*` glob to stay well under it;
+// this modest bump gives headroom without masking real recursion. (No effect on
+// non-test builds.)
+#![recursion_limit = "256"]
+
 // ── Always-on engine modules ──
 pub mod addr;
 pub mod compose;

@@ -45,6 +45,16 @@ fn strip_sel(id: u64) -> u64 {
     id & SEL_STRIP_MASK
 }
 
+/// Public wrapper over [`strip_sel`] for the UI: recover the bare node id from a
+/// selection id (masking off the footer / array-element / member tag + sub bits).
+/// The editor surface needs this to map a `selected_ids()` entry back to the node
+/// id of a rendered line (editor-surface.md §7 `applySelectionOverlay`); the strip
+/// math itself stays private to the controller.
+#[inline]
+pub fn strip_sel_pub(id: u64) -> u64 {
+    strip_sel(id)
+}
+
 const K_PAGE_MASK: u64 = !(K_PAGE_SIZE - 1);
 const K_STABILITY_THRESHOLD: i32 = 5;
 const K_IDLE_BACKOFF_TICKS: i32 = 8;

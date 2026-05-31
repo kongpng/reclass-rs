@@ -160,6 +160,13 @@ pub fn open_main_window(cx: &mut App) {
     // The theme manager is a process-shared handle living in a gpui global.
     let theme_manager = ThemeRegistryGlobal::get(cx);
 
+    // Register the editor-surface + inline-field key bindings (Tab-cycle, Esc,
+    // undo/redo, and the inline text-edit keys). Bound here once, in their key
+    // contexts (`RcxEditor` / `RcxFieldInput`); editor-surface.md §10/§11.
+    let mut bindings = super::editor::editor_key_bindings();
+    bindings.extend(super::editor::inline_edit::field_key_bindings());
+    cx.bind_keys(bindings);
+
     cx.spawn(async move |cx| {
         let _ = cx.open_window(WindowOptions::default(), |window, cx| {
             let view = cx.new(|cx| MainWindow::new(theme_manager.clone(), window, cx));

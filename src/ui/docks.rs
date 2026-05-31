@@ -20,7 +20,7 @@ use gpui::*;
 use gpui_component::dock::{DockArea, DockItem};
 use std::sync::Arc;
 
-use super::panels::{PanelKind, PlaceholderPanel};
+use super::panels::{DocumentPanel, PanelKind, PlaceholderPanel};
 
 /// Identity + layout version for the main dock area, used as the `dump`/`load`
 /// key (the C++ `QSettings` dock-layout slot; app-shell §10 dock persistence).
@@ -57,8 +57,10 @@ pub const MAIN_DOCK_AREA: DockAreaId = DockAreaId {
 pub fn build_default_layout(dock_area: &Entity<DockArea>, window: &mut Window, cx: &mut App) {
     let weak = dock_area.downgrade();
 
-    // Center: the document-tab area (one placeholder document for now).
-    let document = Arc::new(PlaceholderPanel::view(PanelKind::Document, cx));
+    // Center: the document-tab area hosting the real editor surface
+    // (the bespoke `RcxEditor` grid). One document for now; per-tab wiring lands
+    // with the tab/source workflow.
+    let document = Arc::new(DocumentPanel::view("Untitled", window, cx));
     let center = DockItem::tabs(vec![document], &weak, window, cx);
 
     // Left: workspace / project tree.

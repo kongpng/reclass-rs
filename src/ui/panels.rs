@@ -24,6 +24,8 @@ use gpui_component::{
     ActiveTheme,
 };
 
+use super::editor::RcxEditor;
+
 /// Which Reclass surface a placeholder stands in for — picks its title and the
 /// real view that will eventually replace it (app-shell mapping).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,5 +121,73 @@ impl Render for PlaceholderPanel {
             .bg(cx.theme().background)
             .text_color(cx.theme().muted_foreground)
             .child(format!("{} (placeholder)", self.kind.title()))
+    }
+}
+
+/// The center document panel — the real editor surface host.
+///
+/// A gpui-component [`Panel`] wrapping the bespoke [`RcxEditor`] view (the
+/// structured-editor grid). This replaces the [`PanelKind::Document`]
+/// placeholder: the MDI document-tab area holds one `DocumentPanel` per open
+/// document, each owning its own editor + controller (app-shell §8). For this
+/// stage one panel hosts a fresh editor; per-tab document wiring lands with the
+/// tab/source workflow.
+pub struct DocumentPanel {
+    title: SharedString,
+    editor: Entity<RcxEditor>,
+    focus_handle: FocusHandle,
+}
+
+impl DocumentPanel {
+    /// Build a document panel hosting a fresh editor.
+    pub fn new(
+        title: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = RcxEditor::view(window, cx);
+        DocumentPanel {
+            title: title.into(),
+            editor,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Construct as an [`Entity`] (the form a dock holds).
+    pub fn view(title: impl Into<SharedString>, window: &mut Window, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| DocumentPanel::new(title, window, cx))
+    }
+
+    /// The hosted editor view (for the app to push documents/options into).
+    pub fn editor(&self) -> &Entity<RcxEditor> {
+        &self.editor
+    }
+}
+
+impl Panel for DocumentPanel {
+    fn panel_name(&self) -> &'static str {
+        "DocumentPanel"
+    }
+
+    fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.title.clone()
+    }
+}
+
+impl EventEmitter<PanelEvent> for DocumentPanel {}
+
+impl Focusable for DocumentPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for DocumentPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("rcx-document-panel")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .child(self.editor.clone())
     }
 }
