@@ -486,6 +486,10 @@ impl RcxEditor {
         let sub_line = lm.sub_line;
         let palette = EditorPalette::from_theme(cx);
         let color = palette.text;
+        // The inline-edit text-selection fill — the Zed text-selection token (NOT
+        // an ad-hoc hex), so the edit selection reads on-palette and retints with a
+        // theme switch.
+        let selection_color = design::color::selection_bg(cx);
 
         let field = cx.new(|cx| {
             FieldInput::new(
@@ -495,6 +499,7 @@ impl RcxEditor {
                 resolved_addr,
                 initial,
                 color,
+                selection_color,
                 cx,
             )
         });

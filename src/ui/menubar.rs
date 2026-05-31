@@ -4,9 +4,22 @@
 //! horizontal "File · Edit · View · Tools · Plugins · Help" bar where each
 //! top-level title opens a dropdown of commands. The original mirrored the live
 //! `QMenuBar` into Linux tool-buttons; here each top-level title is a ghost
-//! [`Button`] trigger wrapped in a gpui-component [`Popover`], and the dropdown
-//! is a Zed-styled elevated surface of inset rows (hover overlay, separators,
-//! left checkmark slot, right keybinding hint).
+//! [`Button`] trigger and the dropdown is a Zed-styled elevated surface of inset
+//! rows (hover overlay, separators, left checkmark slot, right keybinding hint).
+//!
+//! ## Why this is NOT a [`Popover`](gpui_component::popover::Popover)
+//! The menu bar lives **inside** the frameless [`TitleBar`](gpui_component::TitleBar),
+//! whose whole strip is a window-**drag** region (it grabs `on_mouse_down` to
+//! start a window move). gpui-component's own in-titlebar menu bar
+//! (`menu/app_menu_bar.rs::AppMenu`) does NOT use `Popover` for exactly this
+//! reason — a `Popover`'s trigger does not `stop_propagation` on mouse-down, so
+//! the titlebar swallows the click and the dropdown never opens (the visual-QA
+//! "View did not open any dropdown" bug). We mirror the proven `AppMenu` recipe:
+//! a [`Button`] trigger that **stops propagation on mouse-down** (defeating the
+//! drag) and toggles an explicit open-index on click, with the dropdown rendered
+//! as a `deferred(anchored(...))` child guarded by that index. The menu bar owns
+//! the open state ([`MenuBar::open_index`]) so only one menu is open at a time and
+//! hovering a sibling title switches to it (the C++ menu-bar behaviour).
 //!
 //! ## Reuse, not re-model
 //! The command/menu tree already exists as data for the command palette
@@ -29,11 +42,10 @@ use std::collections::HashSet;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::popover::{Popover, PopoverState};
-use gpui_component::Sizable as _;
+use gpui_component::{Selectable as _, Sizable as _};
 
 use super::commandpalette::{default_menu_tree, CommandId, MenuNode};
-use super::design::{color, icon, tokens};
+use super::design::{color, elevated_surface, icon, tokens};
 
 /// The menu-bar's outcome — a top-level→leaf command was chosen. Routed by the
 /// owning [`MainWindow`](super::window::MainWindow) to `run_menu_command` (the
@@ -50,6 +62,11 @@ pub struct MenuBar {
     /// The menu tree (the shared palette tree by default). Held so the dropdowns
     /// render from the exact same data the command palette searches.
     menus: Vec<MenuNode>,
+    /// The index of the currently-open top-level menu (`None` ⇒ all closed). The
+    /// C++ `QMenuBar` opens one menu at a time; clicking a title toggles it,
+    /// hovering a sibling *while one is open* switches to it, and choosing a
+    /// command (or clicking out / Escape) closes them all.
+    open_index: Option<usize>,
     /// Command ids that should render a leading checkmark (checkable/toggle menu
     /// items reflecting live app state — e.g. `view.scanner` while the scanner
     /// pop-out is open; the C++ `QAction::setChecked`). The host
@@ -65,6 +82,7 @@ impl MenuBar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         MenuBar {
             menus: default_menu_tree(),
+            open_index: None,
             checked: HashSet::new(),
         }
     }
@@ -89,10 +107,41 @@ impl MenuBar {
         }
     }
 
+    /// Toggle the top-level menu at `index` open/closed (the C++ title click). If
+    /// a *different* menu is open it switches to this one; clicking the open menu's
+    /// title again closes it.
+    fn toggle_menu(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.open_index = if self.open_index == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+        cx.notify();
+    }
+
+    /// Switch the open menu to `index` *only while a menu is already open* — the
+    /// C++ "slide across the bar with the mouse" behaviour. A no-op when nothing
+    /// is open (so a passive hover never pops a menu).
+    fn hover_menu(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.open_index.is_some() && self.open_index != Some(index) {
+            self.open_index = Some(index);
+            cx.notify();
+        }
+    }
+
+    /// Close all menus (a command was chosen, the user clicked out, or Escape).
+    fn close_menus(&mut self, cx: &mut Context<Self>) {
+        if self.open_index.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Emit a chosen command to the host (the C++ `action->trigger()` →
-    /// `MainWindow` slot). Called from a dropdown item's click.
-    fn emit_command(&mut self, command: CommandId, cx: &mut Context<Self>) {
+    /// `MainWindow` slot) and close the menus. Called from a dropdown item's click.
+    fn choose_command(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        self.open_index = None;
         cx.emit(MenuCommand(command));
+        cx.notify();
     }
 }
 
@@ -104,81 +153,117 @@ fn clean_title(label: &str) -> String {
 
 impl Render for MenuBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // One dropdown per top-level submenu, in declaration order
+        // One top-level menu per submenu, in declaration order
         // (File · Edit · View · Tools · Plugins · Help).
-        let this = cx.entity();
         let menus = self.menus.clone();
+        let open_index = self.open_index;
+        // Snapshot the checked-command set once here (where `self` is borrowed) so
+        // the dropdown builders don't re-`read` this same entity mid-render.
+        let checked = self.checked.clone();
 
         gpui_component::h_flex()
             .id("rcx-menubar")
             .flex_none()
             .items_center()
             .gap(px(tokens::space::XXS))
-            .children(
-                menus
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(move |(i, node)| match node {
-                        MenuNode::Submenu { label, children } => Some(top_level_menu(
-                            i,
-                            clean_title(&label),
-                            children,
-                            this.clone(),
-                            cx,
-                        )),
-                        // Top-level leaves/separators don't appear in the C++ bar.
-                        _ => None,
-                    }),
-            )
+            .children(menus.into_iter().enumerate().filter_map(move |(i, node)| {
+                match node {
+                    MenuNode::Submenu { label, children } => Some(render_top_level(
+                        i,
+                        clean_title(&label),
+                        children,
+                        open_index == Some(i),
+                        checked.clone(),
+                        cx,
+                    )),
+                    // Top-level leaves/separators don't appear in the C++ bar.
+                    _ => None,
+                }
+            }))
     }
 }
 
-/// Build one top-level menu: a ghost [`Button`] trigger that opens a [`Popover`]
-/// dropdown of the submenu's children. The dropdown content is rebuilt from the
-/// [`MenuNode`] children every render (cheap; the cookbook's Popover guidance).
-fn top_level_menu(
+/// Build one top-level menu: a ghost [`Button`] title that toggles this menu's
+/// open state on click, plus — while `open` — a `deferred(anchored(...))` dropdown
+/// of the submenu's children anchored below-left of the title.
+///
+/// The trigger mirrors gpui-component's in-titlebar `AppMenu` (`app_menu_bar.rs`):
+/// it **stops propagation on mouse-down** so the surrounding [`TitleBar`] drag
+/// region never swallows the click, then toggles the menu on click. Hovering a
+/// title while *another* menu is open switches to it (the C++ menu-bar slide).
+fn render_top_level(
     index: usize,
     title: String,
     children: Vec<MenuNode>,
-    menubar: Entity<MenuBar>,
-    cx: &App,
-) -> impl IntoElement {
-    // The clickable title — Zed chrome: muted text, hover overlay, MD radius.
-    // It selects (lightens) while its popover is open (Popover wires that via
-    // `Selectable`).
+    open: bool,
+    checked: HashSet<CommandId>,
+    cx: &mut Context<MenuBar>,
+) -> AnyElement {
+    // The clickable title — Zed chrome: muted text, hover overlay, MD radius. It
+    // selects (lightens) while its dropdown is open (the C++ pressed-title look).
     let trigger = Button::new(("menu-title", index))
         .ghost()
         .small()
+        .compact()
         .label(title)
-        .text_color(color::text_muted(cx));
-
-    // The dropdown anchors below-left of the trigger — `Anchor::TopLeft` is the
-    // Popover default, so no explicit anchor is needed.
-    Popover::new(("menu", index))
-        .trigger(trigger)
-        .content(move |_state, _window, cx| {
-            // Rebuild the dropdown body from the submenu children. `cx.entity()`
-            // is the `PopoverState`, captured so item clicks can dismiss it.
-            let popover = cx.entity();
-            menu_dropdown(&children, menubar.clone(), popover, cx)
+        .selected(open)
+        .text_color(color::text_muted(cx))
+        // Stop the mouse-down from reaching the TitleBar's window-drag handler —
+        // this is the fix for "clicking a menu title did nothing" (the title was
+        // being consumed as the start of a window move). Mirrors `AppMenu`.
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.prevent_default();
+            cx.stop_propagation();
         })
+        .on_click(cx.listener(move |this, _ev, _window, cx| {
+            this.toggle_menu(index, cx);
+        }));
+
+    div()
+        .id(("menu", index))
+        .relative()
+        .child(trigger)
+        // Slide-across: hovering a title while another menu is open switches to it.
+        .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+            if *hovered {
+                this.hover_menu(index, cx);
+            }
+        }))
+        .when(open, |this| {
+            this.child(deferred(
+                anchored()
+                    .anchor(gpui::Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(tokens::space::MD))
+                    .child(
+                        div()
+                            .occlude()
+                            .top(px(tokens::space::XS))
+                            // Dismiss when the user clicks anywhere outside the
+                            // dropdown (the C++ menu loses focus → closes).
+                            .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
+                                this.close_menus(cx);
+                            }))
+                            .child(menu_dropdown(&children, &checked, cx)),
+                    ),
+            ))
+        })
+        .into_any_element()
 }
 
 /// The dropdown body for a submenu's `children`: an elevated surface of inset
 /// rows. Leaves are clickable command rows (checkmark slot · label · shortcut
-/// hint); separators are 1px rules; empty submenus (e.g. "Recent Files") and
-/// nested submenus collapse to a single labelled, non-interactive parent row so
-/// nothing is silently dropped (the bar must always OPEN and show items).
+/// hint); separators are 1px rules; nested submenus collapse to a labelled
+/// section header with their leaves inlined one indent in, so nothing is silently
+/// dropped (the bar must always OPEN and show items).
 fn menu_dropdown(
     children: &[MenuNode],
-    menubar: Entity<MenuBar>,
-    popover: Entity<PopoverState>,
-    cx: &mut Context<PopoverState>,
+    checked: &HashSet<CommandId>,
+    cx: &mut Context<MenuBar>,
 ) -> impl IntoElement {
-    // Snapshot the host's checked-command set once (the C++ checkable `QAction`
-    // state — e.g. `view.scanner` while the scanner pop-out is open). Read here so
-    // every row's checkmark stays in lockstep with the live app state.
-    let checked = menubar.read(cx).checked.clone();
+    // The host's checked-command set (the C++ checkable `QAction` state — e.g.
+    // `view.scanner` while the scanner pop-out is open) is threaded down from
+    // `render` so every row's checkmark stays in lockstep with the live app state
+    // without re-`read`ing this entity mid-render.
     let is_checked = |command: &str| checked.contains(command);
 
     let mut rows: Vec<AnyElement> = Vec::new();
@@ -198,8 +283,6 @@ fn menu_dropdown(
                     command.clone(),
                     *enabled,
                     is_checked(command),
-                    menubar.clone(),
-                    popover.clone(),
                     cx,
                 )
                 .into_any_element(),
@@ -208,9 +291,9 @@ fn menu_dropdown(
                 label,
                 children: sub,
             } => {
-                // Render the submenu header as a (disabled-looking) section label,
-                // then inline its leaf children one indent in — the chrome surface
-                // keeps the bar flat (no fly-out submenus) but shows every command.
+                // Render the submenu header as a section label, then inline its
+                // leaf children one indent in — the chrome surface keeps the bar
+                // flat (no fly-out submenus) but shows every command.
                 rows.push(submenu_header_row(label, cx).into_any_element());
                 for (j, leaf) in sub.iter().enumerate() {
                     if let MenuNode::Item {
@@ -228,8 +311,6 @@ fn menu_dropdown(
                                 command.clone(),
                                 *enabled,
                                 is_checked(command),
-                                menubar.clone(),
-                                popover.clone(),
                                 cx,
                             )
                             .into_any_element(),
@@ -240,11 +321,11 @@ fn menu_dropdown(
         }
     }
 
-    gpui_component::v_flex()
+    elevated_surface(cx)
+        .occlude()
         .min_w(px(220.0))
         .p(px(tokens::space::XS))
-        .gap(px(1.0))
-        .children(rows)
+        .child(gpui_component::v_flex().gap(px(1.0)).children(rows))
 }
 
 /// A clickable command row: `[checkmark slot] Label …………… [Shortcut]`.
@@ -252,8 +333,7 @@ fn menu_dropdown(
 /// disabled actions). When `checked`, the leading slot shows a real SVG check
 /// (the Assets-stage [`icon::check`]) — the C++ checkable `QAction` (e.g. View ▸
 /// Memory Scanner while the scanner pop-out is open). Clicking emits
-/// [`MenuCommand`] and dismisses the popover.
-#[allow(clippy::too_many_arguments)]
+/// [`MenuCommand`] (via [`MenuBar::choose_command`]) and closes the menu.
 fn command_row(
     key: usize,
     label: &str,
@@ -261,9 +341,7 @@ fn command_row(
     command: CommandId,
     enabled: bool,
     checked: bool,
-    menubar: Entity<MenuBar>,
-    popover: Entity<PopoverState>,
-    cx: &Context<PopoverState>,
+    cx: &mut Context<MenuBar>,
 ) -> impl IntoElement {
     let label_color = if enabled {
         color::text(cx)
@@ -314,17 +392,12 @@ fn command_row(
         .text_size(px(tokens::font::UI_MD))
         .text_color(label_color)
         .when(enabled, |r| {
-            let menubar = menubar.clone();
-            let popover = popover.clone();
             r.cursor_pointer()
                 .hover(|s| s.bg(color::hover_overlay(cx)))
-                .on_click(move |_e, window, cx| {
+                .on_click(cx.listener(move |this, _ev, _window, cx| {
                     cx.stop_propagation();
-                    // Emit the command to the host, then dismiss the dropdown.
-                    let command = command.clone();
-                    menubar.update(cx, |mb, cx| mb.emit_command(command, cx));
-                    popover.update(cx, |state, cx| state.dismiss(window, cx));
-                })
+                    this.choose_command(command.clone(), cx);
+                }))
         })
         .child(check_slot)
         .child(div().flex_1().min_w_0().child(label.to_string()))
@@ -332,7 +405,7 @@ fn command_row(
 }
 
 /// A 1px separator rule between menu groups (spec §5.10).
-fn separator_row(cx: &Context<PopoverState>) -> impl IntoElement {
+fn separator_row(cx: &Context<MenuBar>) -> impl IntoElement {
     div()
         .my(px(tokens::space::XS))
         .h(px(tokens::border::THIN))
@@ -342,7 +415,7 @@ fn separator_row(cx: &Context<PopoverState>) -> impl IntoElement {
 
 /// A nested-submenu header row (e.g. "Import", "Export") — a small uppercase
 /// muted caption introducing the inlined leaves below it.
-fn submenu_header_row(label: &str, cx: &Context<PopoverState>) -> impl IntoElement {
+fn submenu_header_row(label: &str, cx: &Context<MenuBar>) -> impl IntoElement {
     div()
         .w_full()
         .px(px(tokens::space::MD))

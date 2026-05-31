@@ -629,7 +629,9 @@ pub use view::{TypeSelectorEvent, TypeSelectorPopup};
 
 #[cfg(feature = "ui")]
 mod view {
-    use super::{default_type_entries, EntryKind, KindGroup, Modifier, TypeEntry, TypeModel};
+    use super::{
+        default_type_entries, EntryKind, KindGroup, Modifier, TypeEntry, TypeModel, TypePopupMode,
+    };
     use crate::core::kind::NodeKind;
     use crate::theme::model::Theme;
     use crate::ui::design::{color, icon, tokens};
@@ -731,8 +733,18 @@ mod view {
         /// highlighting `current` as the active type (the contract entry point the
         /// editor opens via `window.open_dialog`). Returns the entity so the host
         /// can subscribe to [`TypeSelectorEvent`].
+        ///
+        /// Defaults the model to [`TypePopupMode::FieldType`] so the modifier row
+        /// (`*` / `**` / `[]`) renders — change-type-on-a-field is the field-type
+        /// flow in the C++ (`reclass_right_click_on_type.png` shows
+        /// `*  **  []  + New  OK` in the footer). Hosts that pick a pointer target
+        /// (no modifiers) can override via [`set_mode`](Self::set_mode).
         pub fn view(current: NodeKind, window: &mut Window, cx: &mut App) -> Entity<Self> {
-            cx.new(|cx| Self::new_with_current(default_type_entries(), current, window, cx))
+            cx.new(|cx| {
+                let mut popup = Self::new_with_current(default_type_entries(), current, window, cx);
+                popup.model.set_mode(TypePopupMode::FieldType);
+                popup
+            })
         }
 
         /// Build the popup over the given entries (kept for tests / custom
@@ -771,6 +783,17 @@ mod view {
         /// Read-only access to the model.
         pub fn model(&self) -> &TypeModel {
             &self.model
+        }
+
+        /// Set the popup mode (`setMode`) — drives whether the modifier row
+        /// (`*` / `**` / `[]`) is shown. The change-type entry point
+        /// ([`view`](Self::view)) defaults to [`TypePopupMode::FieldType`]; a host
+        /// retyping an array element should pass [`TypePopupMode::ArrayElement`],
+        /// and a pointer-target pick [`TypePopupMode::PointerTarget`] (which hides
+        /// the modifiers). Clears any active modifier (per `setMode` semantics).
+        pub fn set_mode(&mut self, mode: TypePopupMode, cx: &mut Context<Self>) {
+            self.model.set_mode(mode);
+            cx.notify();
         }
 
         /// Set the array modifier count + select the `[]` modifier.
@@ -1348,7 +1371,7 @@ mod view {
                             ))
                             .child(chip(
                                 "mod-array",
-                                "[ ]",
+                                "[]",
                                 array_on,
                                 array_modifier,
                             ))

@@ -87,6 +87,10 @@ pub struct FieldInput {
     /// Foreground color the field paints its text in (resolved from the theme by
     /// the host so the edited field keeps its column color).
     text_color: Hsla,
+    /// Background fill for the active text selection (the Zed text-selection
+    /// token, resolved from the theme by the host — NOT an ad-hoc hex). Keeps the
+    /// inline-edit selection on-palette and retinting with a theme switch.
+    selection_color: Hsla,
     /// Set by an action handler; drained by the host to learn what to do next.
     pending_outcome: Option<EditOutcome>,
 }
@@ -101,6 +105,7 @@ impl FieldInput {
         resolved_addr: u64,
         initial: impl Into<SharedString>,
         text_color: Hsla,
+        selection_color: Hsla,
         cx: &mut Context<Self>,
     ) -> Self {
         let content: SharedString = initial.into();
@@ -119,6 +124,7 @@ impl FieldInput {
             target,
             resolved_addr,
             text_color,
+            selection_color,
             pending_outcome: None,
         }
     }
@@ -528,6 +534,7 @@ impl Element for FieldElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let color = input.text_color;
+        let selection_color = input.selection_color;
         let style = window.text_style();
 
         let run = TextRun {
@@ -595,7 +602,7 @@ impl Element for FieldElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff44),
+                    selection_color,
                 )),
                 None,
             )
