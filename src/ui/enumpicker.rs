@@ -69,6 +69,12 @@ impl EnumPickerModel {
         &self.members
     }
 
+    /// The current enum value the picker opened on (used by the view to mark the
+    /// active member with a checkmark).
+    pub fn current_value(&self) -> i64 {
+        self.current_value
+    }
+
     /// Whether the filter box should be shown (>10 members).
     pub fn filter_visible(&self) -> bool {
         self.members.len() > FILTER_THRESHOLD
@@ -183,10 +189,50 @@ pub use view::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
 mod view {
     use super::EnumPickerModel;
+    use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{ActiveTheme, Selectable as _};
+
+    /// Render a member name with fuzzy-matched chars emphasized (accent + semibold).
+    fn highlighted_name(
+        name: &str,
+        positions: &[usize],
+        base: Hsla,
+        accent: Hsla,
+    ) -> Vec<AnyElement> {
+        let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
+        let mut spans: Vec<AnyElement> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_hit: Option<bool> = None;
+        let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
+            if text.is_empty() {
+                return;
+            }
+            let mut el = div().child(text.to_string());
+            if hit {
+                el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
+            } else {
+                el = el.text_color(base);
+            }
+            spans.push(el.into_any_element());
+        };
+        for (i, ch) in name.chars().enumerate() {
+            let hit = pos.contains(&i);
+            if cur_hit != Some(hit) {
+                if let Some(prev) = cur_hit {
+                    flush(&mut spans, &cur, prev);
+                }
+                cur.clear();
+                cur_hit = Some(hit);
+            }
+            cur.push(ch);
+        }
+        if let Some(prev) = cur_hit {
+            flush(&mut spans, &cur, prev);
+        }
+        spans
+    }
 
     /// The picker's outcome.
     #[derive(Clone, Debug)]
@@ -257,71 +303,110 @@ mod view {
 
     impl Render for EnumPickerPopup {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            use gpui_component::button::{Button, ButtonVariants as _};
             let selected = self.model.selected();
-            let rows: Vec<_> = self
+            let fg = color::text(cx);
+            let muted = color::text_muted(cx);
+            let accent = color::accent(cx);
+            let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+            let border = color::border(cx);
+            let current = self.model.current_value();
+            let query = self.input.read(cx).value().to_string();
+            let filtering = !query.trim().is_empty();
+
+            let rows: Vec<AnyElement> = self
                 .model
                 .rows()
                 .iter()
                 .enumerate()
                 .map(|(row, r)| {
                     let is_sel = selected == Some(row);
-                    Button::new(("enum-row", row))
-                        .ghost()
+                    let is_current = r.member.value == current;
+                    let name_spans = if filtering {
+                        highlighted_name(&r.member.name, &r.match_positions, fg, accent)
+                    } else {
+                        vec![div()
+                            .text_color(fg)
+                            .child(r.member.name.clone())
+                            .into_any_element()]
+                    };
+                    gpui_component::h_flex()
+                        .id(("enum-row", row))
                         .w_full()
-                        .selected(is_sel)
-                        .child(
-                            gpui_component::h_flex()
-                                .w_full()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_color(cx.theme().foreground)
-                                        .child(r.member.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .ml_auto()
-                                        .text_xs()
-                                        .font_family("monospace")
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!(
-                                            "0x{:x}  {}",
-                                            r.member.value, r.member.value
-                                        )),
-                                ),
-                        )
+                        .h(px(26.))
+                        .px(px(tokens::space::MD))
+                        .gap(px(tokens::space::MD))
+                        .items_center()
+                        .rounded(px(tokens::radius::MD))
+                        .text_size(px(tokens::font::UI_MD))
+                        .when(is_sel, |d| d.bg(sel_bg))
+                        .when(!is_sel, |d| d.hover(|s| s.bg(hover_bg)))
+                        .cursor_pointer()
                         .on_click(cx.listener(move |this, _e, _window, cx| {
                             this.accept_row(row, cx);
                         }))
+                        // Left check slot: the current enum value gets a ✓.
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_none()
+                                .text_color(accent)
+                                .when(is_current, |d| d.child("\u{2713}")),
+                        )
+                        .child(
+                            gpui_component::h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .children(name_spans),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(tokens::font::MONO_FAMILY)
+                                .text_size(px(tokens::font::EDITOR_SIZE))
+                                .text_color(muted)
+                                .child(format!("0x{:x}", r.member.value)),
+                        )
                         .into_any_element()
                 })
                 .collect();
 
-            gpui_component::v_flex()
+            super::super::design::elevated_surface(cx)
                 .id("rcx-enum-picker")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxEnumPicker")
+                .flex()
+                .flex_col()
                 .min_w(px(280.))
                 .max_h(px(360.))
-                .bg(cx.theme().popover)
-                .border_1()
-                .border_color(cx.theme().border)
+                .text_size(px(tokens::font::UI_MD))
                 .child(
                     div()
-                        .px_2()
-                        .py_1()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(cx.theme().foreground)
+                        .w_full()
+                        .px(px(tokens::space::MD))
+                        .py(px(tokens::space::SM))
+                        .border_b_1()
+                        .border_color(border)
+                        .text_size(px(tokens::font::UI_SM))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(muted)
                         .child(format!("enum {}", self.enum_name)),
                 )
                 .when(self.model.filter_visible(), |this| {
-                    this.child(Input::new(&self.input).w_full())
+                    this.child(
+                        div()
+                            .px(px(tokens::space::MD))
+                            .py(px(tokens::space::SM))
+                            .border_b_1()
+                            .border_color(border)
+                            .child(Input::new(&self.input).w_full()),
+                    )
                 })
                 .child(
                     gpui_component::v_flex()
                         .id("rcx-enum-picker-list")
+                        .p(px(tokens::space::XS))
                         .flex_1()
                         .min_h_0()
                         .overflow_y_hidden()

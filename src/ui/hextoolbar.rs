@@ -254,10 +254,11 @@ pub use view::{HexToolbarEvent, HexToolbarPopup};
 mod view {
     use super::{HexPopupContext, HEX_SIZES, HEX_SIZE_LABELS};
     use crate::core::kind::NodeKind;
+    use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputState};
-    use gpui_component::{ActiveTheme, Disableable as _, Selectable as _};
+    use gpui_component::{ActiveTheme as _, Sizable as _};
 
     /// The popup's outcome (the C++ signals).
     #[derive(Clone, Debug)]
@@ -347,21 +348,52 @@ mod view {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::button::{Button, ButtonVariants as _};
 
-            // Size button row.
-            let size_buttons: Vec<_> = HEX_SIZES
+            let accent = color::accent(cx);
+            let fg = color::text(cx);
+            let muted = color::text_muted(cx);
+            let disabled = color::text_disabled(cx);
+            let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+            let border = color::border(cx);
+
+            // Size button row — a segmented chip group (Zed toggle row): each size
+            // is a small chip, the current kind soft-accent-filled, undoable sizes
+            // dimmed + non-interactive.
+            let size_buttons: Vec<AnyElement> = HEX_SIZES
                 .iter()
                 .zip(HEX_SIZE_LABELS.iter())
                 .map(|(&kind, label)| {
                     let is_current = kind == self.ctx.current_kind;
                     let can_do = self.ctx.can_do(kind);
-                    Button::new(("hex-size", kind as usize))
-                        .ghost()
-                        .selected(is_current)
-                        .when(!can_do, |b| b.disabled(true))
-                        .label(*label)
-                        .on_click(cx.listener(move |this, _e, _window, cx| {
-                            this.pick_size(kind, cx);
-                        }))
+                    let chip_fg = if is_current {
+                        accent
+                    } else if can_do {
+                        fg
+                    } else {
+                        disabled
+                    };
+                    gpui_component::h_flex()
+                        .id(("hex-size", kind as usize))
+                        .h(px(22.))
+                        .min_w(px(28.))
+                        .px(px(tokens::space::MD))
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(tokens::radius::MD))
+                        .text_size(px(tokens::font::UI_SM))
+                        .text_color(chip_fg)
+                        .when(is_current, |d| {
+                            d.bg(sel_bg).font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(can_do && !is_current, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(hover_bg))
+                        })
+                        .when(can_do, |d| {
+                            d.on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.pick_size(kind, cx);
+                            }))
+                        })
+                        .child(label.to_string())
                         .into_any_element()
                 })
                 .collect();
@@ -370,72 +402,107 @@ mod view {
             let preview = self.ctx.preview_for_kind(self.ctx.current_kind);
             let info = self.ctx.info_for_kind(self.ctx.current_kind);
 
-            gpui_component::v_flex()
+            super::super::design::elevated_surface(cx)
                 .id("rcx-hex-toolbar")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxHexToolbar")
-                .min_w(px(200.))
-                .p_1()
-                .gap_1()
-                .bg(cx.theme().popover)
-                .border_1()
-                .border_color(cx.theme().border)
+                .flex()
+                .flex_col()
+                .min_w(px(280.))
+                .p(px(tokens::space::MD))
+                .gap(px(tokens::space::MD))
+                .text_size(px(tokens::font::UI_MD))
                 .child(
                     gpui_component::h_flex()
-                        .gap_1()
+                        .w_full()
+                        .gap(px(tokens::space::XS))
+                        .items_center()
                         .children(size_buttons)
+                        // Pin toggle pushed to the right.
                         .child(
-                            Button::new("hex-pin")
-                                .ghost()
-                                .selected(self.pinned)
-                                .label("\u{1F4CC}")
-                                .on_click(cx.listener(|this, _e, _window, cx| this.toggle_pin(cx))),
+                            gpui_component::h_flex()
+                                .id("hex-pin")
+                                .ml_auto()
+                                .h(px(22.))
+                                .px(px(tokens::space::SM))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(tokens::radius::MD))
+                                .text_color(if self.pinned { accent } else { muted })
+                                .cursor_pointer()
+                                .when(self.pinned, |d| d.bg(sel_bg))
+                                .when(!self.pinned, |d| d.hover(|s| s.bg(hover_bg)))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.toggle_pin(cx)))
+                                .child("\u{1F4CC}"),
                         ),
                 )
+                // Monospace byte preview block on a slightly inset surface.
                 .child(
                     div()
-                        .text_xs()
-                        .font_family("monospace")
-                        .text_color(cx.theme().foreground)
+                        .w_full()
+                        .px(px(tokens::space::MD))
+                        .py(px(tokens::space::SM))
+                        .rounded(px(tokens::radius::MD))
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(border)
+                        .font_family(tokens::font::MONO_FAMILY)
+                        .text_size(px(tokens::font::EDITOR_SIZE))
+                        .text_color(fg)
+                        .whitespace_nowrap()
                         .child(preview),
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_size(px(tokens::font::UI_SM))
+                        .text_color(muted)
                         .child(info),
                 )
                 .when(self.pinned, |this| {
-                    this.child(
-                        gpui_component::h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("hex-ins-above")
-                                    .ghost()
-                                    .label("+ hex64 above")
-                                    .on_click(cx.listener(|this, _e, _window, cx| {
-                                        cx.emit(HexToolbarEvent::InsertAbove(this.ctx.node_id));
-                                    })),
-                            )
-                            .child(
-                                Button::new("hex-ins-below")
-                                    .ghost()
-                                    .label("+ hex64 below")
-                                    .on_click(cx.listener(|this, _e, _window, cx| {
-                                        cx.emit(HexToolbarEvent::InsertBelow(this.ctx.node_id));
-                                    })),
-                            ),
-                    )
-                    .child(
-                        gpui_component::h_flex()
-                            .gap_1()
-                            .child(Input::new(&self.offset_input).w(px(80.)))
-                            .child(
-                                Button::new("hex-fill-go").ghost().label("Go").on_click(
-                                    cx.listener(|this, _e, _window, cx| this.fill_go(cx)),
+                    this.child(div().h(px(tokens::border::THIN)).w_full().bg(border))
+                        .child(
+                            gpui_component::h_flex()
+                                .gap(px(tokens::space::XS))
+                                .child(
+                                    Button::new("hex-ins-above")
+                                        .ghost()
+                                        .small()
+                                        .label("+ hex64 above")
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            cx.emit(HexToolbarEvent::InsertAbove(this.ctx.node_id));
+                                        })),
+                                )
+                                .child(
+                                    Button::new("hex-ins-below")
+                                        .ghost()
+                                        .small()
+                                        .label("+ hex64 below")
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            cx.emit(HexToolbarEvent::InsertBelow(this.ctx.node_id));
+                                        })),
                                 ),
-                            ),
-                    )
+                        )
+                        .child(
+                            gpui_component::h_flex()
+                                .gap(px(tokens::space::XS))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::font::UI_SM))
+                                        .text_color(muted)
+                                        .child("Fill to"),
+                                )
+                                .child(Input::new(&self.offset_input).w(px(96.)))
+                                .child(
+                                    Button::new("hex-fill-go")
+                                        .small()
+                                        .primary()
+                                        .label("Go")
+                                        .on_click(
+                                            cx.listener(|this, _e, _window, cx| this.fill_go(cx)),
+                                        ),
+                                ),
+                        )
                 })
         }
     }

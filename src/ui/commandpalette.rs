@@ -416,10 +416,74 @@ pub use view::{command_palette_key_bindings, CommandPalette, PaletteEvent};
 #[cfg(feature = "ui")]
 mod view {
     use super::{default_menu_tree, flatten_menu_bar, CommandId, PaletteModel};
+    use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{ActiveTheme, Selectable as _};
+
+    /// A Zed-style key-cap chip (`SM` radius, `UI_XS`, hairline border, muted
+    /// text) for a single keystroke token shown in the row's end slot.
+    fn key_cap(text: &str, cx: &gpui::App) -> AnyElement {
+        div()
+            .px(px(tokens::space::SM))
+            .h(px(18.))
+            .min_w(px(18.))
+            .rounded(px(tokens::radius::SM))
+            .bg(color::hover_overlay(cx))
+            .border_1()
+            .border_color(color::border(cx))
+            .text_size(px(tokens::font::UI_XS))
+            .text_color(color::text_muted(cx))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(text.to_string())
+            .into_any_element()
+    }
+
+    /// Render a command-path label with the fuzzy-matched characters emphasized
+    /// (Zed `command_palette::render_match`: matched chars in the accent color +
+    /// semibold, the rest muted). `positions` are char indices into `path`.
+    fn highlighted_path(
+        path: &str,
+        positions: &[usize],
+        base: Hsla,
+        accent: Hsla,
+    ) -> Vec<AnyElement> {
+        let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
+        // Coalesce runs of (matched | unmatched) chars into spans so we emit few
+        // elements; each span carries the matched styling or the base styling.
+        let mut spans: Vec<AnyElement> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_hit: Option<bool> = None;
+        let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
+            if text.is_empty() {
+                return;
+            }
+            let mut el = div().child(text.to_string());
+            if hit {
+                el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
+            } else {
+                el = el.text_color(base);
+            }
+            spans.push(el.into_any_element());
+        };
+        for (i, ch) in path.chars().enumerate() {
+            let hit = pos.contains(&i);
+            if cur_hit != Some(hit) {
+                if let Some(prev) = cur_hit {
+                    flush(&mut spans, &cur, prev);
+                }
+                cur.clear();
+                cur_hit = Some(hit);
+            }
+            cur.push(ch);
+        }
+        if let Some(prev) = cur_hit {
+            flush(&mut spans, &cur, prev);
+        }
+        spans
+    }
 
     actions!(
         rcx_command_palette,
@@ -527,51 +591,46 @@ mod view {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             // Visual treatment mirrors Zed's command palette (crates/command_palette
             // `render_match`): an elevated rounded modal; each row is an inset item
-            // with the command name on the left and key-cap chips on the right
-            // (`justify_between`), a subtle highlight on the selected row.
+            // with the command name on the left (matched chars emphasized) and
+            // key-cap chips on the right (`justify_between`), a soft-accent fill on
+            // the selected row. All geometry/color comes from the shared tokens.
             let selected = self.model.selected();
-            let entries: Vec<(String, String, bool)> = self
+            let query = self.input.read(cx).value().to_string();
+            let query = query.trim().to_string();
+
+            // Per-row fuzzy-highlight positions (visual only — ranking stays the
+            // command scorer; positions use the strict matcher over the full path).
+            let entries: Vec<(String, String, bool, Vec<usize>)> = self
                 .model
                 .ranked()
                 .iter()
-                .map(|e| (e.path.clone(), e.shortcut.clone(), e.enabled))
+                .map(|e| {
+                    let mut pos = Vec::new();
+                    if !query.is_empty() {
+                        super::super::fuzzy::fuzzy_score(&query, &e.path, Some(&mut pos));
+                    }
+                    (e.path.clone(), e.shortcut.clone(), e.enabled, pos)
+                })
                 .collect();
 
-            let fg = cx.theme().foreground;
-            let muted = cx.theme().muted_foreground;
-            let border = cx.theme().border;
-            let sel_bg = hsla(0., 0., 1., 0.09);
-            let cap_bg = hsla(0., 0., 1., 0.06);
+            let fg = color::text(cx);
+            let disabled = color::text_disabled(cx);
+            let accent = color::accent(cx);
+            let border = color::border(cx);
+            let sel_bg = color::selected_bg(cx);
+            let hover_bg = color::hover_overlay(cx);
 
-            let rows = entries
+            let rows: Vec<AnyElement> = entries
                 .into_iter()
                 .enumerate()
-                .map(|(row, (path, shortcut, enabled))| {
+                .map(|(row, (path, shortcut, enabled, positions))| {
                     let is_sel = selected == Some(row);
-                    let name_color = if enabled { fg } else { muted };
+                    let name_color = if enabled { fg } else { disabled };
+                    let name_spans = highlighted_path(&path, &positions, name_color, accent);
                     let caps: Vec<AnyElement> = if shortcut.is_empty() {
                         Vec::new()
                     } else {
-                        shortcut
-                            .split('+')
-                            .map(|k| {
-                                div()
-                                    .px_1()
-                                    .h(px(18.))
-                                    .min_w(px(18.))
-                                    .rounded_sm()
-                                    .bg(cap_bg)
-                                    .border_1()
-                                    .border_color(border)
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(k.trim().to_string())
-                                    .into_any_element()
-                            })
-                            .collect()
+                        shortcut.split('+').map(|k| key_cap(k.trim(), cx)).collect()
                     };
                     div()
                         .id(("palette-row", row))
@@ -580,18 +639,31 @@ mod view {
                         .w_full()
                         .items_center()
                         .justify_between()
-                        .gap_2()
-                        .px_2()
-                        .py(px(5.))
-                        .rounded_md()
+                        .gap(px(tokens::space::MD))
+                        .px(px(tokens::space::MD))
+                        .h(px(28.))
+                        .rounded(px(tokens::radius::MD))
+                        .text_size(px(tokens::font::UI_MD))
                         .when(is_sel, |d| d.bg(sel_bg))
-                        .when(!is_sel, |d| d.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
+                        .when(!is_sel && enabled, |d| d.hover(|s| s.bg(hover_bg)))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _e, _window, cx| this.click_row(row, cx)))
-                        .child(div().text_color(name_color).child(path))
-                        .child(gpui_component::h_flex().gap_1().children(caps))
+                        .child(
+                            gpui_component::h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .children(name_spans),
+                        )
+                        .child(
+                            gpui_component::h_flex()
+                                .flex_none()
+                                .gap(px(tokens::space::XS))
+                                .children(caps),
+                        )
                         .into_any_element()
-                });
+                })
+                .collect();
 
             gpui_component::v_flex()
                 .id("rcx-command-palette")
@@ -603,16 +675,16 @@ mod view {
                 .on_action(cx.listener(Self::on_cancel))
                 .w(px(580.))
                 .max_h(px(460.))
-                .bg(cx.theme().popover)
-                .rounded_lg()
+                .bg(color::elevated_bg(cx))
+                .rounded(px(tokens::radius::XL))
                 .border_1()
                 .border_color(border)
                 .shadow_lg()
                 .overflow_hidden()
                 .child(
                     div()
-                        .px_2()
-                        .py(px(6.))
+                        .px(px(tokens::space::LG))
+                        .py(px(tokens::space::MD))
                         .border_b_1()
                         .border_color(border)
                         .child(Input::new(&self.input).w_full()),
@@ -620,8 +692,8 @@ mod view {
                 .child(
                     gpui_component::v_flex()
                         .id("rcx-command-palette-list")
-                        .p_1()
-                        .gap(px(2.))
+                        .p(px(tokens::space::XS))
+                        .gap(px(tokens::space::XXS))
                         .flex_1()
                         .min_h_0()
                         .overflow_y_hidden()

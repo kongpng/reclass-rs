@@ -23,14 +23,18 @@
 //!
 //! Gated behind the `ui` feature.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::input::{Input, InputState};
 use gpui_component::list::ListItem;
 use gpui_component::tree::{tree, TreeItem, TreeState};
-use gpui_component::ActiveTheme;
 
 use crate::core::{kind_to_string, NodeKind, NodeTree};
+use crate::ui::design::{color, tokens};
 
 use super::state::DocId;
 
@@ -424,6 +428,87 @@ fn model_to_tree_items(model: &WorkspaceModel) -> Vec<TreeItem> {
     items
 }
 
+// ── Rich row metadata (Zed styling) ──────────────────────────────────────────
+//
+// `TreeItem` only carries an `id` + a flat `label` (kept for filtering + the
+// headless tests). To paint Zed-style rows — a colored type badge, a truncated
+// name, a muted trailing count pill, and the syntax-tinted "Type field" child
+// rows (the C++ `WorkspaceDelegate::paint`) — the panel keeps a side table keyed
+// by tree-item id. The render closure looks the metadata up by `item.id`, so the
+// flattened-label `TreeItem`s stay byte-identical to what the model tests assert.
+
+/// What kind of row a tree entry is, for styling.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum RowMetaKind {
+    /// A PINNED / ALL TYPES band header (non-interactive caption + hairline).
+    Section,
+    /// A top-level type: badge + name + count pill. `viewed` dims un-opened
+    /// types' badge (the C++ `Qt::UserRole + 3` dim state).
+    Type {
+        badge: TypeBadge,
+        name: String,
+        field_count: usize,
+        viewed: bool,
+    },
+    /// A struct field child: `type_name` in the syntax-type tint, `field_name`
+    /// muted (the C++ child paint path).
+    Field {
+        type_name: String,
+        field_name: String,
+    },
+}
+
+/// Build the per-tree-item metadata table the render closure reads, in lockstep
+/// with [`model_to_tree_items`] (same ids). Cheap to rebuild on every filter
+/// change; wrapped in an [`Rc`] so the render closure can clone it freely.
+fn model_to_row_meta(model: &WorkspaceModel) -> HashMap<SharedString, RowMetaKind> {
+    let mut meta = HashMap::new();
+    for (ri, row) in model.rows.iter().enumerate() {
+        match row {
+            WorkspaceRow::Section(_label) => {
+                meta.insert(
+                    SharedString::from(format!("section-{ri}")),
+                    RowMetaKind::Section,
+                );
+            }
+            WorkspaceRow::Type(t) => {
+                meta.insert(
+                    nav_item_id(t.doc, t.id),
+                    RowMetaKind::Type {
+                        badge: t.badge,
+                        name: t.name.clone(),
+                        field_count: t.field_count,
+                        viewed: t.viewed,
+                    },
+                );
+                for child in &t.children {
+                    meta.insert(
+                        SharedString::from(format!("field-{}-{}", t.id, child.id)),
+                        RowMetaKind::Field {
+                            type_name: child.type_name.clone(),
+                            field_name: child.field_name.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    meta
+}
+
+/// The accent tint for a type badge (the C++ letter-badge color by kind, here
+/// mapped to the One Dark syntax roles so it retints with the theme).
+fn badge_color(badge: TypeBadge, cx: &App) -> Hsla {
+    match badge {
+        // struct/class → type yellow; union → keyword magenta; enum → number/
+        // accent blue; field → muted (unused for the badge, kept exhaustive).
+        TypeBadge::Struct => color::syntax_type(cx),
+        TypeBadge::Union => color::syntax_keyword(cx),
+        TypeBadge::Enum => color::accent(cx),
+        TypeBadge::Field => color::text_muted(cx),
+    }
+}
+
 /// The workspace ("Project") dock panel — a filter input above a virtualized
 /// [`Tree`](gpui_component::tree) of the open documents' types.
 ///
@@ -435,13 +520,17 @@ pub struct WorkspacePanel {
     model: WorkspaceModel,
     search: Entity<InputState>,
     tree_state: Entity<TreeState>,
+    /// Per-tree-item styling metadata (badge / count / field tints), rebuilt
+    /// alongside the tree items so the render closure can paint Zed rows. Shared
+    /// via [`Rc`] into the (re-created each frame) render closure.
+    row_meta: Rc<HashMap<SharedString, RowMetaKind>>,
     focus_handle: FocusHandle,
 }
 
 impl WorkspacePanel {
     /// Build an empty workspace panel.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter types..."));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search types…"));
         let tree_state = cx.new(|cx| TreeState::new(cx));
         // Rebuild the tree whenever the filter changes.
         cx.subscribe(
@@ -455,6 +544,7 @@ impl WorkspacePanel {
             model: WorkspaceModel::default(),
             search,
             tree_state,
+            row_meta: Rc::new(HashMap::new()),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -481,10 +571,12 @@ impl WorkspacePanel {
         self.search.read(cx).value().to_string()
     }
 
-    /// Rebuild the [`TreeState`] items from the (filtered) model.
+    /// Rebuild the [`TreeState`] items + the per-row styling metadata from the
+    /// (filtered) model.
     fn refresh_tree(&mut self, cx: &mut Context<Self>) {
         let filtered = self.model.filtered(&self.filter(cx));
         let items = model_to_tree_items(&filtered);
+        self.row_meta = Rc::new(model_to_row_meta(&filtered));
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
@@ -514,49 +606,339 @@ impl Focusable for WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        div()
+        let meta = self.row_meta.clone();
+
+        gpui_component::v_flex()
             .id("rcx-workspace-panel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .flex()
-            .flex_col()
-            .bg(cx.theme().background)
-            .child(div().p_2().child(Input::new(&self.search).w_full()))
+            .bg(color::panel_bg(cx))
+            .text_color(color::text(cx))
+            .child(self.render_header(cx))
+            .child(self.render_search(cx))
             .child(
                 div().flex_1().min_h_0().child(
-                    tree(
-                        &self.tree_state,
-                        move |ix, entry, _selected, _window, cx| {
-                            let item = entry.item();
-                            let is_section = item.id.starts_with("section-");
-                            let nav = parse_nav_item_id(&item.id);
-                            let label = item.label.clone();
+                    tree(&self.tree_state, move |ix, entry, selected, _window, cx| {
+                        let item = entry.item();
+                        let kind = meta.get(&item.id);
+                        let nav = parse_nav_item_id(&item.id);
+                        let depth = entry.depth();
+                        let is_folder = entry.is_folder();
+                        let is_expanded = entry.is_expanded();
 
-                            let mut list_item = ListItem::new(ix)
-                                .w_full()
-                                .pl(px(12.) * entry.depth() as f32 + px(8.))
-                                .child(label);
+                        let row = render_row(
+                            ix,
+                            item.label.clone(),
+                            kind,
+                            depth,
+                            is_folder,
+                            is_expanded,
+                            selected,
+                            cx,
+                        );
 
-                            // Section header rows are non-interactive (the C++
-                            // RoleSectionHeader bands).
-                            if !is_section {
-                                if let Some(nav) = nav {
-                                    let view = view.clone();
-                                    list_item = list_item.on_click(move |_e, _window, cx| {
-                                        view.update(cx, |_this, cx| {
-                                            cx.emit(nav);
-                                        });
-                                    });
-                                }
-                            }
-                            let _ = cx;
-                            list_item
-                        },
-                    )
-                    .p_1(),
+                        // Type rows route a quick-navigation request up to the
+                        // window on click; section + field rows are inert (the
+                        // C++ RoleSectionHeader bands / non-navigable children).
+                        if let Some(nav) = nav {
+                            let view = view.clone();
+                            row.on_click(move |_e, _window, cx| {
+                                view.update(cx, |_this, cx| cx.emit(nav));
+                            })
+                        } else {
+                            row
+                        }
+                    })
+                    .px(px(tokens::space::SM))
+                    .py(px(tokens::space::XS)),
                 ),
             )
     }
+}
+
+impl WorkspacePanel {
+    /// The Zed-style panel header: a small uppercase muted "PROJECT" title with
+    /// the struct/enum count, plus a close affordance on the right (the C++
+    /// 36px `workspaceHeader` with its `×` button).
+    fn render_header(&self, cx: &App) -> impl IntoElement {
+        let m = &self.model;
+        // The count caption ("N structs · M enums"), or nothing when empty.
+        let mut count = String::new();
+        if m.struct_count > 0 || m.enum_count > 0 {
+            count.push_str(&format!(
+                "{} struct{}",
+                m.struct_count,
+                if m.struct_count != 1 { "s" } else { "" }
+            ));
+            if m.enum_count > 0 {
+                count.push_str(&format!(
+                    " \u{b7} {} enum{}",
+                    m.enum_count,
+                    if m.enum_count != 1 { "s" } else { "" }
+                ));
+            }
+        }
+
+        gpui_component::h_flex()
+            .h(px(32.0))
+            .w_full()
+            .flex_none()
+            .px(px(tokens::space::LG))
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(color::border(cx))
+            .child(
+                gpui_component::h_flex()
+                    .min_w_0()
+                    .gap(px(tokens::space::MD))
+                    .items_baseline()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(tokens::font::UI_SM))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color::text_muted(cx))
+                            .child("PROJECT"),
+                    )
+                    .when(!count.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(tokens::font::UI_XS))
+                                .text_color(color::text_disabled(cx))
+                                .child(count),
+                        )
+                    }),
+            )
+            // Close affordance — a ghost "×" glyph (the C++ header close button).
+            // Closing the dock is the window's layout toggle; here it is a
+            // restrained chrome hint that lightens on hover.
+            .child(
+                div()
+                    .id("rcx-workspace-close")
+                    .flex_none()
+                    .size(px(18.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(tokens::radius::SM))
+                    .text_size(px(tokens::font::UI_MD))
+                    .text_color(color::text_muted(cx))
+                    .hover(|s| s.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
+                    .child("\u{00d7}"),
+            )
+    }
+
+    /// The Zed-style filter input row: a subtle-bg input with a leading
+    /// magnifier glyph (the C++ `m_workspaceSearch` with its `filter.svg`
+    /// leading icon). The `Input` carries the focus ring + clear button.
+    fn render_search(&self, cx: &App) -> impl IntoElement {
+        gpui_component::h_flex()
+            .w_full()
+            .flex_none()
+            .px(px(tokens::space::MD))
+            .py(px(tokens::space::MD))
+            .gap(px(tokens::space::MD))
+            .items_center()
+            // Leading magnifier glyph — asset-free (no SVG bundle), tinted muted.
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(tokens::font::UI_SM))
+                    .text_color(color::text_muted(cx))
+                    .child("\u{1f50d}"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.search).w_full()),
+            )
+    }
+}
+
+/// Render one workspace tree row in Zed styling. Dispatches on the row's
+/// [`RowMetaKind`]: a band header, a top-level type (badge + name + count
+/// pill), or a struct field child (syntax-tinted "Type field"). Falls back to
+/// the flat label when no metadata is found (should not happen in practice).
+#[allow(clippy::too_many_arguments)]
+fn render_row(
+    ix: usize,
+    label: SharedString,
+    kind: Option<&RowMetaKind>,
+    depth: usize,
+    is_folder: bool,
+    is_expanded: bool,
+    selected: bool,
+    cx: &App,
+) -> ListItem {
+    // Left indent: a per-depth step that leaves room for indent guides.
+    let indent = px(tokens::space::LG) * depth as f32;
+
+    match kind {
+        // ── Section band (PINNED / ALL TYPES) ──────────────────────────────
+        Some(RowMetaKind::Section) => ListItem::new(ix)
+            .w_full()
+            .child(section_row(label, cx))
+            .map(strip_row_padding),
+
+        // ── Top-level type: badge + name + trailing count pill ──────────────
+        Some(RowMetaKind::Type {
+            badge,
+            name,
+            field_count,
+            viewed,
+        }) => {
+            let row = gpui_component::h_flex()
+                .w_full()
+                .h(px(24.0))
+                .pl(indent)
+                .pr(px(tokens::space::XS))
+                .gap(px(tokens::space::SM))
+                .items_center()
+                // Disclosure chevron (only when the type has field children).
+                .child(disclosure(is_folder, is_expanded, cx))
+                // Type badge (colored chip with the S / E / U letter).
+                .child(type_badge(*badge, *viewed, cx))
+                // Name — truncates; brighter when selected, muted otherwise so
+                // the active row reads as content-forward (Zed list behavior).
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(tokens::font::UI_MD))
+                        .text_color(if selected {
+                            color::text(cx)
+                        } else {
+                            color::text_muted(cx)
+                        })
+                        .child(SharedString::from(name.clone())),
+                )
+                // Trailing member count — a muted pill (the C++ count pill).
+                .child(count_pill(*field_count, cx));
+
+            ListItem::new(ix).w_full().child(row).map(strip_row_padding)
+        }
+
+        // ── Struct field child: "Type field" with syntax tints ──────────────
+        Some(RowMetaKind::Field {
+            type_name,
+            field_name,
+        }) => {
+            let row = gpui_component::h_flex()
+                .w_full()
+                .h(px(22.0))
+                .pl(indent + px(tokens::space::LG))
+                .pr(px(tokens::space::XS))
+                .gap(px(tokens::space::XS))
+                .items_center()
+                .text_size(px(tokens::font::UI_SM))
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(color::syntax_type(cx))
+                        .child(SharedString::from(type_name.clone())),
+                )
+                .when(!field_name.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(color::text_muted(cx))
+                            .child(SharedString::from(field_name.clone())),
+                    )
+                });
+
+            ListItem::new(ix).w_full().child(row).map(strip_row_padding)
+        }
+
+        // ── Fallback (no metadata) — the flat label. ────────────────────────
+        None => ListItem::new(ix)
+            .w_full()
+            .child(div().pl(indent).child(label))
+            .map(strip_row_padding),
+    }
+}
+
+/// Strip the [`ListItem`]'s default `py_1 px_3` so our row geometry (heights +
+/// indent) is exact; keep its hover / selected fill + radius.
+fn strip_row_padding(li: ListItem) -> ListItem {
+    li.p_0().rounded(px(tokens::radius::MD))
+}
+
+/// A PINNED / ALL TYPES band header: a small uppercase muted caption, padded so
+/// it reads as a divider above the rows it groups (the C++ `RoleSectionHeader`).
+fn section_row(label: SharedString, cx: &App) -> impl IntoElement {
+    div()
+        .w_full()
+        .pt(px(tokens::space::MD))
+        .pb(px(tokens::space::XS))
+        .px(px(tokens::space::SM))
+        .text_size(px(tokens::font::UI_XS))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color::text_muted(cx))
+        .child(SharedString::from(label.to_uppercase()))
+}
+
+/// The disclosure chevron for a row: a ▸ / ▾ glyph for folders (types with
+/// field children), or a same-width spacer for leaves so names align. Asset-free
+/// (no SVG bundle) — a Unicode triangle tinted muted.
+fn disclosure(is_folder: bool, is_expanded: bool, cx: &App) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(12.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(tokens::font::UI_XS))
+        .text_color(color::text_muted(cx))
+        .when(is_folder, |this| {
+            this.child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
+        })
+}
+
+/// The colored type badge — a rounded chip carrying the S / E / U letter, tinted
+/// by kind (the C++ letter-badge `WorkspaceDelegate::paint`). Un-viewed types
+/// render dimmer (the C++ `Qt::UserRole + 3` dim state).
+fn type_badge(badge: TypeBadge, viewed: bool, cx: &App) -> impl IntoElement {
+    let mut tint = badge_color(badge, cx);
+    if !viewed {
+        tint.a = 0.55;
+    }
+    let mut bg = tint;
+    bg.a = 0.16;
+
+    div()
+        .flex_none()
+        .size(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(tokens::radius::SM))
+        .bg(bg)
+        .text_size(px(tokens::font::UI_XS))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(tint)
+        .child(badge.letter().to_string())
+}
+
+/// The trailing member-count pill — a muted, low-contrast right-aligned chip
+/// (the C++ count pill on `surface` bg). Hidden for empty types.
+fn count_pill(count: usize, cx: &App) -> impl IntoElement {
+    div()
+        .flex_none()
+        .min_w(px(18.0))
+        .px(px(tokens::space::SM))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(tokens::font::UI_XS))
+        .text_color(color::text_muted(cx))
+        .child(count.to_string())
 }
 
 #[cfg(test)]

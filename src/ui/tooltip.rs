@@ -290,9 +290,160 @@ impl HoverPreviewRegistry {
     }
 }
 
+// ── gpui hover-popover view (feature-gated) ──────────────────────────────────
+
+/// The structured content of a hover popover (`RcxTooltip` body): a title plus a
+/// body that is either free text, a two-column "value → description" help table
+/// (PIC5 "Base Address"), or a monospace value/time history list (PIC1 "Previous
+/// Values"). gpui-free so it can be unit-tested and assembled headlessly.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TooltipBody {
+    /// Plain wrapped body text.
+    Text(String),
+    /// A two-column help table: each `(example, description)` pair (the example
+    /// column is monospace).
+    HelpTable(Vec<(String, String)>),
+    /// A history list: each `(value, when)` pair (the value column is monospace,
+    /// the relative-time hint is muted).
+    History(Vec<(String, String)>),
+}
+
+/// A complete hover popover: an optional title + a [`TooltipBody`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TooltipContent {
+    pub title: Option<String>,
+    pub body: TooltipBody,
+}
+
+impl TooltipContent {
+    /// A plain text tip (no title).
+    pub fn text(text: &str) -> Self {
+        TooltipContent {
+            title: None,
+            body: TooltipBody::Text(text.to_string()),
+        }
+    }
+
+    /// The "Base Address" help popover (PIC5): a titled two-column table plus a
+    /// trailing operators/notes line folded into the table-following text.
+    pub fn help(title: &str, rows: Vec<(String, String)>) -> Self {
+        TooltipContent {
+            title: Some(title.to_string()),
+            body: TooltipBody::HelpTable(rows),
+        }
+    }
+
+    /// The "Previous Values" history popover (PIC1): a titled value/time list.
+    pub fn history(title: &str, rows: Vec<(String, String)>) -> Self {
+        TooltipContent {
+            title: Some(title.to_string()),
+            body: TooltipBody::History(rows),
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+pub use view::render_tooltip;
+
+#[cfg(feature = "ui")]
+mod view {
+    use super::{TooltipBody, TooltipContent, MAX_W, PAD};
+    use crate::ui::design::{color, tokens};
+    use gpui::prelude::FluentBuilder as _;
+    use gpui::*;
+
+    /// Build the Zed hover-popover element for a [`TooltipContent`]: an elevated
+    /// surface (popover bg, 1px border, `MD` radius, soft shadow) with a semibold
+    /// title and a body laid out per its kind. Monospace is used for the value
+    /// columns (the C++ tip paints addresses in the editor mono font).
+    ///
+    /// Returned as an `AnyElement` so the hover host can anchor it via the overlay
+    /// layer at the geometry from [`place_tooltip`](super::place_tooltip).
+    pub fn render_tooltip(content: &TooltipContent, cx: &App) -> AnyElement {
+        let title: Option<AnyElement> = content.title.as_ref().map(|t| {
+            div()
+                .text_size(px(tokens::font::UI_MD))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color::text(cx))
+                .child(t.clone())
+                .into_any_element()
+        });
+
+        let body: AnyElement = match &content.body {
+            TooltipBody::Text(text) => div()
+                .text_size(px(tokens::font::UI_SM))
+                .text_color(color::text_muted(cx))
+                .child(text.clone())
+                .into_any_element(),
+            TooltipBody::HelpTable(rows) => gpui_component::v_flex()
+                .gap(px(tokens::space::XS))
+                .children(rows.iter().map(|(example, desc)| {
+                    gpui_component::h_flex()
+                        .w_full()
+                        .gap(px(tokens::space::XL))
+                        .items_baseline()
+                        .child(
+                            div()
+                                .flex_none()
+                                .min_w(px(150.))
+                                .font_family(tokens::font::MONO_FAMILY)
+                                .text_size(px(tokens::font::EDITOR_SIZE))
+                                .text_color(color::text(cx))
+                                .child(example.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(tokens::font::UI_SM))
+                                .text_color(color::text_muted(cx))
+                                .child(desc.clone()),
+                        )
+                }))
+                .into_any_element(),
+            TooltipBody::History(rows) => gpui_component::v_flex()
+                .gap(px(tokens::space::XS))
+                .children(rows.iter().map(|(value, when)| {
+                    gpui_component::h_flex()
+                        .w_full()
+                        .gap(px(tokens::space::LG))
+                        .items_baseline()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_family(tokens::font::MONO_FAMILY)
+                                .text_size(px(tokens::font::EDITOR_SIZE))
+                                .text_color(color::text(cx))
+                                .child(value.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(tokens::font::UI_XS))
+                                .text_color(color::text_muted(cx))
+                                .child(when.clone()),
+                        )
+                }))
+                .into_any_element(),
+        };
+
+        super::super::design::elevated_surface(cx)
+            .max_w(px(MAX_W))
+            .p(px(PAD))
+            .child(
+                gpui_component::v_flex()
+                    .gap(px(tokens::space::MD))
+                    .when_some(title, |this, t| this.child(t))
+                    .child(body),
+            )
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{place_tooltip, ArrowSide, HoverState, TipAction, ARROW_H};
+    use super::{
+        place_tooltip, ArrowSide, HoverState, TipAction, TooltipBody, TooltipContent, ARROW_H,
+    };
 
     // ── placement (test_tooltip_event.cpp) ──
 
@@ -440,5 +591,50 @@ mod tests {
         }
         assert_eq!(shows, 1);
         assert_eq!(hides, 0);
+    }
+
+    // ── tooltip content (PIC5 help / PIC1 history) ──
+
+    #[test]
+    fn help_content_carries_title_and_table() {
+        let c = TooltipContent::help(
+            "Base Address",
+            vec![
+                ("0x7FF61234ABCD".into(), "hex address".into()),
+                ("<app.exe>".into(), "module base".into()),
+            ],
+        );
+        assert_eq!(c.title.as_deref(), Some("Base Address"));
+        match c.body {
+            TooltipBody::HelpTable(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[1].0, "<app.exe>");
+                assert_eq!(rows[1].1, "module base");
+            }
+            _ => panic!("expected a help table"),
+        }
+    }
+
+    #[test]
+    fn history_content_carries_value_time_rows() {
+        let c = TooltipContent::history(
+            "Previous Values",
+            vec![("0x19825945810".into(), "9s ago".into())],
+        );
+        assert_eq!(c.title.as_deref(), Some("Previous Values"));
+        match c.body {
+            TooltipBody::History(rows) => {
+                assert_eq!(rows[0].0, "0x19825945810");
+                assert_eq!(rows[0].1, "9s ago");
+            }
+            _ => panic!("expected a history list"),
+        }
+    }
+
+    #[test]
+    fn plain_text_content_has_no_title() {
+        let c = TooltipContent::text("a hint");
+        assert_eq!(c.title, None);
+        assert_eq!(c.body, TooltipBody::Text("a hint".into()));
     }
 }

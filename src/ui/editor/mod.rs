@@ -38,6 +38,7 @@ use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
 use crate::core::linemeta::K_COMMAND_ROW_ID;
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta};
+use crate::ui::design;
 
 use element::{RowElement, RowPaint};
 use geometry::CellMetrics;
@@ -66,6 +67,12 @@ actions!(
 /// the typical width:height of a monospace cell and keeps hit-testing sane before
 /// the first measurement.
 const DEFAULT_CELL_RATIO: f32 = 0.6;
+
+/// Editor line-height multiple (× font size). The shared token is 1.4; the grid
+/// reads more comfortably (and matches the reclass screenshots' generous leading)
+/// at 1.5, so the editor surface uses a slightly looser leading than dense UI
+/// lists. Both the painted rows and the hit-test metrics derive from this.
+const EDITOR_LINE_HEIGHT: f32 = 1.5;
 
 /// The key bindings for the editor surface (bound in the `RcxEditor` context).
 /// Returned so the app can register them once at startup alongside the inline
@@ -536,28 +543,10 @@ impl RcxEditor {
 
         let mut overlays: Vec<(i32, i32, Hsla)> = Vec::new();
 
-        // Per-byte heat (hex rows: only changed byte indices; non-hex: value span;
-        // editor-surface.md §5 `applyHeatmapHighlight`).
-        if let Some(heat) = palette.heat_color(lm.heat_level) {
-            let heat = with_alpha(heat, 0.30);
-            if is_hex_preview(lm.node_kind) {
-                let vs = crate::compose::value_span_for(&lm, type_w, name_w);
-                if vs.valid {
-                    for &b in &lm.changed_byte_indices {
-                        let s = vs.start + b * 3;
-                        overlays.push((s, s + 2, heat));
-                    }
-                }
-            } else if lm.heat_level > 0 {
-                let vs = geometry::narrow_value_at_first_chip(
-                    &lm,
-                    crate::compose::value_span_for(&lm, type_w, name_w),
-                );
-                if vs.valid {
-                    overlays.push((vs.start, vs.end, heat));
-                }
-            }
-        }
+        // Per-byte change heat is now a *glyph* recolor folded into `style_runs`
+        // (editor-surface.md §3: `IND_HEAT_*` are TEXTFORE), matching the
+        // orange→red changed digits in the screenshots. Only the byte-SELECTION
+        // overlay remains a (soft) background highlight here.
 
         // Byte-selection digit highlight (intersect the row with [lo,hi); §12).
         if let Some(sel) = self.byte_sel.range() {
@@ -579,10 +568,39 @@ impl RcxEditor {
             }
         }
 
+        // Rounded chip backgrounds: footer add-bytes/Trim pills and the
+        // command-row chevron/source chips (editor-surface.md §5 step 14;
+        // PIC4/PIC5). Drawn as subtle Zed buttons (soft fill + 1px border).
+        let mut pills: Vec<element::PillPaint> = Vec::new();
+        match lm.line_kind {
+            LineKind::Footer => {
+                for s in geometry::footer_pill_spans(&text) {
+                    pills.push(element::PillPaint {
+                        start: s.start,
+                        end: s.end,
+                        fill: palette.pill_bg,
+                        border: with_alpha(palette.border, 0.6),
+                    });
+                }
+            }
+            LineKind::CommandRow => {
+                for s in geometry::command_row_pill_spans(&text) {
+                    pills.push(element::PillPaint {
+                        start: s.start,
+                        end: s.end,
+                        fill: palette.pill_bg,
+                        border: with_alpha(palette.border, 0.6),
+                    });
+                }
+            }
+            _ => {}
+        }
+
         RowPaint {
             text: text.into(),
             runs,
             overlays,
+            pills,
             palette,
             metrics: self.metrics,
         }
@@ -641,15 +659,21 @@ impl RcxEditor {
         if let Some(c) = bg {
             row = row.bg(c);
         }
-        if selected {
-            // Left accent bar (`M_ACCENT`).
-            row = row.border_l_2().border_color(palette.accent);
-        }
+        // Left accent bar (`M_ACCENT`) for the selected row — a 2px Zed accent
+        // edge. Reserve the 2px on EVERY row (transparent when unselected) so the
+        // gutter + text never jitter sideways as the selection moves.
+        row = row.border_l_2().border_color(if selected {
+            palette.accent
+        } else {
+            gpui::transparent_black()
+        });
 
-        // Address/offset margin — the Scintilla-style left column (PIC1's gray
-        // address column). Fixed width from `offset_hex_digits` so EVERY row's
-        // main text starts at the same column; `lm.offset_text` is pre-padded by
-        // compose (continuation rows render the "·" marker, header/footer blank).
+        // Address/offset margin — the Zed-gutter left column (PIC1/PIC5's muted
+        // "+0 +8 +10 …" address column). Fixed width from `offset_hex_digits` so
+        // EVERY row's main text starts at the same column; `lm.offset_text` is
+        // pre-padded + right-justified by compose (continuation rows render the
+        // "·" marker, header/footer blank). Low-contrast gutter: a hair-darker bg,
+        // muted blue-gray digits, right-aligned with a small trailing pad.
         let addr_cols = self
             .controller
             .last_result()
@@ -662,9 +686,14 @@ impl RcxEditor {
                     .flex_shrink_0()
                     .w(px((addr_cols + 2.0) * self.metrics.cell_width))
                     .h(px(self.metrics.line_height))
-                    .pl(px(self.metrics.cell_width))
-                    .text_color(palette.dim)
-                    .child(SharedString::from(lm.offset_text.clone())),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .pr(px(self.metrics.cell_width))
+                    .bg(palette.gutter_bg)
+                    .text_color(palette.gutter_fg)
+                    .child(SharedString::from(lm.offset_text.trim_end().to_string())),
             );
         }
 
@@ -769,7 +798,12 @@ impl Render for RcxEditor {
             .size_full()
             .bg(palette.paper)
             .text_color(palette.text)
-            .font_family("monospace")
+            // A real monospace at the comfortable Zed editor size + generous
+            // leading (the prior build was cramped). The measured `line_height`
+            // above derives from exactly these so hit-testing stays aligned.
+            .font_family(design::tokens::font::MONO_FAMILY)
+            .text_size(px(design::tokens::font::EDITOR_SIZE))
+            .line_height(px(design::tokens::font::EDITOR_SIZE * EDITOR_LINE_HEIGHT))
             .on_action(cx.listener(Self::action_tab))
             .on_action(cx.listener(Self::action_tab_prev))
             .on_action(cx.listener(Self::action_escape))

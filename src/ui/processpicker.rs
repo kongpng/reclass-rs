@@ -229,13 +229,16 @@ pub use view::{ProcessPickEvent, ProcessPicker};
 
 #[cfg(feature = "ui")]
 mod view {
+    use crate::ui::design::{color, tokens};
+    use crate::ui::dialogs::modal;
+    use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::button::{Button, ButtonVariants as _};
     use gpui_component::input::{Input, InputEvent, InputState};
     use gpui_component::table::{
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
-    use gpui_component::{ActiveTheme, Sizable as _};
+    use gpui_component::Sizable as _;
 
     use super::{ProcessPickerModel, ProcessRow, SourceAvailability};
 
@@ -317,17 +320,23 @@ mod view {
                 return div();
             };
             // Stub rows render dimmed to signal they are not attachable.
-            let color = if row.availability == SourceAvailability::Stub {
-                cx.theme().muted_foreground
+            let fg = if row.availability == SourceAvailability::Stub {
+                color::text_muted(cx)
             } else {
-                cx.theme().foreground
+                color::text(cx)
             };
             let text = match col_ix {
                 COL_PID => row.pid_text(),
                 COL_NAME => row.display_name(),
                 _ => row.path.clone(),
             };
-            div().text_color(color).child(text)
+            // PID + Path columns read as monospace addresses/paths; the name is UI.
+            let mono = matches!(col_ix, COL_PID | COL_PATH);
+            div()
+                .text_color(fg)
+                .text_size(px(tokens::font::UI_SM))
+                .when(mono, |d| d.font_family(tokens::font::MONO_FAMILY))
+                .child(text)
         }
 
         fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
@@ -454,47 +463,61 @@ mod view {
 
     impl Render for ProcessPicker {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            gpui_component::v_flex()
-                .id("rcx-process-picker")
-                .track_focus(&self.focus_handle)
-                .key_context("RcxProcessPicker")
-                .gap_2()
-                .p_3()
-                .min_w(px(680.))
-                .min_h(px(420.))
-                .bg(cx.theme().background)
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "Select a data source to attach. Live process / kernel / remote \
-                             sources are out of scope in this build and shown as stubs.",
-                        ),
-                )
+            let count = self.table.read(cx).delegate().rows.len();
+
+            let body = modal::body(cx)
+                .child(modal::help_text(
+                    "Select a data source to attach. Live process / kernel / remote \
+                     sources are out of scope in this build and shown as stubs.",
+                    cx,
+                ))
                 .child(Input::new(&self.filter).w_full())
                 .child(
                     div()
                         .flex_1()
                         .min_h_0()
+                        .w_full()
+                        .rounded(px(tokens::radius::LG))
+                        .border_1()
+                        .border_color(color::border(cx))
+                        .overflow_hidden()
                         .child(DataTable::new(&self.table).bordered(false).small()),
                 )
                 .child(
-                    gpui_component::h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("process-cancel")
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _e, _w, cx| this.cancel(cx))),
-                        )
-                        .child(
-                            Button::new("process-attach")
-                                .primary()
-                                .label("Attach")
-                                .on_click(cx.listener(|this, _e, _w, cx| this.attach_selected(cx))),
-                        ),
+                    div()
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(color::text_muted(cx))
+                        .child(format!("{count} sources")),
+                );
+
+            let footer = modal::footer(cx)
+                .child(
+                    Button::new("process-cancel")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _e, _w, cx| this.cancel(cx))),
                 )
+                .child(
+                    Button::new("process-attach")
+                        .primary()
+                        .label("Attach")
+                        .on_click(cx.listener(|this, _e, _w, cx| this.attach_selected(cx))),
+                );
+
+            modal::card(cx)
+                .id("rcx-process-picker")
+                .track_focus(&self.focus_handle)
+                .key_context("RcxProcessPicker")
+                .w(px(720.))
+                .h(px(520.))
+                .child(
+                    modal::header("Attach to Process", cx).child(modal::close_button(
+                        "process-close",
+                        cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                        cx,
+                    )),
+                )
+                .child(body)
+                .child(footer)
         }
     }
 }

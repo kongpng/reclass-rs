@@ -196,6 +196,214 @@ pub fn menu_item_labels(items: &[MenuItem]) -> Vec<Option<(String, CommandId, bo
         .collect()
 }
 
+/// A short keystroke hint shown right-aligned on a menu row (e.g. "Ctrl+B").
+/// Used by the view to add Zed-style keybind hints; the pure menu builders don't
+/// carry shortcuts (the C++ context menus mostly don't show them), so this is a
+/// view-side lookup keyed by [`CommandId`].
+#[cfg(feature = "ui")]
+pub fn context_shortcut_for(command: &str) -> &'static str {
+    match command {
+        "hex.break_into_class" => "Ctrl+R",
+        "hex.copy_hex" => "Ctrl+C",
+        "hex.paste" => "Ctrl+V",
+        "node.duplicate" => "Ctrl+D",
+        "node.delete" => "Del",
+        "node.find_references" => "Shift+F12",
+        _ => "",
+    }
+}
+
+/// Commands that are destructive (rendered in the danger color, Zed-style).
+#[cfg(feature = "ui")]
+pub fn is_danger_command(command: &str) -> bool {
+    matches!(
+        command,
+        "node.delete" | "hex.zero_fill" | "hex.clear_selection"
+    )
+}
+
+// ── gpui context-menu view (feature-gated) ───────────────────────────────────
+
+#[cfg(feature = "ui")]
+pub use view::{ContextMenuEvent, ContextMenuView};
+
+#[cfg(feature = "ui")]
+mod view {
+    use super::{context_shortcut_for, is_danger_command, CommandId, MenuItem};
+    use crate::ui::design::{color, tokens};
+    use gpui::prelude::FluentBuilder as _;
+    use gpui::*;
+    use gpui_component::ActiveTheme as _;
+
+    /// The menu's outcome.
+    #[derive(Clone, Debug)]
+    pub enum ContextMenuEvent {
+        /// An item was chosen — route its [`CommandId`].
+        Activated(CommandId),
+        /// Dismissed (clicked outside / Esc).
+        Dismissed,
+    }
+
+    /// A free-standing Zed-styled right-click menu rendered from a [`MenuItem`]
+    /// list. The host anchors this (via the overlay/popover layer) at the click
+    /// point; it emits [`ContextMenuEvent`] for the chosen command. (The C++ uses
+    /// `QMenu` / `ContextMenuExt`; this is the gpui equivalent with the shared
+    /// elevated-surface look: 6px radius, 1px border, soft shadow, inset rows,
+    /// hover overlay, separators, a left check/icon slot, and a right keybind slot.)
+    pub struct ContextMenuView {
+        items: Vec<MenuItem>,
+        focus_handle: FocusHandle,
+    }
+
+    impl ContextMenuView {
+        /// Build a context menu over the given items.
+        pub fn new(items: Vec<MenuItem>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+            ContextMenuView {
+                items,
+                focus_handle: cx.focus_handle(),
+            }
+        }
+
+        /// Read-only access to the items (tests / wiring).
+        pub fn items(&self) -> &[MenuItem] {
+            &self.items
+        }
+
+        fn activate(&mut self, command: CommandId, cx: &mut Context<Self>) {
+            cx.emit(ContextMenuEvent::Activated(command));
+        }
+    }
+
+    impl Focusable for ContextMenuView {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl EventEmitter<ContextMenuEvent> for ContextMenuView {}
+
+    impl Render for ContextMenuView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let fg = color::text(cx);
+            let muted = color::text_muted(cx);
+            let disabled = color::text_disabled(cx);
+            let danger = cx.theme().danger_foreground;
+            let hover_bg = color::hover_overlay(cx);
+
+            let rows: Vec<AnyElement> = self
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    MenuItem::Separator => div()
+                        .h(px(tokens::border::THIN))
+                        .my(px(tokens::space::XS))
+                        .mx(px(tokens::space::SM))
+                        .bg(color::border(cx))
+                        .into_any_element(),
+                    MenuItem::Action {
+                        label,
+                        command,
+                        enabled,
+                    } => {
+                        let is_danger = is_danger_command(command);
+                        let row_fg = if !enabled {
+                            disabled
+                        } else if is_danger {
+                            danger
+                        } else {
+                            fg
+                        };
+                        let shortcut = context_shortcut_for(command);
+                        let cmd = command.clone();
+                        let enabled = *enabled;
+                        menu_row(i)
+                            .text_color(row_fg)
+                            .when(enabled, |r| {
+                                let cmd = cmd.clone();
+                                r.cursor_pointer()
+                                    .hover(|s| s.bg(hover_bg))
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.activate(cmd.clone(), cx)
+                                    }))
+                            })
+                            // left check/icon slot (empty for plain actions, keeps
+                            // labels aligned with checkables).
+                            .child(check_slot(false, muted))
+                            .child(div().flex_1().min_w_0().child(label.clone()))
+                            .child(shortcut_slot(shortcut, muted))
+                            .into_any_element()
+                    }
+                    MenuItem::Check {
+                        label,
+                        command,
+                        checked,
+                    } => {
+                        let cmd = command.clone();
+                        let checked = *checked;
+                        menu_row(i)
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(hover_bg))
+                            .on_click(
+                                cx.listener(move |this, _e, _w, cx| this.activate(cmd.clone(), cx)),
+                            )
+                            .child(check_slot(checked, color::accent(cx)))
+                            .child(div().flex_1().min_w_0().child(label.clone()))
+                            .child(shortcut_slot("", muted))
+                            .into_any_element()
+                    }
+                })
+                .collect();
+
+            gpui_component::v_flex()
+                .id("rcx-context-menu")
+                .track_focus(&self.focus_handle)
+                .key_context("RcxContextMenu")
+                .min_w(px(200.))
+                .p(px(tokens::space::XS))
+                .bg(color::elevated_bg(cx))
+                .border_1()
+                .border_color(color::border(cx))
+                .rounded(px(tokens::radius::LG))
+                .shadow_md()
+                .text_size(px(tokens::font::UI_MD))
+                .children(rows)
+        }
+    }
+
+    /// A menu-item row shell (Zed inset row: 24px, comfortable padding, MD radius).
+    fn menu_row(i: usize) -> Stateful<Div> {
+        gpui_component::h_flex()
+            .id(("ctx-row", i))
+            .w_full()
+            .h(px(24.))
+            .px(px(tokens::space::SM))
+            .gap(px(tokens::space::MD))
+            .items_center()
+            .rounded(px(tokens::radius::MD))
+    }
+
+    /// The left check/icon slot — a fixed-width column holding a checkmark (for a
+    /// checked toggle) or nothing, so labels stay aligned.
+    fn check_slot(checked: bool, color: Hsla) -> Div {
+        div()
+            .w(px(14.))
+            .flex_none()
+            .text_color(color)
+            .when(checked, |d| d.child("\u{2713}"))
+    }
+
+    /// The right keybind slot — a muted, fixed end column for the shortcut hint.
+    fn shortcut_slot(shortcut: &str, color: Hsla) -> Div {
+        div()
+            .flex_none()
+            .text_size(px(tokens::font::UI_XS))
+            .text_color(color)
+            .when(!shortcut.is_empty(), |d| d.child(shortcut.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

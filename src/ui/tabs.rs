@@ -23,18 +23,39 @@
 //! establishes the strip + sentinel + source-icon + view-toggle chrome and wires
 //! it to the editor surface.
 //!
+//! **Styling (Zed tab bar; `_design/zed_ui_spec.md` §5.6).** The strip is drawn
+//! directly as a flat `chrome_bg` bar with a 1px bottom `border`. Each tab is a
+//! bespoke row — source icon, middle-elided title, and a trailing slot that holds
+//! the **modified dot** at rest and a **close ✕** on hover (Zed's reveal-on-hover
+//! close). The **active** tab lifts to `tab_active` (backgroundAlt) and carries a
+//! 2px `accent` top edge; inactive tabs are `text_muted` and lighten by a hover
+//! overlay. A trailing **"+"** affordance opens a new document. The dual
+//! tree/rendered view-mode toggle is a Zed **segmented control** anchored at the
+//! bottom of the body ("Reclass" | "Code", as in the C++ bottom view tabs).
+//!
 //! Gated behind the `ui` feature.
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
-use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{ActiveTheme, Selectable as _, Sizable as _};
+use gpui_component::{Icon, IconName};
 
+use super::design::{color, tokens};
 use super::editor::RcxEditor;
 use super::state::{DataSource, DocId, SourceKind, ViewMode};
 use super::titlebar::source_icon;
+
+/// Tab-strip height (logical px). The C++ dock tab bar was a fixed 37px
+/// (`MenuBarStyle::sizeFromContents` `CT_TabBarTab`, app-shell §3); Zed runs a
+/// touch shorter for a tighter chrome.
+const TAB_STRIP_H: f32 = 36.0;
+/// Maximum tab width before the title middle-elides (Zed caps tab width so a long
+/// struct name never crowds the strip).
+const TAB_MAX_W: f32 = 220.0;
+/// Bottom view-mode toggle bar height.
+const VIEW_TOGGLE_H: f32 = 30.0;
+/// One segment's height inside the view-mode toggle.
+const SEGMENT_H: f32 = 22.0;
 
 /// One open document tab in the center area — the per-tab UI state + its editor.
 ///
@@ -47,6 +68,11 @@ pub struct DocEntry {
     pub title: SharedString,
     pub source: DataSource,
     pub view_mode: ViewMode,
+    /// Unsaved-changes flag — drives the tab's **modified dot** (Zed shows a dot
+    /// in the close slot until the tab is hovered). Pure tab-strip chrome state
+    /// (the authoritative dirty bit lives on the document/undo stack); the window
+    /// pushes it in via [`DocumentArea::set_modified`].
+    pub modified: bool,
     pub editor: Entity<RcxEditor>,
 }
 
@@ -57,6 +83,7 @@ impl DocEntry {
             title: title.into(),
             source: DataSource::none(),
             view_mode: ViewMode::default(),
+            modified: false,
             editor,
         }
     }
@@ -171,6 +198,17 @@ impl DocumentArea {
         }
     }
 
+    /// Set a tab's modified (unsaved-changes) flag — the Zed modified dot
+    /// (`undoStack.indexChanged` → "document is dirty"; app-shell §8 step 9).
+    pub fn set_modified(&mut self, id: DocId, modified: bool, cx: &mut Context<Self>) {
+        if let Some(i) = self.index_of(id) {
+            if self.tabs[i].modified != modified {
+                self.tabs[i].modified = modified;
+                cx.notify();
+            }
+        }
+    }
+
     /// Activate a tab by index (a tab-strip click). Emits [`DocAreaEvent::Activated`].
     fn activate_index(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.tabs.len() && ix != self.active {
@@ -248,76 +286,218 @@ impl DocumentArea {
         }
     }
 
-    /// Build the tab strip: one [`Tab`] per document (source icon + title + close
-    /// ✕) followed by the trailing "+" sentinel and the view-mode toggle suffix.
+    /// Build the Zed tab bar: a flat `chrome_bg` strip with a 1px bottom border,
+    /// one bespoke tab per document, then a trailing "+" new-document affordance.
+    ///
+    /// Each tab carries a source icon, a middle-elided title, an active 2px accent
+    /// top edge + `tab_active` lift, and a trailing slot that holds the modified
+    /// dot at rest / a reveal-on-hover close ✕ (spec §5.6).
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
+
+        gpui_component::h_flex()
+            .id("rcx-doc-tabs")
+            .w_full()
+            .flex_none()
+            .h(px(TAB_STRIP_H))
+            .items_stretch()
+            .bg(color::chrome_bg(cx))
+            .border_b_1()
+            .border_color(color::border(cx))
+            // Scroll the tabs horizontally when they overflow; the "+" stays put.
+            .child(
+                gpui_component::h_flex()
+                    .id("rcx-doc-tabs-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .items_stretch()
+                    .overflow_x_scroll()
+                    .children(
+                        self.tabs
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, entry)| self.render_tab(ix, entry, ix == active, cx)),
+                    ),
+            )
+            // The trailing "+" new-document affordance (app-shell §8 "+" sentinel).
+            .child(self.render_new_tab_button(cx))
+    }
+
+    /// One bespoke Zed document tab.
+    fn render_tab(
+        &self,
+        ix: usize,
+        entry: &DocEntry,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = entry.id;
+        let group_name = SharedString::from(format!("rcx-tab-{}", id.get()));
+        // Per-tab source icon (full opacity = live, dimmed = disconnected).
+        let icon = source_icon(entry.source.kind, entry.source.live, cx);
+
+        // Trailing slot: the modified dot at rest, the close ✕ on hover. Both
+        // occupy the same fixed-width slot so the title never shifts.
+        let dot = div()
+            .absolute()
+            .size(px(6.0))
+            .rounded(px(tokens::radius::FULL))
+            .bg(if selected {
+                color::text(cx)
+            } else {
+                color::text_muted(cx)
+            })
+            .when(!entry.modified, |d| d.invisible())
+            .group_hover(group_name.clone(), |d| d.invisible());
+
+        let close = div()
+            .id(SharedString::from(format!("rcx-tab-close-{}", id.get())))
+            .absolute()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(16.0))
+            .rounded(px(tokens::radius::SM))
+            .text_color(color::text_muted(cx))
+            .invisible()
+            .group_hover(group_name.clone(), |d| d.visible())
+            .hover(|d| d.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
+            .child(Icon::new(IconName::Close).size_3())
+            // Swallow the press so closing a tab doesn't also activate it (the
+            // close click must not bubble to the tab's `on_click`).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _e, window, cx| {
+                if let Some(i) = this.index_of(id) {
+                    this.close_index(i, window, cx);
+                }
+            }));
+
+        let trailing = div()
+            .flex_none()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(16.0))
+            .child(dot)
+            .child(close);
+
+        gpui_component::h_flex()
+            .id(SharedString::from(format!("rcx-tab-{}", id.get())))
+            .group(group_name)
+            .relative()
+            .flex_none()
+            .h_full()
+            .max_w(px(TAB_MAX_W))
+            .items_center()
+            .gap(px(tokens::space::SM))
+            .px(px(tokens::space::LG))
+            .border_r_1()
+            .border_color(color::border(cx))
+            .text_size(px(tokens::font::UI_SM))
+            // Selected: lift to the elevated tab bg + brighter text; inactive:
+            // muted text that lightens on hover (no border change — spec §7).
+            .map(|t| {
+                if selected {
+                    t.bg(color::elevated_bg(cx)).text_color(color::text(cx))
+                } else {
+                    t.text_color(color::text_muted(cx))
+                        .hover(|s| s.bg(color::hover_overlay(cx)))
+                }
+            })
+            // The 2px accent top edge marks the active tab (spec §5.6).
+            .when(selected, |t| {
+                t.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(tokens::border::THICK))
+                        .bg(color::accent(cx)),
+                )
+            })
+            .child(icon)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .whitespace_nowrap()
+                    .child(entry.title.clone()),
+            )
+            .child(trailing)
+            .on_click(cx.listener(move |this, _e, _window, cx| {
+                this.activate_index(ix, cx);
+            }))
+    }
+
+    /// The trailing "+" affordance — a ghost icon button that opens a new
+    /// document (the C++ sentinel "+" click; app-shell §8).
+    fn render_new_tab_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("rcx-new-tab")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(TAB_STRIP_H))
+            .h_full()
+            .text_color(color::text_muted(cx))
+            .hover(|d| d.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
+            .child(Icon::new(IconName::Plus).size_4())
+            .on_click(cx.listener(|this, _e, window, cx| {
+                this.on_new_tab(window, cx);
+            }))
+    }
+
+    /// The dual view-mode toggle, styled as a Zed **segmented control** —
+    /// "Reclass" (tree) | "Code" (rendered C/C++). Matches the C++ bottom view
+    /// tabs (PIC5/PIC2); the selected segment lifts to a soft inset surface.
+    fn render_view_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view_mode = self.active_entry().map(|e| e.view_mode).unwrap_or_default();
         let has_doc = !self.tabs.is_empty();
 
-        let tab_bar = TabBar::new("rcx-doc-tabs")
-            .selected_index(active)
-            .children(self.tabs.iter().enumerate().map(|(ix, entry)| {
-                let id = entry.id;
-                // Per-tab source icon (full opacity = live, dimmed = disconnected).
-                let icon = source_icon(entry.source.kind, entry.source.live, cx);
-                // Close ✕ on the right (the C++ `DockTabButtons` close button).
-                let close = Button::new(SharedString::from(format!("tab-close-{}", id.get())))
-                    .ghost()
-                    .xsmall()
-                    .label("\u{2715}") // ✕
-                    .tooltip("Close")
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        if let Some(i) = this.index_of(id) {
-                            this.close_index(i, window, cx);
-                        }
-                    }));
-
-                Tab::new()
-                    .selected(ix == active)
-                    .prefix(icon)
-                    .label(entry.title.clone())
-                    .suffix(close)
-                    .on_click(cx.listener(move |this, _e, _window, cx| {
-                        this.activate_index(ix, cx);
+        let segment = |label: &'static str, this_mode: ViewMode, cx: &mut Context<Self>| {
+            let selected = view_mode == this_mode;
+            div()
+                .id(label)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(SEGMENT_H))
+                .px(px(tokens::space::LG))
+                .rounded(px(tokens::radius::MD))
+                .text_size(px(tokens::font::UI_SM))
+                .map(|s| {
+                    if selected {
+                        // Soft elevated inset for the active segment + accent text.
+                        s.bg(color::elevated_bg(cx)).text_color(color::accent(cx))
+                    } else {
+                        s.text_color(color::text_muted(cx))
+                            .hover(|h| h.text_color(color::text(cx)))
+                    }
+                })
+                .when(has_doc && !selected, |s| {
+                    s.on_click(cx.listener(|this, _e, _window, cx| {
+                        this.toggle_view_mode(cx);
                     }))
-            }))
-            // The trailing "+" new-tab sentinel (app-shell §8).
-            .suffix(
-                gpui_component::h_flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .child(
-                        Button::new("rcx-new-tab")
-                            .ghost()
-                            .small()
-                            .label("+")
-                            .tooltip("New document")
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.on_new_tab(window, cx);
-                            })),
-                    )
-                    // The dual view-mode toggle (tree ⇄ rendered C/C++).
-                    .child(
-                        Button::new("rcx-view-mode")
-                            .ghost()
-                            .small()
-                            .selected(view_mode == ViewMode::Rendered)
-                            .label(view_mode.label())
-                            .tooltip(match view_mode {
-                                ViewMode::Tree => "Switch to rendered C/C++",
-                                ViewMode::Rendered => "Switch to tree view",
-                            })
-                            .when(has_doc, |b| {
-                                b.on_click(cx.listener(|this, _e, _window, cx| {
-                                    this.toggle_view_mode(cx);
-                                }))
-                            }),
-                    ),
-            );
+                })
+        };
 
-        tab_bar
+        gpui_component::h_flex()
+            .id("rcx-view-toggle")
+            .flex_none()
+            .h(px(VIEW_TOGGLE_H))
+            .w_full()
+            .items_center()
+            .px(px(tokens::space::MD))
+            .gap(px(tokens::space::XS))
+            .bg(color::chrome_bg(cx))
+            .border_t_1()
+            .border_color(color::border(cx))
+            .child(segment("Reclass", ViewMode::Tree, cx))
+            .child(segment("Code", ViewMode::Rendered, cx))
     }
 
     /// The body for the active tab: the editor (tree mode) or a rendered-output
@@ -331,7 +511,7 @@ impl DocumentArea {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(cx.theme().muted_foreground)
+                .text_color(color::text_muted(cx))
                 .child("No document")
                 .into_any_element();
         };
@@ -344,9 +524,10 @@ impl DocumentArea {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(cx.theme().background)
-                .text_color(cx.theme().muted_foreground)
-                .font_family("monospace")
+                .bg(color::content_bg(cx))
+                .text_color(color::text_muted(cx))
+                .font_family(tokens::font::MONO_FAMILY)
+                .text_size(px(tokens::font::EDITOR_SIZE))
                 .child(format!(
                     "// Rendered C/C++ for {} (generated view)",
                     entry.title
@@ -386,16 +567,20 @@ impl Render for DocumentArea {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strip = self.render_tab_strip(cx);
         let body = self.render_body(cx);
+        let view_toggle = self.render_view_toggle(cx);
 
+        // Top → bottom: the document tab strip, the active editor/rendered body,
+        // then the Zed segmented "Reclass | Code" view-mode toggle (PIC5/PIC2).
         div()
             .id("rcx-document-area")
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().background)
+            .bg(color::content_bg(cx))
             .child(strip)
             .child(div().flex_1().min_h_0().child(body))
+            .child(view_toggle)
     }
 }
 

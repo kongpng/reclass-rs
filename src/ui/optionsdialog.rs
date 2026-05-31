@@ -175,10 +175,11 @@ pub use view::{OptionsDialog, OptionsEvent};
 #[cfg(feature = "ui")]
 mod view {
     use super::{filter_visible, OptionsPage, OptionsResult, FONT_CHOICES, REFRESH_DEFAULT};
+    use crate::ui::design::{color, section_label, tokens, zed_list_row};
+    use crate::ui::dialogs::modal;
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{ActiveTheme, Selectable as _};
 
     /// The dialog's outcome (the C++ `accept`/`reject`).
     #[derive(Clone, Debug)]
@@ -262,30 +263,41 @@ mod view {
             cx.emit(OptionsEvent::Cancel);
         }
 
-        /// Render the left nav: the filtered page list.
+        /// Render the left nav: a search box above the filtered page list, styled
+        /// like a Zed settings sidebar (an "Environment" group caption + soft
+        /// accent-selected rows).
         fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-            use gpui_component::button::{Button, ButtonVariants as _};
             let visible = filter_visible(&self.query);
-            let mut col = gpui_component::v_flex().w(px(200.)).gap_0p5().child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Environment"),
-            );
+            let mut list = gpui_component::v_flex()
+                .w_full()
+                .gap(px(tokens::space::XXS))
+                .child(section_label("Environment", cx));
             for page in visible {
                 let selected = page == self.page;
-                col = col.child(
-                    Button::new(SharedString::from(format!("opt-nav-{}", page.index())))
-                        .ghost()
-                        .w_full()
-                        .selected(selected)
-                        .label(page.nav_label())
-                        .on_click(cx.listener(move |this, _e, _window, cx| {
-                            this.select_page(page, cx);
-                        })),
+                list = list.child(
+                    zed_list_row(
+                        SharedString::from(format!("opt-nav-{}", page.index())),
+                        selected,
+                        cx,
+                    )
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _e, _window, cx| {
+                        this.select_page(page, cx);
+                    }))
+                    .child(page.nav_label()),
                 );
             }
-            col
+
+            gpui_component::v_flex()
+                .w(px(200.))
+                .flex_none()
+                .h_full()
+                .gap(px(tokens::space::MD))
+                .pr(px(tokens::space::LG))
+                .border_r_1()
+                .border_color(color::border(cx))
+                .child(Input::new(&self.search).w_full())
+                .child(list)
         }
 
         /// Render the selected page's controls.
@@ -299,41 +311,38 @@ mod view {
 
         fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::checkbox::Checkbox;
+            let theme_summary = format!(
+                "Theme #{}  \u{00b7}  Font: {}",
+                self.result.theme_index,
+                if self.result.font_name.is_empty() {
+                    FONT_CHOICES[0]
+                } else {
+                    self.result.font_name.as_str()
+                }
+            );
             gpui_component::v_flex()
-                .gap_3()
+                .gap(px(tokens::space::SM))
                 .flex_1()
-                .child(group_label("Refresh Rate", cx))
+                .child(section_label("Refresh Rate", cx))
+                .child(modal::help_text(
+                    format!(
+                        "Default {REFRESH_DEFAULT} ms (current {} ms).",
+                        self.result.refresh_ms
+                    ),
+                    cx,
+                ))
+                .child(section_label("Visual Experience", cx))
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "Default {REFRESH_DEFAULT} ms (current {} ms)",
-                            self.result.refresh_ms
-                        )),
-                )
-                .child(group_label("Visual Experience", cx))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .child(format!(
-                            "Theme #{}  ·  Font: {}",
-                            self.result.theme_index,
-                            if self.result.font_name.is_empty() {
-                                FONT_CHOICES[0]
-                            } else {
-                                self.result.font_name.as_str()
-                            }
-                        )),
+                        .text_size(px(tokens::font::UI_MD))
+                        .text_color(color::text(cx))
+                        .child(theme_summary),
                 )
                 .when(!self.themes.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} themes available", self.themes.len())),
-                    )
+                    this.child(modal::help_text(
+                        format!("{} themes available.", self.themes.len()),
+                        cx,
+                    ))
                 })
                 .child(
                     Checkbox::new("opt-titlecase")
@@ -367,9 +376,9 @@ mod view {
         fn render_ai(&self, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::checkbox::Checkbox;
             gpui_component::v_flex()
-                .gap_3()
+                .gap(px(tokens::space::SM))
                 .flex_1()
-                .child(group_label("MCP Server", cx))
+                .child(section_label("MCP Server", cx))
                 .child(
                     Checkbox::new("opt-automcp")
                         .label("Auto-start MCP server")
@@ -379,14 +388,19 @@ mod view {
                             cx.notify();
                         })),
                 )
+                .child(modal::help_text(
+                    "Starts the Model-Context-Protocol server automatically when \
+                     Reclass launches.",
+                    cx,
+                ))
         }
 
         fn render_generator(&self, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::checkbox::Checkbox;
             gpui_component::v_flex()
-                .gap_3()
+                .gap(px(tokens::space::SM))
                 .flex_1()
-                .child(group_label("C++ Header", cx))
+                .child(section_label("C++ Header", cx))
                 .child(
                     Checkbox::new("opt-asserts")
                         .label("Emit static_assert size checks")
@@ -396,16 +410,12 @@ mod view {
                             cx.notify();
                         })),
                 )
+                .child(modal::help_text(
+                    "Appends a static_assert after each generated struct to verify \
+                     its size at compile time.",
+                    cx,
+                ))
         }
-    }
-
-    /// A group-box-style section title.
-    fn group_label(text: &str, cx: &mut Context<OptionsDialog>) -> impl IntoElement {
-        div()
-            .text_sm()
-            .font_weight(FontWeight::BOLD)
-            .text_color(cx.theme().foreground)
-            .child(text.to_string())
     }
 
     impl Focusable for OptionsDialog {
@@ -422,45 +432,50 @@ mod view {
             let nav = self.render_nav(cx);
             let page = self.render_page(cx);
 
-            gpui_component::v_flex()
+            let body = modal::body(cx).child(
+                gpui_component::h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .gap(px(tokens::space::LG))
+                    .child(nav)
+                    .child(
+                        div()
+                            .id("rcx-options-page")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .child(page),
+                    ),
+            );
+
+            let footer = modal::footer(cx)
+                .child(
+                    Button::new("opt-cancel")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _e, _window, cx| this.cancel(cx))),
+                )
+                .child(
+                    Button::new("opt-ok")
+                        .primary()
+                        .label("OK")
+                        .on_click(cx.listener(|this, _e, _window, cx| this.confirm(cx))),
+                );
+
+            modal::card(cx)
                 .id("rcx-options-dialog")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxOptions")
-                .w(px(700.))
-                .h(px(450.))
-                .p_3()
-                .gap_3()
-                .bg(cx.theme().background)
-                .child(
-                    gpui_component::h_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .gap_3()
-                        .child(
-                            gpui_component::v_flex()
-                                .w(px(200.))
-                                .gap_2()
-                                .child(Input::new(&self.search).w_full())
-                                .child(nav),
-                        )
-                        .child(div().flex_1().min_w_0().child(page)),
-                )
-                .child(
-                    gpui_component::h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("opt-cancel")
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _e, _window, cx| this.cancel(cx))),
-                        )
-                        .child(
-                            Button::new("opt-ok")
-                                .primary()
-                                .label("OK")
-                                .on_click(cx.listener(|this, _e, _window, cx| this.confirm(cx))),
-                        ),
-                )
+                .w(px(720.))
+                .h(px(480.))
+                .child(modal::header("Options", cx).child(modal::close_button(
+                    "opt-close",
+                    cx.listener(|this, _e, _window, cx| this.cancel(cx)),
+                    cx,
+                )))
+                .child(body)
+                .child(footer)
         }
     }
 }

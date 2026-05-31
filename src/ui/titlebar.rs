@@ -27,6 +27,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, TitleBar};
 
+use super::menubar::MenuBar;
 use super::state::ViewMode;
 
 /// The two-mode workspace layout toggle (`enum LayoutPreset`, `titlebar.h:15-18`).
@@ -109,7 +110,9 @@ pub fn title_case(title: &str) -> String {
 /// and the view-mode toggle). The C++ painted these as custom flat checkable
 /// buttons with a 2px bottom accent when checked; here a ghost [`Button`] with a
 /// `selected`/accent state reproduces the look. The click closure carries the
-/// toggle's intent.
+/// toggle's intent. Kept as the canonical chrome-toggle recipe (the inline
+/// toggles below mirror it); retained for the icon-button workflow.
+#[allow(dead_code)]
 fn chrome_toggle(
     id: &'static str,
     glyph: &'static str,
@@ -127,8 +130,9 @@ fn chrome_toggle(
 }
 
 /// Assemble the titlebar contents into a [`TitleBar`] (app-shell §5 layout:
-/// app label · menu placeholder · stretch · workspace-toggle pair · view-mode
-/// toggle · document title).
+/// app label · menu bar · stretch · view-mode toggle · sidebar toggle ·
+/// document title). The window controls (min/max/close) are supplied by the
+/// gpui-component [`TitleBar`] itself.
 ///
 /// Callbacks (plain `Fn`s so the titlebar stays decoupled from `MainWindow`):
 /// - `on_layout` — a workspace-toggle button was clicked (the C++
@@ -137,13 +141,16 @@ fn chrome_toggle(
 ///   [`ViewMode`] (the opposite of the current one).
 ///
 /// `preset` / `view_mode` are the current states (drive the checked styling);
-/// `doc_title` is the active document's display title (the right-aligned label).
+/// `doc_title` is the active document's display title (the right-aligned label);
+/// `menubar` is the in-window menu-bar entity (rendered as a child so its
+/// dropdowns open from the bar).
 #[allow(clippy::too_many_arguments)]
 pub fn render_titlebar(
     preset: LayoutPreset,
     view_mode: ViewMode,
     doc_title: impl Into<SharedString>,
     has_doc: bool,
+    menubar: Entity<MenuBar>,
     on_layout: impl Fn(LayoutPreset, &mut Window, &mut App) + 'static,
     on_view_mode: impl Fn(ViewMode, &mut Window, &mut App) + 'static,
     cx: &App,
@@ -203,8 +210,17 @@ pub fn render_titlebar(
     let title: SharedString = doc_title.into();
 
     TitleBar::new()
-        .child(app_label)
-        // Stretch pushes the controls to the right.
+        // Left cluster: the app label + the in-window menu bar (PIC1/PIC5:
+        // "Reclass  File  Edit  View  Tools  Plugins  Help").
+        .child(
+            gpui_component::h_flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .child(app_label)
+                .child(menubar),
+        )
+        // Stretch pushes the right-side controls to the far edge.
         .child(div().flex_1())
         .child(
             gpui_component::h_flex()

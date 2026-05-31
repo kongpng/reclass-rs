@@ -603,10 +603,51 @@ pub use view::{TypeSelectorEvent, TypeSelectorPopup};
 mod view {
     use super::{EntryKind, Modifier, TypeEntry, TypeModel};
     use crate::theme::model::Theme;
+    use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{ActiveTheme, Selectable as _};
+
+    /// Render a type name with fuzzy-matched chars emphasized (accent + semibold),
+    /// the rest in `base`. `positions` are char indices into `name`.
+    fn highlighted_name(
+        name: &str,
+        positions: &[usize],
+        base: Hsla,
+        accent: Hsla,
+    ) -> Vec<AnyElement> {
+        let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
+        let mut spans: Vec<AnyElement> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_hit: Option<bool> = None;
+        let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
+            if text.is_empty() {
+                return;
+            }
+            let mut el = div().child(text.to_string());
+            if hit {
+                el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
+            } else {
+                el = el.text_color(base);
+            }
+            spans.push(el.into_any_element());
+        };
+        for (i, ch) in name.chars().enumerate() {
+            let hit = pos.contains(&i);
+            if cur_hit != Some(hit) {
+                if let Some(prev) = cur_hit {
+                    flush(&mut spans, &cur, prev);
+                }
+                cur.clear();
+                cur_hit = Some(hit);
+            }
+            cur.push(ch);
+        }
+        if let Some(prev) = cur_hit {
+            flush(&mut spans, &cur, prev);
+        }
+        spans
+    }
 
     /// The popup's outcome.
     #[derive(Clone, Debug)]
@@ -686,83 +727,221 @@ mod view {
 
     impl Render for TypeSelectorPopup {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            use gpui_component::button::{Button, ButtonVariants as _};
             let theme = self.theme(cx);
             let selected = self.model.selected();
-            let rows: Vec<_> = self
+            let muted = color::text_muted(cx);
+            let accent = color::accent(cx);
+            let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+            let border = color::border(cx);
+            let query = self.input.read(cx).value().to_string();
+            let filtering = !query.trim().is_empty();
+
+            let rows: Vec<AnyElement> = self
                 .model
                 .rows()
                 .iter()
                 .enumerate()
                 .map(|(row, r)| {
                     if r.entry.entry_kind == EntryKind::Section {
+                        // A Zed section caption: uppercase micro label, muted.
                         div()
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(r.entry.display_name.clone())
+                            .w_full()
+                            .px(px(tokens::space::MD))
+                            .pt(px(tokens::space::MD))
+                            .pb(px(tokens::space::XS))
+                            .text_size(px(tokens::font::UI_XS))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(muted)
+                            .child(r.entry.display_name.to_uppercase())
                             .into_any_element()
                     } else {
-                        let group_color = super::kind_group_color(r.entry.group, &theme);
+                        let group_color = super::super::theme_apply::to_hsla(
+                            super::kind_group_color(r.entry.group, &theme),
+                        );
                         let is_sel = selected == Some(row);
+                        let name_color = if r.entry.enabled {
+                            group_color
+                        } else {
+                            color::text_disabled(cx)
+                        };
+                        let name_spans = if filtering {
+                            highlighted_name(
+                                &r.entry.display_name,
+                                &r.match_positions,
+                                name_color,
+                                accent,
+                            )
+                        } else {
+                            vec![div()
+                                .text_color(name_color)
+                                .child(r.entry.display_name.clone())
+                                .into_any_element()]
+                        };
                         let size_label = if r.entry.size_bytes > 0 {
                             format!("{}B", r.entry.size_bytes)
                         } else {
                             "dyn".to_string()
                         };
-                        Button::new(("type-row", row))
-                            .ghost()
+                        // The composite keyword chip (struct/class/enum), shown muted.
+                        let keyword = r.entry.class_keyword.clone();
+                        gpui_component::h_flex()
+                            .id(("type-row", row))
                             .w_full()
-                            .selected(is_sel)
-                            .when(!r.entry.enabled, |b| {
-                                b.text_color(cx.theme().muted_foreground)
+                            .h(px(26.))
+                            .px(px(tokens::space::MD))
+                            .gap(px(tokens::space::MD))
+                            .items_center()
+                            .rounded(px(tokens::radius::MD))
+                            .text_size(px(tokens::font::UI_MD))
+                            .when(is_sel, |d| d.bg(sel_bg))
+                            .when(!is_sel && r.entry.enabled, |d| d.hover(|s| s.bg(hover_bg)))
+                            .when(r.entry.enabled, |d| d.cursor_pointer())
+                            .when(r.entry.enabled, |d| {
+                                d.on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.accept_row(row, cx);
+                                }))
                             })
+                            // A 2px left group-color accent bar.
+                            .child(div().w(px(2.)).h(px(14.)).rounded_full().bg(group_color))
                             .child(
                                 gpui_component::h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_color(super::super::theme_apply::to_hsla(
-                                                group_color,
-                                            ))
-                                            .child(r.entry.display_name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .ml_auto()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(size_label),
-                                    ),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .children(name_spans),
                             )
-                            .on_click(cx.listener(move |this, _e, _window, cx| {
-                                this.accept_row(row, cx);
-                            }))
+                            .when(!keyword.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(tokens::font::UI_XS))
+                                        .text_color(muted)
+                                        .child(keyword),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .min_w(px(28.))
+                                    .text_size(px(tokens::font::UI_XS))
+                                    .text_color(muted)
+                                    .child(size_label),
+                            )
                             .into_any_element()
                     }
                 })
                 .collect();
 
-            gpui_component::v_flex()
+            super::super::design::elevated_surface(cx)
                 .id("rcx-type-selector")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxTypeSelector")
+                .flex()
+                .flex_col()
                 .w(px(360.))
                 .max_h(px(440.))
-                .bg(cx.theme().popover)
-                .border_1()
-                .border_color(cx.theme().border)
-                .child(Input::new(&self.input).w_full())
+                .text_size(px(tokens::font::UI_MD))
+                .child(
+                    div()
+                        .px(px(tokens::space::MD))
+                        .py(px(tokens::space::MD))
+                        .border_b_1()
+                        .border_color(border)
+                        .child(Input::new(&self.input).w_full()),
+                )
+                .when(self.model.mode().allows_modifiers(), |this| {
+                    this.child(self.render_modifier_row(cx))
+                })
                 .child(
                     gpui_component::v_flex()
                         .id("rcx-type-selector-list")
+                        .p(px(tokens::space::XS))
                         .flex_1()
                         .min_h_0()
                         .overflow_y_hidden()
                         .children(rows),
                 )
+        }
+    }
+
+    impl TypeSelectorPopup {
+        /// The modifier toggle row (`*` / `**` / `[]`) — a Zed segmented toggle
+        /// group, shown only in FieldType / ArrayElement modes. Each chip reflects
+        /// the active [`Modifier`].
+        fn render_modifier_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            let active = self.model.modifier();
+            let accent = color::accent(cx);
+            let fg = color::text(cx);
+            let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+
+            let chip = |id: &'static str,
+                        label: &'static str,
+                        is_on: bool,
+                        modifier: Modifier|
+             -> AnyElement {
+                gpui_component::h_flex()
+                    .id(id)
+                    .h(px(22.))
+                    .min_w(px(34.))
+                    .px(px(tokens::space::MD))
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(tokens::radius::MD))
+                    .text_size(px(tokens::font::UI_SM))
+                    .text_color(if is_on { accent } else { fg })
+                    .when(is_on, |d| d.bg(sel_bg).font_weight(FontWeight::SEMIBOLD))
+                    .when(!is_on, |d| d.cursor_pointer().hover(|s| s.bg(hover_bg)))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        // Toggle off if already active, else set.
+                        let next = if this.model.modifier() == modifier {
+                            Modifier::None
+                        } else {
+                            modifier
+                        };
+                        this.model.set_modifier(next);
+                        cx.notify();
+                    }))
+                    .child(label.to_string())
+                    .into_any_element()
+            };
+
+            let array_on = matches!(active, Modifier::Array(_));
+            let array_modifier = match active {
+                Modifier::Array(n) => Modifier::Array(n),
+                _ => Modifier::Array(1),
+            };
+
+            gpui_component::h_flex()
+                .w_full()
+                .px(px(tokens::space::MD))
+                .py(px(tokens::space::SM))
+                .gap(px(tokens::space::XS))
+                .items_center()
+                .border_b_1()
+                .border_color(color::border(cx))
+                .child(
+                    div()
+                        .flex_none()
+                        .mr(px(tokens::space::XS))
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(color::text_muted(cx))
+                        .child("Modify"),
+                )
+                .child(chip(
+                    "mod-ptr",
+                    "*",
+                    active == Modifier::Pointer,
+                    Modifier::Pointer,
+                ))
+                .child(chip(
+                    "mod-ptrptr",
+                    "**",
+                    active == Modifier::PointerPointer,
+                    Modifier::PointerPointer,
+                ))
+                .child(chip("mod-array", "[ ]", array_on, array_modifier))
         }
     }
 }

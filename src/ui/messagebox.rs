@@ -297,11 +297,16 @@ pub use open::{open_confirm, open_message};
 
 #[cfg(feature = "ui")]
 mod open {
-    use super::{ButtonVariant, DefaultButton, MessageSpec};
+    use super::{
+        format_detail, ButtonVariant, DefaultButton, DetailLayout, MessageSpec, Severity,
+        MSG_MAX_WIDTH,
+    };
+    use crate::ui::design::{color, tokens};
+    use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::button::ButtonVariant as GButtonVariant;
     use gpui_component::dialog::DialogButtonProps;
-    use gpui_component::WindowExt as _;
+    use gpui_component::{ActiveTheme as _, Icon, IconName, WindowExt as _};
 
     fn to_gpui_variant(v: ButtonVariant) -> GButtonVariant {
         match v {
@@ -311,21 +316,81 @@ mod open {
         }
     }
 
+    /// The severity icon + tint (the C++ removed the icon, but a Zed alert reads
+    /// far better with a tinted leading glyph; title + text still carry meaning).
+    fn severity_icon(severity: Severity, cx: &App) -> impl IntoElement {
+        let (name, tint) = match severity {
+            Severity::Info => (IconName::Info, color::accent(cx)),
+            Severity::Warning => (IconName::TriangleAlert, cx.theme().warning),
+            Severity::Critical => (IconName::CircleX, cx.theme().danger),
+            // No dedicated question glyph in the bundled set; the accent Info glyph
+            // reads as a neutral prompt for confirm/unsaved dialogs.
+            Severity::Question => (IconName::Info, color::accent(cx)),
+        };
+        Icon::new(name).text_color(tint)
+    }
+
+    /// Build the alert body: the wrapped message text, then the detail block
+    /// (small list/label) when present, as a single description element.
+    fn description_body(text: String, detail: &[String], cx: &App) -> AnyElement {
+        let layout = format_detail(detail);
+        gpui_component::v_flex()
+            .gap(px(tokens::space::MD))
+            .child(
+                div()
+                    .text_size(px(tokens::font::UI_MD))
+                    .text_color(color::text(cx))
+                    .child(text),
+            )
+            .map(|col| match layout {
+                DetailLayout::None => col,
+                DetailLayout::Label(s) => col.child(
+                    div()
+                        .text_size(px(tokens::font::UI_SM))
+                        .text_color(color::text_muted(cx))
+                        .child(s),
+                ),
+                DetailLayout::List(items) => col.child(
+                    gpui_component::v_flex()
+                        .id("rcx-msg-detail")
+                        .max_h(px(140.))
+                        .overflow_y_scroll()
+                        .p(px(tokens::space::MD))
+                        .gap(px(tokens::space::XXS))
+                        .rounded(px(tokens::radius::MD))
+                        .border_1()
+                        .border_color(color::border(cx))
+                        .bg(color::panel_bg(cx))
+                        .children(items.into_iter().map(|item| {
+                            div()
+                                .text_size(px(tokens::font::UI_SM))
+                                .text_color(color::text_muted(cx))
+                                .child(item)
+                        })),
+                ),
+            })
+            .into_any_element()
+    }
+
     /// Open a one-button message box (info/warn/critical) through the `Root`
     /// overlay. The button just dismisses (the C++ `exec()` returns; callers that
     /// need the result use [`open_confirm`]).
     pub fn open_message(spec: MessageSpec, window: &mut Window, cx: &mut App) {
         let title = spec.title.clone();
         let text = spec.text.clone();
+        let detail = spec.detail.clone();
+        let severity = spec.severity;
         let ok_label = spec
             .buttons
             .first()
             .map(|b| b.label.clone())
             .unwrap_or_else(|| "OK".to_string());
-        window.open_alert_dialog(cx, move |alert, _window, _cx| {
+        window.open_alert_dialog(cx, move |alert, _window, cx| {
             alert
+                .icon(severity_icon(severity, cx))
                 .title(title.clone())
-                .description(text.clone())
+                .description(description_body(text.clone(), &detail, cx))
+                .width(px(MSG_MAX_WIDTH))
                 .button_props(DialogButtonProps::default().ok_text(ok_label.clone()))
         });
     }
@@ -340,12 +405,14 @@ mod open {
     {
         let title = spec.title.clone();
         let text = spec.text.clone();
+        let detail = spec.detail.clone();
+        let severity = spec.severity;
         // buttons = [Cancel, Accept]; read the accept (last) button.
         let accept = spec.buttons.last().cloned();
         let cancel = spec.buttons.first().cloned();
         let _focus_accept = spec.default == DefaultButton::Accept;
         let on_accept = std::rc::Rc::new(on_accept);
-        window.open_alert_dialog(cx, move |alert, _window, _cx| {
+        window.open_alert_dialog(cx, move |alert, _window, cx| {
             let ok_text = accept
                 .as_ref()
                 .map(|b| b.label.clone())
@@ -360,8 +427,10 @@ mod open {
                 .unwrap_or_else(|| "Cancel".to_string());
             let cb = on_accept.clone();
             alert
+                .icon(severity_icon(severity, cx))
                 .title(title.clone())
-                .description(text.clone())
+                .description(description_body(text.clone(), &detail, cx))
+                .width(px(MSG_MAX_WIDTH))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(ok_text)

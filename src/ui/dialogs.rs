@@ -89,6 +89,138 @@ impl DialogKind {
     }
 }
 
+// ── Shared Zed modal scaffolding (the reusable frame the dialogs build on) ────
+
+/// The reusable Zed-modal frame helpers — a centered elevated card with a header
+/// (title + optional close), a comfortable body, and a right-aligned footer
+/// button row. Every owned modal (`optionsdialog`, `gotoaddress`,
+/// `processpicker`, …) renders its body inside [`modal::frame`] so the chrome
+/// stays identical (and themeable via the shared [`design`](crate::ui::design)
+/// tokens).
+///
+/// Gated behind the `ui` feature (it pulls gpui / gpui-component).
+#[cfg(feature = "ui")]
+pub mod modal {
+    use crate::ui::design::{color, tokens};
+    use gpui::{
+        div, px, App, ClickEvent, Div, FontWeight, InteractiveElement as _, IntoElement,
+        ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled, Window,
+    };
+
+    /// The standard modal padding (`XL` = 16px) applied to header/body/footer.
+    pub const PAD: f32 = tokens::space::XL;
+
+    /// The elevated modal card shell: `elevated_bg`, 1px border, `XL` (8px)
+    /// radius, and a soft drop shadow (`.shadow_lg()`). Callers set their own
+    /// width/height and add the header/body/footer children. This is the
+    /// executable counterpart of zed_ui_spec §5.8.
+    pub fn card(cx: &App) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .bg(color::elevated_bg(cx))
+            .border_1()
+            .border_color(color::border(cx))
+            .rounded(px(tokens::radius::XL))
+            .shadow_lg()
+            .text_color(color::text(cx))
+            .overflow_hidden()
+    }
+
+    /// A modal header strip: the title (`UI_LG` semibold) on the left, with a 1px
+    /// bottom border. Callers that want a `×` close affordance add
+    /// [`close_button`] as a trailing child (the row already lays out with
+    /// `justify_between`).
+    pub fn header(title: impl Into<SharedString>, cx: &App) -> Div {
+        let title: SharedString = title.into();
+        gpui_component::h_flex()
+            .w_full()
+            .px(px(PAD))
+            .py(px(tokens::space::LG))
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(color::border(cx))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(tokens::font::UI_LG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color::text(cx))
+                    .child(title),
+            )
+    }
+
+    /// The header's `×` close button: a ghost square that lightens on hover.
+    /// `id` must be unique within the window (gpui interactivity).
+    pub fn close_button(
+        id: &'static str,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &App,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(tokens::radius::MD))
+            .text_size(px(tokens::font::UI_MD))
+            .text_color(color::text_muted(cx))
+            .hover(|s| s.bg(color::hover_overlay(cx)))
+            .cursor_pointer()
+            .on_click(on_click)
+            .child("\u{2715}")
+    }
+
+    /// The modal body container: comfortable `XL` padding, vertical stack with a
+    /// `LG` gap, and it grows to fill the card (`flex_1`). Callers add the
+    /// labelled rows / sections / controls.
+    pub fn body(cx: &App) -> Div {
+        let _ = cx;
+        gpui_component::v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p(px(PAD))
+            .gap(px(tokens::space::LG))
+    }
+
+    /// The footer button row: a 1px top border, `XL` horizontal / `LG` vertical
+    /// padding, right-aligned, with an `MD` gap between buttons. Convention
+    /// `{secondary…, primary}` left→right (the C++ `makeButtonRow`). Callers add
+    /// the gpui-component `Button`s as children.
+    pub fn footer(cx: &App) -> Div {
+        gpui_component::h_flex()
+            .w_full()
+            .px(px(PAD))
+            .py(px(tokens::space::LG))
+            .gap(px(tokens::space::MD))
+            .items_center()
+            .justify_end()
+            .border_t_1()
+            .border_color(color::border(cx))
+    }
+
+    /// A field label (the small left-of-control caption inside a settings row /
+    /// goto input): `UI_SM` muted, medium weight.
+    pub fn field_label(text: impl Into<SharedString>, cx: &App) -> Div {
+        div()
+            .text_size(px(tokens::font::UI_SM))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color::text_muted(cx))
+            .child(text.into())
+    }
+
+    /// A muted helper / description line (`UI_SM`, muted) under a control.
+    pub fn help_text(text: impl Into<SharedString>, cx: &App) -> Div {
+        div()
+            .text_size(px(tokens::font::UI_SM))
+            .text_color(color::text_muted(cx))
+            .child(text.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

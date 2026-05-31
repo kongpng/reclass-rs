@@ -23,11 +23,10 @@
 //!
 //! Gated behind the `ui` feature.
 
+use crate::ui::design::{color, tokens};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
-use gpui_component::ActiveTheme;
 
 /// The five start-page action cards (`drawCards`, `startpage.h`) — the order is
 /// load-bearing for parity (card index → action; `hitTest` cards 0..4).
@@ -85,6 +84,31 @@ impl StartCard {
             StartCard::ImportSource => "card-import-source",
             StartCard::ImportXml => "card-import-xml",
             StartCard::ImportPdb => "card-import-pdb",
+        }
+    }
+
+    /// The leading glyph shown in the card's icon tile. SVG assets are not yet
+    /// wired (see `titlebar::source_icon`), so — like the rest of the chrome — we
+    /// stand in with a themeable unicode glyph that mirrors the C++ card icons
+    /// (`symbol-structure` / `folder-opened` / `file-binary` / `code` / `debug`).
+    fn glyph(self) -> &'static str {
+        match self {
+            StartCard::NewClass => "\u{25A4}",          // ▤ struct/class
+            StartCard::OpenProject => "\u{1F5C1}",      // 🗁 open folder
+            StartCard::ImportSource => "\u{1F5CE}",     // 🗎 source file
+            StartCard::ImportXml => "\u{2039}\u{203A}", // ‹› markup
+            StartCard::ImportPdb => "\u{25A3}",         // ▣ symbols
+        }
+    }
+
+    /// The right-aligned keybinding hint shown for the card (Zed's welcome tab
+    /// lists the conventional shortcut next to each primary action). `None` for
+    /// the import actions, which the C++ reached via menus only.
+    fn shortcut(self) -> Option<&'static str> {
+        match self {
+            StartCard::NewClass => Some("Ctrl N"),
+            StartCard::OpenProject => Some("Ctrl O"),
+            _ => None,
         }
     }
 }
@@ -263,102 +287,155 @@ impl StartPage {
         cx.emit(StartPageEvent::Dismissed);
     }
 
-    /// Render one action card (`drawCards`): title + dim description, hover fill +
-    /// a left accent bar (the C++ "3px accent left bar").
+    /// Render one action row (`drawCards`) as a Zed welcome-list row: a tinted
+    /// leading icon tile, a bold title over a muted subtitle, and a right-aligned
+    /// keybinding hint where one applies. The whole row is the click target, with
+    /// a hover-overlay lift and a soft-accent rounded surface (no hard fill, no
+    /// loud left bar — content leads, chrome recedes).
     fn render_card(&self, card: StartCard, cx: &mut Context<Self>) -> impl IntoElement {
-        // A clickable, CONTENT-SIZED card. A gpui-component `Button` clamps its
-        // content to a single row height, which clipped the two-line
-        // title+description into an overlap — so this is a plain interactive div
-        // that grows to fit both lines.
+        let accent = color::accent(cx);
+        // The icon tile: a low-alpha tint of the accent behind the glyph — Zed's
+        // restrained "content-forward" badge, not a saturated fill.
+        let mut tile_bg = accent;
+        tile_bg.a = 0.12;
+
         div()
             .id(card.id())
             .w_full()
             .cursor_pointer()
-            .rounded_md()
-            .hover(|s| s.bg(hsla(0., 0., 1., 0.06)))
+            .rounded(px(tokens::radius::LG))
+            .hover(|s| s.bg(color::hover_overlay(cx)))
             .on_click(cx.listener(move |_this, _e, _window, cx| {
                 cx.emit(StartPageEvent::Card(card));
             }))
             .child(
                 gpui_component::h_flex()
                     .w_full()
-                    .gap_3()
-                    .items_start()
-                    .py_2()
-                    .px_3()
-                    .border_l_2()
-                    .border_color(cx.theme().accent)
+                    .gap(px(tokens::space::LG))
+                    .items_center()
+                    .py(px(tokens::space::MD))
+                    .px(px(tokens::space::MD))
+                    .child(
+                        // Leading icon tile.
+                        div()
+                            .flex_none()
+                            .size(px(34.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(tokens::radius::MD))
+                            .bg(tile_bg)
+                            .text_color(accent)
+                            .text_size(px(tokens::font::UI_LG))
+                            .child(card.glyph()),
+                    )
                     .child(
                         gpui_component::v_flex()
-                            .gap_0p5()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(tokens::space::XXS))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(cx.theme().foreground)
+                                    .text_size(px(tokens::font::UI_MD))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(color::text(cx))
                                     .child(card.title()),
                             )
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_size(px(tokens::font::UI_SM))
+                                    .text_color(color::text_muted(cx))
                                     .child(card.description()),
                             ),
-                    ),
+                    )
+                    .when_some(card.shortcut(), |row, keys| row.child(key_cap(keys, cx))),
             )
     }
 
     /// Render the recent-files list: the date-bucketed groups + a row per entry
     /// (`drawFileList`): file name + dim dir path; clicking a row selects the file.
+    /// Section captions use [`design::section_label`]; each row is a
+    /// [`design::zed_list_row`] with a leading glyph, the file name, and the
+    /// middle-elided dir path muted alongside it.
     fn render_recent(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let groups = build_groups(&self.entries, &self.filter(cx));
 
-        let mut col = gpui_component::v_flex().w_full().gap_2();
+        let mut col = gpui_component::v_flex().w_full().gap(px(tokens::space::XS));
 
         if groups.is_empty() {
+            // The empty state — a quiet, centered hint (Zed's "no items yet" feel),
+            // not a bare left-aligned line.
             col = col.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("No recent files"),
+                gpui_component::v_flex()
+                    .w_full()
+                    .py(px(tokens::space::XXL))
+                    .gap(px(tokens::space::XS))
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(tokens::font::UI_MD))
+                            .text_color(color::text_muted(cx))
+                            .child(if self.filter(cx).trim().is_empty() {
+                                "No recent files"
+                            } else {
+                                "No matching files"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text_disabled(cx))
+                            .child("Open a project to see it here"),
+                    ),
             );
             return col;
         }
 
         for group in groups {
-            // Section header (the collapsible group label; we render it static).
-            col = col.child(
-                div()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(group.bucket.label().to_uppercase()),
-            );
+            // Section header (the collapsible group label; rendered static here —
+            // the C++ expand/collapse toggle isn't part of the welcome restyle).
+            col = col.child(crate::ui::design::section_label(group.bucket.label(), cx));
             for entry in group.entries {
                 let path = entry.path.clone();
+                let glyph = if entry.is_example {
+                    "\u{1F4D6}" // 📖 example/book
+                } else {
+                    "\u{25A4}" // ▤ struct/class
+                };
                 col = col.child(
-                    Button::new(SharedString::from(format!("recent-{}", entry.path)))
-                        .ghost()
-                        .w_full()
-                        .on_click(cx.listener(move |_this, _e, _window, cx| {
-                            cx.emit(StartPageEvent::FileSelected(path.clone()));
-                        }))
-                        .child(
-                            gpui_component::h_flex()
-                                .w_full()
-                                .gap_2()
-                                .items_baseline()
-                                .child(
-                                    div()
-                                        .text_color(cx.theme().foreground)
-                                        .child(entry.file_name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(entry.dir_path.clone()),
-                                ),
-                        ),
+                    crate::ui::design::zed_list_row(
+                        SharedString::from(format!("recent-{}", entry.path)),
+                        false,
+                        cx,
+                    )
+                    .h(px(30.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_this, _e, _window, cx| {
+                        cx.emit(StartPageEvent::FileSelected(path.clone()));
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text_muted(cx))
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(tokens::font::UI_MD))
+                            .text_color(color::text(cx))
+                            .child(entry.file_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text_muted(cx))
+                            .child(entry.dir_path.clone()),
+                    ),
                 );
             }
         }
@@ -376,14 +453,15 @@ impl EventEmitter<StartPageEvent> for StartPage {}
 
 impl Render for StartPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Left column = title + recent list; right column = action cards (the C++
-        // "Open recent" left, cards right).
         let recent = self.render_recent(cx);
         let cards: Vec<_> = StartCard::ALL
             .iter()
             .map(|c| self.render_card(*c, cx).into_any_element())
             .collect();
 
+        // The welcome surface: a full-window content-bg backdrop, with a single
+        // centered, comfortably-proportioned column (Zed's welcome tab) — a brand
+        // header, the action list, then the recent-files block under a divider.
         div()
             .id("rcx-start-page")
             .track_focus(&self.focus_handle)
@@ -392,54 +470,93 @@ impl Render for StartPage {
             .absolute()
             .inset_0()
             .size_full()
-            .bg(cx.theme().background)
+            .bg(color::content_bg(cx))
             .flex()
-            .flex_row()
+            .flex_col()
+            .items_center()
             .justify_center()
-            .p_8()
-            .gap_16()
+            .p(px(tokens::space::XXL))
             .child(
-                // Left: title + search + recent files.
                 gpui_component::v_flex()
                     .w(px(560.))
-                    .gap_4()
-                    .min_w_0()
+                    .max_w_full()
+                    .gap(px(tokens::space::XXL))
+                    // ── Brand header ──
                     .child(
-                        div()
-                            .text_3xl()
-                            .text_color(cx.theme().foreground)
-                            .child("Reclass"),
+                        gpui_component::v_flex()
+                            .gap(px(tokens::space::XS))
+                            .child(
+                                div()
+                                    .text_size(px(32.))
+                                    .font_weight(FontWeight::LIGHT)
+                                    .text_color(color::text(cx))
+                                    .child("Reclass"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens::font::UI_MD))
+                                    .text_color(color::text_muted(cx))
+                                    .child("A faithful struct-layout editor"),
+                            ),
                     )
+                    // ── Get started ──
                     .child(
-                        div()
-                            .text_lg()
-                            .text_color(cx.theme().foreground)
-                            .child("Open recent"),
+                        gpui_component::v_flex()
+                            .gap(px(tokens::space::MD))
+                            .child(crate::ui::design::section_label("Get started", cx))
+                            .child(
+                                gpui_component::v_flex()
+                                    .gap(px(tokens::space::XXS))
+                                    .children(cards),
+                            )
+                            .child(
+                                // The "Tutorial →" link (the C++ centered tutorial
+                                // link); link target wired with the help workflow.
+                                div()
+                                    .id("start-tutorial")
+                                    .cursor_pointer()
+                                    .self_start()
+                                    .px(px(tokens::space::MD))
+                                    .pt(px(tokens::space::XS))
+                                    .text_size(px(tokens::font::UI_SM))
+                                    .text_color(color::link(cx))
+                                    .hover(|s| s.underline())
+                                    .child("Tutorial \u{2192}"),
+                            ),
                     )
-                    .child(Input::new(&self.search).w(px(330.)))
-                    .child(recent),
-            )
-            .child(
-                // Right: the action cards.
-                gpui_component::v_flex()
-                    .w(px(340.))
-                    .gap_2()
+                    // ── Open recent ──
                     .child(
-                        div()
-                            .text_lg()
-                            .text_color(cx.theme().foreground)
-                            .child("Get started"),
-                    )
-                    .children(cards)
-                    .child(
-                        // The "Tutorial →" link (the C++ centered tutorial link).
-                        Button::new("start-tutorial")
-                            .ghost()
-                            .label("Tutorial \u{2192}")
-                            .when(false, |b| b), // link target wired with the help workflow
+                        gpui_component::v_flex()
+                            .gap(px(tokens::space::MD))
+                            .child(
+                                gpui_component::h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(tokens::space::MD))
+                                    .child(crate::ui::design::section_label("Open recent", cx))
+                                    .child(Input::new(&self.search).w(px(220.))),
+                            )
+                            .child(recent),
                     ),
             )
     }
+}
+
+/// A right-aligned key-cap chip (the keybinding hint on a welcome action row):
+/// a small `SM`-radius outlined pill in `UI_XS` muted text — the shared spec's
+/// key-cap recipe (`zed_ui_spec.md` §6 "Key-cap chip").
+fn key_cap(keys: &str, cx: &gpui::App) -> impl IntoElement {
+    div()
+        .flex_none()
+        .px(px(tokens::space::SM))
+        .py(px(tokens::space::XXS))
+        .rounded(px(tokens::radius::SM))
+        .border_1()
+        .border_color(color::border(cx))
+        .text_size(px(tokens::font::UI_XS))
+        .text_color(color::text_muted(cx))
+        .child(SharedString::from(keys.to_string()))
 }
 
 #[cfg(test)]

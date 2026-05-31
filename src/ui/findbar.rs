@@ -172,6 +172,7 @@ pub use view::{find_bar_key_bindings, FindBar, FindEvent};
 #[cfg(feature = "ui")]
 mod view {
     use super::{FindMatch, FindState};
+    use crate::ui::design::{color, tokens};
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
     use gpui_component::ActiveTheme;
@@ -275,8 +276,10 @@ mod view {
     impl Render for FindBar {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::button::{Button, ButtonVariants as _};
+            use gpui_component::{IconName, Sizable as _};
             let count = self.state.match_count();
             let ordinal = self.state.current_ordinal();
+            let no_results = !self.state.query().is_empty() && count == 0;
             let readout = if self.state.query().is_empty() {
                 String::new()
             } else if count == 0 {
@@ -284,7 +287,14 @@ mod view {
             } else {
                 format!("{ordinal} of {count}")
             };
+            let readout_color = if no_results {
+                cx.theme().danger
+            } else {
+                color::text_muted(cx)
+            };
 
+            // A compact Zed inline search bar: an elevated rounded pill holding the
+            // input, the match-count readout, prev/next nav, and a close button.
             gpui_component::h_flex()
                 .id("rcx-find-bar")
                 .track_focus(&self.focus_handle)
@@ -292,28 +302,45 @@ mod view {
                 .on_action(cx.listener(Self::on_next))
                 .on_action(cx.listener(Self::on_prev))
                 .on_action(cx.listener(Self::on_close))
-                .gap_1()
-                .p_1()
-                .bg(cx.theme().background)
+                .gap(px(tokens::space::XS))
+                .px(px(tokens::space::MD))
+                .py(px(tokens::space::SM))
+                .items_center()
+                .bg(color::elevated_bg(cx))
                 .border_b_1()
-                .border_color(cx.theme().border)
-                .child(Input::new(&self.input).w(px(220.)))
+                .border_color(color::border(cx))
+                .shadow_md()
+                .child(Input::new(&self.input).small().w(px(240.)))
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .min_w(px(64.))
+                        .text_size(px(tokens::font::UI_SM))
+                        .text_color(readout_color)
                         .child(readout),
                 )
-                .child(Button::new("find-prev").ghost().label("\u{25C0}").on_click(
-                    cx.listener(|this, _e, window, cx| this.on_prev(&FindPrev, window, cx)),
-                ))
-                .child(Button::new("find-next").ghost().label("\u{25B6}").on_click(
-                    cx.listener(|this, _e, window, cx| this.on_next(&FindNext, window, cx)),
-                ))
+                .child(
+                    Button::new("find-prev")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ChevronUp)
+                        .on_click(
+                            cx.listener(|this, _e, window, cx| this.on_prev(&FindPrev, window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("find-next")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ChevronDown)
+                        .on_click(
+                            cx.listener(|this, _e, window, cx| this.on_next(&FindNext, window, cx)),
+                        ),
+                )
                 .child(
                     Button::new("find-close")
                         .ghost()
-                        .label("\u{2715}")
+                        .small()
+                        .icon(IconName::Close)
                         .on_click(cx.listener(|this, _e, window, cx| {
                             this.on_close(&FindClose, window, cx)
                         })),

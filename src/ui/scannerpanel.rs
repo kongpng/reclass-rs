@@ -495,18 +495,22 @@ mod view {
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::button::{Button, ButtonVariants as _};
+    use gpui_component::checkbox::Checkbox;
     use gpui_component::dock::{Panel, PanelEvent};
     use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::popover::Popover;
     use gpui_component::table::{
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
-    use gpui_component::{ActiveTheme, Sizable as _};
+    use gpui_component::{Disableable as _, Sizable as _};
 
     use super::{
         filter_rows, split_address_dim, value_type_entries, CondEntry, ScanRow, ScannerForm,
+        FAST_SCAN_ALIGNMENTS,
     };
     use crate::provider::Provider;
     use crate::scanner::{run_scan, NullObserver, ScanResult, ValueType};
+    use crate::ui::design::{color, tokens};
 
     /// A "go to this address" request raised when a result row is activated
     /// (double-click / Enter) — the C++ `goToAddress(uint64_t)` signal. The window
@@ -545,8 +549,8 @@ mod view {
 
         fn column(&self, col_ix: usize, _cx: &App) -> Column {
             match col_ix {
-                COL_VALUE => Column::new("value", "Value").width(px(160.)).sortable(),
-                _ => Column::new("address", "Address").width(px(170.)).sortable(),
+                COL_VALUE => Column::new("value", "Value").width(px(220.)).sortable(),
+                _ => Column::new("address", "Address").width(px(176.)).sortable(),
             }
         }
 
@@ -578,26 +582,33 @@ mod view {
                 return div();
             };
             if col_ix == COL_ADDRESS {
-                // Dim the leading-zero prefix, bright the rest (AddressDelegate).
+                // Dim the leading-zero prefix, bright the rest (AddressDelegate):
+                // the C++ `AddressDelegate` paints the leading-zero high bytes in
+                // a faint color so the significant address digits read first.
                 let (dim, bright) = split_address_dim(&row.address_text);
-                div().font_family("monospace").child(
-                    div()
-                        .flex()
-                        .child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(dim.to_string()),
-                        )
-                        .child(
-                            div()
-                                .text_color(cx.theme().foreground)
-                                .child(bright.to_string()),
-                        ),
-                )
-            } else {
                 div()
-                    .font_family("monospace")
-                    .text_color(cx.theme().foreground)
+                    .font_family(tokens::font::MONO_FAMILY)
+                    .text_size(px(tokens::font::EDITOR_SIZE))
+                    .child(
+                        div()
+                            .flex()
+                            .child(
+                                div()
+                                    .text_color(color::text_muted(cx))
+                                    .child(dim.to_string()),
+                            )
+                            .child(div().text_color(color::text(cx)).child(bright.to_string())),
+                    )
+            } else {
+                // Numeric / hex value column: monospace, right-aligned so digits
+                // line up the way the original scanner table presents them.
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .font_family(tokens::font::MONO_FAMILY)
+                    .text_size(px(tokens::font::EDITOR_SIZE))
+                    .text_color(color::text(cx))
                     .child(row.value_text.clone())
             }
         }
@@ -633,6 +644,14 @@ mod view {
         all_rows: Vec<ScanRow>,
         provider: Option<Arc<dyn Provider + Send + Sync>>,
         status: String,
+        /// The currently-selected result row (drives the footer goto/copy
+        /// buttons), tracked from [`TableEvent::SelectRow`].
+        selected_row: Option<usize>,
+        /// Controlled-open state for the toolbar dropdown popovers (condition /
+        /// value-type / fast-scan), so picking an item dismisses the popover.
+        cond_open: bool,
+        type_open: bool,
+        align_open: bool,
         focus_handle: FocusHandle,
         _subs: Vec<Subscription>,
     }
@@ -673,20 +692,28 @@ mod view {
                     }
                 }),
             );
-            // Forward row activations as goto requests (the C++ onResultDoubleClicked).
-            subs.push(cx.subscribe(&table, |_this, table, ev: &TableEvent, cx| {
-                if let TableEvent::DoubleClickedRow(row_ix) = ev {
-                    let addr = table
-                        .read(cx)
-                        .delegate()
-                        .rows
-                        .get(*row_ix)
-                        .map(|r| r.address);
-                    if let Some(address) = addr {
-                        cx.emit(ScannerNav { address });
+            // Track row selection (for the footer goto/copy buttons) and forward
+            // row activations as goto requests (the C++ onResultDoubleClicked).
+            subs.push(
+                cx.subscribe(&table, |this, table, ev: &TableEvent, cx| match ev {
+                    TableEvent::SelectRow(row_ix) => {
+                        this.selected_row = Some(*row_ix);
+                        cx.notify();
                     }
-                }
-            }));
+                    TableEvent::DoubleClickedRow(row_ix) => {
+                        let addr = table
+                            .read(cx)
+                            .delegate()
+                            .rows
+                            .get(*row_ix)
+                            .map(|r| r.address);
+                        if let Some(address) = addr {
+                            cx.emit(ScannerNav { address });
+                        }
+                    }
+                    _ => {}
+                }),
+            );
 
             ScannerPanel {
                 form: ScannerForm::new(),
@@ -697,6 +724,10 @@ mod view {
                 all_rows: Vec::new(),
                 provider: None,
                 status: String::new(),
+                selected_row: None,
+                cond_open: false,
+                type_open: false,
+                align_open: false,
                 focus_handle: cx.focus_handle(),
                 _subs: subs,
             }
@@ -723,15 +754,39 @@ mod view {
             &self.status
         }
 
-        /// Pick a value type from the dropdown.
+        /// Pick a value type from the dropdown (dismisses the popover).
         fn set_value_type(&mut self, vt: ValueType, cx: &mut Context<Self>) {
             self.form.value_type = vt;
+            self.type_open = false;
             cx.notify();
         }
 
-        /// Pick a condition entry from the dropdown.
+        /// Pick a condition entry from the dropdown (dismisses the popover).
         fn set_condition(&mut self, c: CondEntry, cx: &mut Context<Self>) {
             self.form.condition = c;
+            self.cond_open = false;
+            cx.notify();
+        }
+
+        /// Pick a fast-scan (alignment) stride from the dropdown.
+        fn set_alignment(&mut self, a: i32, cx: &mut Context<Self>) {
+            self.form.alignment = a;
+            self.align_open = false;
+            cx.notify();
+        }
+
+        /// Toggle a filter checkbox (the C++ filter checkboxes feeding
+        /// `buildRequest`).
+        fn toggle_executable(&mut self, on: bool, cx: &mut Context<Self>) {
+            self.form.filter_executable = on;
+            cx.notify();
+        }
+        fn toggle_writable(&mut self, on: bool, cx: &mut Context<Self>) {
+            self.form.filter_writable = on;
+            cx.notify();
+        }
+        fn toggle_struct_only(&mut self, on: bool, cx: &mut Context<Self>) {
+            self.form.struct_only = on;
             cx.notify();
         }
 
@@ -757,7 +812,13 @@ mod view {
                         .iter()
                         .map(|r| ScanRow::from_result(&self.form, r))
                         .collect();
-                    self.status = format!("{} results", self.all_rows.len());
+                    self.selected_row = None;
+                    let n = self.all_rows.len();
+                    self.status = if n == 1 {
+                        "1 result".to_string()
+                    } else {
+                        format!("{n} results")
+                    };
                     self.refresh_table(cx);
                 }
             }
@@ -768,8 +829,39 @@ mod view {
         fn reset(&mut self, cx: &mut Context<Self>) {
             self.all_rows.clear();
             self.status.clear();
+            self.selected_row = None;
             self.refresh_table(cx);
             cx.notify();
+        }
+
+        /// The address of the currently-selected result row, if any (drives the
+        /// footer goto/copy buttons).
+        fn selected_address(&self, cx: &App) -> Option<u64> {
+            let ix = self.selected_row?;
+            self.table
+                .read(cx)
+                .delegate()
+                .rows
+                .get(ix)
+                .map(|r| r.address)
+        }
+
+        /// "Go to Address" footer button — raise a [`ScannerNav`] for the selected
+        /// row (the C++ `goToAddress` signal), same as a double-click.
+        fn go_to_selected(&mut self, cx: &mut Context<Self>) {
+            if let Some(address) = self.selected_address(cx) {
+                cx.emit(ScannerNav { address });
+            }
+        }
+
+        /// "Copy Address" footer button — copy the selected row's address to the
+        /// clipboard as `0x...` (the C++ copy-address context action).
+        fn copy_selected(&mut self, cx: &mut Context<Self>) {
+            if let Some(address) = self.selected_address(cx) {
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{address:X}")));
+                self.status = format!("Copied 0x{address:X}");
+                cx.notify();
+            }
         }
 
         /// The current post-scan filter text.
@@ -796,31 +888,60 @@ mod view {
             });
         }
 
-        /// The value-type dropdown (gpui-component Button + a simple popup of
-        /// labels is overkill here; render as inline ghost buttons row would be
-        /// noisy — instead a compact label showing the current type, which the
-        /// window's options/picker can drive). For now a button cycling forward
-        /// keeps the control keyboard-reachable and faithful to "pick a type".
-        fn cycle_value_type(&mut self, cx: &mut Context<Self>) {
-            let entries = value_type_entries();
-            let cur = entries
+        /// The currently-selected condition entry's display label.
+        fn cond_label(&self) -> &'static str {
+            CondEntry::entries()
                 .iter()
-                .position(|(vt, _)| *vt == self.form.value_type)
-                .unwrap_or(0);
-            let next = (cur + 1) % entries.len();
-            self.set_value_type(entries[next].0, cx);
+                .find(|(c, _)| *c == self.form.condition)
+                .map(|(_, n)| *n)
+                .unwrap_or("Exact Value")
         }
 
-        /// Cycle the condition forward (compact control, keyboard-reachable).
-        fn cycle_condition(&mut self, cx: &mut Context<Self>) {
-            let entries = CondEntry::entries();
-            let cur = entries
+        /// The currently-selected value-type display label.
+        fn type_label(&self) -> &'static str {
+            value_type_entries()
                 .iter()
-                .position(|(c, _)| *c == self.form.condition)
-                .unwrap_or(0);
-            let next = (cur + 1) % entries.len();
-            self.set_condition(entries[next].0, cx);
+                .find(|(vt, _)| *vt == self.form.value_type)
+                .map(|(_, n)| *n)
+                .unwrap_or("int32")
         }
+    }
+
+    /// A compact Zed dropdown popover row: a clickable inset row inside the
+    /// elevated popover surface, with the soft-accent fill on the current pick.
+    fn dropdown_row(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        selected: bool,
+        cx: &App,
+    ) -> Stateful<Div> {
+        let label: SharedString = label.into();
+        gpui_component::h_flex()
+            .id(id)
+            .w_full()
+            .h(px(24.))
+            .px(px(tokens::space::MD))
+            .items_center()
+            .rounded(px(tokens::radius::MD))
+            .text_size(px(tokens::font::UI_MD))
+            .text_color(color::text(cx))
+            .when(selected, |r| r.bg(color::selected_bg(cx)))
+            .when(!selected, |r| r.hover(|s| s.bg(color::hover_overlay(cx))))
+            .child(label)
+    }
+
+    /// The elevated container the dropdown popovers drop into (the §5.10 menu
+    /// surface: `elevated_bg`, 1px border, 6px radius, soft shadow).
+    fn dropdown_menu(cx: &App) -> Div {
+        gpui_component::v_flex()
+            .min_w(px(140.))
+            .p(px(tokens::space::XS))
+            .gap(px(1.))
+            .bg(color::elevated_bg(cx))
+            .border_1()
+            .border_color(color::border(cx))
+            .rounded(px(tokens::radius::LG))
+            .shadow_md()
     }
 
     impl Panel for ScannerPanel {
@@ -842,114 +963,300 @@ mod view {
         }
     }
 
+    /// A compact Zed dropdown trigger: an outline button showing the current pick
+    /// with a trailing chevron, sitting in the toolbar like the reclass scan-type
+    /// / type / scan combos. Built on a gpui-component `Button` (which is
+    /// `Selectable` — the bound `Popover::trigger` requires) so it inherits the
+    /// themed control look + the open/selected highlight.
+    fn dropdown_trigger(id: impl Into<SharedString>, text: impl Into<SharedString>) -> Button {
+        let id: SharedString = id.into();
+        let text: SharedString = text.into();
+        Button::new(SharedString::from(format!("scanner-trig-{id}")))
+            .outline()
+            .small()
+            .label(format!("{text}  ▾"))
+    }
+
     impl Render for ScannerPanel {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let vis = self.form.field_visibility();
-            let scanning = false; // synchronous scan; no in-flight state yet.
+            let has_results = !self.all_rows.is_empty();
+            let has_selection = self.selected_row.is_some();
+            let cur_cond = self.form.condition;
+            let cur_type = self.form.value_type;
+            let cur_align = self.form.alignment.max(1);
 
-            // Current condition + type labels for the compact pickers.
-            let cond_label = CondEntry::entries()
-                .iter()
-                .find(|(c, _)| *c == self.form.condition)
-                .map(|(_, n)| *n)
-                .unwrap_or("Exact Value");
-            let type_label = value_type_entries()
-                .iter()
-                .find(|(vt, _)| *vt == self.form.value_type)
-                .map(|(_, n)| *n)
-                .unwrap_or("int32");
+            // A weak handle to self so the popover content (which renders in the
+            // PopoverState context) can drive the panel reducer on a pick.
+            let panel = cx.entity().downgrade();
+
+            // ── Condition dropdown (the C++ scan-type / condition combo) ──
+            let cond_popover = Popover::new("scanner-cond-pop")
+                .anchor(Anchor::TopLeft)
+                .open(self.cond_open)
+                .on_open_change(cx.listener(|this, open: &bool, _w, cx| {
+                    this.cond_open = *open;
+                    cx.notify();
+                }))
+                .trigger(dropdown_trigger("cond", self.cond_label()))
+                .content({
+                    let panel = panel.clone();
+                    move |_state, _window, cx| {
+                        let mut menu = dropdown_menu(cx);
+                        for (i, (entry, name)) in CondEntry::entries().iter().enumerate() {
+                            let entry = *entry;
+                            let panel = panel.clone();
+                            menu = menu.child(
+                                dropdown_row(("cond-row", i), *name, entry == cur_cond, cx)
+                                    .on_click(move |_e, _w, cx| {
+                                        panel
+                                            .update(cx, |this, cx| this.set_condition(entry, cx))
+                                            .ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    }
+                });
+
+            // ── Value-type dropdown (value mode only) ──
+            let type_popover = Popover::new("scanner-type-pop")
+                .anchor(Anchor::TopLeft)
+                .open(self.type_open)
+                .on_open_change(cx.listener(|this, open: &bool, _w, cx| {
+                    this.type_open = *open;
+                    cx.notify();
+                }))
+                .trigger(dropdown_trigger(
+                    "type",
+                    format!("Type: {}", self.type_label()),
+                ))
+                .content({
+                    let panel = panel.clone();
+                    move |_state, _window, cx| {
+                        let mut menu = dropdown_menu(cx);
+                        for (i, (vt, name)) in value_type_entries().iter().enumerate() {
+                            let vt = *vt;
+                            let panel = panel.clone();
+                            menu = menu.child(
+                                dropdown_row(("type-row", i), *name, vt == cur_type, cx).on_click(
+                                    move |_e, _w, cx| {
+                                        panel
+                                            .update(cx, |this, cx| this.set_value_type(vt, cx))
+                                            .ok();
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    }
+                });
+
+            // ── Fast-Scan (alignment) dropdown (value mode only) ──
+            let align_popover = Popover::new("scanner-align-pop")
+                .anchor(Anchor::TopLeft)
+                .open(self.align_open)
+                .on_open_change(cx.listener(|this, open: &bool, _w, cx| {
+                    this.align_open = *open;
+                    cx.notify();
+                }))
+                .trigger(dropdown_trigger("align", format!("Align: {cur_align}")))
+                .content({
+                    let panel = panel.clone();
+                    move |_state, _window, cx| {
+                        let mut menu = dropdown_menu(cx);
+                        for (i, a) in FAST_SCAN_ALIGNMENTS.iter().enumerate() {
+                            let a = *a;
+                            let panel = panel.clone();
+                            menu = menu.child(
+                                dropdown_row(("align-row", i), a.to_string(), a == cur_align, cx)
+                                    .on_click(move |_e, _w, cx| {
+                                        panel.update(cx, |this, cx| this.set_alignment(a, cx)).ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    }
+                });
+
+            // ── Status line: muted "N results" / "Copied ..." ──
+            let status_text = if self.status.is_empty() {
+                if has_results {
+                    String::new()
+                } else {
+                    "No results".to_string()
+                }
+            } else {
+                self.status.clone()
+            };
 
             gpui_component::v_flex()
                 .id("rcx-scanner-panel")
                 .track_focus(&self.focus_handle)
                 .size_full()
-                .bg(cx.theme().background)
+                .bg(color::panel_bg(cx))
+                .text_color(color::text(cx))
+                // ── Panel header (uppercase muted title strip) ──
+                .child(crate::ui::design::panel_header("Scanner", cx))
                 .child(
-                    // ── Search controls ──
+                    // ── Search controls cluster ──
                     gpui_component::v_flex()
-                        .gap_1p5()
-                        .p_2()
+                        .gap(px(tokens::space::MD))
+                        .p(px(tokens::space::LG))
+                        // Row 1: scan-type / value-type / alignment dropdowns.
                         .child(
                             gpui_component::h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("scanner-cond")
-                                        .ghost()
-                                        .label(format!("Condition: {cond_label}"))
-                                        .on_click(
-                                            cx.listener(|this, _e, _w, cx| {
-                                                this.cycle_condition(cx)
-                                            }),
-                                        ),
-                                )
-                                .when(vis.type_enabled, |row| {
-                                    row.child(
-                                        Button::new("scanner-type")
-                                            .ghost()
-                                            .label(format!("Type: {type_label}"))
-                                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                                this.cycle_value_type(cx)
-                                            })),
-                                    )
-                                }),
+                                .gap(px(tokens::space::MD))
+                                .flex_wrap()
+                                .items_center()
+                                .child(cond_popover)
+                                .when(vis.type_enabled, |row| row.child(type_popover))
+                                .when(vis.type_enabled, |row| row.child(align_popover)),
                         )
+                        // Row 2: Pattern:/Value: label + compact input(s).
                         .child(
                             gpui_component::h_flex()
-                                .gap_2()
+                                .gap(px(tokens::space::MD))
                                 .items_center()
                                 .child(
                                     div()
-                                        .w(px(64.))
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
+                                        .w(px(56.))
+                                        .flex_none()
+                                        .text_size(px(tokens::font::UI_SM))
+                                        .text_color(color::text_muted(cx))
                                         .child(vis.value_label),
                                 )
                                 .when(vis.value_visible || vis.pattern_visible, |row| {
                                     row.child(
                                         Input::new(&self.value_input)
+                                            .small()
                                             .when(!vis.value_enabled, |i| i.disabled(true))
                                             .flex_1(),
                                     )
                                 })
                                 .when(vis.value2_visible, |row| {
-                                    row.child(Input::new(&self.value2_input).flex_1())
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(tokens::font::UI_SM))
+                                            .text_color(color::text_muted(cx))
+                                            .child(".."),
+                                    )
+                                    .child(Input::new(&self.value2_input).small().flex_1())
                                 }),
                         )
+                        // Row 3: filter checkboxes (Executable / Writable / Current Struct).
                         .child(
                             gpui_component::h_flex()
-                                .gap_2()
+                                .gap(px(tokens::space::LG))
+                                .items_center()
+                                .child(
+                                    Checkbox::new("scanner-exec")
+                                        .label("Executable")
+                                        .checked(self.form.filter_executable)
+                                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                            this.toggle_executable(*on, cx)
+                                        })),
+                                )
+                                .child(
+                                    Checkbox::new("scanner-write")
+                                        .label("Writable")
+                                        .checked(self.form.filter_writable)
+                                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                            this.toggle_writable(*on, cx)
+                                        })),
+                                )
+                                .child(
+                                    Checkbox::new("scanner-struct")
+                                        .label("Current Struct")
+                                        .checked(self.form.struct_only)
+                                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                            this.toggle_struct_only(*on, cx)
+                                        })),
+                                ),
+                        )
+                        // Row 4: primary Scan + secondary Re-scan + Reset.
+                        .child(
+                            gpui_component::h_flex()
+                                .gap(px(tokens::space::MD))
+                                .items_center()
                                 .child(
                                     Button::new("scanner-scan")
                                         .primary()
-                                        .label(if scanning { "Cancel" } else { "First Scan" })
+                                        .small()
+                                        .label("⌕  Scan")
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| this.run_scan(cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("scanner-rescan")
+                                        .small()
+                                        .label("↻  Re-scan")
+                                        .disabled(!has_results)
                                         .on_click(
                                             cx.listener(|this, _e, _w, cx| this.run_scan(cx)),
                                         ),
                                 )
                                 .child(
                                     Button::new("scanner-reset")
+                                        .ghost()
+                                        .small()
                                         .label("Reset")
                                         .on_click(cx.listener(|this, _e, _w, cx| this.reset(cx))),
                                 ),
-                        )
-                        .child(Input::new(&self.filter_input).w_full())
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if self.status.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    self.status.clone()
-                                }),
                         ),
                 )
+                // ── Post-scan filter + status ──
                 .child(
-                    // ── Results table ──
+                    gpui_component::h_flex()
+                        .px(px(tokens::space::LG))
+                        .pb(px(tokens::space::MD))
+                        .gap(px(tokens::space::MD))
+                        .items_center()
+                        .child(Input::new(&self.filter_input).small().flex_1())
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(tokens::font::UI_SM))
+                                .text_color(color::text_muted(cx))
+                                .child(status_text),
+                        ),
+                )
+                // ── Results table (virtualized) ──
+                .child(
                     div()
                         .flex_1()
                         .min_h_0()
+                        .border_t_1()
+                        .border_color(color::border(cx))
                         .child(DataTable::new(&self.table).bordered(false).small()),
+                )
+                // ── Footer: Go to Address + Copy Address ──
+                .child(
+                    gpui_component::h_flex()
+                        .w_full()
+                        .px(px(tokens::space::LG))
+                        .py(px(tokens::space::MD))
+                        .gap(px(tokens::space::MD))
+                        .justify_end()
+                        .border_t_1()
+                        .border_color(color::border(cx))
+                        .bg(color::panel_bg(cx))
+                        .child(
+                            Button::new("scanner-goto")
+                                .small()
+                                .label("→  Go to Address")
+                                .disabled(!has_selection)
+                                .on_click(cx.listener(|this, _e, _w, cx| this.go_to_selected(cx))),
+                        )
+                        .child(
+                            Button::new("scanner-copy")
+                                .small()
+                                .label("⧉  Copy Address")
+                                .disabled(!has_selection)
+                                .on_click(cx.listener(|this, _e, _w, cx| this.copy_selected(cx))),
+                        ),
                 )
         }
     }

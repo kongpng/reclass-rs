@@ -13,20 +13,38 @@ use gpui_component::ActiveTheme;
 use super::geometry::SpanRole;
 
 /// Resolved editor colors for one frame, snapshotted from the active theme.
+///
+/// The roles map the C++ Scintilla indicator vocabulary (editor-surface.md §3)
+/// onto **Zed One Dark** syntax hues (zed_ui_spec.md §1.3): types are yellow
+/// (`#e5c07b`), function pointers blue (`#61afef`), keywords magenta (`#c678dd`),
+/// numbers/addresses warm orange (`#d19a66`), comments dim green-gray (`#5c6370`),
+/// the ASCII preview soft green (`#98c379`). Everything reads `cx.theme()` so a
+/// theme switch instantly retints the editor.
 #[derive(Copy, Clone, Debug)]
 pub struct EditorPalette {
     pub text: Hsla,
     pub type_fg: Hsla,
+    /// Function-pointer type token (`fnptr64`) — One Dark blue.
+    pub fnptr_fg: Hsla,
     pub name_fg: Hsla,
     pub value_fg: Hsla,
     pub dim: Hsla,
+    /// `struct`/`class`/`enum`/`void*` keyword — One Dark magenta/purple.
+    pub keyword: Hsla,
+    /// The root class name on the command row — One Dark blue (the screenshots
+    /// render it in the link/accent blue, not teal).
     pub class_name: Hsla,
+    /// Numeric literal / base address — One Dark warm orange.
+    pub number: Hsla,
+    /// The ASCII preview column on hex rows — soft One Dark green, dimmed.
+    pub ascii: Hsla,
     pub comment_green: Hsla,
     pub type_hint: Hsla,
     pub rtti_hint: Hsla,
     pub enum_chip: Hsla,
     pub tree_conn: Hsla,
-    /// Selection row background (`M_SELECTED`).
+    /// Selection row background (`M_SELECTED`) — a soft accent-tinted fill, NOT
+    /// the loud text-selection color (zed_ui_spec.md §5.4).
     pub selection_bg: Hsla,
     /// Left accent bar for selected rows (`M_ACCENT`).
     pub accent: Hsla,
@@ -36,12 +54,22 @@ pub struct EditorPalette {
     pub caret: Hsla,
     /// Editor paper (slightly darker than chrome, like `background.darker(115)`).
     pub paper: Hsla,
-    /// Heat colors (cold/warm/hot) for the change heatmap.
+    /// The offset-margin / gutter background (a hair darker than the paper).
+    pub gutter_bg: Hsla,
+    /// The offset-margin digits — muted blue-gray Zed gutter text.
+    pub gutter_fg: Hsla,
+    /// Chip / pill background (the rounded fill behind footer + command-row pills).
+    pub pill_bg: Hsla,
+    /// Heat colors (cold/warm/hot) for the change heatmap — amber-leaning per the
+    /// spec (§5.4 "heat backgrounds … amber, never red"), hottest reaches a warm
+    /// red the screenshots use for freshly-changed bytes.
     pub heat_cold: Hsla,
     pub heat_warm: Hsla,
     pub heat_hot: Hsla,
     /// Byte-selection digit recolor (`IND_BYTE_SEL`).
     pub byte_sel: Hsla,
+    /// The border color for chrome accents (chevron box, source chip outline).
+    pub border: Hsla,
 }
 
 impl EditorPalette {
@@ -50,25 +78,36 @@ impl EditorPalette {
         let t = cx.theme();
         EditorPalette {
             text: t.foreground,
-            type_fg: t.blue,
+            type_fg: t.yellow,
+            fnptr_fg: t.blue,
             name_fg: t.foreground,
+            // Resolved field values (the `0x7ff60baa84c0` pointer/address column)
+            // read green in the reclass screenshots (PIC1) — One Dark string green.
             value_fg: t.green,
             dim: t.muted_foreground,
-            class_name: t.cyan,
+            keyword: t.magenta,
+            class_name: t.blue,
+            number: t.yellow_light,
+            ascii: with_alpha(t.green, 0.75),
             comment_green: t.green_light,
             type_hint: t.muted_foreground,
             rtti_hint: t.yellow,
             enum_chip: t.link,
             tree_conn: t.muted_foreground,
-            selection_bg: t.selection,
+            // Soft accent-tinted selection fill (not the hard text-selection bg).
+            selection_bg: with_alpha(t.primary, 0.14),
             accent: t.primary,
             hover_bg: t.list_hover,
             caret: t.caret,
             paper: darker(t.background, 0.06),
+            gutter_bg: darker(t.background, 0.06),
+            gutter_fg: with_alpha(t.muted_foreground, 0.70),
+            pill_bg: with_alpha(t.foreground, 0.06),
             heat_cold: t.blue_light,
-            heat_warm: t.yellow,
+            heat_warm: t.yellow_light,
             heat_hot: t.red,
             byte_sel: t.link,
+            border: t.border,
         }
     }
 
@@ -77,8 +116,13 @@ impl EditorPalette {
         match role {
             SpanRole::Text => self.text,
             SpanRole::Type => self.type_fg,
+            SpanRole::FnPtr => self.fnptr_fg,
+            SpanRole::Keyword => self.keyword,
+            SpanRole::Address => self.number,
+            SpanRole::Source => self.dim,
             SpanRole::Name => self.name_fg,
             SpanRole::Value => self.value_fg,
+            SpanRole::Ascii => self.ascii,
             SpanRole::Dim => self.dim,
             SpanRole::ClassName => self.class_name,
             SpanRole::CommentGreen => self.comment_green,
@@ -86,6 +130,9 @@ impl EditorPalette {
             SpanRole::RttiHint => self.rtti_hint,
             SpanRole::EnumChip => self.enum_chip,
             SpanRole::TreeConn => self.tree_conn,
+            SpanRole::HeatCold => self.heat_cold,
+            SpanRole::HeatWarm => self.heat_warm,
+            SpanRole::HeatHot => self.heat_hot,
         }
     }
 
@@ -107,4 +154,9 @@ fn darker(c: Hsla, amount: f32) -> Hsla {
         l: (c.l - amount).clamp(0.0, 1.0),
         ..c
     }
+}
+
+/// Apply an alpha to an `Hsla` (translucent tints: soft selection, dim ASCII).
+fn with_alpha(c: Hsla, a: f32) -> Hsla {
+    Hsla { a, ..c }
 }

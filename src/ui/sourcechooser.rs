@@ -356,18 +356,115 @@ impl SourceModel {
     }
 }
 
+/// The built-in provider actions shown at the top of the chooser (PIC4): the
+/// memory-source plugins, each labeled with its plugin filename hint. These map
+/// 1:1 onto the C++ provider registry entries; the trailing recent/saved sources
+/// + the "Clear All" action are appended by [`default_entries`].
+pub fn provider_entries() -> Vec<SourceEntry> {
+    let mk = |id: &str, name: &str, kind: &str, dll: &str| {
+        let mut e = SourceEntry::provider(id, name, kind);
+        e.dll_file_name = dll.to_string();
+        e
+    };
+    vec![
+        // "File" has no plugin dll hint in the screenshot.
+        SourceEntry::provider("file", "File", "File"),
+        mk(
+            "kernelmemory",
+            "Kernel Memory",
+            "Kernel",
+            "libKernelMemoryPlugin.dll",
+        ),
+        mk(
+            "processmemory",
+            "Process Memory",
+            "Process",
+            "libProcessMemoryPlugin.dll",
+        ),
+        mk(
+            "rcnetcompat",
+            "ReClass.NET Compat Layer",
+            "Compat",
+            "libRcNetCompatPlugin.dll",
+        ),
+        mk(
+            "remoteprocessmemory",
+            "Remote Process Memory",
+            "Remote",
+            "libRemoteProcessMemoryPlugin.dll",
+        ),
+        mk(
+            "windbgmemory",
+            "WinDbg Memory",
+            "WinDbg",
+            "libWinDbgMemoryPlugin.dll",
+        ),
+    ]
+}
+
+/// The full default chooser content (PIC4): the provider list, a separator, the
+/// `recent` saved sources (with the active one flagged), a separator, and the
+/// "Clear All" action. `recent` are `(name, kind_label, active)` tuples in
+/// most-recent-first order.
+pub fn default_entries(recent: &[(String, String, bool)]) -> Vec<SourceEntry> {
+    let mut entries = provider_entries();
+    if !recent.is_empty() {
+        entries.push(SourceEntry::section("Recent"));
+        for (i, (name, kind, active)) in recent.iter().enumerate() {
+            let mut e = SourceEntry::saved(i as i32, name, kind);
+            e.is_active = *active;
+            entries.push(e);
+        }
+    }
+    entries.push(SourceEntry::section("Actions"));
+    let mut clear = SourceEntry::clear_action();
+    clear.display_name = "Clear All".to_string();
+    entries.push(clear);
+    entries
+}
+
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
 pub use view::{SourceChooserEvent, SourceChooserPopup};
 
+/// A small left-slot glyph for a source row, chosen from the kind label /
+/// provider identifier (the C++ paints a per-provider icon; we use a clean
+/// unicode glyph since no SVG icon set is bundled — same approach as the
+/// titlebar source badge). Falls back to a generic chip.
+#[cfg(feature = "ui")]
+pub fn source_glyph(kind_label: &str, provider_identifier: &str) -> &'static str {
+    let key = if !provider_identifier.is_empty() {
+        provider_identifier
+    } else {
+        kind_label
+    };
+    let lower = key.to_ascii_lowercase();
+    if lower.contains("kernel") {
+        "\u{229E}" // ⊞ squared plus — kernel memory
+    } else if lower.contains("remote") {
+        "\u{2715}" // ✕ — remote process
+    } else if lower.contains("windbg") || lower.contains("dbg") {
+        "\u{1F50C}" // 🔌 debugger
+    } else if lower.contains("net") || lower.contains("compat") || lower.contains("rcnet") {
+        "\u{1F50C}" // 🔌 .NET compat layer
+    } else if lower.contains("process") || lower.contains("processmemory") {
+        "\u{2637}" // ☷ — process memory
+    } else if lower.contains("file") {
+        "\u{1F4C4}" // 📄 file
+    } else {
+        "\u{25A2}" // ▢ generic
+    }
+}
+
 #[cfg(feature = "ui")]
 mod view {
-    use super::{SourceAccept, SourceEntryKind, SourceModel};
+    use super::{source_glyph, SourceAccept, SourceEntryKind, SourceModel};
+    use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{ActiveTheme, Selectable as _};
+    use gpui_component::ActiveTheme as _;
 
     /// The popup's outcome.
     #[derive(Clone, Debug)]
@@ -440,61 +537,109 @@ mod view {
 
     impl Render for SourceChooserPopup {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            use gpui_component::button::{Button, ButtonVariants as _};
             let selected = self.model.selected();
-            let rows: Vec<_> = self
+            let fg = color::text(cx);
+            let muted = color::text_muted(cx);
+            let disabled = color::text_disabled(cx);
+            let accent = color::accent(cx);
+            let danger = cx.theme().danger_foreground;
+            let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+            let border = color::border(cx);
+            // Show the filter only when the list is long enough to warrant it
+            // (PIC4 is a plain dropdown; a long saved-source list gets a filter).
+            let show_filter = self.model.entries().len() > 8;
+
+            let rows: Vec<AnyElement> = self
                 .model
                 .rows()
                 .iter()
                 .enumerate()
                 .map(|(row, r)| {
-                    if r.entry.entry_kind == SourceEntryKind::SectionHeader {
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(r.entry.display_name.to_uppercase())
-                            .into_any_element()
-                    } else {
-                        let is_sel = selected == Some(row);
-                        let mut subline = r.entry.kind_label.clone();
-                        if r.entry.is_active {
-                            subline.push_str("  · active");
-                        }
-                        if r.entry.is_stale {
-                            subline.push_str("  · (exited)");
-                        }
-                        Button::new(("source-row", row))
-                            .ghost()
-                            .w_full()
-                            .selected(is_sel)
-                            .when(!r.entry.enabled, |b| {
-                                b.text_color(cx.theme().muted_foreground)
-                            })
-                            .child(
-                                gpui_component::v_flex()
-                                    .w_full()
-                                    .gap_0p5()
-                                    .child(
+                    let e = &r.entry;
+                    match e.entry_kind {
+                        SourceEntryKind::SectionHeader => div()
+                            .h(px(tokens::border::THIN))
+                            .my(px(tokens::space::XS))
+                            .mx(px(tokens::space::SM))
+                            .bg(border)
+                            .into_any_element(),
+                        _ => {
+                            let is_sel = selected == Some(row);
+                            let is_clear = e.entry_kind == SourceEntryKind::ClearAction;
+                            let glyph = source_glyph(&e.kind_label, &e.provider_identifier);
+                            let row_fg = if !e.enabled {
+                                disabled
+                            } else if is_clear {
+                                danger
+                            } else {
+                                fg
+                            };
+                            // The plugin filename hint (PIC4: "(libKernelMemoryPlugin.dll)")
+                            // or, for saved sources, the kind + stale note.
+                            let hint = if !e.dll_file_name.is_empty() {
+                                format!("({})", e.dll_file_name)
+                            } else if e.is_stale {
+                                format!("{}  · (exited)", e.kind_label)
+                            } else if e.entry_kind == SourceEntryKind::SavedSource {
+                                e.kind_label.clone()
+                            } else {
+                                String::new()
+                            };
+
+                            gpui_component::h_flex()
+                                .id(("source-row", row))
+                                .w_full()
+                                .h(px(26.))
+                                .px(px(tokens::space::SM))
+                                .gap(px(tokens::space::MD))
+                                .items_center()
+                                .rounded(px(tokens::radius::MD))
+                                .when(is_sel, |d| d.bg(sel_bg))
+                                .when(!is_sel && e.enabled, |d| d.hover(|s| s.bg(hover_bg)))
+                                .when(e.enabled, |d| d.cursor_pointer())
+                                .when(e.enabled, |d| {
+                                    d.on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.accept_row(row, cx);
+                                    }))
+                                })
+                                // Left checkmark slot (active saved source gets a ✓).
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_none()
+                                        .text_color(accent)
+                                        .when(e.is_active, |d| d.child("\u{2713}")),
+                                )
+                                // Kind glyph.
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(16.))
+                                        .text_color(if is_clear { danger } else { muted })
+                                        .child(glyph),
+                                )
+                                // Name (+ inline plugin hint).
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_color(row_fg)
+                                        .when(e.is_active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                        .child(e.display_name.clone()),
+                                )
+                                .when(!hint.is_empty(), |d| {
+                                    d.child(
                                         div()
-                                            .when(r.entry.is_active, |d| {
-                                                d.font_weight(FontWeight::BOLD)
-                                            })
-                                            .text_color(cx.theme().foreground)
-                                            .child(r.entry.display_name.clone()),
+                                            .flex_none()
+                                            .text_size(px(tokens::font::UI_SM))
+                                            .text_color(muted)
+                                            .child(hint),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(subline),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _e, _window, cx| {
-                                this.accept_row(row, cx);
-                            }))
-                            .into_any_element()
+                                })
+                                .into_any_element()
+                        }
                     }
                 })
                 .collect();
@@ -505,19 +650,21 @@ mod view {
                 .key_context("RcxSourceChooser")
                 .min_w(px(360.))
                 .max_h(px(520.))
-                .bg(cx.theme().popover)
+                .p(px(tokens::space::XS))
+                .bg(color::elevated_bg(cx))
                 .border_1()
-                .border_color(cx.theme().border)
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(cx.theme().foreground)
-                        .child("Data Source"),
-                )
-                .child(Input::new(&self.input).w_full())
+                .border_color(border)
+                .rounded(px(tokens::radius::LG))
+                .shadow_md()
+                .text_size(px(tokens::font::UI_MD))
+                .when(show_filter, |this| {
+                    this.child(
+                        div()
+                            .px(px(tokens::space::XS))
+                            .pb(px(tokens::space::XS))
+                            .child(Input::new(&self.input).w_full()),
+                    )
+                })
                 .child(
                     gpui_component::v_flex()
                         .id("rcx-source-chooser-list")
@@ -532,6 +679,77 @@ mod view {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        default_entries, provider_entries, SourceAccept, SourceEntry, SourceEntryKind, SourceModel,
+    };
+
+    #[test]
+    fn provider_entries_match_pic4_list() {
+        let ps = provider_entries();
+        let names: Vec<&str> = ps.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "File",
+                "Kernel Memory",
+                "Process Memory",
+                "ReClass.NET Compat Layer",
+                "Remote Process Memory",
+                "WinDbg Memory",
+            ]
+        );
+        // The plugins carry their dll filename hint; "File" does not.
+        let kernel = ps
+            .iter()
+            .find(|e| e.display_name == "Kernel Memory")
+            .unwrap();
+        assert_eq!(kernel.dll_file_name, "libKernelMemoryPlugin.dll");
+        let file = ps.iter().find(|e| e.display_name == "File").unwrap();
+        assert!(file.dll_file_name.is_empty());
+        // All providers are provider actions.
+        assert!(ps
+            .iter()
+            .all(|e| e.entry_kind == SourceEntryKind::ProviderAction));
+    }
+
+    #[test]
+    fn default_entries_have_separators_recents_and_clear() {
+        let recent = vec![
+            ("Reclass.exe".to_string(), "Process".to_string(), false),
+            ("Reclass.exe".to_string(), "File".to_string(), true),
+        ];
+        let es = default_entries(&recent);
+        // Two section separators (Recent + Actions).
+        let sections = es
+            .iter()
+            .filter(|e| e.entry_kind == SourceEntryKind::SectionHeader)
+            .count();
+        assert_eq!(sections, 2);
+        // The active recent source is flagged.
+        assert!(es
+            .iter()
+            .any(|e| e.is_active && e.display_name == "Reclass.exe"));
+        // "Clear All" is the last entry.
+        let last = es.last().unwrap();
+        assert_eq!(last.entry_kind, SourceEntryKind::ClearAction);
+        assert_eq!(last.display_name, "Clear All");
+    }
+
+    #[test]
+    fn default_entries_without_recents_skip_recent_section() {
+        let es = default_entries(&[]);
+        // Only the "Actions" separator, no "Recent".
+        assert_eq!(
+            es.iter()
+                .filter(|e| e.entry_kind == SourceEntryKind::SectionHeader)
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
     use super::{SourceAccept, SourceEntry, SourceModel};
 
     fn entries() -> Vec<SourceEntry> {

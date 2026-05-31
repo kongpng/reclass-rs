@@ -36,8 +36,10 @@ use gpui_component::dock::{DockArea, DockPlacement};
 use gpui_component::{ActiveTheme, Root, TitleBar, WindowExt};
 
 use super::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
+use super::menubar::{MenuBar, MenuCommand};
 use super::startpage::{RecentEntry, StartPage, StartPageEvent};
 use super::state::{AppState, DocId, ViewMode};
+use super::statusbar::{render_status_bar, StatusInfo};
 use super::tabs::{DocAreaEvent, DocumentArea};
 use super::theme_apply::ThemeRegistryGlobal;
 use super::titlebar::{self, LayoutPreset};
@@ -59,6 +61,8 @@ pub struct MainWindow {
     document_area: Entity<DocumentArea>,
     /// The left workspace ("Project") dock panel.
     workspace: Entity<WorkspacePanel>,
+    /// The in-window menu bar (the titlebar's File/Edit/View/… dropdown row).
+    menubar: Entity<MenuBar>,
     /// The start-page welcome overlay while shown (app-shell §13).
     start_page: Option<Entity<StartPage>>,
     /// The workspace layout-toggle state (mirrors the left dock's visibility).
@@ -127,11 +131,25 @@ impl MainWindow {
         )
         .detach();
 
+        // ── The in-window menu bar (the titlebar dropdown row; app-shell §7). ──
+        // Its chosen-command events route to `run_menu_command` — the same
+        // dispatch the command palette's `Trigger` uses.
+        let menubar = MenuBar::view(cx);
+        cx.subscribe_in(
+            &menubar,
+            window,
+            |this, _mb, ev: &MenuCommand, window, cx| {
+                this.run_menu_command(&ev.0, window, cx);
+            },
+        )
+        .detach();
+
         let mut win = MainWindow {
             state,
             dock_area,
             document_area,
             workspace,
+            menubar,
             start_page: None,
             layout_preset,
             theme_manager,
@@ -187,15 +205,80 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// Dispatch a chosen palette command. Full menu→action mapping is layered in
-    /// incrementally; the palette already opens, filters, navigates, and closes.
+    /// Dispatch a chosen command (from the menu bar or the command palette).
+    ///
+    /// Maps a [`CommandId`](super::commandpalette::CommandId) to the app
+    /// operations that already exist (view mode, workspace toggle, command
+    /// palette, undo/redo, new document, welcome screen); everything else is a
+    /// graceful no-op (logged) until its workflow lands, so a menu/palette pick
+    /// never panics or dead-ends — it OPENS, shows items, and dispatches what is
+    /// wired (the stage contract).
     fn run_menu_command(
         &mut self,
-        _cmd: &super::commandpalette::CommandId,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cmd: &super::commandpalette::CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        // TODO(menu-dispatch): map CommandId -> app actions (New Class, Open, …).
+        match cmd.as_str() {
+            // ── File ──
+            "file.new_class" | "file.new_struct" | "file.new_enum" => {
+                // Open a fresh document tab (the C++ `project_new` family). The
+                // per-kind seed (struct/enum) lands with the project-lifecycle
+                // workflow; for now every "New …" opens a blank document.
+                self.dismiss_start_page(cx);
+                self.document_area.update(cx, |area, cx| {
+                    area.push_document("Untitled", window, cx);
+                });
+                self.state.open_document("Untitled");
+                self.rebuild_workspace(cx);
+            }
+            "file.welcome" => self.show_start_page(window, cx),
+
+            // ── Edit ──
+            "edit.undo" => self.active_editor_undo(false, cx),
+            "edit.redo" => self.active_editor_undo(true, cx),
+
+            // ── View ──
+            "view.command_palette" => self.open_command_palette(&OpenCommandPalette, window, cx),
+            "view.scanner" | "view.symbols" | "view.bookmarks" => {
+                // Dock toggles for the secondary panels land with the dock
+                // workflow; the workspace dock toggle below is the wired one.
+                tracing::debug!(command = %cmd, "menu command: dock toggle not yet wired");
+            }
+            "view.reset_windows" => {
+                // Reset to the default layout — show the workspace dock.
+                self.apply_layout_preset(LayoutPreset::Workspace, window, cx);
+            }
+
+            // The view-mode dual toggle (Tree ⇄ rendered C/C++) is exposed through
+            // the titlebar; the menu has no direct entries for it, but the toggle
+            // is reachable from the command palette via these synthetic ids.
+            _ if cmd == "view.tree" => self.set_active_view_mode(ViewMode::Tree, window, cx),
+            _ if cmd == "view.rendered" => {
+                self.set_active_view_mode(ViewMode::Rendered, window, cx)
+            }
+
+            // ── Everything else: graceful no-op until its workflow is wired. ──
+            other => {
+                tracing::debug!(command = %other, "menu command not yet wired");
+            }
+        }
+    }
+
+    /// Undo / redo on the active editor (menu Edit▸Undo/Redo). No-op if no
+    /// editor is active.
+    fn active_editor_undo(&mut self, redo: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+            editor.update(cx, |ed, cx| {
+                if redo {
+                    ed.redo(cx);
+                } else {
+                    ed.undo(cx);
+                }
+            });
+            self.rebuild_workspace(cx);
+            cx.notify();
+        }
     }
 
     /// The docking workspace entity.
@@ -650,8 +733,27 @@ impl Render for MainWindow {
             }
         };
         let titlebar: TitleBar = titlebar::render_titlebar(
-            preset, view_mode, doc_title, has_doc, layout_cb, view_cb, cx,
+            preset,
+            view_mode,
+            doc_title,
+            has_doc,
+            self.menubar.clone(),
+            layout_cb,
+            view_cb,
+            cx,
         );
+
+        // The bottom status bar's active-node readout (app-shell §11): pull the
+        // selection/offset/size from the active editor's controller (a read-only
+        // borrow), and the active source from the window state.
+        let status_info = self
+            .document_area
+            .read(cx)
+            .active_editor()
+            .map(|ed| StatusInfo::for_controller(ed.read(cx).controller()))
+            .unwrap_or_default();
+        let source = self.state.active_source();
+        let status_bar = render_status_bar(&status_info, &source, cx);
 
         div()
             .id("reclass-main-window")
@@ -664,10 +766,21 @@ impl Render for MainWindow {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::open_command_palette))
             .child(titlebar)
-            // The docking workspace: center document tabs + side docks.
-            .child(div().flex_1().min_h_0().child(self.dock_area.clone()))
-            // The start-page overlay (rendered on top of the workspace while shown).
-            .when_some(self.start_page.clone(), |this, page| this.child(page))
+            // The content column: the docking workspace + the start-page overlay.
+            // Wrapped so the status bar is a sibling pinned to the window bottom
+            // and the overlay only covers the content area (not the status bar).
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    // The docking workspace: center document tabs + side docks.
+                    .child(div().size_full().child(self.dock_area.clone()))
+                    // The start-page overlay (over the workspace while shown).
+                    .when_some(self.start_page.clone(), |this, page| this.child(page)),
+            )
+            // The bottom status bar (app-shell §11) — a thin chrome strip.
+            .child(status_bar)
             // Overlay layers.
             .children(sheet_layer)
             .children(dialog_layer)

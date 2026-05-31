@@ -229,10 +229,23 @@ pub use view::{GotoAddressDialog, GotoEvent};
 mod view {
     use super::{GotoState, GotoStatus};
     use crate::addr::AddressParserCallbacks;
+    use crate::ui::design::{color, tokens};
+    use crate::ui::dialogs::modal;
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
     use gpui_component::{ActiveTheme, Disableable as _};
+
+    /// The "Base Address" help table (PIC5) — example expression on the left, the
+    /// addressing mode it demonstrates on the right. The C++ goto dialog shows the
+    /// same rich-text legend so the user knows the accepted expression forms.
+    const ADDRESS_FORMS: [(&str, &str); 5] = [
+        ("0x7FF61234ABCD", "hex address"),
+        ("<app.exe>", "module base"),
+        ("<app.exe> + 0x1A0", "module + offset"),
+        ("[<app.exe> + 0x58]", "follow pointer"),
+        ("ntdll!SymbolName", "PDB symbol"),
+    ];
 
     /// The dialog's outcome, raised to the host (the C++ `accept`/`reject`).
     #[derive(Clone, Debug)]
@@ -325,6 +338,57 @@ mod view {
                 .update(cx, |s, cx| s.set_value(entry, window, cx));
             self.on_text_changed(cx);
         }
+
+        /// The "Base Address" help legend (PIC5): a titled card listing the
+        /// accepted address-expression forms (example → mode) plus the operator
+        /// hint, styled like a Zed popover section.
+        fn render_help(&self, cx: &Context<Self>) -> impl IntoElement {
+            let mono = SharedString::from(tokens::font::MONO_FAMILY);
+            let rows = ADDRESS_FORMS.into_iter().map(|(example, meaning)| {
+                gpui_component::h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(tokens::space::LG))
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::accent(cx))
+                            .child(example),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text_muted(cx))
+                            .child(meaning),
+                    )
+            });
+
+            gpui_component::v_flex()
+                .w_full()
+                .p(px(tokens::space::LG))
+                .gap(px(tokens::space::SM))
+                .rounded(px(tokens::radius::LG))
+                .border_1()
+                .border_color(color::border(cx))
+                .bg(color::panel_bg(cx))
+                .child(
+                    div()
+                        .text_size(px(tokens::font::UI_SM))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color::text(cx))
+                        .child("Base Address"),
+                )
+                .children(rows)
+                .child(
+                    div()
+                        .pt(px(tokens::space::XS))
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(color::text_muted(cx))
+                        .child("Operators: + - * << >> & | ^  ·  all numbers are hexadecimal"),
+                )
+        }
     }
 
     impl Focusable for GotoAddressDialog {
@@ -340,77 +404,93 @@ mod view {
             use gpui_component::button::{Button, ButtonVariants as _};
 
             let can_go = self.state.can_go();
+            let mono = SharedString::from(tokens::font::MONO_FAMILY);
             let (status_text, status_color) = match self.state.status() {
-                GotoStatus::Idle => (" ".to_string(), cx.theme().muted_foreground),
+                GotoStatus::Idle => (" ".to_string(), color::text_muted(cx)),
                 GotoStatus::Resolved(v) => (format!("\u{2192} 0x{v:x}"), cx.theme().success),
                 GotoStatus::Error(e) => (e, cx.theme().danger),
             };
 
-            let recent_rows: Vec<_> = self
+            // The recent entries as compact Zed list-rows (mono, selectable).
+            let recent_rows: Vec<AnyElement> = self
                 .recent
                 .iter()
                 .map(|entry| {
                     let entry = entry.clone();
-                    Button::new(SharedString::from(format!("goto-recent-{entry}")))
-                        .ghost()
-                        .w_full()
-                        .label(entry.clone())
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.pick_recent(entry.clone(), window, cx);
-                        }))
-                        .into_any_element()
+                    let pick = entry.clone();
+                    crate::ui::design::zed_list_row(
+                        SharedString::from(format!("goto-recent-{entry}")),
+                        false,
+                        cx,
+                    )
+                    .font_family(mono.clone())
+                    .text_size(px(tokens::font::UI_SM))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.pick_recent(pick.clone(), window, cx);
+                    }))
+                    .child(entry)
+                    .into_any_element()
                 })
                 .collect();
 
-            gpui_component::v_flex()
-                .id("rcx-goto-address")
-                .track_focus(&self.focus_handle)
-                .key_context("RcxGotoAddress")
-                .gap_2()
-                .p_3()
-                .min_w(px(440.))
-                .bg(cx.theme().background)
+            let help = self.render_help(cx);
+
+            let body = modal::body(cx)
+                .child(modal::help_text(
+                    "Enter an absolute address or an expression to resolve, \
+                     then press Go.",
+                    cx,
+                ))
+                .child(modal::field_label("Address", cx))
+                .child(Input::new(&self.input).w_full().font_family(mono.clone()))
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "Enter an absolute address or expression \
-                         (e.g. 0x7FF6..., <game.exe>+0x40, [ntdll!Ldr]):",
-                        ),
-                )
-                .child(Input::new(&self.input).w_full())
-                .child(
-                    div()
-                        .text_sm()
-                        .font_family("monospace")
+                        .h(px(18.))
+                        .font_family(mono.clone())
+                        .text_size(px(tokens::font::UI_SM))
                         .text_color(status_color)
                         .child(status_text),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Recent:"),
-                )
-                .child(gpui_component::v_flex().gap_0p5().children(recent_rows))
-                .child(
-                    gpui_component::h_flex()
-                        .justify_end()
-                        .gap_2()
+                .child(help)
+                .when(!self.recent.is_empty(), |b| {
+                    b.child(crate::ui::design::section_label("Recent", cx))
                         .child(
-                            Button::new("goto-cancel")
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _e, _window, cx| this.cancel(cx))),
+                            gpui_component::v_flex()
+                                .gap(px(tokens::space::XXS))
+                                .children(recent_rows),
                         )
-                        .child(
-                            Button::new("goto-go")
-                                .primary()
-                                .label("Go")
-                                .when(!can_go, |b| b.disabled(true))
-                                .on_click(cx.listener(|this, _e, _window, cx| this.confirm(cx))),
-                        ),
+                });
+
+            let footer = modal::footer(cx)
+                .child(
+                    Button::new("goto-cancel")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _e, _window, cx| this.cancel(cx))),
                 )
+                .child(
+                    Button::new("goto-go")
+                        .primary()
+                        .label("Go")
+                        .when(!can_go, |b| b.disabled(true))
+                        .on_click(cx.listener(|this, _e, _window, cx| this.confirm(cx))),
+                );
+
+            modal::card(cx)
+                .id("rcx-goto-address")
+                .track_focus(&self.focus_handle)
+                .key_context("RcxGotoAddress")
+                .w(px(460.))
+                .max_h(px(560.))
+                .child(
+                    modal::header("Go to Address", cx).child(modal::close_button(
+                        "goto-close",
+                        cx.listener(|this, _e, _window, cx| this.cancel(cx)),
+                        cx,
+                    )),
+                )
+                .child(body)
+                .child(footer)
         }
     }
 }

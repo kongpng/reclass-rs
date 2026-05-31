@@ -28,8 +28,22 @@ pub struct RowPaint {
     /// Inline background overlays as `(char_start, char_end, color)` — heat byte
     /// runs and byte-selection digit highlights (drawn behind the glyphs).
     pub overlays: Vec<(i32, i32, Hsla)>,
+    /// Rounded chip/pill backgrounds (`char_start, char_end, fill, border`) — the
+    /// subtle Zed buttons behind footer add-bytes/Trim controls and the
+    /// command-row chevron/source chips (editor-surface.md §5 step 14, PIC4/PIC5).
+    pub pills: Vec<PillPaint>,
     pub palette: EditorPalette,
     pub metrics: CellMetrics,
+}
+
+/// A rounded pill background drawn behind a tail/command-row chip, in char-column
+/// coordinates. Painted as a soft Zed button (low-alpha fill + 1px border).
+#[derive(Copy, Clone, Debug)]
+pub struct PillPaint {
+    pub start: i32,
+    pub end: i32,
+    pub fill: Hsla,
+    pub border: Hsla,
 }
 
 /// The leaf element that paints a single row's text + overlays and routes clicks.
@@ -43,6 +57,8 @@ pub struct RowElement {
 
 pub struct RowPrepaint {
     line: Option<ShapedLine>,
+    /// Rounded pill backgrounds (drawn first, behind the inline overlays + text).
+    pills: Vec<PaintQuad>,
     overlays: Vec<PaintQuad>,
     hitbox: Option<Hitbox>,
 }
@@ -89,10 +105,38 @@ impl Element for RowElement {
     ) -> Self::PrepaintState {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
+        let cell = self.row.metrics.cell_width;
+
+        // Rounded pill backgrounds (footer / command-row chips). Built whether or
+        // not the line has text so an empty pill list is cheap; inset vertically
+        // a touch so the chip reads as a Zed button, not a full-height block.
+        let mut pills = Vec::with_capacity(self.row.pills.len());
+        let pill_inset = (f32::from(bounds.bottom() - bounds.top()) * 0.14).clamp(1.0, 4.0);
+        for pill in &self.row.pills {
+            if pill.end <= pill.start {
+                continue;
+            }
+            let x0 = bounds.left() + px(pill.start.max(0) as f32 * cell);
+            let x1 = bounds.left() + px(pill.end.max(0) as f32 * cell);
+            let pb = Bounds::from_corners(
+                point(x0, bounds.top() + px(pill_inset)),
+                point(x1, bounds.bottom() - px(pill_inset)),
+            );
+            pills.push(quad(
+                pb,
+                px(crate::ui::design::tokens::radius::MD),
+                pill.fill,
+                px(crate::ui::design::tokens::border::THIN),
+                pill.border,
+                BorderStyle::Solid,
+            ));
+        }
+
         let text = self.row.text.clone();
         if text.is_empty() {
             return RowPrepaint {
                 line: None,
+                pills,
                 overlays: Vec::new(),
                 hitbox: Some(hitbox),
             };
@@ -107,7 +151,6 @@ impl Element for RowElement {
             .shape_line(text, font_size, &runs, None);
 
         let mut overlays = Vec::with_capacity(self.row.overlays.len());
-        let cell = self.row.metrics.cell_width;
         for &(start, end, color) in &self.row.overlays {
             if end <= start {
                 continue;
@@ -122,6 +165,7 @@ impl Element for RowElement {
 
         RowPrepaint {
             line: Some(line),
+            pills,
             overlays,
             hitbox: Some(hitbox),
         }
@@ -137,7 +181,11 @@ impl Element for RowElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Overlays first (behind glyphs).
+        // Pills furthest back (the chip "button" surface), then inline overlays
+        // (heat / byte-selection), then the glyphs.
+        for pill in prepaint.pills.drain(..) {
+            window.paint_quad(pill);
+        }
         for quad in prepaint.overlays.drain(..) {
             window.paint_quad(quad);
         }

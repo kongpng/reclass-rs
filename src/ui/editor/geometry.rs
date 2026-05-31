@@ -147,15 +147,27 @@ pub fn byte_range_for_span(text: &str, span: ColumnSpan) -> Option<std::ops::Ran
 pub enum SpanRole {
     /// Default text (the lexer's normal foreground).
     Text,
-    /// Type-name column (C++ keyword/type coloring).
+    /// Type-name column for value/struct kinds — One Dark yellow.
     Type,
+    /// Function-pointer type token (`fnptr64`) — One Dark blue (the screenshots
+    /// render function pointers distinctly from value types).
+    FnPtr,
+    /// `struct`/`class`/`enum`/`void*` keyword — One Dark magenta.
+    Keyword,
+    /// A base address / numeric literal on the command row — One Dark orange.
+    Address,
+    /// The command-row source label (`'Reclass.exe'`/`source`) — muted.
+    Source,
     /// Field-name column.
     Name,
-    /// A formatted value (numbers green-ish).
+    /// A formatted field value (resolved addresses / numbers) — One Dark green
+    /// (the `0x…` value column reads green in the reclass screenshots).
     Value,
+    /// The ASCII preview column on hex rows — soft green, dim.
+    Ascii,
     /// Dimmed hex bytes / fold arrows / braces / footer (`IND_HEX_DIM`).
     Dim,
-    /// The teal root class name (`IND_CLASS_NAME`).
+    /// The root class name (`IND_CLASS_NAME`) — One Dark blue.
     ClassName,
     /// Green comment / symbol / add-comment chip (`IND_HINT_GREEN`).
     CommentGreen,
@@ -167,6 +179,27 @@ pub enum SpanRole {
     EnumChip,
     /// The innermost tree connector glyph tint (`IND_TREE_CONN`).
     TreeConn,
+    /// Per-byte change heat, recoloring the *glyphs* of freshly-changed bytes
+    /// (editor-surface.md §3 `IND_HEAT_*` are TEXTFORE, not backgrounds). Three
+    /// escalating warmth levels: cold (recently changed), warm, hot (just now).
+    HeatCold,
+    HeatWarm,
+    HeatHot,
+}
+
+/// Whether a node kind renders its type token as a function-pointer (One Dark
+/// blue) vs a value type (yellow). Used to color the type column per kind, like
+/// the reclass screenshots where `fnptr64` is blue and `hex64`/`int32` are not.
+pub fn is_fnptr_kind(kind: crate::core::NodeKind) -> bool {
+    use crate::core::NodeKind::*;
+    matches!(kind, FuncPtr32 | FuncPtr64)
+}
+
+/// Whether a node kind renders its type token as a keyword color (pointers and
+/// `void*` lean magenta/purple like a C++ keyword in the screenshots).
+pub fn is_pointer_kind(kind: crate::core::NodeKind) -> bool {
+    use crate::core::NodeKind::*;
+    matches!(kind, Pointer32 | Pointer64)
 }
 
 /// One colored run over a `[start,end)` **char-column** range with a role.
@@ -214,8 +247,30 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
 
     match lm.line_kind {
         LineKind::CommandRow => {
-            // Root class name teal; the rest stays default/dim (the view dims the
-            // chevron/source/addr separately as hover affordances).
+            // The command/header row chrome (PIC4/PIC5):
+            //   "[▸] source▾  0x400000  class UnnamedClass0 {"
+            // chevron box (dim), source label (muted), base address (orange),
+            // the struct/class/enum keyword (magenta), class name (blue), `{` dim.
+            push(
+                &mut layers,
+                compose::command_row_chevron_span(text),
+                SpanRole::Dim,
+            );
+            push(
+                &mut layers,
+                compose::command_row_src_span(text),
+                SpanRole::Source,
+            );
+            push(
+                &mut layers,
+                compose::command_row_addr_span(text),
+                SpanRole::Address,
+            );
+            push(
+                &mut layers,
+                compose::command_row_root_type_span(text),
+                SpanRole::Keyword,
+            );
             push(
                 &mut layers,
                 compose::command_row_root_name_span(text),
@@ -223,7 +278,9 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
             );
         }
         LineKind::Footer => {
-            // Whole footer is dim (`applyHexDimming`: footer text dim).
+            // Whole footer is dim (`applyHexDimming`: footer text dim). The pills
+            // (`+10h`/`+100h`/`+1000h`/`Trim`) get their own background quads from
+            // the view; their glyphs read on the default dim text.
             layers.push(SpanStyle {
                 start: 0,
                 end: n,
@@ -233,11 +290,16 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
         _ => {
             let is_hex = is_hex_preview(lm.node_kind);
             if !lm.is_member_line && !lm.is_continuation {
-                push(
-                    &mut layers,
-                    compose::type_span_for(lm, type_w),
-                    SpanRole::Type,
-                );
+                // Type token, colored by node kind: function pointers blue,
+                // pointers magenta-ish (keyword), value/struct types yellow.
+                let type_role = if is_fnptr_kind(lm.node_kind) {
+                    SpanRole::FnPtr
+                } else if is_pointer_kind(lm.node_kind) {
+                    SpanRole::Keyword
+                } else {
+                    SpanRole::Type
+                };
+                push(&mut layers, compose::type_span_for(lm, type_w), type_role);
                 if !is_hex {
                     // Hex rows hold the ASCII preview in the name column, not a
                     // field name (editor-surface.md §2 valueSpanFor note).
@@ -246,12 +308,21 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
                         compose::name_span_for(lm, type_w, name_w),
                         SpanRole::Name,
                     );
+                } else {
+                    // Hex rows: the name column carries the ASCII preview
+                    // (".X.%...."). Tint it the soft green ASCII role (PIC1/PIC5).
+                    push(
+                        &mut layers,
+                        compose::name_span_for(lm, type_w, name_w),
+                        SpanRole::Ascii,
+                    );
                 }
             }
             // Value column.
             let vs = compose::value_span_for(lm, type_w, name_w);
             if is_hex {
-                // Dim the hex byte run (`IND_HEX_DIM` over the whole preview).
+                // Dim the hex byte run (`IND_HEX_DIM` over the whole preview);
+                // the per-byte heat overlay recolors freshly-changed bytes.
                 push(&mut layers, vs, SpanRole::Dim);
             } else {
                 // Clip the value at the first chip so trailing chips keep their
@@ -313,7 +384,119 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
         );
     }
 
+    // Per-byte change heat — recolor the changed-byte *glyphs* (the orange→red
+    // hex digits in PIC1/PIC5), on top of the dim hex run. `IND_HEAT_*` are
+    // TEXTFORE indicators (editor-surface.md §3), so this is glyph color, not a
+    // background. Hex rows recolor only `changed_byte_indices` ("XX " = 3 cols);
+    // non-hex heated rows recolor the (chip-clipped) value span.
+    if let Some(heat_role) = heat_role_for_level(lm.heat_level) {
+        if is_hex_preview(lm.node_kind) {
+            let vs = compose::value_span_for(lm, type_w, name_w);
+            if vs.valid {
+                for &b in &lm.changed_byte_indices {
+                    let s = vs.start + b * 3;
+                    push(
+                        &mut layers,
+                        ColumnSpan {
+                            start: s,
+                            end: s + 2,
+                            valid: true,
+                        },
+                        heat_role,
+                    );
+                }
+            }
+        } else if !matches!(lm.line_kind, LineKind::CommandRow | LineKind::Footer) {
+            let vs = narrow_value_at_first_chip(lm, compose::value_span_for(lm, type_w, name_w));
+            push(&mut layers, vs, heat_role);
+        }
+    }
+
     flatten(&layers, n)
+}
+
+/// Map a `LineMeta::heat_level` (1=cold, 2=warm, 3=hot) to its heat [`SpanRole`],
+/// or `None` for static rows (level 0).
+pub fn heat_role_for_level(level: i32) -> Option<SpanRole> {
+    match level {
+        1 => Some(SpanRole::HeatCold),
+        2 => Some(SpanRole::HeatWarm),
+        3 => Some(SpanRole::HeatHot),
+        _ => None,
+    }
+}
+
+/// The footer pill spans (`applyCommandRowPills` / footer pill backgrounds,
+/// editor-surface.md §5 step 14): the clickable add-bytes / Trim controls drawn
+/// as subtle rounded chips. Each returned [`ColumnSpan`] is a char-column range to
+/// paint a pill background behind. Matched longest-first so `+1000h` is not eaten
+/// by `+100h`/`+10h` (the C++ collision guard). Pure (text-scan), unit-tested.
+pub fn footer_pill_spans(text: &str) -> Vec<ColumnSpan> {
+    // Longest-first so a longer token's match consumes its columns before a
+    // shorter token can match the suffix.
+    const TOKENS: [&str; 6] = ["+1000h", "+100h", "+10h", "Trim", "Top", "+10"];
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len() as i32;
+    // Which columns are already claimed by a longer token.
+    let mut claimed = vec![false; n.max(0) as usize];
+    let mut out: Vec<ColumnSpan> = Vec::new();
+    for tok in TOKENS {
+        let toklen = tok.chars().count() as i32;
+        if toklen == 0 || toklen > n {
+            continue;
+        }
+        let tchars: Vec<char> = tok.chars().collect();
+        let mut start = 0i32;
+        while start + toklen <= n {
+            let s = start as usize;
+            // Match the token at `start` and ensure none of its columns are claimed.
+            let mut matches = true;
+            for (k, &tc) in tchars.iter().enumerate() {
+                if chars[s + k] != tc || claimed[s + k] {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                for slot in claimed.iter_mut().skip(s).take(toklen as usize) {
+                    *slot = true;
+                }
+                out.push(ColumnSpan {
+                    start,
+                    end: start + toklen,
+                    valid: true,
+                });
+                start += toklen;
+            } else {
+                start += 1;
+            }
+        }
+    }
+    out.sort_by_key(|s| s.start);
+    out
+}
+
+/// The command-row pill spans (the chevron box + source chip): subtle rounded
+/// chips the screenshots show around `[▸]` and the `source▾` selector. Returned
+/// as char-column ranges for the view to paint pill backgrounds behind.
+/// `source` chip spans from the source label start through the `▾` caret.
+pub fn command_row_pill_spans(text: &str) -> Vec<ColumnSpan> {
+    let mut out = Vec::new();
+    let chevron = compose::command_row_chevron_span(text);
+    if chevron.valid && chevron.end > chevron.start {
+        out.push(chevron);
+    }
+    // Source chip: src label start .. just past the ▾ caret (one char after the
+    // src span end, which lands on the arrow).
+    let src = compose::command_row_src_span(text);
+    if src.valid && src.end > src.start {
+        out.push(ColumnSpan {
+            start: src.start,
+            end: src.end + 1,
+            valid: true,
+        });
+    }
+    out
 }
 
 /// Clip a value span at the first chip's `start_col` (so the editable/colored
@@ -623,6 +806,57 @@ mod tests {
     }
 
     #[test]
+    fn heat_recolors_only_changed_hex_byte_glyphs() {
+        // A hot hex row where bytes 0 and 2 changed this tick: only those byte
+        // digit pairs get a heat role, the rest stay dim.
+        let mut lm = field_line(0, NodeKind::Hex64);
+        lm.heat_level = 3;
+        lm.changed_byte_indices = vec![0, 2];
+        // Build a line long enough to span the real value column (which starts at
+        // fold(3)+type(14)+name(22)+2 seps = 41), so byte 2's digits (cols 47-49)
+        // are not clipped by the line length.
+        let vs = compose::value_span_for(&lm, 14, 22);
+        let mut text = String::new();
+        text.push_str("hex64");
+        while col_len(&text) < vs.start {
+            text.push(' ');
+        }
+        text.push_str("AB CD EF 01 23 45 67 89"); // 8 bytes ("XX " ×8 minus tail)
+        let runs = style_runs(&lm, &text, 14, 22);
+        let heat_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.role == SpanRole::HeatHot)
+            .collect();
+        // Exactly two heat runs (byte 0 and byte 2), each 2 columns wide.
+        assert_eq!(heat_runs.len(), 2, "runs={runs:?}");
+        for r in &heat_runs {
+            assert_eq!(
+                r.end - r.start,
+                2,
+                "heat run not 2 wide: {r:?} all={heat_runs:?}"
+            );
+        }
+        // The two heat runs sit at the right byte offsets (byte 0 and byte 2).
+        assert_eq!(heat_runs[0].start, vs.start);
+        assert_eq!(heat_runs[1].start, vs.start + 6);
+        // The unchanged bytes keep the dim role.
+        assert!(runs.iter().any(|r| r.role == SpanRole::Dim));
+    }
+
+    #[test]
+    fn heat_level_zero_adds_no_heat_runs() {
+        let lm = field_line(0, NodeKind::Hex64);
+        let text = "hex64         AB CD EF 01 23 45 67 89   ........";
+        let runs = style_runs(&lm, text, 14, 22);
+        assert!(!runs.iter().any(|r| matches!(
+            r.role,
+            SpanRole::HeatCold | SpanRole::HeatWarm | SpanRole::HeatHot
+        )));
+        assert_eq!(heat_role_for_level(0), None);
+        assert_eq!(heat_role_for_level(2), Some(SpanRole::HeatWarm));
+    }
+
+    #[test]
     fn narrow_value_clips_at_first_chip() {
         let mut lm = field_line(0, NodeKind::Pointer64);
         lm.chips.push(crate::core::LineChip {
@@ -650,6 +884,84 @@ mod tests {
         assert!(!resolved_span_for(&lm, text, EditTarget::Value, 14, 22).valid);
         // Type is editable on a hex row.
         assert!(resolved_span_for(&lm, text, EditTarget::Type, 14, 22).valid);
+    }
+
+    #[test]
+    fn footer_pills_match_longest_first_without_collision() {
+        // The default footer: "};   +10h  +100h  +1000h   Trim".
+        let text = "};   +10h  +100h  +1000h   Trim";
+        let pills = footer_pill_spans(text);
+        // Collect the matched substrings.
+        let chars: Vec<char> = text.chars().collect();
+        let got: Vec<String> = pills
+            .iter()
+            .map(|s| chars[s.start as usize..s.end as usize].iter().collect())
+            .collect();
+        // Each control matched exactly once; +1000h not split into +100h/+10h.
+        assert!(got.contains(&"+10h".to_string()));
+        assert!(got.contains(&"+100h".to_string()));
+        assert!(got.contains(&"+1000h".to_string()));
+        assert!(got.contains(&"Trim".to_string()));
+        // Exactly four pills (no spurious +10 inside +100h/+1000h, no +100h
+        // inside +1000h).
+        assert_eq!(got.len(), 4, "got {got:?}");
+        // Spans are sorted and non-overlapping.
+        for w in pills.windows(2) {
+            assert!(w[0].end <= w[1].start, "pill spans must not overlap");
+        }
+    }
+
+    #[test]
+    fn footer_pills_empty_when_no_controls() {
+        assert!(footer_pill_spans("};").is_empty());
+        assert!(footer_pill_spans("").is_empty());
+    }
+
+    #[test]
+    fn command_row_pills_cover_chevron_and_source() {
+        // "[▸] 'Reclass.exe'▾  0x400000  class Foo {"
+        let text = "[\u{25B8}] 'Reclass.exe'\u{25BE}  0x400000  class Foo {";
+        let pills = command_row_pill_spans(text);
+        assert!(!pills.is_empty());
+        // First pill is the chevron box at col 0.
+        assert_eq!(pills[0].start, 0);
+        // A source chip is present and spans past the ▾ caret.
+        let src = compose::command_row_src_span(text);
+        assert!(src.valid);
+        assert!(pills
+            .iter()
+            .any(|p| p.start == src.start && p.end == src.end + 1));
+    }
+
+    #[test]
+    fn fnptr_and_pointer_kind_classifiers() {
+        use crate::core::NodeKind;
+        assert!(is_fnptr_kind(NodeKind::FuncPtr64));
+        assert!(is_fnptr_kind(NodeKind::FuncPtr32));
+        assert!(!is_fnptr_kind(NodeKind::Hex64));
+        assert!(is_pointer_kind(NodeKind::Pointer64));
+        assert!(!is_pointer_kind(NodeKind::FuncPtr64));
+    }
+
+    #[test]
+    fn command_row_chrome_colors_keyword_address_and_name() {
+        let lm = LineMeta {
+            line_kind: LineKind::CommandRow,
+            ..LineMeta::default()
+        };
+        let text = "[\u{25B8}] source\u{25BE}  0x400000  class Foo {";
+        let runs = style_runs(&lm, text, 14, 22);
+        assert!(runs.iter().any(|r| r.role == SpanRole::Keyword));
+        assert!(runs.iter().any(|r| r.role == SpanRole::Address));
+        assert!(runs.iter().any(|r| r.role == SpanRole::ClassName));
+    }
+
+    #[test]
+    fn fnptr_row_colors_type_token_blue() {
+        let lm = field_line(0, NodeKind::FuncPtr64);
+        let text = "fnptr64       event           0x7ff60baa84c0";
+        let runs = style_runs(&lm, text, 14, 22);
+        assert!(runs.iter().any(|r| r.role == SpanRole::FnPtr));
     }
 
     #[test]
