@@ -35,6 +35,15 @@ impl DocId {
     pub fn get(self) -> u64 {
         self.0.get()
     }
+
+    /// Construct from a raw non-zero id. Used by the document-tab area, which
+    /// owns its own monotonic allocator kept in lockstep with [`AppState`].
+    ///
+    /// # Panics
+    /// Panics if `raw == 0` (a `DocId` is always a live, allocated id).
+    pub fn from_raw(raw: u64) -> Self {
+        DocId(NonZeroU64::new(raw).expect("DocId must be non-zero"))
+    }
 }
 
 /// The active data source backing a document — the UI-facing summary of the
@@ -104,6 +113,39 @@ impl DataSource {
     }
 }
 
+/// The per-pane view mode — which of the editor's rendering surfaces is shown
+/// (the C++ `enum ViewMode`, app-shell §6; the per-`SplitPane` Reclass/Code/Debug
+/// tab). The chrome stage wires the dual toggle the titlebar/tab strip exposes:
+/// the structured **tree** view vs the generated **rendered** C/C++ output. The
+/// third `Debug` surface exists in the C++ `SplitPane` but is not part of the
+/// dual toggle and is added with the editor split work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewMode {
+    /// `VM_Reclass` — the bespoke structured-editor grid (default; app-shell §6).
+    #[default]
+    Tree,
+    /// `VM_Rendered` — the generated C/C++ source for the viewed struct.
+    Rendered,
+}
+
+impl ViewMode {
+    /// Short label for the toggle button / tooltips.
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Tree => "Tree",
+            ViewMode::Rendered => "C/C++",
+        }
+    }
+
+    /// The other mode (the dual toggle flips between exactly two states).
+    pub fn toggled(self) -> Self {
+        match self {
+            ViewMode::Tree => ViewMode::Rendered,
+            ViewMode::Rendered => ViewMode::Tree,
+        }
+    }
+}
+
 /// The active node selection, mirrored from the controller's selection signals
 /// (`nodeSelected(idx)` / `selectionChanged(count)`, app-shell §8 step 9).
 ///
@@ -151,6 +193,10 @@ pub struct DocTab {
     pub view_root: Option<u64>,
     /// Cached selection for the status bar.
     pub selection: Selection,
+    /// The active pane's view mode — structured tree vs rendered C/C++ output
+    /// (the dual toggle; app-shell §6, §16 `syncViewButtons`). Per-tab so the
+    /// strip + toggle reflect the active document.
+    pub view_mode: ViewMode,
 }
 
 impl DocTab {
@@ -161,6 +207,7 @@ impl DocTab {
             source: DataSource::none(),
             view_root: None,
             selection: Selection::empty(),
+            view_mode: ViewMode::default(),
         }
     }
 }
@@ -317,6 +364,29 @@ impl AppState {
         }
     }
 
+    // ── View mode (the dual tree/rendered toggle) ──
+
+    /// The active tab's view mode (defaults to `Tree` when no tab is open).
+    pub fn active_view_mode(&self) -> ViewMode {
+        self.active_tab().map(|t| t.view_mode).unwrap_or_default()
+    }
+
+    /// Set a document's view mode (the toggle button / `setViewMode`; app-shell
+    /// §16). No-op if the id is unknown.
+    pub fn set_view_mode(&mut self, id: DocId, mode: ViewMode) {
+        if let Some(t) = self.tab_mut(id) {
+            t.view_mode = mode;
+        }
+    }
+
+    /// Flip the active tab's view mode (the dual toggle click). Returns the new
+    /// mode, or `None` when no tab is open.
+    pub fn toggle_active_view_mode(&mut self) -> Option<ViewMode> {
+        let t = self.active_tab_mut()?;
+        t.view_mode = t.view_mode.toggled();
+        Some(t.view_mode)
+    }
+
     // ── Theme handle ──
 
     /// The active theme's display name (the theme handle).
@@ -470,5 +540,40 @@ mod tests {
         assert_eq!(SourceKind::None.label(), "No source");
         assert_eq!(SourceKind::File.label(), "File");
         assert_eq!(SourceKind::Process.label(), "Process");
+    }
+
+    #[test]
+    fn view_mode_defaults_to_tree_and_toggles() {
+        // The C++ default per-pane mode is VM_Reclass (the structured grid).
+        assert_eq!(ViewMode::default(), ViewMode::Tree);
+        assert_eq!(ViewMode::Tree.toggled(), ViewMode::Rendered);
+        assert_eq!(ViewMode::Rendered.toggled(), ViewMode::Tree);
+        assert_eq!(ViewMode::Tree.label(), "Tree");
+        assert_eq!(ViewMode::Rendered.label(), "C/C++");
+    }
+
+    #[test]
+    fn view_mode_is_per_tab_and_follows_active() {
+        let mut s = AppState::new();
+        // No tabs → the default mode.
+        assert_eq!(s.active_view_mode(), ViewMode::Tree);
+        assert_eq!(s.toggle_active_view_mode(), None);
+
+        let a = s.open_document("A");
+        let b = s.open_document("B");
+        // Toggle the active tab (b) only.
+        assert_eq!(s.toggle_active_view_mode(), Some(ViewMode::Rendered));
+        assert_eq!(s.active_view_mode(), ViewMode::Rendered);
+        assert_eq!(s.tab(b).unwrap().view_mode, ViewMode::Rendered);
+        // a is untouched.
+        assert_eq!(s.tab(a).unwrap().view_mode, ViewMode::Tree);
+
+        // Switching back to a shows a's (still Tree) mode.
+        s.activate(a);
+        assert_eq!(s.active_view_mode(), ViewMode::Tree);
+
+        // Explicit set on a specific tab.
+        s.set_view_mode(a, ViewMode::Rendered);
+        assert_eq!(s.tab(a).unwrap().view_mode, ViewMode::Rendered);
     }
 }

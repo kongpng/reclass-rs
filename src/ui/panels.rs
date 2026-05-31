@@ -1,20 +1,19 @@
-//! Dock panels — the placeholder gpui-component [`Panel`]s the window shell
-//! docks, and the seam real content plugs into next.
+//! Dock panels — the generic placeholder [`Panel`] for not-yet-built docks.
 //!
-//! Port of the dockable side panels + MDI document panels (app-shell §8, §10):
-//! the workspace ("Project") tree, the memory-scanner panel, the symbols/
-//! bookmarks panels, and each open-document editor panel. **SKELETON** — every
-//! panel is a placeholder that renders its name; the real content (workspace
-//! `Tree`, scanner `DataTable`, the bespoke editor surface) is filled in by the
-//! later UI workflows. What's defined here is the *structure*: a single generic
-//! [`PlaceholderPanel`] that satisfies gpui-component's `Panel` trait so a
-//! [`DockArea`](gpui_component::dock::DockArea) can be assembled and shown.
+//! Port of the dockable side panels + MDI document panels (app-shell §8, §10).
+//! The **workspace** ("Project") dock is now the real
+//! [`WorkspacePanel`](super::workspace::WorkspacePanel) (a virtualized tree) and
+//! the **center document area** is the real
+//! [`DocumentArea`](super::tabs::DocumentArea) (the tab strip + editor host); the
+//! remaining docks (memory scanner, symbols, bookmarks) are still stood up with
+//! the generic [`PlaceholderPanel`] until their workflows land.
 //!
-//! gpui-component's `Panel` requires `EventEmitter<PanelEvent> + Render +
-//! Focusable` plus a `panel_name`; this provides exactly that, parameterized by
-//! a [`PanelKind`] so one type covers the workspace dock, scanner dock, and the
-//! center document area. As real panels arrive they become their own views
-//! implementing `Panel`, replacing the matching placeholder.
+//! What's defined here is the *structure*: a single generic [`PlaceholderPanel`]
+//! that satisfies gpui-component's `Panel` trait (`EventEmitter<PanelEvent> +
+//! Render + Focusable` + a `panel_name`) so a
+//! [`DockArea`](gpui_component::dock::DockArea) can host it. [`DocumentPanel`]
+//! (the older single-editor center panel) is kept for reference + reuse; the
+//! center is now the multi-tab [`DocumentArea`](super::tabs::DocumentArea).
 //!
 //! Gated behind the `ui` feature (pulls gpui-component).
 

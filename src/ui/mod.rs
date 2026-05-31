@@ -28,8 +28,12 @@ pub mod dialogs;
 pub mod docks;
 pub mod editor;
 pub mod panels;
+pub mod startpage;
 pub mod state;
+pub mod tabs;
 pub mod theme_apply;
+pub mod titlebar;
 pub mod window;
+pub mod workspace;
 
 pub use window::{open_main_window, MainWindow};
