@@ -170,9 +170,53 @@ pub fn flatten_menu_bar(top_level: &[MenuNode]) -> Vec<Entry> {
     entries
 }
 
+/// The display names of the bundled built-in themes, in built-in order — the
+/// gpui-free source for the **View ▸ Theme ▸** fly-out children
+/// (`view.theme.<name>`). Parses each shipped default theme's `"name"` field
+/// straight off [`crate::theme::DEFAULT_THEMES`] (the same JSON the
+/// `ThemeManager` loads at startup), so the menu reflects the built-in set
+/// without needing a live gpui context. (User-added themes are not visible to
+/// this static builder; the C++ default state is exactly the built-ins.)
+pub fn theme_display_names() -> Vec<String> {
+    crate::theme::DEFAULT_THEMES
+        .iter()
+        .filter_map(|(_, json)| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()?
+                .get("name")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+/// Build the **Examples ▸** fly-out children: one leaf per bundled example,
+/// `file.example.<name>` (the start-page Examples bucket, surfaced in the File
+/// menu). Reads [`crate::ui::examples::examples`].
+fn example_menu_items() -> Vec<MenuNode> {
+    crate::ui::examples::examples()
+        .iter()
+        .map(|(name, _)| MenuNode::item(name, "", &format!("file.example.{name}")))
+        .collect()
+}
+
+/// Build the **View ▸ Theme ▸** fly-out children: one checkable-style leaf per
+/// available theme, `view.theme.<name>` (the active theme is shown checked via
+/// the live checked-set, not baked into the tree).
+fn theme_menu_items() -> Vec<MenuNode> {
+    theme_display_names()
+        .into_iter()
+        .map(|name| MenuNode::item(&name, "", &format!("view.theme.{name}")))
+        .collect()
+}
+
 /// The Reclass menu bar as data (app-shell §7 `createMenus`) — the full command
-/// set + shortcuts the palette searches. Faithful to the C++ menu tree (the
-/// exact paths/shortcuts drive parity).
+/// set + shortcuts the palette searches and the menu bar renders. Mirrors the
+/// C++ menus (`_design`/reclass_reference crops): the File menu uses **cascading
+/// submenus** (Recent Files ▸ · Import ▸ · Export ▸ · Examples ▸ · Data Source ▸),
+/// the View menu carries the checkable display toggles plus Font ▸ / Theme ▸.
+/// Examples ▸ children come from the bundled set; Theme ▸ children from the
+/// shipped themes.
 pub fn default_menu_tree() -> Vec<MenuNode> {
     use MenuNode as N;
     vec![
@@ -183,8 +227,9 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::item("New Struct", "Ctrl+T", "file.new_struct"),
                 N::item("New Enum", "Ctrl+E", "file.new_enum"),
                 N::item("Open…", "Ctrl+O", "file.open"),
+                // Dynamic — populated by the host as the user opens files. Empty
+                // submenu (still shows a ▸ fly-out with no children for now).
                 N::submenu("Recent Files", vec![]),
-                N::item("Welcome Screen", "", "file.welcome"),
                 N::Separator,
                 N::item("Save", "Ctrl+S", "file.save"),
                 N::item("Save As…", "Ctrl+Shift+S", "file.save_as"),
@@ -192,24 +237,39 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::submenu(
                     "Import",
                     vec![
-                        N::item("From Source…", "", "import.source"),
-                        N::item("ReClass XML…", "", "import.xml"),
-                        N::item("PDB…", "", "import.pdb"),
+                        N::item("From Source…", "", "file.import.source"),
+                        N::item("ReClass XML…", "", "file.import.xml"),
+                        N::item("PDB…", "", "file.import.pdb"),
                     ],
                 ),
                 N::submenu(
                     "Export",
                     vec![
-                        N::item("C++ Header…", "", "export.cpp"),
-                        N::item("Rust Structs…", "", "export.rust"),
-                        N::item("#define Offsets…", "", "export.defines"),
-                        N::item("C# Structs…", "", "export.csharp"),
-                        N::item("Python ctypes…", "", "export.python"),
-                        N::item("ReClass XML…", "", "export.xml"),
+                        N::item("C++ Header…", "", "file.export.cpp"),
+                        N::item("Rust Structs…", "", "file.export.rust"),
+                        N::item("#define Offsets…", "", "file.export.defines"),
+                        N::item("C# Structs…", "", "file.export.csharp"),
+                        N::item("Python ctypes…", "", "file.export.python"),
+                        N::item("ReClass XML…", "", "file.export.xml"),
                     ],
                 ),
+                N::submenu("Examples", example_menu_items()),
                 N::Separator,
                 N::item("Close Project", "Ctrl+W", "file.close"),
+                N::Separator,
+                N::submenu(
+                    "Data Source",
+                    vec![
+                        N::item("File", "", "source.file"),
+                        N::item("Process Memory", "", "source.process"),
+                        N::item("Kernel Memory", "", "source.kernel"),
+                        N::item("Remote Process Memory", "", "source.remote"),
+                        N::item("WinDbg Memory", "", "source.windbg"),
+                        N::item("ReClass.NET Compat", "", "source.rcnet"),
+                        N::Separator,
+                        N::item("Clear All", "", "source.clear"),
+                    ],
+                ),
                 N::Separator,
                 N::item("Exit", "", "file.exit"),
             ],
@@ -220,10 +280,12 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::item("Undo", "Ctrl+Z", "edit.undo"),
                 N::item("Redo", "Ctrl+Y", "edit.redo"),
                 N::Separator,
-                N::item("Find Field…", "Ctrl+F", "edit.find"),
+                N::item("Cut", "Ctrl+X", "edit.cut"),
+                N::item("Copy", "Ctrl+C", "edit.copy"),
+                N::item("Paste", "Ctrl+V", "edit.paste"),
+                N::item("Delete", "Del", "edit.delete"),
                 N::Separator,
-                N::item("Add Bookmark…", "Ctrl+B", "edit.add_bookmark"),
-                N::item("Quick Bookmark Here", "Ctrl+Alt+B", "edit.quick_bookmark"),
+                N::item("Select All", "Ctrl+A", "edit.select_all"),
             ],
         ),
         N::submenu(
@@ -231,23 +293,34 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
             vec![
                 N::item("Reset Windows", "", "view.reset_windows"),
                 N::Separator,
+                N::submenu(
+                    "Font",
+                    vec![
+                        N::item("Increase", "", "view.font.inc"),
+                        N::item("Decrease", "", "view.font.dec"),
+                        N::item("Reset", "", "view.font.reset"),
+                    ],
+                ),
+                N::submenu("Theme", theme_menu_items()),
+                N::Separator,
                 N::item("Compact Columns", "", "view.compact_columns"),
                 N::item("Tree Lines", "", "view.tree_lines"),
                 N::item("Relative Offsets", "", "view.relative_offsets"),
-                N::Separator,
-                N::item("Show Comment chips", "", "view.comment_chips"),
-                N::item("Show RTTI chips", "", "view.rtti_chips"),
-                N::item("Show Enum-value chips", "", "view.enum_chips"),
+                N::item("Type Hints", "", "view.type_hints"),
+                N::item("Comments", "", "view.comments"),
+                N::item("Hover Effects", "", "view.hover"),
+                N::item("Minimap", "", "view.minimap"),
                 N::Separator,
                 N::item("Refresh", "F5", "view.refresh"),
                 N::item("Go to Address…", "Ctrl+G", "view.goto_address"),
                 N::item("Command Palette…", "Ctrl+K", "view.command_palette"),
                 N::Separator,
-                N::item("Split View Below", "Ctrl+\\", "view.split"),
-                N::item("Unsplit View", "Ctrl+Shift+\\", "view.unsplit"),
+                N::item("Split Editor", "Ctrl+\\", "view.split"),
+                N::item("Unsplit Editor", "Ctrl+Shift+\\", "view.unsplit"),
                 N::Separator,
+                N::item("Project", "", "view.project"),
                 N::item("Memory Scanner", "Ctrl+Shift+M", "view.scanner"),
-                N::item("Symbols", "Ctrl+Shift+Y", "view.symbols"),
+                N::item("Modules", "Ctrl+Shift+Y", "view.modules"),
                 N::item("Bookmarks", "Ctrl+Shift+B", "view.bookmarks"),
                 N::Separator,
                 N::item("Presentation Mode", "Ctrl+Shift+P", "view.presentation"),
@@ -273,8 +346,8 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
         N::submenu(
             "&Help",
             vec![
-                N::item("Keyboard Shortcuts…", "F1", "help.shortcuts"),
                 N::item("About Reclass", "", "help.about"),
+                N::item("Documentation", "", "help.docs"),
             ],
         ),
     ]
@@ -899,11 +972,86 @@ mod tests {
         let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
         // Spot-check load-bearing commands + the palette/goto entries.
         assert!(cmds.contains(&"file.save"));
-        assert!(cmds.contains(&"edit.find"));
+        assert!(cmds.contains(&"edit.select_all"));
         assert!(cmds.contains(&"view.goto_address"));
         assert!(cmds.contains(&"view.command_palette"));
         assert!(cmds.contains(&"tools.options"));
         // Recent Files (empty submenu) contributes no leaf entries.
         assert!(!cmds.iter().any(|c| c.contains("recent")));
+    }
+
+    #[test]
+    fn file_menu_uses_cascading_submenus() {
+        // The File menu's Import/Export/Examples/Data Source are real submenus
+        // (cascading fly-outs), so their leaves flatten under those paths.
+        let entries = flatten_menu_bar(&default_menu_tree());
+        let path_of = |cmd: &str| {
+            entries
+                .iter()
+                .find(|e| e.command == cmd)
+                .map(|e| e.path.clone())
+        };
+        assert_eq!(
+            path_of("file.import.source").as_deref(),
+            Some("File > Import > From Source…")
+        );
+        assert_eq!(
+            path_of("file.export.cpp").as_deref(),
+            Some("File > Export > C++ Header…")
+        );
+        assert_eq!(
+            path_of("source.file").as_deref(),
+            Some("File > Data Source > File")
+        );
+    }
+
+    #[test]
+    fn examples_submenu_has_one_item_per_bundled_example() {
+        let entries = flatten_menu_bar(&default_menu_tree());
+        for (name, _) in crate::ui::examples::examples() {
+            let cmd = format!("file.example.{name}");
+            assert!(
+                entries.iter().any(|e| e.command == cmd),
+                "missing example command {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_menu_has_checkable_toggles_and_theme_children() {
+        let entries = flatten_menu_bar(&default_menu_tree());
+        let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        for c in [
+            "view.compact_columns",
+            "view.tree_lines",
+            "view.relative_offsets",
+            "view.type_hints",
+            "view.comments",
+            "view.hover",
+            "view.minimap",
+            "view.font.inc",
+            "view.split",
+            "view.presentation",
+        ] {
+            assert!(cmds.contains(&c), "View menu missing {c}");
+        }
+        // One Theme child per shipped theme.
+        for name in super::theme_display_names() {
+            let cmd = format!("view.theme.{name}");
+            assert!(
+                entries.iter().any(|e| e.command == cmd),
+                "missing theme command {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_display_names_are_nonempty_and_include_default() {
+        let names = super::theme_display_names();
+        assert!(!names.is_empty(), "expected bundled theme names");
+        assert!(
+            names.iter().any(|n| n == "Zed One Dark"),
+            "default theme name should be present"
+        );
     }
 }

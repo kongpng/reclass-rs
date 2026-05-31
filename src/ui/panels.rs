@@ -35,6 +35,12 @@ pub enum PanelKind {
     Scanner,
     /// The center MDI document area (app-shell §8 — the editor surface lives here).
     Document,
+    /// The right-dock modules/symbols/types list (the C++ View ▸ Modules,
+    /// `Ctrl+Shift+Y`). The real view is [`super::modulespanel::ModulesPanel`].
+    Modules,
+    /// The right-dock bookmarks list (the C++ View ▸ Bookmarks, `Ctrl+Shift+B`).
+    /// The real view is [`super::bookmarkspanel::BookmarksPanel`].
+    Bookmarks,
 }
 
 impl PanelKind {
@@ -44,6 +50,8 @@ impl PanelKind {
             PanelKind::Workspace => "Project",
             PanelKind::Scanner => "Memory Scanner",
             PanelKind::Document => "Document",
+            PanelKind::Modules => "Modules",
+            PanelKind::Bookmarks => "Bookmarks",
         }
     }
 
@@ -54,6 +62,8 @@ impl PanelKind {
             PanelKind::Workspace => "WorkspacePanel",
             PanelKind::Scanner => "ScannerPanel",
             PanelKind::Document => "DocumentPanel",
+            PanelKind::Modules => super::modulespanel::PANEL_NAME,
+            PanelKind::Bookmarks => super::bookmarkspanel::PANEL_NAME,
         }
     }
 }

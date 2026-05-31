@@ -15,10 +15,15 @@
 //! contract carrying `(node_idx, sub_line, target, text)`.
 
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::*;
 
 use crate::compose::EditTarget;
+
+/// Caret blink half-period (on→off or off→on). Matches the gpui-component input
+/// blink cadence (500ms) so the inline field caret feels native.
+const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// What a committed inline edit carries back to the editor → controller
 /// (`inlineEditCommitted(nodeIdx, subLine, target, text)`, editor-surface.md §11
@@ -93,6 +98,19 @@ pub struct FieldInput {
     selection_color: Hsla,
     /// Set by an action handler; drained by the host to learn what to do next.
     pending_outcome: Option<EditOutcome>,
+
+    // ── Caret blink (BUG 2) ──
+    /// Whether the caret quad is drawn this frame. Kept SOLID-visible (`true`)
+    /// while typing / moving the cursor; flips on the idle blink timer only.
+    blink_visible: bool,
+    /// Monotonic blink epoch — every keystroke / cursor move bumps it so an
+    /// in-flight blink timer from a *previous* edit is ignored (it compares its
+    /// captured epoch against this and bails), guaranteeing the caret resets to
+    /// solid the instant the field changes (no stale "off" phase swallowing a
+    /// keystroke's caret).
+    blink_epoch: usize,
+    /// The pending blink timer task (dropped/replaced on each reset).
+    _blink_task: Task<()>,
 }
 
 impl FieldInput {
@@ -126,7 +144,61 @@ impl FieldInput {
             text_color,
             selection_color,
             pending_outcome: None,
+            // The caret starts solid-visible; the blink timer is armed when the
+            // field is focused / on the first reset (begin-edit calls `notify_edit`).
+            blink_visible: true,
+            blink_epoch: 0,
+            _blink_task: Task::ready(()),
         }
+    }
+
+    /// Whether the caret quad should be painted this frame (BUG 2). Solid while
+    /// typing/moving; toggles on the idle blink timer.
+    pub fn caret_visible(&self) -> bool {
+        self.blink_visible
+    }
+
+    /// Reset the caret to **solid-visible** and (re)arm the idle blink timer
+    /// (BUG 2). Called on every text edit, key, and cursor move so the caret is
+    /// continuously drawn while the user is active, blinking only once they pause.
+    /// Bumps the blink epoch so any timer from a prior edit is a no-op when it
+    /// fires, then schedules a fresh half-period before the next toggle.
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_visible = true;
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        let epoch = self.blink_epoch;
+        // Schedule the next phase flip a half-period out. A foreground spawn on
+        // the field entity keeps the toggle on the UI timeline; the epoch guard
+        // makes superseded timers inert. Each notify also re-renders the host
+        // editor (the host observes this field), so the embedded caret quad is
+        // recomputed at the current cursor offset on every tick.
+        self._blink_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BLINK_INTERVAL).await;
+            let _ = this.update(cx, |this, cx| this.blink_phase(epoch, cx));
+        });
+    }
+
+    /// One idle blink toggle: flip caret visibility and schedule the next flip,
+    /// unless a newer edit has bumped the epoch (then bail, leaving the caret as
+    /// the edit left it — solid). Drives itself via the foreground timer.
+    fn blink_phase(&mut self, epoch: usize, cx: &mut Context<Self>) {
+        if epoch != self.blink_epoch {
+            return; // superseded by a later edit/reset — do nothing.
+        }
+        self.blink_visible = !self.blink_visible;
+        cx.notify();
+        let next = self.blink_epoch.wrapping_add(1);
+        self.blink_epoch = next;
+        self._blink_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BLINK_INTERVAL).await;
+            let _ = this.update(cx, |this, cx| this.blink_phase(next, cx));
+        });
+    }
+
+    /// Public hook the host calls right after begin-edit (and any time it focuses
+    /// the field) to arm the blink with a solid caret.
+    pub fn arm_caret(&mut self, cx: &mut Context<Self>) {
+        self.restart_blink(cx);
     }
 
     /// The field's focus handle (the editor focuses this on begin-edit). Named
@@ -261,6 +333,7 @@ impl FieldInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.restart_blink(cx);
         cx.notify();
     }
     fn cursor_offset(&self) -> usize {
@@ -280,6 +353,7 @@ impl FieldInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.restart_blink(cx);
         cx.notify();
     }
 
@@ -411,6 +485,9 @@ impl EntityInputHandler for FieldInput {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        // Keep the caret solid + recomputed at the new cursor offset while typing
+        // (BUG 2): a keystroke must not leave the caret in a stale "off" phase.
+        self.restart_blink(cx);
         cx.notify();
     }
 
@@ -440,6 +517,8 @@ impl EntityInputHandler for FieldInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .map(|new_range| new_range.start + range.start..new_range.end + range.end)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        // IME composition keeps the caret solid + recomputed (BUG 2).
+        self.restart_blink(cx);
         cx.notify();
     }
 
@@ -535,6 +614,10 @@ impl Element for FieldElement {
         let cursor = input.cursor_offset();
         let color = input.text_color;
         let selection_color = input.selection_color;
+        // BUG 2: only build the caret quad when the blink phase says it is visible.
+        // The quad is recomputed from `cursor` (the live cursor offset) every
+        // prepaint, so each keystroke / move lands the caret at the new position.
+        let caret_visible = input.caret_visible();
         let style = window.text_style();
 
         let run = TextRun {
@@ -581,13 +664,17 @@ impl Element for FieldElement {
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
-                Some(fill(
-                    Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
-                        size(px(2.), bounds.bottom() - bounds.top()),
-                    ),
-                    color,
-                )),
+                // Painted only while the blink phase is in its visible half (or
+                // solid mid-type); `None` hides it on the off phase (BUG 2).
+                caret_visible.then(|| {
+                    fill(
+                        Bounds::new(
+                            point(bounds.left() + cursor_pos, bounds.top()),
+                            size(px(2.), bounds.bottom() - bounds.top()),
+                        ),
+                        color,
+                    )
+                }),
             )
         } else {
             (

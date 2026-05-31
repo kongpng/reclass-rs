@@ -67,6 +67,12 @@ pub struct MenuBar {
     /// hovering a sibling *while one is open* switches to it, and choosing a
     /// command (or clicking out / Escape) closes them all.
     open_index: Option<usize>,
+    /// The currently-open cascading submenu path *within* the open top-level menu
+    /// — a chain of child indices (the C++ `QMenu` opening a nested `QMenu` as the
+    /// pointer rests on a "▸" item). Empty ⇒ no fly-out open. Hovering a different
+    /// submenu row at a given depth replaces the tail (the classic "slide between
+    /// fly-outs" behaviour); hovering a plain leaf collapses any deeper fly-outs.
+    open_submenu: Vec<usize>,
     /// Command ids that should render a leading checkmark (checkable/toggle menu
     /// items reflecting live app state — e.g. `view.scanner` while the scanner
     /// pop-out is open; the C++ `QAction::setChecked`). The host
@@ -83,6 +89,7 @@ impl MenuBar {
         MenuBar {
             menus: default_menu_tree(),
             open_index: None,
+            open_submenu: Vec::new(),
             checked: HashSet::new(),
         }
     }
@@ -109,29 +116,55 @@ impl MenuBar {
 
     /// Toggle the top-level menu at `index` open/closed (the C++ title click). If
     /// a *different* menu is open it switches to this one; clicking the open menu's
-    /// title again closes it.
+    /// title again closes it. Always collapses any open fly-out chain.
     fn toggle_menu(&mut self, index: usize, cx: &mut Context<Self>) {
         self.open_index = if self.open_index == Some(index) {
             None
         } else {
             Some(index)
         };
+        self.open_submenu.clear();
         cx.notify();
     }
 
     /// Switch the open menu to `index` *only while a menu is already open* — the
     /// C++ "slide across the bar with the mouse" behaviour. A no-op when nothing
-    /// is open (so a passive hover never pops a menu).
+    /// is open (so a passive hover never pops a menu). Collapses fly-outs from the
+    /// previously-open menu.
     fn hover_menu(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.open_index.is_some() && self.open_index != Some(index) {
             self.open_index = Some(index);
+            self.open_submenu.clear();
+            cx.notify();
+        }
+    }
+
+    /// Open the cascading fly-out for the submenu reached by `path` (a chain of
+    /// child indices from the open top-level menu). Hovering a "▸" row calls this;
+    /// it replaces the current fly-out chain (so sliding from one submenu row to a
+    /// sibling swaps the open fly-out). No-op if already open at that exact path.
+    fn open_submenu_path(&mut self, path: Vec<usize>, cx: &mut Context<Self>) {
+        if self.open_submenu != path {
+            self.open_submenu = path;
+            cx.notify();
+        }
+    }
+
+    /// Collapse any fly-out at `depth` and deeper (the pointer moved onto a plain
+    /// leaf at this level, so its sibling fly-outs must close). Keeps the shallower
+    /// part of the chain intact. No-op if nothing deeper is open.
+    fn collapse_submenu_to(&mut self, depth: usize, cx: &mut Context<Self>) {
+        if self.open_submenu.len() > depth {
+            self.open_submenu.truncate(depth);
             cx.notify();
         }
     }
 
     /// Close all menus (a command was chosen, the user clicked out, or Escape).
     fn close_menus(&mut self, cx: &mut Context<Self>) {
-        if self.open_index.take().is_some() {
+        let was_open = self.open_index.take().is_some() || !self.open_submenu.is_empty();
+        self.open_submenu.clear();
+        if was_open {
             cx.notify();
         }
     }
@@ -140,6 +173,7 @@ impl MenuBar {
     /// `MainWindow` slot) and close the menus. Called from a dropdown item's click.
     fn choose_command(&mut self, command: CommandId, cx: &mut Context<Self>) {
         self.open_index = None;
+        self.open_submenu.clear();
         cx.emit(MenuCommand(command));
         cx.notify();
     }
@@ -157,6 +191,8 @@ impl Render for MenuBar {
         // (File · Edit · View · Tools · Plugins · Help).
         let menus = self.menus.clone();
         let open_index = self.open_index;
+        // The open cascading fly-out chain within the active top-level menu.
+        let open_submenu = self.open_submenu.clone();
         // Snapshot the checked-command set once here (where `self` is borrowed) so
         // the dropdown builders don't re-`read` this same entity mid-render.
         let checked = self.checked.clone();
@@ -173,6 +209,7 @@ impl Render for MenuBar {
                         clean_title(&label),
                         children,
                         open_index == Some(i),
+                        open_submenu.clone(),
                         checked.clone(),
                         cx,
                     )),
@@ -191,11 +228,13 @@ impl Render for MenuBar {
 /// it **stops propagation on mouse-down** so the surrounding [`TitleBar`] drag
 /// region never swallows the click, then toggles the menu on click. Hovering a
 /// title while *another* menu is open switches to it (the C++ menu-bar slide).
+#[allow(clippy::too_many_arguments)]
 fn render_top_level(
     index: usize,
     title: String,
     children: Vec<MenuNode>,
     open: bool,
+    open_submenu: Vec<usize>,
     checked: HashSet<CommandId>,
     cx: &mut Context<MenuBar>,
 ) -> AnyElement {
@@ -243,28 +282,55 @@ fn render_top_level(
                             .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
                                 this.close_menus(cx);
                             }))
-                            .child(menu_dropdown(&children, &checked, cx)),
+                            // The whole cascading chain (this menu + any open
+                            // fly-outs) is rendered relative to the top-level
+                            // dropdown so each child anchors to the right of its
+                            // parent row.
+                            .child(menu_dropdown(&children, &open_submenu, &checked, cx)),
                     ),
             ))
         })
         .into_any_element()
 }
 
-/// The dropdown body for a submenu's `children`: an elevated surface of inset
-/// rows. Leaves are clickable command rows (checkmark slot · label · shortcut
-/// hint); separators are 1px rules; nested submenus collapse to a labelled
-/// section header with their leaves inlined one indent in, so nothing is silently
-/// dropped (the bar must always OPEN and show items).
+/// The dropdown body for a top-level menu's `children` — the root of a cascading
+/// chain. `open_submenu` is the chain of child indices whose fly-outs are open
+/// (within this top-level menu). Delegates to [`menu_panel`] at depth 0.
 fn menu_dropdown(
     children: &[MenuNode],
+    open_submenu: &[usize],
     checked: &HashSet<CommandId>,
     cx: &mut Context<MenuBar>,
 ) -> impl IntoElement {
+    menu_panel(children, &[], open_submenu, checked, cx)
+}
+
+/// Render one cascading menu **panel**: an elevated surface of inset rows for
+/// `children`. `parent_path` is the absolute index chain from the top-level
+/// dropdown down to (but not including) this panel's rows; `open_path` is the
+/// open fly-out chain *relative to this panel* (its head, if any, is the child
+/// index whose fly-out is open here, the tail recurses).
+///
+/// Leaves are clickable command rows; separators are 1px rules; submenus render
+/// a "▸" fly-out trigger row that, while open, anchors its child panel to the
+/// right of the row (the C++ cascading `QMenu`). Hovering a "▸" row opens its
+/// fly-out (replacing any sibling fly-out); hovering a plain leaf collapses any
+/// deeper fly-out at this level (the classic menu slide behaviour).
+fn menu_panel(
+    children: &[MenuNode],
+    parent_path: &[usize],
+    open_path: &[usize],
+    checked: &HashSet<CommandId>,
+    cx: &mut Context<MenuBar>,
+) -> AnyElement {
     // The host's checked-command set (the C++ checkable `QAction` state — e.g.
     // `view.scanner` while the scanner pop-out is open) is threaded down from
     // `render` so every row's checkmark stays in lockstep with the live app state
     // without re-`read`ing this entity mid-render.
     let is_checked = |command: &str| checked.contains(command);
+    // Depth of this panel = number of fly-outs already crossed to reach it.
+    let depth = parent_path.len();
+    let open_here = open_path.first().copied();
 
     let mut rows: Vec<AnyElement> = Vec::new();
     for (i, child) in children.iter().enumerate() {
@@ -283,6 +349,7 @@ fn menu_dropdown(
                     command.clone(),
                     *enabled,
                     is_checked(command),
+                    depth,
                     cx,
                 )
                 .into_any_element(),
@@ -291,32 +358,19 @@ fn menu_dropdown(
                 label,
                 children: sub,
             } => {
-                // Render the submenu header as a section label, then inline its
-                // leaf children one indent in — the chrome surface keeps the bar
-                // flat (no fly-out submenus) but shows every command.
-                rows.push(submenu_header_row(label, cx).into_any_element());
-                for (j, leaf) in sub.iter().enumerate() {
-                    if let MenuNode::Item {
-                        label,
-                        shortcut,
-                        command,
-                        enabled,
-                    } = leaf
-                    {
-                        rows.push(
-                            command_row(
-                                1000 + i * 100 + j,
-                                label,
-                                shortcut,
-                                command.clone(),
-                                *enabled,
-                                is_checked(command),
-                                cx,
-                            )
-                            .into_any_element(),
-                        );
-                    }
-                }
+                // Absolute path to this submenu's fly-out panel.
+                let mut abs_path = parent_path.to_vec();
+                abs_path.push(i);
+                let is_open = open_here == Some(i);
+                // Recurse into the child panel only while this fly-out is open.
+                let child_panel: Option<AnyElement> = if is_open {
+                    Some(menu_panel(sub, &abs_path, &open_path[1..], checked, cx))
+                } else {
+                    None
+                };
+                rows.push(
+                    submenu_row(i, label, is_open, abs_path, child_panel, cx).into_any_element(),
+                );
             }
         }
     }
@@ -326,6 +380,87 @@ fn menu_dropdown(
         .min_w(px(220.0))
         .p(px(tokens::space::XS))
         .child(gpui_component::v_flex().gap(px(1.0)).children(rows))
+        .into_any_element()
+}
+
+/// A cascading-submenu trigger row: `[gap] Label ……………………… ▸`, opening its child
+/// panel to the right while `open`. Hovering the row opens its fly-out (via
+/// [`MenuBar::open_submenu_path`] with `abs_path`); the child panel is rendered
+/// as a `deferred(...)` absolutely positioned at the row's right edge so it
+/// floats over siblings (the C++ cascading `QMenu`). The row highlights while
+/// open.
+fn submenu_row(
+    key: usize,
+    label: &str,
+    open: bool,
+    abs_path: Vec<usize>,
+    child_panel: Option<AnyElement>,
+    cx: &mut Context<MenuBar>,
+) -> impl IntoElement {
+    let fg = color::text(cx);
+    let muted = color::text_muted(cx);
+
+    // Empty leading slot mirrors the command row's checkmark slot so submenu
+    // labels line up with sibling leaves.
+    let lead_slot = div()
+        .flex_none()
+        .w(px(tokens::font::UI_MD))
+        .h(px(tokens::font::UI_MD));
+
+    let hover_path = abs_path.clone();
+    div()
+        .id(("menu-submenu", key))
+        .relative()
+        .child(
+            gpui_component::h_flex()
+                .w_full()
+                .h(px(26.0))
+                .px(px(tokens::space::SM))
+                .gap(px(tokens::space::SM))
+                .items_center()
+                .justify_between()
+                .rounded(px(tokens::radius::MD))
+                .text_size(px(tokens::font::UI_MD))
+                .text_color(fg)
+                .cursor_pointer()
+                .when(open, |r| r.bg(color::hover_overlay(cx)))
+                .when(!open, |r| r.hover(|s| s.bg(color::hover_overlay(cx))))
+                .child(lead_slot)
+                .child(div().flex_1().min_w_0().child(label.to_string()))
+                // The fly-out affordance (the C++ submenu ▸).
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(muted)
+                        .child(icon::chevron_right().xsmall()),
+                ),
+        )
+        // Open this fly-out when the pointer rests on the row (replacing any
+        // sibling fly-out at this level).
+        .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+            if *hovered {
+                this.open_submenu_path(hover_path.clone(), cx);
+            }
+        }))
+        // The child panel floats to the right of this row, in a higher paint
+        // layer (`deferred` + priority) so it sits over sibling rows. Positioned
+        // at the row's right edge (`left_full`) and level with its top within the
+        // row's `relative()` box — the C++ cascading `QMenu` placement.
+        .when_some(child_panel, |this, panel| {
+            this.child(
+                deferred(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .left_full()
+                        .top_0()
+                        // Nudge the fly-out off the parent panel's edge.
+                        .ml(px(tokens::space::XS))
+                        .child(panel),
+                )
+                .priority(1),
+            )
+        })
 }
 
 /// A clickable command row: `[checkmark slot] Label …………… [Shortcut]`.
@@ -334,6 +469,7 @@ fn menu_dropdown(
 /// (the Assets-stage [`icon::check`]) — the C++ checkable `QAction` (e.g. View ▸
 /// Memory Scanner while the scanner pop-out is open). Clicking emits
 /// [`MenuCommand`] (via [`MenuBar::choose_command`]) and closes the menu.
+#[allow(clippy::too_many_arguments)]
 fn command_row(
     key: usize,
     label: &str,
@@ -341,6 +477,7 @@ fn command_row(
     command: CommandId,
     enabled: bool,
     checked: bool,
+    depth: usize,
     cx: &mut Context<MenuBar>,
 ) -> impl IntoElement {
     let label_color = if enabled {
@@ -391,6 +528,13 @@ fn command_row(
         .rounded(px(tokens::radius::MD))
         .text_size(px(tokens::font::UI_MD))
         .text_color(label_color)
+        // Resting the pointer on a plain leaf at this level collapses any open
+        // fly-out from a *sibling* "▸" row (the C++ slide-off-the-submenu close).
+        .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+            if *hovered {
+                this.collapse_submenu_to(depth, cx);
+            }
+        }))
         .when(enabled, |r| {
             r.cursor_pointer()
                 .hover(|s| s.bg(color::hover_overlay(cx)))
@@ -411,20 +555,6 @@ fn separator_row(cx: &Context<MenuBar>) -> impl IntoElement {
         .h(px(tokens::border::THIN))
         .w_full()
         .bg(color::border(cx))
-}
-
-/// A nested-submenu header row (e.g. "Import", "Export") — a small uppercase
-/// muted caption introducing the inlined leaves below it.
-fn submenu_header_row(label: &str, cx: &Context<MenuBar>) -> impl IntoElement {
-    div()
-        .w_full()
-        .px(px(tokens::space::MD))
-        .pt(px(tokens::space::SM))
-        .pb(px(tokens::space::XXS))
-        .text_size(px(tokens::font::UI_XS))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(color::text_muted(cx))
-        .child(clean_title(label).to_uppercase())
 }
 
 #[cfg(test)]

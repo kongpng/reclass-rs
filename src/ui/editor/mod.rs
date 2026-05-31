@@ -27,6 +27,7 @@ pub mod element;
 pub mod geometry;
 pub mod hit_test;
 pub mod inline_edit;
+pub mod minimap;
 pub mod palette;
 pub mod selection;
 pub mod tab_cycle;
@@ -145,6 +146,19 @@ pub struct RcxEditor {
     /// user toggles to absolute addresses (PIC1/PIC2) via the margin double-click /
     /// context menu. Purely-visual editor state, so it lives on the view.
     relative_offsets: bool,
+    /// Shadow of the controller's `compactColumns` flag. The controller owns the
+    /// flag (it threads it into `compose(..)`) but exposes no getter, so the view
+    /// mirrors the last value it set for `compact_columns()` to read back.
+    compact_columns: bool,
+    /// View-option toggle: gate the hovered-line background (the per-row hover
+    /// wash). Purely-visual editor state (the C++ `m_hoverEffects`), defaults on;
+    /// the View menu's "Hover effects" item flips it. When off, no hover band is
+    /// drawn (the row still tracks the pointer for other affordances).
+    hover_effects: bool,
+    /// View-option toggle: render the right-side minimap overview column (the Zed
+    /// minimap / the C++ purple overview block, data_options.png). Purely-visual
+    /// editor state, defaults off; the View menu's "Minimap" item flips it.
+    minimap: bool,
     /// Measured monospace cell metrics (updated each frame from the font).
     metrics: CellMetrics,
     /// The node-row context menu (`editor.cpp` `customContextMenuRequested`,
@@ -206,6 +220,9 @@ impl RcxEditor {
             hovered_line: None,
             last_tab_target: None,
             relative_offsets: true,
+            compact_columns: false,
+            hover_effects: true,
+            minimap: false,
             metrics: CellMetrics::new(8.0, 16.0),
             context_menu: None,
             context_menu_pos: Point::default(),
@@ -299,6 +316,86 @@ impl RcxEditor {
     pub fn set_relative_offsets(&mut self, relative: bool, cx: &mut Context<Self>) {
         if self.relative_offsets != relative {
             self.relative_offsets = relative;
+            cx.notify();
+        }
+    }
+
+    // ── View-option toggles (EDITOR SETTER CONTRACT) ──
+    //
+    // The four compose-affecting toggles (`compact_columns`, `tree_lines`,
+    // `type_hints`, `show_comments`) are owned by the controller, which already
+    // threads them into `compose(..)` through `refresh()` (controller.rs). The
+    // editor setters delegate to the controller so a flip recomposes the document;
+    // the getters read the controller's live value. `hover_effects` and `minimap`
+    // are purely-visual editor state (no recompose) and live on the view, mirroring
+    // `relative_offsets`.
+
+    /// Whether columns are tightened (`compactColumns`, controller-backed; the
+    /// view shadows the flag since the controller exposes no getter).
+    pub fn compact_columns(&self) -> bool {
+        self.compact_columns
+    }
+    /// `setCompactColumns(v)` — tighten/loosen the type/name column spacing. Routes
+    /// to the controller, which recomposes with the new column geometry.
+    pub fn set_compact_columns(&mut self, v: bool, cx: &mut Context<Self>) {
+        self.compact_columns = v;
+        self.controller.set_compact_columns(v);
+        self.after_mutation(cx);
+    }
+
+    /// Whether the tree-line connectors are drawn (`treeLines`, controller-backed).
+    /// The controller exposes no getter, but the composed [`LayoutInfo`] carries
+    /// the flag it last composed with, so read it back from there.
+    pub fn tree_lines(&self) -> bool {
+        self.controller.last_result().layout.tree_lines
+    }
+    /// `setTreeLines(v)` — toggle the indent tree-connector glyphs; recomposes.
+    pub fn set_tree_lines(&mut self, v: bool, cx: &mut Context<Self>) {
+        self.controller.set_tree_lines(v);
+        self.after_mutation(cx);
+    }
+
+    /// Whether type-inference hint chips are shown (`typeHints`, controller-backed).
+    pub fn type_hints(&self) -> bool {
+        self.controller.type_hints()
+    }
+    /// `setTypeHints(v)` — toggle the dim type-inference chips; recomposes.
+    pub fn set_type_hints(&mut self, v: bool, cx: &mut Context<Self>) {
+        self.controller.set_type_hints(v);
+        self.after_mutation(cx);
+    }
+
+    /// Whether comment chips are shown (`showComments`, controller-backed).
+    pub fn show_comments(&self) -> bool {
+        self.controller.show_comments()
+    }
+    /// `setShowComments(v)` — toggle the green comment chips; recomposes.
+    pub fn set_show_comments(&mut self, v: bool, cx: &mut Context<Self>) {
+        self.controller.set_show_comments(v);
+        self.after_mutation(cx);
+    }
+
+    /// Whether the hovered-line background wash is drawn (view-only).
+    pub fn hover_effects(&self) -> bool {
+        self.hover_effects
+    }
+    /// `setHoverEffects(v)` — gate the per-row hover band (no recompose).
+    pub fn set_hover_effects(&mut self, v: bool, cx: &mut Context<Self>) {
+        if self.hover_effects != v {
+            self.hover_effects = v;
+            cx.notify();
+        }
+    }
+
+    /// Whether the right-side minimap overview column is shown (view-only).
+    pub fn minimap(&self) -> bool {
+        self.minimap
+    }
+    /// `setMinimap(v)` — show/hide the scaled structure overview column on the
+    /// right edge (the Zed minimap / C++ purple overview; no recompose).
+    pub fn set_minimap(&mut self, v: bool, cx: &mut Context<Self>) {
+        if self.minimap != v {
+            self.minimap = v;
             cx.notify();
         }
     }
@@ -504,12 +601,20 @@ impl RcxEditor {
             )
         });
 
-        // React to the field's commit/cancel outcome.
+        // React to the field's commit/cancel outcome AND re-render the host on
+        // every field change. The editable `FieldElement` is embedded in this
+        // view's `render_row` (not in the field's own `Render`), so a keystroke —
+        // which notifies the field — would otherwise leave the row's painted caret
+        // stale until an unrelated editor repaint (mouse-move) ran. Observing the
+        // field and `cx.notify()`-ing here re-prepaints the row on every keystroke,
+        // cursor move, and blink tick, so the caret stays solid while typing and
+        // is recomputed at the live cursor offset (BUG 2).
         let subscription = cx.observe(&field, |this: &mut RcxEditor, field, cx| {
             let outcome = field.update(cx, |f, _| f.take_outcome());
             if let Some(outcome) = outcome {
                 this.resolve_edit_outcome(outcome, cx);
             }
+            cx.notify();
         });
 
         self.last_tab_target = Some(target);
@@ -521,6 +626,9 @@ impl RcxEditor {
         });
         let handle = field.read(cx).field_focus_handle();
         window.focus(&handle, cx);
+        // Arm the caret blink with a solid caret so the field shows an immediate,
+        // continuously-visible cursor the moment editing begins (BUG 2).
+        field.update(cx, |f, cx| f.arm_caret(cx));
         cx.notify();
     }
 
@@ -553,9 +661,13 @@ impl RcxEditor {
     /// (editor-surface.md §1: the controller recomposes, then we refresh).
     fn apply_commit(&mut self, commit: &EditCommit, cx: &mut Context<Self>) {
         if commit.node_idx < 0 {
-            // Command-row edits (base address / source / root name) are not yet
-            // wired to a controller setter in this stage; recompose to clear the
-            // overlay and keep state consistent.
+            // Command-row edits act on the *active/root class*, which has no row
+            // `node_idx` of its own (the command row is synthetic, node_idx = -1).
+            // Route them to the controller against the view-root node / tree base
+            // so a left-click → type → Enter on the base address / class name / the
+            // `struct`/`class` keyword actually persists (BUG 1: previously these
+            // recomposed without writing, so "typing did nothing").
+            self.apply_command_row_commit(commit, cx);
             self.after_mutation(cx);
             return;
         }
@@ -582,6 +694,47 @@ impl RcxEditor {
             _ => {}
         }
         self.after_mutation(cx);
+    }
+
+    /// Apply a committed **command-row** edit (the synthetic class-header row,
+    /// `node_idx < 0`) against the active/root class (BUG 1):
+    /// - `BaseAddress` → parse the typed hex/expression and push the controller's
+    ///   `ChangeBase` command (undoable). A bare hex literal sets the numeric base
+    ///   and clears the formula; anything else is kept as the base-address
+    ///   *formula* string (`app.exe + 0x1A0`, `[app.exe + 0x58]`, …) so the
+    ///   command row redisplays it verbatim (the address tooltip documents these).
+    /// - `RootClassName` → rename the view-root struct node via the existing
+    ///   `rename_node` op.
+    /// - other command-row targets (source / keyword / chevron) have no plain-text
+    ///   controller op here, so they recompose without writing.
+    fn apply_command_row_commit(&mut self, commit: &EditCommit, cx: &mut Context<Self>) {
+        match commit.target {
+            EditTarget::BaseAddress => {
+                let text = commit.text.trim();
+                let old_base = self.controller.tree().base_address;
+                let old_formula = self.controller.document().tree.base_address_formula.clone();
+                let (new_base, new_formula) = parse_base_address(text, old_base);
+                if new_base != old_base || new_formula != old_formula {
+                    self.controller
+                        .push_command(crate::core::Command::ChangeBase {
+                            old_base,
+                            new_base,
+                            old_formula,
+                            new_formula,
+                        });
+                }
+            }
+            EditTarget::RootClassName => {
+                let root_id = self.controller.view_root_id();
+                let idx = self.controller.tree().index_of_id(root_id);
+                if idx >= 0 {
+                    self.controller
+                        .rename_node(idx as usize, commit.text.trim());
+                }
+            }
+            _ => {}
+        }
+        let _ = cx;
     }
 
     /// Tab to the next editable field in the current row (or first field if not
@@ -755,6 +908,60 @@ impl RcxEditor {
         }
     }
 
+    /// Build the [`minimap::Minimap`] element from the current compose result: one
+    /// proportional bar per composed line, colored by node kind / line role, plus
+    /// the viewport indicator from the live scroll offset (item 4). Cheap — it only
+    /// reads the existing `LineMeta`s and the scroll handle; no re-layout.
+    fn build_minimap(&self, palette: EditorPalette, cx: &App) -> minimap::Minimap {
+        let result = self.controller.last_result();
+        let rows: Vec<minimap::MinimapRow> = result
+            .meta
+            .iter()
+            .map(|lm| minimap_row_for(lm, &palette))
+            .collect();
+        let total = rows.len();
+        let (visible_start, visible_end) = self.minimap_visible_range(total);
+        let t = cx.theme();
+        minimap::Minimap {
+            rows,
+            chrome: minimap::MinimapChrome {
+                // A faint panel a hair darker than the paper, with the muted-blue
+                // overview tint the C++ purple block suggests (kept subtle / on
+                // palette via the primary accent, low alpha).
+                bg: with_alpha(t.primary, 0.06),
+                border: palette.border,
+                viewport: with_alpha(t.primary, 0.16),
+                viewport_border: with_alpha(t.primary, 0.45),
+            },
+            total,
+            visible_start,
+            visible_end,
+        }
+    }
+
+    /// The `[start, end)` composed-line range currently visible in the editor, for
+    /// the minimap viewport indicator. Derived from the uniform-list scroll offset
+    /// (the handle's tuple field + `base_handle` are public) and the measured row
+    /// height; clamps to `[0, total]` and degrades to "all visible" when the scroll
+    /// state is not yet populated (first frame).
+    fn minimap_visible_range(&self, total: usize) -> (usize, usize) {
+        if total == 0 || self.metrics.line_height <= 0.0 {
+            return (0, total);
+        }
+        let state = self.scroll.0.borrow();
+        let offset_y = f32::from(state.base_handle.offset().y); // <= 0 when scrolled down
+        let view_h = f32::from(state.base_handle.bounds().size.height);
+        if view_h <= 0.0 {
+            return (0, total);
+        }
+        let lh = self.metrics.line_height;
+        let start = ((-offset_y) / lh).floor().max(0.0) as usize;
+        let visible = (view_h / lh).ceil() as usize + 1;
+        let start = start.min(total);
+        let end = (start + visible).min(total);
+        (start, end)
+    }
+
     /// Whether row `idx` is selected (any selection-id maps to its node, matching
     /// the line type for footer/array-elem/member rows; §7 `applySelectionOverlay`).
     fn is_row_selected(&self, lm: &LineMeta) -> bool {
@@ -774,7 +981,9 @@ impl RcxEditor {
         let palette = EditorPalette::from_theme(cx);
         let lm = self.line_meta(idx).cloned().unwrap_or_default();
         let selected = self.is_row_selected(&lm);
-        let hovered = self.hovered_line == Some(idx);
+        // The hover band is gated by the `hover_effects` view toggle (item 3): when
+        // off, the row still tracks the pointer but paints no hover wash.
+        let hovered = self.hover_effects && self.hovered_line == Some(idx);
 
         let editing_here = self
             .editing
@@ -965,11 +1174,19 @@ impl RcxEditor {
                 // Forward a left mouse-down on the overlay back into the normal row
                 // click routing: the overlay's hitbox occludes the row-text hitbox,
                 // so without this the base-address inline edit (the `BaseAddress`
-                // hit-test target) would stop working under the tooltip strip. The
-                // overlay starts at the address span's first column (`left`), so
-                // dispatching a row-local X just inside it reliably resolves to the
-                // BaseAddress span — the same begin-edit the bare text click gives.
-                let addr_click_x = f32::from(left) + cell * 0.5;
+                // hit-test target) would stop working under the tooltip strip.
+                //
+                // BUG 1: `on_row_mouse_down` → `hit_test_row` resolves the column
+                // from a **row-text-local** X (column 0 = the first char of the
+                // composed command-row string, AFTER the address margin + icon
+                // gutter). `left` above is in the *row's* coordinate space (it
+                // includes the `margin + ICON_CELLS` lead-in), so forwarding it
+                // verbatim shifted the hit-test column right by the gutter width and
+                // the `BaseAddress` span never matched — clicking the address did
+                // nothing. Forward a **text-local** X (the address span's first
+                // column + half a cell) so the hit test lands inside the address
+                // span and the base-address edit actually begins.
+                let addr_click_x = (addr.start.max(0) as f32 + 0.5) * cell;
                 row = row.child(
                     div()
                         .id(("rcx-addr-hover", idx))
@@ -1503,6 +1720,46 @@ impl RcxEditor {
     }
 }
 
+/// Reduce a composed [`LineMeta`] to a minimap bar: a fill color (by node kind /
+/// line role) plus indent + width fractions so the overview reads the tree shape
+/// (item 4). Chrome rows (command/footer) render as faint full-width bars; node
+/// rows tint by kind (struct/array/pointer/fnptr/hex/value) and inset by depth.
+/// Pure (palette in, bar out) — unit-tested.
+fn minimap_row_for(lm: &LineMeta, palette: &EditorPalette) -> minimap::MinimapRow {
+    use crate::core::NodeKind::*;
+    // Depth → left indent fraction (cap so very deep rows still show a bar).
+    let indent = (lm.depth.max(0) as f32 * 0.08).min(0.5);
+    let (color, width) = match lm.line_kind {
+        LineKind::CommandRow => (with_alpha(palette.class_name, 0.85), 0.9),
+        LineKind::Footer => (with_alpha(palette.dim, 0.5), 0.5),
+        LineKind::Header => {
+            // Struct/array container headers: the loud type hue, near-full width.
+            let c = match lm.node_kind {
+                Array => palette.type_fg,
+                _ => palette.class_name,
+            };
+            (c, 0.85)
+        }
+        _ => {
+            // Field rows: color by kind, matching the gutter icon semantics.
+            let c = match lm.node_kind {
+                Struct => palette.class_name,
+                Array => palette.type_fg,
+                Pointer32 | Pointer64 => palette.keyword,
+                FuncPtr32 | FuncPtr64 => palette.fnptr_fg,
+                Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => palette.dim,
+                _ => palette.value_fg,
+            };
+            (c, 0.7)
+        }
+    };
+    minimap::MinimapRow {
+        color: with_alpha(color, color.a.max(0.7)),
+        indent,
+        width: (width - indent * 0.5).max(0.15),
+    }
+}
+
 /// The "alternate" kind for the quick type-cycler (`← cur ↔ alt →`) and the
 /// forward `T`-less cycle: steps to the next kind in the [`NodeKind`] table,
 /// wrapping. This is the in-place type stepper the C++ menu's `← type ↔ type →`
@@ -1518,6 +1775,51 @@ fn prev_kind_for(kind: NodeKind) -> NodeKind {
     let i = kind as u8 as usize;
     let n = crate::core::K_KIND_META.len();
     crate::core::K_KIND_META[(i + n - 1) % n].kind
+}
+
+/// Parse a typed base-address string into `(numeric_base, formula)` for the
+/// command-row `ChangeBase` commit (BUG 1). A pure hex literal (`0x7FF6...`,
+/// `7FF6...`, or a plain decimal) sets the numeric base and clears the formula;
+/// anything containing an operator / module name (`app.exe + 0x1A0`,
+/// `[app.exe + 0x58]`, `ntdll!Sym`) is kept as a *formula* string (the numeric
+/// base is left at `fallback` until a live source resolves it). Empty input
+/// resets to base 0 with no formula. Pure (no gpui) — unit-tested below.
+fn parse_base_address(text: &str, fallback: u64) -> (u64, String) {
+    let t = text.trim();
+    if t.is_empty() {
+        return (0, String::new());
+    }
+    // A bare numeric literal: hex (`0x…`/`…h`/plain hex) or decimal.
+    if let Some(n) = parse_pure_number(t) {
+        return (n, String::new());
+    }
+    // Otherwise treat the whole thing as a base-address formula; keep the current
+    // numeric base so the gutter math stays sane until a source resolves it.
+    (fallback, t.to_string())
+}
+
+/// Parse a *bare* numeric literal as a `u64`, or `None` if it is not a plain
+/// number (so the caller can treat it as a formula). Accepts `0x`-prefixed hex, a
+/// trailing-`h` hex, all-hex-digit strings, and plain decimal.
+fn parse_pure_number(t: &str) -> Option<u64> {
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if let Some(hex) = t.strip_suffix('h').or_else(|| t.strip_suffix('H')) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    // All hex digits (no operators / module chars) → hex; else plain decimal.
+    if t.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Prefer hex when any a-f digit is present; otherwise it is ambiguous
+        // decimal/hex — addresses are hex by convention (the tooltip says "all
+        // numbers are hexadecimal"), so parse as hex.
+        return u64::from_str_radix(t, 16).ok();
+    }
+    None
 }
 
 /// The SVG icon ([`IconName`]) for a node-kind gutter marker — the crisp
@@ -1618,16 +1920,29 @@ impl Render for RcxEditor {
                     this.commit_active_edit(window, cx);
                 }
             }))
+            // Body: the virtualized row list (flex-1) and, when toggled, the
+            // right-side minimap overview column (item 4). A flex row keeps the
+            // minimap pinned to the right edge without overlapping the rows.
             .child(
-                uniform_list(
-                    "rcx-rows",
-                    count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                        range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        uniform_list(
+                            "rcx-rows",
+                            count,
+                            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                                range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
+                            }),
+                        )
+                        .flex_grow()
+                        .h_full()
+                        .track_scroll(&self.scroll),
+                    )
+                    .when(self.minimap, |this| {
+                        this.child(self.build_minimap(palette, cx))
                     }),
-                )
-                .size_full()
-                .track_scroll(&self.scroll),
             )
             // The node context menu: a Zed PopupMenu floated at the right-click
             // position via the deferred-overlay pattern (gpui_cookbook.md §"deferred
@@ -1913,6 +2228,46 @@ mod tests {
             .selected_ids()
             .iter()
             .any(|&id| crate::controller::strip_sel_pub(id) == node_id));
+    }
+
+    #[test]
+    fn parse_base_address_hex_decimal_and_formula() {
+        // BUG 1: the base-address commit parses the typed string into
+        // (numeric_base, formula). Pure number → numeric base, empty formula; an
+        // expression / module reference → formula kept, numeric base falls back.
+        use super::parse_base_address;
+        let fallback = 0x1000u64;
+        // 0x-prefixed hex.
+        assert_eq!(
+            parse_base_address("0x7FF60BF02B80", fallback),
+            (0x7FF6_0BF0_2B80, String::new())
+        );
+        // Trailing-h hex.
+        assert_eq!(
+            parse_base_address("400000h", fallback),
+            (0x40_0000, String::new())
+        );
+        // Bare hex digits (addresses are hex by convention).
+        assert_eq!(
+            parse_base_address("ABCD", fallback),
+            (0xABCD, String::new())
+        );
+        // Empty → reset to 0, no formula.
+        assert_eq!(parse_base_address("", fallback), (0, String::new()));
+        assert_eq!(parse_base_address("   ", fallback), (0, String::new()));
+        // A formula (operator / module) → kept verbatim, base = fallback.
+        assert_eq!(
+            parse_base_address("app.exe + 0x1A0", fallback),
+            (fallback, "app.exe + 0x1A0".to_string())
+        );
+        assert_eq!(
+            parse_base_address("[app.exe + 0x58]", fallback),
+            (fallback, "[app.exe + 0x58]".to_string())
+        );
+        assert_eq!(
+            parse_base_address("ntdll!Sym", fallback),
+            (fallback, "ntdll!Sym".to_string())
+        );
     }
 
     #[test]

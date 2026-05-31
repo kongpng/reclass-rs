@@ -11,11 +11,15 @@
 //! [`build_default_layout`] assembles the canonical layout: the center is the
 //! real MDI [`DocumentArea`](super::tabs::DocumentArea) (tab strip + "+" sentinel
 //! + source icons + view-mode toggle + editor), the left dock is the real
-//! [`WorkspacePanel`](super::workspace::WorkspacePanel), and the bottom dock is the
-//! real [`ScannerPanel`](super::scannerpanel::ScannerPanel). It returns [`LayoutHandles`] the window
-//! wires + observes. The dock drag overlay + per-dock toolbars (app-shell §9)
-//! come later; the seam is the layout builder + the [`MAIN_DOCK_AREA`] id/version
-//! used by `dump`/`load`.
+//! [`WorkspacePanel`](super::workspace::WorkspacePanel), the bottom dock is the
+//! real [`ScannerPanel`](super::scannerpanel::ScannerPanel) (closed by default),
+//! and the **right** dock tabifies the
+//! [`ModulesPanel`](super::modulespanel::ModulesPanel) +
+//! [`BookmarksPanel`](super::bookmarkspanel::BookmarksPanel) (also closed by
+//! default — the C++ View ▸ Modules / Bookmarks summon them on demand). It
+//! returns [`LayoutHandles`] the window wires + observes. The dock drag overlay +
+//! per-dock toolbars (app-shell §9) come later; the seam is the layout builder +
+//! the [`MAIN_DOCK_AREA`] id/version used by `dump`/`load`.
 //!
 //! Gated behind the `ui` feature.
 
@@ -23,6 +27,8 @@ use gpui::*;
 use gpui_component::dock::{DockArea, DockItem};
 use std::sync::Arc;
 
+use super::bookmarkspanel::BookmarksPanel;
+use super::modulespanel::ModulesPanel;
 use super::tabs::DocumentArea;
 use super::workspace::WorkspacePanel;
 
@@ -51,6 +57,16 @@ pub struct LayoutHandles {
     pub document_area: Entity<DocumentArea>,
     /// The left workspace ("Project") dock panel.
     pub workspace: Entity<WorkspacePanel>,
+    /// The right-dock Modules / Symbols / Types panel (the C++ View ▸ Modules,
+    /// `Ctrl+Shift+Y`). Tabified with [`bookmarks`](Self::bookmarks) in the
+    /// **right** dock, **closed by default** — summoned from the View menu like
+    /// the C++. The window keeps this so it can toggle/observe the dock.
+    pub modules: Entity<ModulesPanel>,
+    /// The right-dock Bookmarks panel (the C++ View ▸ Bookmarks,
+    /// `Ctrl+Shift+B`). Shares the right dock's tab strip with
+    /// [`modules`](Self::modules); the window pushes the document's bookmark list
+    /// into it on change and observes its `BookmarkAction` intents.
+    pub bookmarks: Entity<BookmarksPanel>,
 }
 
 /// Assemble the canonical default dock layout into `dock_area`
@@ -97,14 +113,33 @@ pub fn build_default_layout(
     let scanner = Arc::new(super::scannerpanel::ScannerPanel::view(window, cx));
     let bottom = DockItem::tabs(vec![scanner], &weak, window, cx);
 
+    // Right: the Modules / Symbols / Types panel + the Bookmarks panel,
+    // **tabified together**, **closed by default**. The C++ surfaces both from
+    // the View menu (Modules `Ctrl+Shift+Y`, Bookmarks `Ctrl+Shift+B`) — they are
+    // not always-present panels, so the dock launches closed; the View toggles
+    // (`MainWindow::toggle_modules_dock` / `toggle_bookmarks_dock`) reveal it.
+    // Both panels are still built + registered here so the toggle has them ready
+    // — only the dock's `open` flag starts `false`.
+    let modules = ModulesPanel::view(window, cx);
+    let bookmarks = BookmarksPanel::view(window, cx);
+    let right = DockItem::tabs(
+        vec![Arc::new(modules.clone()), Arc::new(bookmarks.clone())],
+        &weak,
+        window,
+        cx,
+    );
+
     dock_area.update(cx, |area, cx| {
         area.set_center(center, window, cx);
         area.set_left_dock(left, Some(px(280.)), true, window, cx);
         area.set_bottom_dock(bottom, Some(px(320.)), false, window, cx);
+        area.set_right_dock(right, Some(px(280.)), false, window, cx);
     });
 
     LayoutHandles {
         document_area,
         workspace,
+        modules,
+        bookmarks,
     }
 }

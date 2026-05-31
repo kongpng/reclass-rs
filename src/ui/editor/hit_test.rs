@@ -279,4 +279,53 @@ mod tests {
         let hit = hit_test_row(&lm, text, 4000.0, metrics(), 14, 22);
         assert_eq!(hit.target, None);
     }
+
+    #[test]
+    fn full_hit_test_maps_address_and_type_columns() {
+        // BUG 1 regression guard: a left-click on the command-row base ADDRESS and
+        // on a node row's TYPE token must resolve through the *full pixel* hit test
+        // (`hit_test_row`, the exact path `on_row_mouse_down` runs) to the right
+        // `EditTarget`. The earlier address bug was a coordinate mismatch — the
+        // pixel X handed to `hit_test_row` for the address overlay was in row space
+        // (margin+icon offset) instead of text-local, so the resolved column missed
+        // the `BaseAddress` span entirely. Here we drive the metrics path directly
+        // with a text-local pixel X to lock the column→target mapping.
+        let m = metrics(); // cell_width = 8.0
+                           // ── Command-row base address ──
+        let cmd = LineMeta {
+            line_kind: LineKind::CommandRow,
+            ..LineMeta::default()
+        };
+        let cmd_text = "[\u{25B8}] source\u{25BE}  0x400000  struct Foo {";
+        let addr = compose::command_row_addr_span(cmd_text);
+        assert!(addr.valid, "address span must resolve on the command row");
+        // A text-local pixel X mid-way through the address span's first cell.
+        let addr_x = (addr.start as f32 + 0.5) * m.cell_width;
+        let addr_hit = hit_test_row(&cmd, cmd_text, addr_x, m, 14, 22);
+        assert_eq!(
+            addr_hit.target,
+            Some(EditTarget::BaseAddress),
+            "address column (col {}) must hit BaseAddress, got {:?}",
+            addr_hit.col,
+            addr_hit.target
+        );
+        // And the resolved column is the address span start (not shifted right by a
+        // phantom margin/icon offset — the precise regression).
+        assert_eq!(addr_hit.col, addr.start);
+
+        // ── Node-row type token ──
+        let node = field(NodeKind::Int32, 0);
+        let node_text = "int32         field                  100";
+        // Type column begins just past the fold prefix (K_FOLD_COL).
+        let type_col = compose::K_FOLD_COL + 1;
+        let type_x = (type_col as f32 + 0.5) * m.cell_width;
+        let type_hit = hit_test_row(&node, node_text, type_x, m, 14, 22);
+        assert_eq!(
+            type_hit.target,
+            Some(EditTarget::Type),
+            "type column (col {}) must hit Type, got {:?}",
+            type_hit.col,
+            type_hit.target
+        );
+    }
 }
