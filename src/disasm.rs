@@ -186,6 +186,8 @@ pub fn hex_dump(bytes: &[u8], base_addr: u64, max_bytes: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compose::compose_default;
+    use crate::core::{LineKind, Node, NodeKind, NodeTree};
     use crate::provider::{BufferProvider, Provider};
 
     /// Test-local helper mirroring `test_disasm.cpp:9-12`: split each line on
@@ -628,17 +630,306 @@ mod tests {
     // workflow.
 
     #[test]
-    #[ignore = "TODO(compose): un-ignore once compose::compose lands"]
     fn vtable_disasm_composed_address() {
-        // Full port of test_disasm.cpp:135-302 — needs compose(tree, prov)
-        // to produce LineMeta.offsetAddr for the pointer-expanded VTable.
-        unimplemented!("requires compose::compose (skeleton)");
+        // Full port of test_disasm.cpp:135-302 (testVTableDisasm_composed-
+        // Address) — uses compose(tree, prov) to produce LineMeta.offsetAddr
+        // for the pointer-expanded VTable.
+        //
+        // Memory layout (absolute addresses, baseAddress = 0):
+        //   [0x0000]  Root "Obj": +0x00 Pointer64 __vptr => 0x100 (vtable)
+        //   [0x0100]  VTable (pointer-expanded): +0x00 funcptr=0x200,
+        //                                        +0x08 funcptr=0x300
+        //   [0x0200]  func0 code: push rbp; ret
+        //   [0x0300]  func1 code: xor eax, eax; ret
+        let mut mem = vec![0u8; 4096];
+        w64(&mut mem, 0x00, 0x100); // root __vptr -> vtable @ 0x100
+        w64(&mut mem, 0x100, 0x200); // vtable slot 0 -> func0
+        w64(&mut mem, 0x108, 0x300); // vtable slot 1 -> func1
+        mem[0x200] = 0x55; // func0: push rbp
+        mem[0x201] = 0xc3; //        ret
+        mem[0x300] = 0x31; // func1: xor eax, eax
+        mem[0x301] = 0xc0;
+        mem[0x302] = 0xc3; //        ret
+
+        let prov = BufferProvider::new(mem, "mem");
+
+        // Build node tree (test_disasm.cpp:174-218).
+        let mut tree = NodeTree::new();
+        tree.base_address = 0;
+
+        // Root struct "Obj".
+        let ri = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Obj".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let root_id = tree.nodes[ri].id;
+
+        // VTable struct definition (template), parked far away at 0x1000.
+        let vti = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "VTable".into(),
+            parent_id: 0,
+            offset: 0x1000,
+            ..Node::default()
+        });
+        let vt_id = tree.nodes[vti].id;
+
+        // Two FuncPtr64 children inside the VTable definition.
+        tree.add_node(Node {
+            kind: NodeKind::FuncPtr64,
+            name: "func0".into(),
+            parent_id: vt_id,
+            offset: 0,
+            ..Node::default()
+        });
+        tree.add_node(Node {
+            kind: NodeKind::FuncPtr64,
+            name: "func1".into(),
+            parent_id: vt_id,
+            offset: 8,
+            ..Node::default()
+        });
+
+        // Pointer64 "__vptr" in root, pointing to VTable via ref_id.
+        tree.add_node(Node {
+            kind: NodeKind::Pointer64,
+            name: "__vptr".into(),
+            parent_id: root_id,
+            offset: 0,
+            ref_id: vt_id,
+            collapsed: false,
+            ..Node::default()
+        });
+
+        // Compose the tree.
+        let result = compose_default(&tree, &prov);
+
+        // Find the FuncPtr64 lines that are inside the pointer-expanded VTable
+        // (near the vtable address 0x100..0x200), not the standalone definition
+        // (test_disasm.cpp:225-237).
+        struct FuncInfo {
+            offset_addr: u64,
+            name: String,
+        }
+        let mut func_ptrs: Vec<FuncInfo> = Vec::new();
+        for lm in &result.meta {
+            if lm.node_kind == NodeKind::FuncPtr64
+                && lm.line_kind == LineKind::Field
+                && (0x100..0x200).contains(&lm.offset_addr)
+            {
+                let name = if lm.node_idx >= 0 {
+                    tree.nodes[lm.node_idx as usize].name.clone()
+                } else {
+                    String::new()
+                };
+                func_ptrs.push(FuncInfo {
+                    offset_addr: lm.offset_addr,
+                    name,
+                });
+            }
+        }
+
+        assert_eq!(func_ptrs.len(), 2);
+
+        // Composed addresses point to the vtable, NOT the root struct
+        // (test_disasm.cpp:243-245).
+        assert_eq!(func_ptrs[0].offset_addr, 0x100); // func0 @ vtable + 0
+        assert_eq!(func_ptrs[1].offset_addr, 0x108); // func1 @ vtable + 8
+
+        // Simulate the hover code: read the function pointer VALUE from the
+        // correct provider address, then disassemble the target
+        // (test_disasm.cpp:249-288).
+        for fp in &func_ptrs {
+            let prov_addr = fp.offset_addr;
+            let ptr_val = prov.read_u64(prov_addr);
+
+            if fp.name == "func0" {
+                assert_eq!(ptr_val, 0x200);
+            } else {
+                assert_eq!(ptr_val, 0x300);
+            }
+
+            let code_bytes = prov.read_bytes(ptr_val, 128);
+            let asm_ = disassemble(&code_bytes, ptr_val, 64, 128);
+            assert!(!asm_.is_empty(), "Empty disasm for {}", fp.name);
+
+            let lines = split_lines(&asm_);
+            if fp.name == "func0" {
+                // push rbp; ret
+                assert!(
+                    lines.len() >= 2,
+                    "Expected >= 2 lines for func0, got {}: {asm_}",
+                    lines.len()
+                );
+                assert_eq!(mnemonic(lines[0]), "push rbp");
+                assert_eq!(mnemonic(lines[1]), "ret");
+                assert!(lines[0].contains("200"), "func0 addr wrong: {}", lines[0]);
+            } else {
+                // xor eax, eax; ret
+                assert!(
+                    lines.len() >= 2,
+                    "Expected >= 2 lines for func1, got {}: {asm_}",
+                    lines.len()
+                );
+                assert_eq!(mnemonic(lines[0]), "xor eax, eax");
+                assert_eq!(mnemonic(lines[1]), "ret");
+                assert!(lines[0].contains("300"), "func1 addr wrong: {}", lines[0]);
+            }
+        }
+
+        // CRITICAL: reading from node.offset (the WRONG way) gives wrong
+        // results. node.offset for func0=0, func1=8 are inside the ROOT struct,
+        // not the vtable (test_disasm.cpp:290-301).
+        let wrong_val0 = prov.read_u64(0); // node.offset=0: reads the __vptr value
+        let wrong_val1 = prov.read_u64(8); // node.offset=8: reads past __vptr
+        assert_eq!(wrong_val0, 0x100); // the vptr itself, NOT a function address
+        assert_ne!(
+            wrong_val0, 0x200,
+            "node.offset reads the vptr, not the function pointer"
+        );
+        assert_ne!(
+            wrong_val1, 0x300,
+            "node.offset=8 reads past vptr, not the second function pointer"
+        );
     }
 
     #[test]
-    #[ignore = "TODO(compose): un-ignore once compose::compose lands"]
     fn hover_flow_full_simulation() {
-        // Full port of test_disasm.cpp:346-463 — needs compose(tree, snapProv).
-        unimplemented!("requires compose::compose (skeleton)");
+        // Full port of test_disasm.cpp:346-463 (testHoverFlow_fullSimulation).
+        //
+        // Full simulation of the hover flow as implemented in the editor:
+        //   1. compose(tree, snapProv) → LineMeta with correct offsetAddr.
+        //   2. For each FuncPtr64 line, read the pointer value from the
+        //      SNAPSHOT provider using lm.offset_addr (absolute address).
+        //   3. Read code bytes from the REAL provider using ptrVal directly
+        //      (the snapshot does NOT contain the code pages).
+        //   4. Disassemble.
+        let mut mem = vec![0u8; 8192];
+        w64(&mut mem, 0x000, 0x100); // __vptr -> vtable @ 0x100
+        w64(&mut mem, 0x100, 0x1000); // vtable[0] -> func0 @ 0x1000
+        w64(&mut mem, 0x108, 0x1800); // vtable[1] -> func1 @ 0x1800
+                                      // func0: push rbp; mov rbp, rsp; sub rsp, 0x20; ret
+        mem[0x1000..0x1009]
+            .copy_from_slice(&[0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0xc3]);
+        // func1: xor eax, eax; ret
+        mem[0x1800..0x1803].copy_from_slice(&[0x31, 0xc0, 0xc3]);
+
+        // This provider represents the real process memory.
+        let real_prov = BufferProvider::new(mem.clone(), "real");
+
+        // The snapshot only contains tree-data pages (root + vtable, first
+        // 0x200 bytes), NOT the function code pages (test_disasm.cpp:385-387).
+        let snap_prov = BufferProvider::new(mem[..0x200].to_vec(), "snap");
+
+        // Build node tree (test_disasm.cpp:390-413).
+        let mut tree = NodeTree::new();
+        tree.base_address = 0;
+
+        let ri = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Obj".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let root_id = tree.nodes[ri].id;
+
+        let vti = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "VTable".into(),
+            parent_id: 0,
+            offset: 0x2000,
+            ..Node::default()
+        });
+        let vt_id = tree.nodes[vti].id;
+
+        tree.add_node(Node {
+            kind: NodeKind::FuncPtr64,
+            name: "func0".into(),
+            parent_id: vt_id,
+            offset: 0,
+            ..Node::default()
+        });
+        tree.add_node(Node {
+            kind: NodeKind::FuncPtr64,
+            name: "func1".into(),
+            parent_id: vt_id,
+            offset: 8,
+            ..Node::default()
+        });
+
+        tree.add_node(Node {
+            kind: NodeKind::Pointer64,
+            name: "__vptr".into(),
+            parent_id: root_id,
+            offset: 0,
+            ref_id: vt_id,
+            collapsed: false,
+            ..Node::default()
+        });
+
+        // Compose with the snapshot (like production: compose uses snapshot).
+        let result = compose_default(&tree, &snap_prov);
+
+        // Track that we actually walked the expanded FuncPtr64 lines.
+        let mut seen = 0;
+
+        for (i, lm) in result.meta.iter().enumerate() {
+            if lm.node_kind != NodeKind::FuncPtr64 || lm.line_kind != LineKind::Field {
+                continue;
+            }
+            // Skip the standalone VTable definition entries.
+            if !(0x100..0x200).contains(&lm.offset_addr) {
+                continue;
+            }
+            seen += 1;
+
+            // --- Hover step 1: read pointer value from the snapshot. ---
+            let prov_addr = lm.offset_addr;
+            assert!(
+                snap_prov.is_readable(prov_addr, 8),
+                "Snapshot should have vtable page at {prov_addr:x}"
+            );
+            let ptr_val = snap_prov.read_u64(prov_addr);
+            assert_ne!(ptr_val, 0, "Function pointer should not be zero");
+
+            // --- Hover step 2: read code from the REAL provider. ---
+            // The snapshot does NOT have the code pages:
+            let code_addr = ptr_val;
+            assert!(
+                !snap_prov.is_readable(code_addr, 1),
+                "Snapshot should NOT have function code pages"
+            );
+            // But the real provider does:
+            let mut code_bytes = vec![0u8; 128];
+            assert!(
+                real_prov.read(code_addr, &mut code_bytes),
+                "Real provider should be able to read code bytes"
+            );
+
+            // --- Hover step 3: disassemble. ---
+            let asm_ = disassemble(&code_bytes, ptr_val, 64, 128);
+            assert!(!asm_.is_empty(), "Empty disasm for line {i}");
+
+            let lines = split_lines(&asm_);
+            let name = tree.nodes[lm.node_idx as usize].name.clone();
+            if name == "func0" {
+                assert!(lines.len() >= 4);
+                assert_eq!(mnemonic(lines[0]), "push rbp");
+                assert_eq!(mnemonic(lines[1]), "mov rbp, rsp");
+                assert_eq!(mnemonic(lines[2]), "sub rsp, 0x20");
+                assert_eq!(mnemonic(lines[3]), "ret");
+            } else if name == "func1" {
+                assert!(lines.len() >= 2);
+                assert_eq!(mnemonic(lines[0]), "xor eax, eax");
+                assert_eq!(mnemonic(lines[1]), "ret");
+            }
+        }
+
+        // Both expanded function pointers must have been exercised.
+        assert_eq!(seen, 2);
     }
 }
