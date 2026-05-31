@@ -266,9 +266,16 @@ impl StartPage {
     /// Render one action card (`drawCards`): title + dim description, hover fill +
     /// a left accent bar (the C++ "3px accent left bar").
     fn render_card(&self, card: StartCard, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new(card.id())
-            .ghost()
+        // A clickable, CONTENT-SIZED card. A gpui-component `Button` clamps its
+        // content to a single row height, which clipped the two-line
+        // title+description into an overlap — so this is a plain interactive div
+        // that grows to fit both lines.
+        div()
+            .id(card.id())
             .w_full()
+            .cursor_pointer()
+            .rounded_md()
+            .hover(|s| s.bg(hsla(0., 0., 1., 0.06)))
             .on_click(cx.listener(move |_this, _e, _window, cx| {
                 cx.emit(StartPageEvent::Card(card));
             }))
@@ -276,7 +283,7 @@ impl StartPage {
                 gpui_component::h_flex()
                     .w_full()
                     .gap_3()
-                    .items_center()
+                    .items_start()
                     .py_2()
                     .px_3()
                     .border_l_2()
@@ -388,12 +395,13 @@ impl Render for StartPage {
             .bg(cx.theme().background)
             .flex()
             .flex_row()
+            .justify_center()
             .p_8()
-            .gap_8()
+            .gap_16()
             .child(
                 // Left: title + search + recent files.
                 gpui_component::v_flex()
-                    .flex_1()
+                    .w(px(560.))
                     .gap_4()
                     .min_w_0()
                     .child(

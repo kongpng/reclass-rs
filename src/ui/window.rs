@@ -671,6 +671,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
 
     cx.spawn(async move |cx| {
         let window_handle = cx.open_window(WindowOptions::default(), |window, cx| {
+            window.set_window_title("Reclass");
             let view = cx.new(|cx| MainWindow::new(theme_manager.clone(), window, cx));
             cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
         });
