@@ -33,7 +33,7 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::dock::{DockArea, DockPlacement};
-use gpui_component::{ActiveTheme, Root, TitleBar};
+use gpui_component::{ActiveTheme, Root, TitleBar, WindowExt};
 
 use super::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
 use super::startpage::{RecentEntry, StartPage, StartPageEvent};
@@ -43,6 +43,10 @@ use super::theme_apply::ThemeRegistryGlobal;
 use super::titlebar::{self, LayoutPreset};
 use super::workspace::{WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspacePanel};
 use crate::theme::ThemeManager;
+
+// App-level actions. Mirrors Zed: the command palette opens on Ctrl+Shift+P / F1
+// (`command_palette::Toggle` in Zed's default keymap).
+actions!(rcx_app, [OpenCommandPalette]);
 
 /// The application's root view — the C++ `MainWindow` (app-shell §6).
 pub struct MainWindow {
@@ -61,6 +65,9 @@ pub struct MainWindow {
     layout_preset: LayoutPreset,
     /// Shared theme manager (the C++ `ThemeManager` singleton; owned by the app).
     theme_manager: Rc<RefCell<ThemeManager>>,
+    /// Live subscription to the currently-open command-palette modal — kept so its
+    /// Trigger/Cancel events fire while shown (a dropped subscription stops them).
+    palette_sub: Option<Subscription>,
 }
 
 impl MainWindow {
@@ -128,6 +135,7 @@ impl MainWindow {
             start_page: None,
             layout_preset,
             theme_manager,
+            palette_sub: None,
         };
 
         // Rebuild the workspace model from the seeded document, then show the
@@ -145,6 +153,49 @@ impl MainWindow {
     /// Mutable access to the window state.
     pub fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
+    }
+
+    /// Open the command palette (Ctrl+Shift+P / F1 — Zed parity). Builds a fresh
+    /// palette over the menu tree, shows it in the gpui-component dialog layer, and
+    /// routes its Trigger/Cancel back here (close, then dispatch the command).
+    fn open_command_palette(
+        &mut self,
+        _: &OpenCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::commandpalette::{CommandPalette, PaletteEvent};
+        let palette = cx.new(|cx| CommandPalette::new(window, cx));
+        let focus = palette.read(cx).focus_handle(cx);
+        self.palette_sub = Some(cx.subscribe_in(
+            &palette,
+            window,
+            |this, _p, ev: &PaletteEvent, window, cx| match ev {
+                PaletteEvent::Trigger(cmd) => {
+                    let cmd = cmd.clone();
+                    window.close_dialog(cx);
+                    this.run_menu_command(&cmd, window, cx);
+                }
+                PaletteEvent::Cancel => window.close_dialog(cx),
+            },
+        ));
+        let palette_for_modal = palette.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog.child(palette_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Dispatch a chosen palette command. Full menu→action mapping is layered in
+    /// incrementally; the palette already opens, filters, navigates, and closes.
+    fn run_menu_command(
+        &mut self,
+        _cmd: &super::commandpalette::CommandId,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // TODO(menu-dispatch): map CommandId -> app actions (New Class, Open, …).
     }
 
     /// The docking workspace entity.
@@ -604,12 +655,14 @@ impl Render for MainWindow {
 
         div()
             .id("reclass-main-window")
+            .key_context("RcxWindow")
             .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_action(cx.listener(Self::open_command_palette))
             .child(titlebar)
             // The docking workspace: center document tabs + side docks.
             .child(div().flex_1().min_h_0().child(self.dock_area.clone()))
@@ -667,6 +720,18 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     bindings.extend(super::startpage::start_page_key_bindings());
     bindings.extend(super::commandpalette::command_palette_key_bindings());
     bindings.extend(super::findbar::find_bar_key_bindings());
+    // Global trigger to OPEN the palette (Zed: ctrl-shift-p / f1; cmd-shift-p on mac).
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-p",
+        OpenCommandPalette,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-p",
+        OpenCommandPalette,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new("f1", OpenCommandPalette, Some("RcxWindow")));
     cx.bind_keys(bindings);
 
     cx.spawn(async move |cx| {
