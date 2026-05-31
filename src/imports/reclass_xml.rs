@@ -1,0 +1,807 @@
+//! ReClass XML import + ReClassEx XML export.
+//!
+//! Faithful 1:1 port of `src/imports/import_reclass_xml.cpp` (392 lines) and
+//! `src/imports/export_reclass_xml.cpp` (222 lines). Both PURE. Uses `quick-xml`
+//! for read and write. See BMAP §2–§3.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
+
+use quick_xml::events::{BytesDecl, BytesText, Event};
+use quick_xml::reader::Reader;
+use quick_xml::writer::Writer;
+
+use crate::core::kind::{is_hex_node, kind_to_string, size_for_kind, NodeKind};
+use crate::core::node::Node;
+use crate::core::tree::NodeTree;
+
+use super::{resolve_pending_refs, ImportError, PendingRef};
+
+// ── Version-specific type maps (cpp:14-96) ──
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XmlVersion {
+    V2013,
+    V2016,
+}
+
+/// 2016 / ReClassEx / MemeClsEx type map (`import_reclass_xml.cpp:17-52`).
+const K_TYPE_MAP_2016: &[(i32, NodeKind)] = &[
+    (1, NodeKind::Struct),
+    (4, NodeKind::Hex32),
+    (5, NodeKind::Hex64),
+    (6, NodeKind::Hex16),
+    (7, NodeKind::Hex8),
+    (8, NodeKind::Pointer64),
+    (9, NodeKind::Int64),
+    (10, NodeKind::Int32),
+    (11, NodeKind::Int16),
+    (12, NodeKind::Int8),
+    (13, NodeKind::Float),
+    (14, NodeKind::Double),
+    (15, NodeKind::UInt32),
+    (16, NodeKind::UInt16),
+    (17, NodeKind::UInt8),
+    (18, NodeKind::UTF8),
+    (19, NodeKind::UTF16),
+    (20, NodeKind::Pointer64),
+    (21, NodeKind::Hex8),
+    (22, NodeKind::Vec2),
+    (23, NodeKind::Vec3),
+    (24, NodeKind::Vec4),
+    (25, NodeKind::Mat4x4),
+    (26, NodeKind::Pointer64),
+    (27, NodeKind::Array),
+    (29, NodeKind::Pointer64),
+    (30, NodeKind::Pointer64),
+    (31, NodeKind::UInt8),
+    (32, NodeKind::UInt64),
+    (33, NodeKind::Pointer64),
+];
+
+/// 2013 / ReClass 2011 type map (`import_reclass_xml.cpp:55-81`).
+const K_TYPE_MAP_2013: &[(i32, NodeKind)] = &[
+    (1, NodeKind::Struct),
+    (4, NodeKind::Hex32),
+    (5, NodeKind::Hex16),
+    (6, NodeKind::Hex8),
+    (7, NodeKind::Pointer64),
+    (8, NodeKind::Int32),
+    (9, NodeKind::Int16),
+    (10, NodeKind::Int8),
+    (11, NodeKind::Float),
+    (12, NodeKind::UInt32),
+    (13, NodeKind::UInt16),
+    (14, NodeKind::UInt8),
+    (15, NodeKind::UTF8),
+    (16, NodeKind::Pointer64),
+    (17, NodeKind::Hex8),
+    (18, NodeKind::Vec2),
+    (19, NodeKind::Vec3),
+    (20, NodeKind::Vec4),
+    (21, NodeKind::Mat4x4),
+    (22, NodeKind::Pointer64),
+    (23, NodeKind::Array),
+    (27, NodeKind::Int64),
+    (28, NodeKind::Double),
+    (29, NodeKind::UTF16),
+    (30, NodeKind::Array),
+];
+
+/// `lookupKind` (`import_reclass_xml.cpp:83-96`).
+fn lookup_kind(xml_type: i32, ver: XmlVersion, ptr_size: i32) -> NodeKind {
+    let table = if ver == XmlVersion::V2016 {
+        K_TYPE_MAP_2016
+    } else {
+        K_TYPE_MAP_2013
+    };
+    let mut k = NodeKind::Hex8;
+    for &(t, kind) in table {
+        if t == xml_type {
+            k = kind;
+            break;
+        }
+    }
+    // Remap pointer types for 32-bit targets
+    if ptr_size < 8 && k == NodeKind::Pointer64 {
+        k = NodeKind::Pointer32;
+    }
+    k
+}
+
+// (cpp:99-104)
+fn is_pointer_type(xml_type: i32, ver: XmlVersion) -> bool {
+    if ver == XmlVersion::V2016 {
+        matches!(xml_type, 8 | 20 | 26 | 29 | 30 | 33)
+    } else {
+        matches!(xml_type, 7 | 16 | 22)
+    }
+}
+
+fn is_class_instance_type(xml_type: i32, _ver: XmlVersion) -> bool {
+    xml_type == 1
+}
+
+fn is_class_instance_array_type(xml_type: i32, ver: XmlVersion) -> bool {
+    if ver == XmlVersion::V2016 {
+        xml_type == 27
+    } else {
+        xml_type == 23 || xml_type == 30
+    }
+}
+
+fn is_text_type(xml_type: i32, ver: XmlVersion) -> bool {
+    if ver == XmlVersion::V2016 {
+        xml_type == 18 || xml_type == 19
+    } else {
+        xml_type == 15 || xml_type == 29
+    }
+}
+
+fn is_utf16_text_type(xml_type: i32, ver: XmlVersion) -> bool {
+    if ver == XmlVersion::V2016 {
+        xml_type == 19
+    } else {
+        xml_type == 29
+    }
+}
+
+fn is_custom_type(xml_type: i32, ver: XmlVersion) -> bool {
+    if ver == XmlVersion::V2016 {
+        xml_type == 21
+    } else {
+        xml_type == 17
+    }
+}
+
+// ── Attribute helpers (Qt toInt() → 0 on miss; toString() → "") ──
+
+#[allow(deprecated)]
+fn attr_str(e: &quick_xml::events::BytesStart, name: &str) -> String {
+    match e.try_get_attribute(name.as_bytes()) {
+        // `unescape_value` (no-args) is the correct decoder when the `encoding`
+        // feature is off; it forwards to `normalized_value` internally and
+        // matches Qt's `QXmlStreamAttribute::value()` (unescaped UTF-8).
+        Ok(Some(a)) => a
+            .unescape_value()
+            .map(|c| c.into_owned())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn attr_int(e: &quick_xml::events::BytesStart, name: &str) -> i32 {
+    // Qt toInt(): empty/missing/non-numeric → 0.
+    attr_str(e, name).trim().parse::<i32>().unwrap_or(0)
+}
+
+// ── Import (cpp:142-390) ──
+
+pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, ImportError> {
+    let file = File::open(path).map_err(|_| ImportError::CannotOpen(path.display().to_string()))?;
+    let mut reader = Reader::from_reader(BufReader::new(file));
+    reader.config_mut().trim_text(false);
+
+    let mut version = XmlVersion::V2016; // default to 2016 (most common)
+
+    let mut tree = NodeTree::default();
+    tree.base_address = 0x0040_0000;
+    tree.pointer_size = pointer_size;
+
+    let mut class_ids: HashMap<String, u64> = HashMap::new();
+    let mut pending_refs: Vec<PendingRef> = Vec::new();
+
+    let mut version_detected = false;
+
+    let mut buf: Vec<u8> = Vec::new();
+    // State for the currently-open Class element.
+    let mut in_class = false;
+    let mut struct_id: u64 = 0;
+    let mut child_offset: i32 = 0;
+
+    loop {
+        let ev = match reader.read_event_into(&mut buf) {
+            Ok(ev) => ev,
+            Err(e) => {
+                // Genuine malformed XML mid-stream → error. (Qt tolerates
+                // PrematureEndOfDocumentError; quick-xml returns Ok(Eof) on a
+                // clean end, so any Err here is a real parse error.)
+                return Err(ImportError::XmlParse {
+                    line: reader.buffer_position(),
+                    msg: e.to_string(),
+                });
+            }
+        };
+
+        match ev {
+            Event::Eof => break,
+            Event::Comment(t) => {
+                if !version_detected {
+                    let comment = t.decode().map(|c| c.into_owned()).unwrap_or_default();
+                    let comment = comment.trim();
+                    let cl = comment.to_ascii_lowercase();
+                    if cl.contains("reclassex")
+                        || cl.contains("memeclsex")
+                        || cl.contains("2016")
+                        || cl.contains("2015")
+                    {
+                        version = XmlVersion::V2016;
+                    } else if cl.contains("2013") || cl.contains("2011") {
+                        version = XmlVersion::V2013;
+                    }
+                    version_detected = true;
+                }
+            }
+            Event::Start(e) | Event::Empty(e) => {
+                let name = e.name();
+                let local = name.as_ref();
+                if !in_class {
+                    if local == b"Class" {
+                        let class_name = attr_str(&e, "Name");
+                        let _str_offset = attr_str(&e, "strOffset"); // read but unused
+                        let root = Node {
+                            kind: NodeKind::Struct,
+                            name: class_name.clone(),
+                            struct_type_name: class_name.clone(),
+                            parent_id: 0,
+                            offset: 0,
+                            collapsed: true,
+                            ..Node::default()
+                        };
+                        let idx = tree.add_node(root);
+                        struct_id = tree.nodes[idx].id;
+                        class_ids.insert(class_name, struct_id);
+                        child_offset = 0;
+                        in_class = true;
+                    }
+                    // else: ignore (ReClass / decl etc.)
+                } else if local == b"Node" {
+                    // Extract all attributes into owned values BEFORE borrowing
+                    // the reader for any inner reads (ClassInstanceArray).
+                    let attrs = NodeAttrs {
+                        xml_type: attr_int(&e, "Type"),
+                        node_name: attr_str(&e, "Name"),
+                        node_size: attr_int(&e, "Size"),
+                        ptr_class: attr_str(&e, "Pointer"),
+                        inst_class: attr_str(&e, "Instance"),
+                        total: attr_int(&e, "Total"),
+                        count: attr_int(&e, "Count"),
+                    };
+                    handle_node(
+                        &mut reader,
+                        attrs,
+                        version,
+                        pointer_size,
+                        struct_id,
+                        &mut child_offset,
+                        &mut tree,
+                        &mut pending_refs,
+                    )?;
+                }
+            }
+            Event::End(e) => {
+                if in_class && e.name().as_ref() == b"Class" {
+                    in_class = false;
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if tree.nodes.is_empty() {
+        return Err(ImportError::NoClasses);
+    }
+
+    resolve_pending_refs(&mut tree, &pending_refs, &class_ids);
+    Ok(tree)
+}
+
+/// Owned attribute snapshot of a `<Node>` element.
+struct NodeAttrs {
+    xml_type: i32,
+    node_name: String,
+    node_size: i32,
+    ptr_class: String,
+    inst_class: String,
+    total: i32,
+    count: i32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_node(
+    reader: &mut Reader<BufReader<File>>,
+    attrs: NodeAttrs,
+    version: XmlVersion,
+    pointer_size: i32,
+    struct_id: u64,
+    child_offset: &mut i32,
+    tree: &mut NodeTree,
+    pending_refs: &mut Vec<PendingRef>,
+) -> Result<(), ImportError> {
+    let NodeAttrs {
+        xml_type,
+        node_name,
+        node_size,
+        ptr_class,
+        inst_class,
+        total: node_total,
+        count: node_count,
+    } = attrs;
+    let mut buf: Vec<u8> = Vec::new();
+    let buf = &mut buf;
+
+    // (a) Custom type: expand to appropriate hex nodes (cpp:231-255)
+    if is_custom_type(xml_type, version) && node_size > 0 {
+        let (hex_kind, hex_size) = if node_size >= 8 && node_size % 8 == 0 {
+            (NodeKind::Hex64, 8)
+        } else if node_size >= 4 && node_size % 4 == 0 {
+            (NodeKind::Hex32, 4)
+        } else if node_size >= 2 && node_size % 2 == 0 {
+            (NodeKind::Hex16, 2)
+        } else {
+            (NodeKind::Hex8, 1)
+        };
+        let count = node_size / hex_size;
+        for _ in 0..count {
+            let n = Node {
+                kind: hex_kind,
+                name: if count == 1 {
+                    node_name.clone()
+                } else {
+                    String::new()
+                },
+                parent_id: struct_id,
+                offset: *child_offset,
+                ..Node::default()
+            };
+            tree.add_node(n);
+            *child_offset += hex_size;
+        }
+        return Ok(());
+    }
+
+    let kind = lookup_kind(xml_type, version, pointer_size);
+
+    // (c) ClassInstanceArray (cpp:260-302)
+    if is_class_instance_array_type(xml_type, version) {
+        let mut total = node_total;
+        if total <= 0 {
+            total = node_count;
+        }
+        if total <= 0 {
+            total = 1;
+        }
+
+        // Read child <Array> element for class name. Iterate inner events until
+        // </Node>.
+        let mut array_class_name = String::new();
+        loop {
+            let inner = match reader.read_event_into(buf) {
+                Ok(ev) => ev,
+                Err(err) => {
+                    return Err(ImportError::XmlParse {
+                        line: reader.buffer_position(),
+                        msg: err.to_string(),
+                    })
+                }
+            };
+            match inner {
+                Event::Eof => break,
+                Event::End(ee) if ee.name().as_ref() == b"Node" => break,
+                Event::Start(ae) | Event::Empty(ae) if ae.name().as_ref() == b"Array" => {
+                    array_class_name = attr_str(&ae, "Name");
+                    let mut array_total = attr_int(&ae, "Total");
+                    if array_total <= 0 {
+                        array_total = attr_int(&ae, "Count");
+                    }
+                    if array_total > 0 {
+                        total = array_total;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut arr = Node {
+            kind: NodeKind::Array,
+            name: node_name,
+            parent_id: struct_id,
+            offset: *child_offset,
+            array_len: total,
+            element_kind: NodeKind::Struct,
+            ..Node::default()
+        };
+        if !array_class_name.is_empty() {
+            arr.struct_type_name = array_class_name.clone();
+        }
+        let arr_idx = tree.add_node(arr);
+        let arr_id = tree.nodes[arr_idx].id;
+
+        if !array_class_name.is_empty() {
+            pending_refs.push(PendingRef {
+                node_id: arr_id,
+                class_name: array_class_name,
+            });
+        }
+
+        *child_offset += if node_size > 0 { node_size } else { 0 };
+        return Ok(());
+    }
+
+    // (d) Build a Node
+    let mut n = Node {
+        kind,
+        name: node_name,
+        parent_id: struct_id,
+        offset: *child_offset,
+        ..Node::default()
+    };
+
+    // Text nodes (cpp:311-316)
+    if is_text_type(xml_type, version) {
+        if is_utf16_text_type(xml_type, version) {
+            n.str_len = (node_size / 2).max(1);
+        } else {
+            n.str_len = node_size.max(1);
+        }
+    }
+
+    // Pointer types (cpp:319-327)
+    if is_pointer_type(xml_type, version) && !ptr_class.is_empty() {
+        n.collapsed = true;
+        let node_idx = tree.add_node(n);
+        let node_id = tree.nodes[node_idx].id;
+        pending_refs.push(PendingRef {
+            node_id,
+            class_name: ptr_class,
+        });
+        *child_offset += if node_size > 0 {
+            node_size
+        } else {
+            size_for_kind(kind)
+        };
+        return Ok(());
+    }
+
+    // Embedded class instance (cpp:330-344)
+    if is_class_instance_type(xml_type, version) {
+        let resolved_class = if inst_class.is_empty() {
+            ptr_class
+        } else {
+            inst_class
+        };
+        n.collapsed = true;
+        n.struct_type_name = resolved_class;
+        if !n.struct_type_name.is_empty() {
+            let class_name = n.struct_type_name.clone();
+            let node_idx = tree.add_node(n);
+            let node_id = tree.nodes[node_idx].id;
+            pending_refs.push(PendingRef {
+                node_id,
+                class_name,
+            });
+        } else {
+            tree.add_node(n);
+        }
+        *child_offset += if node_size > 0 { node_size } else { 0 };
+        return Ok(());
+    }
+
+    tree.add_node(n);
+    *child_offset += if node_size > 0 {
+        node_size
+    } else {
+        size_for_kind(kind)
+    };
+    Ok(())
+}
+
+// ── Export (cpp:11-220) ──
+
+/// `xmlTypeForKind` (`export_reclass_xml.cpp:11-40`) — reverse of the 2016 map.
+fn xml_type_for_kind(kind: NodeKind) -> i32 {
+    match kind {
+        NodeKind::Struct => 1,
+        NodeKind::Hex32 => 4,
+        NodeKind::Hex64 => 5,
+        NodeKind::Hex16 => 6,
+        NodeKind::Hex8 => 7,
+        NodeKind::Pointer64 => 8,
+        NodeKind::Pointer32 => 8,
+        NodeKind::Int64 => 9,
+        NodeKind::Int32 => 10,
+        NodeKind::Int16 => 11,
+        NodeKind::Int8 => 12,
+        NodeKind::Float => 13,
+        NodeKind::Double => 14,
+        NodeKind::UInt32 => 15,
+        NodeKind::UInt16 => 16,
+        NodeKind::UInt8 => 17,
+        NodeKind::UInt64 => 32,
+        NodeKind::UTF8 => 18,
+        NodeKind::UTF16 => 19,
+        NodeKind::Bool => 17, // No native bool in ReClass, map to UInt8
+        NodeKind::Vec2 => 22,
+        NodeKind::Vec3 => 23,
+        NodeKind::Vec4 => 24,
+        NodeKind::Mat4x4 => 25,
+        NodeKind::Array => 27,
+        _ => 7, // fallback to Hex8
+    }
+}
+
+/// `nodeSizeForExport` (`export_reclass_xml.cpp:42-52`).
+fn node_size_for_export(node: &Node) -> i32 {
+    match node.kind {
+        NodeKind::UTF8 => node.str_len,
+        NodeKind::UTF16 => node.str_len * 2,
+        NodeKind::Array => {
+            let elem_sz = size_for_kind(node.element_kind);
+            node.array_len * if elem_sz > 0 { elem_sz } else { 0 }
+        }
+        _ => size_for_kind(node.kind),
+    }
+}
+
+/// `resolveStructName` (`export_reclass_xml.cpp:55-61`).
+fn resolve_struct_name(tree: &NodeTree, ref_id: u64) -> String {
+    let idx = tree.index_of_id(ref_id);
+    if idx < 0 {
+        return String::new();
+    }
+    let r = &tree.nodes[idx as usize];
+    if !r.struct_type_name.is_empty() {
+        r.struct_type_name.clone()
+    } else {
+        r.name.clone()
+    }
+}
+
+pub fn export_reclass_xml(tree: &NodeTree, path: &Path) -> Result<(), ImportError> {
+    if tree.nodes.is_empty() {
+        return Err(ImportError::NoNodesToExport);
+    }
+
+    let file =
+        File::create(path).map_err(|_| ImportError::CannotOpenWrite(path.display().to_string()))?;
+
+    // Build child map (cpp:76-78)
+    let mut child_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, n) in tree.nodes.iter().enumerate() {
+        child_map.entry(n.parent_id).or_default().push(i);
+    }
+
+    let mut writer = Writer::new_with_indent(BufWriter::new(file), b' ', 4);
+    writer
+        .write_event(Event::Decl(BytesDecl::new(
+            "1.0",
+            Some("UTF-8"),
+            Some("yes"),
+        )))
+        .map_err(|e| ImportError::Io(e.to_string()))?;
+
+    // <ReClass>
+    writer
+        .write_event(Event::Start(quick_xml::events::BytesStart::new("ReClass")))
+        .map_err(|e| ImportError::Io(e.to_string()))?;
+    // <!--ReClassEx--> (importer version-detection key)
+    writer
+        .write_event(Event::Comment(BytesText::new("ReClassEx")))
+        .map_err(|e| ImportError::Io(e.to_string()))?;
+
+    // Roots sorted by offset (cpp:89-92)
+    let mut roots = child_map.get(&0).cloned().unwrap_or_default();
+    roots.sort_by_key(|&a| tree.nodes[a].offset);
+
+    let mut class_count = 0;
+
+    for ri in roots {
+        let root = &tree.nodes[ri];
+        if root.kind != NodeKind::Struct {
+            continue;
+        }
+
+        // <Class ...> attributes in this exact order (cpp:100-106)
+        let class_name = if root.name.is_empty() {
+            root.struct_type_name.clone()
+        } else {
+            root.name.clone()
+        };
+        let class_attrs: [(&str, &str); 6] = [
+            ("Name", class_name.as_str()),
+            ("Type", "28"),
+            ("Comment", ""),
+            ("Offset", "0"),
+            ("strOffset", "0"),
+            ("Code", ""),
+        ];
+        writer
+            .write_event(Event::Start(
+                quick_xml::events::BytesStart::new("Class")
+                    .with_attributes(class_attrs.iter().copied()),
+            ))
+            .map_err(|e| ImportError::Io(e.to_string()))?;
+
+        // Children sorted by offset (cpp:109-112)
+        let mut children = child_map.get(&root.id).cloned().unwrap_or_default();
+        children.sort_by_key(|&a| tree.nodes[a].offset);
+
+        let mut i = 0usize;
+        while i < children.len() {
+            let child = &tree.nodes[children[i]];
+
+            // (A) Bitfield container (cpp:118-134)
+            if child.kind == NodeKind::Struct && child.resolved_class_keyword() == "bitfield" {
+                let mut sz = child.byte_size();
+                if sz <= 0 {
+                    sz = 4;
+                }
+                let hex_kind = if sz <= 1 {
+                    NodeKind::Hex8
+                } else if sz <= 2 {
+                    NodeKind::Hex16
+                } else if sz <= 4 {
+                    NodeKind::Hex32
+                } else {
+                    NodeKind::Hex64
+                };
+                let type_str = xml_type_for_kind(hex_kind).to_string();
+                let size_str = sz.to_string();
+                let attrs: [(&str, &str); 5] = [
+                    ("Name", child.name.as_str()),
+                    ("Type", type_str.as_str()),
+                    ("Size", size_str.as_str()),
+                    ("bHidden", "false"),
+                    ("Comment", "bitfield"),
+                ];
+                writer
+                    .write_event(Event::Empty(
+                        quick_xml::events::BytesStart::new("Node")
+                            .with_attributes(attrs.iter().copied()),
+                    ))
+                    .map_err(|e| ImportError::Io(e.to_string()))?;
+                i += 1;
+                continue;
+            }
+
+            // (B) Hex-run collapse (cpp:137-160)
+            if is_hex_node(child.kind) {
+                let run_start = child.offset;
+                let mut run_end = child.offset + child.byte_size();
+                let mut j = i + 1;
+                while j < children.len() {
+                    let next = &tree.nodes[children[j]];
+                    if !is_hex_node(next.kind) {
+                        break;
+                    }
+                    if next.offset < run_end {
+                        break; // overlap/gap stops the run
+                    }
+                    run_end = next.offset + next.byte_size();
+                    j += 1;
+                }
+                let total_size = run_end - run_start;
+                let hex_name = if j - i == 1 && !child.name.is_empty() {
+                    child.name.clone()
+                } else {
+                    String::new()
+                };
+                let size_str = total_size.to_string();
+                let attrs: [(&str, &str); 5] = [
+                    ("Name", hex_name.as_str()),
+                    ("Type", "21"),
+                    ("Size", size_str.as_str()),
+                    ("bHidden", "false"),
+                    ("Comment", ""),
+                ];
+                writer
+                    .write_event(Event::Empty(
+                        quick_xml::events::BytesStart::new("Node")
+                            .with_attributes(attrs.iter().copied()),
+                    ))
+                    .map_err(|e| ImportError::Io(e.to_string()))?;
+                i = j;
+                continue;
+            }
+
+            // (C) Generic node (cpp:162-203) — Start + (optional Array) + End
+            let type_str = xml_type_for_kind(child.kind).to_string();
+            let size_str = node_size_for_export(child).to_string();
+            let mut attrs: Vec<(&str, String)> = vec![
+                ("Name", child.name.clone()),
+                ("Type", type_str),
+                ("Size", size_str),
+                ("bHidden", "false".to_string()),
+                ("Comment", String::new()),
+            ];
+
+            // Pointer with target
+            if (child.kind == NodeKind::Pointer64 || child.kind == NodeKind::Pointer32)
+                && child.ref_id != 0
+            {
+                let target = resolve_struct_name(tree, child.ref_id);
+                if !target.is_empty() {
+                    attrs.push(("Pointer", target));
+                }
+            }
+
+            // Embedded struct instance
+            if child.kind == NodeKind::Struct {
+                let inst_name = if child.struct_type_name.is_empty() {
+                    child.name.clone()
+                } else {
+                    child.struct_type_name.clone()
+                };
+                attrs.push(("Instance", inst_name));
+            }
+
+            // Array: Total + child <Array>
+            let mut array_elem_name: Option<String> = None;
+            if child.kind == NodeKind::Array {
+                attrs.push(("Total", child.array_len.to_string()));
+
+                let mut elem_name = if child.element_kind == NodeKind::Struct
+                    && !child.struct_type_name.is_empty()
+                {
+                    child.struct_type_name.clone()
+                } else if child.ref_id != 0 {
+                    resolve_struct_name(tree, child.ref_id)
+                } else {
+                    String::new()
+                };
+                if elem_name.is_empty() {
+                    elem_name = kind_to_string(child.element_kind).to_string();
+                }
+                array_elem_name = Some(elem_name);
+            }
+
+            let start = quick_xml::events::BytesStart::new("Node")
+                .with_attributes(attrs.iter().map(|(k, v)| (*k, v.as_str())));
+            writer
+                .write_event(Event::Start(start))
+                .map_err(|e| ImportError::Io(e.to_string()))?;
+
+            if let Some(elem_name) = array_elem_name {
+                let total_str = child.array_len.to_string();
+                let arr_attrs: [(&str, &str); 2] =
+                    [("Name", elem_name.as_str()), ("Total", total_str.as_str())];
+                writer
+                    .write_event(Event::Empty(
+                        quick_xml::events::BytesStart::new("Array")
+                            .with_attributes(arr_attrs.iter().copied()),
+                    ))
+                    .map_err(|e| ImportError::Io(e.to_string()))?;
+            }
+
+            writer
+                .write_event(Event::End(quick_xml::events::BytesEnd::new("Node")))
+                .map_err(|e| ImportError::Io(e.to_string()))?;
+
+            i += 1;
+        }
+
+        writer
+            .write_event(Event::End(quick_xml::events::BytesEnd::new("Class")))
+            .map_err(|e| ImportError::Io(e.to_string()))?;
+        class_count += 1;
+    }
+
+    writer
+        .write_event(Event::End(quick_xml::events::BytesEnd::new("ReClass")))
+        .map_err(|e| ImportError::Io(e.to_string()))?;
+
+    // flush
+    writer
+        .into_inner()
+        .into_inner()
+        .map_err(|e| ImportError::Io(e.to_string()))?;
+
+    if class_count == 0 {
+        return Err(ImportError::NoClassesToExport);
+    }
+
+    Ok(())
+}
