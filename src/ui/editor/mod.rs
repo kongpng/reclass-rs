@@ -646,6 +646,23 @@ impl RcxEditor {
             row = row.border_l_2().border_color(palette.accent);
         }
 
+        // Address/offset margin — the Scintilla-style left column (PIC1's gray
+        // address column). Fixed width from `offset_hex_digits` so EVERY row's
+        // main text starts at the same column; `lm.offset_text` is pre-padded by
+        // compose (continuation rows render the "·" marker, header/footer blank).
+        let addr_cols = self.controller.last_result().layout.offset_hex_digits.max(0) as f32;
+        if addr_cols > 0.0 {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .w(px((addr_cols + 2.0) * self.metrics.cell_width))
+                    .h(px(self.metrics.line_height))
+                    .pl(px(self.metrics.cell_width))
+                    .text_color(palette.dim)
+                    .child(SharedString::from(lm.offset_text.clone())),
+            );
+        }
+
         // The text element (static) — always painted as the base layer; it owns
         // the hitbox + row-local click routing back into the view.
         let row_paint = self.build_row_paint(idx, palette);
@@ -655,9 +672,12 @@ impl RcxEditor {
             line: idx,
         });
 
-        // Inline-edit overlay positioned at the edited column.
+        // Inline-edit overlay positioned at the edited column — offset by the
+        // address-margin width so it lands over the field, not the margin.
         if let Some((field, col_start)) = editing_here {
-            let left = px(col_start.max(0) as f32 * self.metrics.cell_width);
+            let hex_digits = self.controller.last_result().layout.offset_hex_digits.max(0) as f32;
+            let margin = if hex_digits > 0.0 { hex_digits + 2.0 } else { 0.0 };
+            let left = px((margin + col_start.max(0) as f32) * self.metrics.cell_width);
             row = row.child(
                 div()
                     .absolute()

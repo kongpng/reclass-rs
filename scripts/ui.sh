@@ -25,6 +25,9 @@ ensure_xserver() {
 case "${1:-}" in
   start)
     ensure_xserver
+    # Always (re)build the DEFAULT (ui) binary — a prior `--no-default-features`
+    # build can leave a headless binary in target/debug/reclass.
+    ( cd /home/loke/reclass-rs && LIBRARY_PATH="$LIBRARY_PATH" cargo build 2>&1 | grep -E '^error|Finished' | tail -1 )
     pkill -x reclass 2>/dev/null; sleep 1
     setsid env -u WAYLAND_DISPLAY DISPLAY=:99 XDG_RUNTIME_DIR=/run/user/1000 "$APP" ${2:+"$2"} </dev/null >/tmp/reclass_run.log 2>&1 &
     sleep 10
