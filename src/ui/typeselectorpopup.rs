@@ -24,10 +24,24 @@
 
 use crate::core::kind::{
     is_container_kind, is_func_ptr, is_hex_node, is_matrix_kind, is_pointer_kind, is_string_kind,
-    is_vector_kind, size_for_kind, NodeKind,
+    is_vector_kind, size_for_kind, NodeKind, K_KIND_META,
 };
 use crate::theme::color::Color;
 use crate::theme::model::Theme;
+
+/// The default built-in primitive type catalogue (`TypeSelectorPopup::setTypes`
+/// over `kKindMeta`): one [`TypeEntry`] per primitive kind, in table order, using
+/// the kind's display `type_name` ("hex64", "int32_t", "ptr64", …). The
+/// dynamic-size container kinds (Struct/Array) are excluded — those are picked via
+/// the modifier row / composite list, not as a base primitive. This is the
+/// catalogue [`TypeSelectorPopup::view`] builds its model over.
+pub fn default_type_entries() -> Vec<TypeEntry> {
+    K_KIND_META
+        .iter()
+        .filter(|m| !matches!(m.kind, NodeKind::Struct | NodeKind::Array))
+        .map(|m| TypeEntry::primitive(m.kind, m.type_name))
+        .collect()
+}
 
 /// `enum class TypePopupMode` (`typeselectorpopup.h:26`) — what is being picked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -365,6 +379,20 @@ pub struct TypeRow {
     pub match_positions: Vec<usize>,
 }
 
+impl TypeRow {
+    /// For a section-header row, the [`KindGroup`] it heads (resolved from its
+    /// section label) so the view can paint a matching colored dot. `None` for a
+    /// non-section row or an unrecognized label.
+    pub fn entry_group_for_label(&self) -> Option<KindGroup> {
+        if self.entry.entry_kind != EntryKind::Section {
+            return None;
+        }
+        KindGroup::ALL
+            .into_iter()
+            .find(|g| g.section_label() == self.entry.display_name)
+    }
+}
+
 /// The type-selector list model + filter (`applyFilter`,
 /// `typeselectorpopup.cpp:1485`).
 #[derive(Clone, Debug, Default)]
@@ -601,12 +629,31 @@ pub use view::{TypeSelectorEvent, TypeSelectorPopup};
 
 #[cfg(feature = "ui")]
 mod view {
-    use super::{EntryKind, Modifier, TypeEntry, TypeModel};
+    use super::{default_type_entries, EntryKind, KindGroup, Modifier, TypeEntry, TypeModel};
+    use crate::core::kind::NodeKind;
     use crate::theme::model::Theme;
-    use crate::ui::design::{color, tokens};
+    use crate::ui::design::{color, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::{Icon, IconName, Sizable as _};
+
+    /// The leading kind-chip icon for a type group (the colored square chip in the
+    /// C++ delegate). Maps each [`KindGroup`] to a domain [`icon`] helper so the
+    /// chip glyph reads the group (hex memory-stick, int dash, float dash, ptr
+    /// arrow, …). Tinted by the caller with the group color.
+    fn group_icon(group: KindGroup) -> Icon {
+        match group {
+            KindGroup::Hex => icon::hex(),
+            KindGroup::Int => Icon::new(IconName::Dash),
+            KindGroup::Float => Icon::new(IconName::Dash),
+            KindGroup::Ptr => icon::pointer(),
+            KindGroup::Vec => icon::array(),
+            KindGroup::Str => Icon::new(IconName::Dash),
+            KindGroup::Ctr => icon::struct_(),
+            KindGroup::Common => Icon::new(IconName::Dash),
+        }
+    }
 
     /// Render a type name with fuzzy-matched chars emphasized (accent + semibold),
     /// the rest in `base`. `positions` are char indices into `name`.
@@ -649,27 +696,57 @@ mod view {
         spans
     }
 
-    /// The popup's outcome.
+    /// The popup's outcome (the editor consumes this — see the menus↔editor
+    /// CONTRACT). `Chosen` carries the picked base [`NodeKind`] plus the optional
+    /// [`Modifier`] (`*` pointer / `**` double-pointer / `[]` array); the editor
+    /// calls `controller_mut().change_node_kind(idx, kind)` then applies the
+    /// modifier via its existing pointer/array ops.
     #[derive(Clone, Debug)]
     pub enum TypeSelectorEvent {
-        /// A type was chosen: the full type text (with modifier suffix), the
-        /// entry's primitive kind (if a primitive) or struct id (if composite).
-        Selected { full_text: String, entry: TypeEntry },
-        /// Dismissed.
-        Dismissed,
+        /// A type was chosen: its base kind + the optional modifier.
+        Chosen {
+            kind: NodeKind,
+            modifier: Option<Modifier>,
+        },
+        /// Dismissed (the `×`, Esc, or clicking outside).
+        Cancel,
     }
 
     /// The type-selector popover view.
     pub struct TypeSelectorPopup {
         model: TypeModel,
+        /// The kind the node currently has — highlighted as the active type.
+        current: NodeKind,
+        /// Which group chips are enabled (Hex/Int/Float/Ptr); `None` filter for the
+        /// rest. Empty set = all shown (the "all" state); a non-empty set filters
+        /// the list to those groups.
+        active_groups: std::collections::BTreeSet<&'static str>,
         input: Entity<InputState>,
         focus_handle: FocusHandle,
         _subscription: Subscription,
     }
 
     impl TypeSelectorPopup {
-        /// Build the popup over the given entries.
+        /// Build the change-type popup over the built-in primitive catalogue,
+        /// highlighting `current` as the active type (the contract entry point the
+        /// editor opens via `window.open_dialog`). Returns the entity so the host
+        /// can subscribe to [`TypeSelectorEvent`].
+        pub fn view(current: NodeKind, window: &mut Window, cx: &mut App) -> Entity<Self> {
+            cx.new(|cx| Self::new_with_current(default_type_entries(), current, window, cx))
+        }
+
+        /// Build the popup over the given entries (kept for tests / custom
+        /// catalogues), with no preset current kind.
         pub fn new(entries: Vec<TypeEntry>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            Self::new_with_current(entries, NodeKind::Hex8, window, cx)
+        }
+
+        fn new_with_current(
+            entries: Vec<TypeEntry>,
+            current: NodeKind,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
             let model = TypeModel::new(entries);
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Filter types..  (Ctrl+F)"));
@@ -683,6 +760,8 @@ mod view {
                 });
             TypeSelectorPopup {
                 model,
+                current,
+                active_groups: std::collections::BTreeSet::new(),
                 input,
                 focus_handle: cx.focus_handle(),
                 _subscription: subscription,
@@ -700,13 +779,58 @@ mod view {
             cx.notify();
         }
 
+        /// Whether an entry's group passes the active category-chip filter (empty
+        /// set = all visible).
+        fn group_visible(&self, group: KindGroup) -> bool {
+            self.active_groups.is_empty() || self.active_groups.contains(group.key())
+        }
+
+        /// Toggle a category chip (Hex/Int/Float/Ptr).
+        fn toggle_group(&mut self, group: KindGroup, cx: &mut Context<Self>) {
+            let key = group.key();
+            if self.active_groups.contains(key) {
+                self.active_groups.remove(key);
+            } else {
+                self.active_groups.insert(key);
+            }
+            cx.notify();
+        }
+
+        /// "all" — clear the category filter (every group shown).
+        fn select_all_groups(&mut self, cx: &mut Context<Self>) {
+            self.active_groups.clear();
+            cx.notify();
+        }
+
+        /// "none" — restrict to a single empty bucket (nothing shown). We model
+        /// this by enabling no chips but flagging the explicit-none state via a
+        /// sentinel: an active set containing only an unused key hides every group.
+        fn select_no_groups(&mut self, cx: &mut Context<Self>) {
+            self.active_groups.clear();
+            self.active_groups.insert("\u{0}none");
+            cx.notify();
+        }
+
+        /// Emit the chosen kind + the active modifier, then signal the host to
+        /// close. The base kind is the selected row's primitive kind; the modifier
+        /// is the active `*`/`**`/`[]` (or `None`).
+        fn accept_selected(&mut self, cx: &mut Context<Self>) {
+            let Some(entry) = self.model.selected_entry().cloned() else {
+                return;
+            };
+            let modifier = match self.model.modifier() {
+                Modifier::None => None,
+                m => Some(m),
+            };
+            cx.emit(TypeSelectorEvent::Chosen {
+                kind: entry.primitive_kind,
+                modifier,
+            });
+        }
+
         fn accept_row(&mut self, row: usize, cx: &mut Context<Self>) {
             if self.model.select_row(row) {
-                if let (Some(full_text), Some(entry)) =
-                    (self.model.full_text(), self.model.selected_entry().cloned())
-                {
-                    cx.emit(TypeSelectorEvent::Selected { full_text, entry });
-                }
+                self.accept_selected(cx);
             }
         }
 
@@ -737,29 +861,52 @@ mod view {
             let query = self.input.read(cx).value().to_string();
             let filtering = !query.trim().is_empty();
 
+            // The widest primitive (16B = Hex128/Int128) anchors the size width-bar
+            // so each row's bar is proportional to its byte size (the C++ delegate's
+            // little size bar). dyn (0B) shows no bar.
+            const MAX_SIZE_B: f32 = 16.0;
+
             let rows: Vec<AnyElement> = self
                 .model
                 .rows()
                 .iter()
                 .enumerate()
+                .filter(|(_, r)| {
+                    // Hide entries whose group is filtered out by the category chips
+                    // (sections always show — they head their own group).
+                    r.entry.entry_kind == EntryKind::Section || self.group_visible(r.entry.group)
+                })
                 .map(|(row, r)| {
                     if r.entry.entry_kind == EntryKind::Section {
-                        // A Zed section caption: uppercase micro label, muted.
-                        div()
+                        // A Zed section caption: a colored group dot + uppercase
+                        // micro label, muted.
+                        let group = r.entry_group_for_label();
+                        let dot = group.map(|g| {
+                            super::super::theme_apply::to_hsla(super::kind_group_color(g, &theme))
+                        });
+                        gpui_component::h_flex()
                             .w_full()
                             .px(px(tokens::space::MD))
                             .pt(px(tokens::space::MD))
                             .pb(px(tokens::space::XS))
-                            .text_size(px(tokens::font::UI_XS))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(muted)
-                            .child(r.entry.display_name.to_uppercase())
+                            .gap(px(tokens::space::SM))
+                            .items_center()
+                            .when_some(dot, |d, c| d.child(div().size(px(6.)).rounded_full().bg(c)))
+                            .child(
+                                div()
+                                    .text_size(px(tokens::font::UI_XS))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(muted)
+                                    .child(r.entry.display_name.to_uppercase()),
+                            )
                             .into_any_element()
                     } else {
                         let group_color = super::super::theme_apply::to_hsla(
                             super::kind_group_color(r.entry.group, &theme),
                         );
                         let is_sel = selected == Some(row);
+                        let is_current = r.entry.primitive_kind == self.current
+                            && r.entry.entry_kind != EntryKind::Composite;
                         let name_color = if r.entry.enabled {
                             group_color
                         } else {
@@ -783,6 +930,12 @@ mod view {
                         } else {
                             "dyn".to_string()
                         };
+                        // Proportional width bar (max 40px) for the byte size.
+                        let bar_w = if r.entry.size_bytes > 0 {
+                            (r.entry.size_bytes as f32 / MAX_SIZE_B * 40.).clamp(4., 40.)
+                        } else {
+                            0.
+                        };
                         // The composite keyword chip (struct/class/enum), shown muted.
                         let keyword = r.entry.class_keyword.clone();
                         gpui_component::h_flex()
@@ -795,6 +948,11 @@ mod view {
                             .rounded(px(tokens::radius::MD))
                             .text_size(px(tokens::font::UI_MD))
                             .when(is_sel, |d| d.bg(sel_bg))
+                            .when(!is_sel && is_current, |d| {
+                                // The node's current type — a soft ring even when
+                                // not the active row.
+                                d.border_1().border_color(accent)
+                            })
                             .when(!is_sel && r.entry.enabled, |d| d.hover(|s| s.bg(hover_bg)))
                             .when(r.entry.enabled, |d| d.cursor_pointer())
                             .when(r.entry.enabled, |d| {
@@ -802,13 +960,20 @@ mod view {
                                     this.accept_row(row, cx);
                                 }))
                             })
-                            // A 2px left group-color accent bar.
-                            .child(div().w(px(2.)).h(px(14.)).rounded_full().bg(group_color))
+                            // Leading colored kind chip (the SVG glyph for the group).
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(group_color)
+                                    .child(group_icon(r.entry.group).size_3()),
+                            )
                             .child(
                                 gpui_component::h_flex()
                                     .flex_1()
                                     .min_w_0()
                                     .overflow_hidden()
+                                    .font_family(tokens::font::MONO_FAMILY)
+                                    .text_size(px(tokens::font::EDITOR_SIZE))
                                     .children(name_spans),
                             )
                             .when(!keyword.is_empty(), |d| {
@@ -820,13 +985,33 @@ mod view {
                                         .child(keyword),
                                 )
                             })
+                            // Right-aligned size: a proportional width bar + the
+                            // "NB" label.
                             .child(
-                                div()
+                                gpui_component::h_flex()
                                     .flex_none()
-                                    .min_w(px(28.))
-                                    .text_size(px(tokens::font::UI_XS))
-                                    .text_color(muted)
-                                    .child(size_label),
+                                    .gap(px(tokens::space::SM))
+                                    .items_center()
+                                    .justify_end()
+                                    .child(div().w(px(40.)).h(px(4.)).flex().justify_end().when(
+                                        bar_w > 0.,
+                                        |d| {
+                                            d.child(
+                                                div()
+                                                    .w(px(bar_w))
+                                                    .h(px(4.))
+                                                    .rounded_full()
+                                                    .bg(group_color),
+                                            )
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .min_w(px(28.))
+                                            .text_size(px(tokens::font::UI_XS))
+                                            .text_color(muted)
+                                            .child(size_label),
+                                    ),
                             )
                             .into_any_element()
                     }
@@ -839,20 +1024,45 @@ mod view {
                 .key_context("RcxTypeSelector")
                 .flex()
                 .flex_col()
-                .w(px(360.))
-                .max_h(px(440.))
+                .w(px(380.))
+                .max_h(px(520.))
                 .text_size(px(tokens::font::UI_MD))
+                // Search row with a trailing × close.
                 .child(
-                    div()
+                    gpui_component::h_flex()
                         .px(px(tokens::space::MD))
                         .py(px(tokens::space::MD))
+                        .gap(px(tokens::space::SM))
+                        .items_center()
                         .border_b_1()
                         .border_color(border)
-                        .child(Input::new(&self.input).w_full()),
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(muted)
+                                .child(icon::search().size_3()),
+                        )
+                        .child(div().flex_1().child(Input::new(&self.input).w_full()))
+                        .child(
+                            div()
+                                .id("type-close")
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(20.))
+                                .rounded(px(tokens::radius::MD))
+                                .text_color(muted)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(hover_bg).text_color(color::text(cx)))
+                                .on_click(cx.listener(|_this, _e, _w, cx| {
+                                    cx.emit(TypeSelectorEvent::Cancel)
+                                }))
+                                .child(icon::close().size_3()),
+                        ),
                 )
-                .when(self.model.mode().allows_modifiers(), |this| {
-                    this.child(self.render_modifier_row(cx))
-                })
+                .child(self.render_category_tabs(&theme, cx))
+                .child(self.render_column_header(cx))
                 .child(
                     gpui_component::v_flex()
                         .id("rcx-type-selector-list")
@@ -862,29 +1072,218 @@ mod view {
                         .overflow_y_hidden()
                         .children(rows),
                 )
+                .child(self.render_footer(cx))
         }
     }
 
     impl TypeSelectorPopup {
-        /// The modifier toggle row (`*` / `**` / `[]`) — a Zed segmented toggle
-        /// group, shown only in FieldType / ArrayElement modes. Each chip reflects
-        /// the active [`Modifier`].
-        fn render_modifier_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-            let active = self.model.modifier();
-            let accent = color::accent(cx);
+        /// The CATEGORY FILTER TABS row: "● Hex (5)  ● Int (11)  ● Float (3)  ● Ptr
+        /// (4)" colored chips with live counts, plus the "all / none / N types"
+        /// trailing controls (the C++ category filter bar).
+        fn render_category_tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+            let muted = color::text_muted(cx);
             let fg = color::text(cx);
             let hover_bg = color::hover_overlay(cx);
             let sel_bg = color::selected_bg(cx);
 
-            let chip = |id: &'static str,
-                        label: &'static str,
-                        is_on: bool,
-                        modifier: Modifier|
+            // Live per-group counts over the catalogue.
+            let count_of = |g: KindGroup| -> usize {
+                self.model
+                    .entries()
+                    .iter()
+                    .filter(|e| e.group == g && e.selectable())
+                    .count()
+            };
+            let total = self
+                .model
+                .entries()
+                .iter()
+                .filter(|e| e.selectable())
+                .count();
+
+            let chip = |group: KindGroup, count: usize, color: Hsla, on: bool| -> AnyElement {
+                gpui_component::h_flex()
+                    .id(SharedString::from(format!("cat-{}", group.key())))
+                    .h(px(20.))
+                    .px(px(tokens::space::SM))
+                    .gap(px(tokens::space::XS))
+                    .items_center()
+                    .rounded(px(tokens::radius::SM))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(sel_bg))
+                    .when(!on, |d| d.hover(|s| s.bg(hover_bg)))
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.toggle_group(group, cx)))
+                    .child(div().size(px(6.)).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .text_size(px(tokens::font::UI_XS))
+                            .text_color(if on { fg } else { muted })
+                            .child(format!("{} ({count})", group.key())),
+                    )
+                    .into_any_element()
+            };
+
+            let group_color = |g: KindGroup| -> Hsla {
+                super::super::theme_apply::to_hsla(super::kind_group_color(g, theme))
+            };
+            let on = |g: KindGroup| self.active_groups.contains(g.key());
+
+            // A small "all" / "none" text control.
+            let text_btn = |id: &'static str,
+                            label: &'static str,
+                            active: bool,
+                            f: fn(&mut Self, &mut Context<Self>)|
              -> AnyElement {
+                div()
+                    .id(id)
+                    .px(px(tokens::space::SM))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(tokens::radius::SM))
+                    .text_size(px(tokens::font::UI_XS))
+                    .text_color(if active { fg } else { muted })
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(sel_bg))
+                    .when(!active, |d| d.hover(|s| s.bg(hover_bg)))
+                    .on_click(cx.listener(move |this, _e, _w, cx| f(this, cx)))
+                    .child(label.to_string())
+                    .into_any_element()
+            };
+
+            let all_active = self.active_groups.is_empty();
+            let none_active = self.active_groups.contains("\u{0}none");
+
+            gpui_component::h_flex()
+                .w_full()
+                .px(px(tokens::space::MD))
+                .py(px(tokens::space::SM))
+                .gap(px(tokens::space::SM))
+                .items_center()
+                .flex_wrap()
+                .border_b_1()
+                .border_color(color::border(cx))
+                .child(chip(
+                    KindGroup::Hex,
+                    count_of(KindGroup::Hex),
+                    group_color(KindGroup::Hex),
+                    on(KindGroup::Hex),
+                ))
+                .child(chip(
+                    KindGroup::Int,
+                    count_of(KindGroup::Int),
+                    group_color(KindGroup::Int),
+                    on(KindGroup::Int),
+                ))
+                .child(chip(
+                    KindGroup::Float,
+                    count_of(KindGroup::Float),
+                    group_color(KindGroup::Float),
+                    on(KindGroup::Float),
+                ))
+                .child(chip(
+                    KindGroup::Ptr,
+                    count_of(KindGroup::Ptr),
+                    group_color(KindGroup::Ptr),
+                    on(KindGroup::Ptr),
+                ))
+                .child(div().flex_1())
+                .child(text_btn(
+                    "cat-all",
+                    "all",
+                    all_active,
+                    Self::select_all_groups,
+                ))
+                .child(text_btn(
+                    "cat-none",
+                    "none",
+                    none_active,
+                    Self::select_no_groups,
+                ))
+                .child(
+                    div()
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(muted)
+                        .child(format!("{total} types")),
+                )
+        }
+
+        /// The column header "group · name · size" with the sort + layout-toggle
+        /// icons on the right (the C++ list header).
+        fn render_column_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            let muted = color::text_muted(cx);
+            let hover_bg = color::hover_overlay(cx);
+            let icon_btn = |id: &'static str, ic: Icon| -> AnyElement {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(18.))
+                    .rounded(px(tokens::radius::SM))
+                    .text_color(muted)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover_bg))
+                    .child(ic.size_3())
+                    .into_any_element()
+            };
+            gpui_component::h_flex()
+                .w_full()
+                .h(px(20.))
+                .px(px(tokens::space::MD))
+                .gap(px(tokens::space::MD))
+                .items_center()
+                .text_size(px(tokens::font::UI_XS))
+                .text_color(muted)
+                .child(div().flex_none().child("group"))
+                .child(div().flex_1().min_w_0().child("name"))
+                .child(div().flex_none().child("size"))
+                // Sort + layout toggles (cosmetic affordances mirroring the C++).
+                .child(icon_btn("col-sort", Icon::new(IconName::SortAscending)))
+                .child(icon_btn("col-layout-list", Icon::new(IconName::Menu)))
+                .child(icon_btn(
+                    "col-layout-grid",
+                    Icon::new(IconName::LayoutDashboard),
+                ))
+        }
+
+        /// The footer: "<curtype> · <size>" on the left + the MODIFIER buttons
+        /// `*` `**` `[]`, a "+ New" button, and a primary blue "OK".
+        fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            use gpui_component::button::{Button, ButtonVariants as _};
+            let muted = color::text_muted(cx);
+            let fg = color::text(cx);
+            let accent = color::accent(cx);
+            let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+            let border = color::border(cx);
+            let active = self.model.modifier();
+
+            // The current selection summary "<curtype> · <size>".
+            let summary = self
+                .model
+                .selected_entry()
+                .map(|e| {
+                    let size = if e.size_bytes > 0 {
+                        format!("{}B", e.size_bytes)
+                    } else {
+                        "dyn".to_string()
+                    };
+                    let full = self
+                        .model
+                        .full_text()
+                        .unwrap_or_else(|| e.display_name.clone());
+                    format!("{full} · {size}")
+                })
+                .unwrap_or_else(|| "—".to_string());
+
+            // A modifier toggle chip.
+            let chip = |id: &'static str, label: &'static str, is_on: bool, modifier: Modifier| {
                 gpui_component::h_flex()
                     .id(id)
-                    .h(px(22.))
-                    .min_w(px(34.))
+                    .h(px(24.))
+                    .min_w(px(30.))
                     .px(px(tokens::space::MD))
                     .items_center()
                     .justify_center()
@@ -894,7 +1293,6 @@ mod view {
                     .when(is_on, |d| d.bg(sel_bg).font_weight(FontWeight::SEMIBOLD))
                     .when(!is_on, |d| d.cursor_pointer().hover(|s| s.bg(hover_bg)))
                     .on_click(cx.listener(move |this, _e, _w, cx| {
-                        // Toggle off if already active, else set.
                         let next = if this.model.modifier() == modifier {
                             Modifier::None
                         } else {
@@ -906,42 +1304,73 @@ mod view {
                     .child(label.to_string())
                     .into_any_element()
             };
-
             let array_on = matches!(active, Modifier::Array(_));
             let array_modifier = match active {
                 Modifier::Array(n) => Modifier::Array(n),
                 _ => Modifier::Array(1),
             };
+            let modifiers_allowed = self.model.mode().allows_modifiers();
 
-            gpui_component::h_flex()
+            gpui_component::v_flex()
                 .w_full()
-                .px(px(tokens::space::MD))
-                .py(px(tokens::space::SM))
-                .gap(px(tokens::space::XS))
-                .items_center()
-                .border_b_1()
-                .border_color(color::border(cx))
+                .border_t_1()
+                .border_color(border)
                 .child(
+                    // The summary line.
                     div()
-                        .flex_none()
-                        .mr(px(tokens::space::XS))
+                        .w_full()
+                        .px(px(tokens::space::MD))
+                        .pt(px(tokens::space::SM))
+                        .font_family(tokens::font::MONO_FAMILY)
                         .text_size(px(tokens::font::UI_XS))
-                        .text_color(color::text_muted(cx))
-                        .child("Modify"),
+                        .text_color(muted)
+                        .child(summary),
                 )
-                .child(chip(
-                    "mod-ptr",
-                    "*",
-                    active == Modifier::Pointer,
-                    Modifier::Pointer,
-                ))
-                .child(chip(
-                    "mod-ptrptr",
-                    "**",
-                    active == Modifier::PointerPointer,
-                    Modifier::PointerPointer,
-                ))
-                .child(chip("mod-array", "[ ]", array_on, array_modifier))
+                .child(
+                    gpui_component::h_flex()
+                        .w_full()
+                        .px(px(tokens::space::MD))
+                        .py(px(tokens::space::SM))
+                        .gap(px(tokens::space::XS))
+                        .items_center()
+                        .when(modifiers_allowed, |d| {
+                            d.child(chip(
+                                "mod-ptr",
+                                "*",
+                                active == Modifier::Pointer,
+                                Modifier::Pointer,
+                            ))
+                            .child(chip(
+                                "mod-ptrptr",
+                                "**",
+                                active == Modifier::PointerPointer,
+                                Modifier::PointerPointer,
+                            ))
+                            .child(chip(
+                                "mod-array",
+                                "[ ]",
+                                array_on,
+                                array_modifier,
+                            ))
+                        })
+                        .child(
+                            Button::new("type-new")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Plus)
+                                .label("New"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("type-ok")
+                                .primary()
+                                .small()
+                                .label("OK")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.accept_selected(cx);
+                                })),
+                        ),
+                )
         }
     }
 }

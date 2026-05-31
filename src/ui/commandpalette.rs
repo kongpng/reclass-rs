@@ -735,12 +735,20 @@ mod view {
                 .shadow_lg()
                 .overflow_hidden()
                 .child(
-                    div()
+                    gpui_component::h_flex()
                         .px(px(tokens::space::LG))
                         .py(px(tokens::space::MD))
+                        .gap(px(tokens::space::MD))
+                        .items_center()
                         .border_b_1()
                         .border_color(border)
-                        .child(Input::new(&self.input).w_full()),
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(color::text_muted(cx))
+                                .child(crate::ui::design::icon::search().size_4()),
+                        )
+                        .child(div().flex_1().child(Input::new(&self.input).w_full())),
                 )
                 .child(
                     gpui_component::v_flex()

@@ -258,7 +258,7 @@ mod view {
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputState};
-    use gpui_component::{ActiveTheme as _, Sizable as _};
+    use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 
     /// The popup's outcome (the C++ signals).
     #[derive(Clone, Debug)]
@@ -433,7 +433,7 @@ mod view {
                                 .when(self.pinned, |d| d.bg(sel_bg))
                                 .when(!self.pinned, |d| d.hover(|s| s.bg(hover_bg)))
                                 .on_click(cx.listener(|this, _e, _w, cx| this.toggle_pin(cx)))
-                                .child("\u{1F4CC}"),
+                                .child(Icon::new(IconName::Star).size_3()),
                         ),
                 )
                 // Monospace byte preview block on a slightly inset surface.
@@ -467,7 +467,8 @@ mod view {
                                     Button::new("hex-ins-above")
                                         .ghost()
                                         .small()
-                                        .label("+ hex64 above")
+                                        .icon(IconName::Plus)
+                                        .label("hex64 above")
                                         .on_click(cx.listener(|this, _e, _window, cx| {
                                             cx.emit(HexToolbarEvent::InsertAbove(this.ctx.node_id));
                                         })),
@@ -476,7 +477,8 @@ mod view {
                                     Button::new("hex-ins-below")
                                         .ghost()
                                         .small()
-                                        .label("+ hex64 below")
+                                        .icon(IconName::Plus)
+                                        .label("hex64 below")
                                         .on_click(cx.listener(|this, _e, _window, cx| {
                                             cx.emit(HexToolbarEvent::InsertBelow(this.ctx.node_id));
                                         })),

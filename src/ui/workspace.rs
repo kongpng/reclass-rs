@@ -36,7 +36,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::tree::{tree, TreeItem, TreeState};
 
 use crate::core::{kind_to_string, NodeKind, NodeTree};
-use crate::ui::design::{color, tokens};
+use crate::ui::design::{color, icon, tokens};
 
 use super::state::DocId;
 
@@ -829,6 +829,8 @@ impl WorkspacePanel {
     /// the struct/enum count, plus a close affordance on the right (the C++
     /// 36px `workspaceHeader` with its `×` button).
     fn render_header(&self, cx: &App) -> impl IntoElement {
+        use gpui_component::Sizable as _;
+
         let m = &self.model;
         // The count caption ("N structs · M enums"), or nothing when empty.
         let mut count = String::new();
@@ -879,7 +881,8 @@ impl WorkspacePanel {
                         )
                     }),
             )
-            // Close affordance — a ghost "×" glyph (the C++ header close button).
+            // Close affordance — the Assets-stage `design::icon::close` SVG (the
+            // C++ header close button, replacing the round-2 "×" text glyph).
             // Closing the dock is the window's layout toggle; here it is a
             // restrained chrome hint that lightens on hover.
             .child(
@@ -891,17 +894,18 @@ impl WorkspacePanel {
                     .items_center()
                     .justify_center()
                     .rounded(px(tokens::radius::SM))
-                    .text_size(px(tokens::font::UI_MD))
                     .text_color(color::text_muted(cx))
                     .hover(|s| s.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
-                    .child("\u{00d7}"),
+                    .child(icon::close().with_size(px(12.0))),
             )
     }
 
     /// The Zed-style filter input row: a subtle-bg input with a leading
-    /// magnifier glyph (the C++ `m_workspaceSearch` with its `filter.svg`
-    /// leading icon). The `Input` carries the focus ring + clear button.
+    /// magnifier icon (the C++ `m_workspaceSearch` with its `filter.svg` leading
+    /// icon). The `Input` carries the focus ring + clear button.
     fn render_search(&self, cx: &App) -> impl IntoElement {
+        use gpui_component::Sizable as _;
+
         gpui_component::h_flex()
             .w_full()
             .flex_none()
@@ -909,13 +913,14 @@ impl WorkspacePanel {
             .py(px(tokens::space::MD))
             .gap(px(tokens::space::MD))
             .items_center()
-            // Leading magnifier glyph — asset-free (no SVG bundle), tinted muted.
+            // Leading magnifier — the Assets-stage `design::icon::search` SVG
+            // (replacing the round-2 emoji glyph), tinted muted.
             .child(
-                div()
-                    .flex_none()
-                    .text_size(px(tokens::font::UI_SM))
-                    .text_color(color::text_muted(cx))
-                    .child("\u{1f50d}"),
+                div().flex_none().child(
+                    icon::search()
+                        .with_size(px(14.0))
+                        .text_color(color::text_muted(cx)),
+                ),
             )
             .child(
                 div()
@@ -1179,12 +1184,21 @@ fn section_row(label: SharedString, cx: &App) -> impl IntoElement {
         .child(SharedString::from(label.to_uppercase()))
 }
 
-/// The disclosure chevron for a row: a crisp ▸ / ▾ glyph for folders (types with
-/// field children), or a same-width spacer for leaves so names align. Asset-free
-/// (no SVG bundle) — a Unicode triangle. Collapsed chevrons are faint and the
-/// expanded one is brighter (the active disclosure reads forward), matching Zed's
-/// tree twisties; the fixed 12px box keeps every name column aligned.
+/// The disclosure chevron for a row: a crisp SVG chevron (the Assets-stage
+/// `design::icon::chevron_right` / `chevron_down` — real Lucide SVGs, replacing
+/// the round-2 Unicode-triangle text glyphs) for folders (types with field
+/// children), or a same-width spacer for leaves so names align. Collapsed
+/// chevrons are faint and the expanded one is brighter (the active disclosure
+/// reads forward), matching Zed's tree twisties; the fixed 12px box keeps every
+/// name column aligned and the icon is sized to match.
 fn disclosure(is_folder: bool, is_expanded: bool, cx: &App) -> impl IntoElement {
+    use gpui_component::Sizable as _;
+
+    let tint = if is_expanded {
+        color::text(cx)
+    } else {
+        color::text_muted(cx)
+    };
     div()
         .flex_none()
         .w(px(12.0))
@@ -1192,27 +1206,40 @@ fn disclosure(is_folder: bool, is_expanded: bool, cx: &App) -> impl IntoElement 
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(tokens::font::UI_XS))
-        .text_color(if is_expanded {
-            color::text(cx)
-        } else {
-            color::text_muted(cx)
-        })
         .when(is_folder, |this| {
-            this.child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
+            let chevron = if is_expanded {
+                icon::chevron_down()
+            } else {
+                icon::chevron_right()
+            };
+            this.child(chevron.with_size(px(12.0)).text_color(tint))
         })
 }
 
-/// The colored type badge — a rounded chip carrying the S / E / U letter, tinted
-/// by kind (the C++ letter-badge `WorkspaceDelegate::paint`). Un-viewed types
-/// render dimmer (the C++ `Qt::UserRole + 3` dim state).
+/// The colored type badge — a rounded chip carrying a crisp SVG kind icon
+/// (replacing the round-2 `S` / `E` / `U` letter glyph with the Assets-stage
+/// `design::icon::*` Lucide SVGs), tinted by kind (the C++ letter-badge
+/// `WorkspaceDelegate::paint`). struct/class/union → the framed-container
+/// `struct_` glyph (`IconName::Frame`); enum → the cased-list `enum_` glyph
+/// (`IconName::Menu`) — the chip's tint (yellow / magenta / blue) keeps the
+/// struct↔union↔enum distinction the old letter carried. Un-viewed types render
+/// dimmer (the C++ `Qt::UserRole + 3` dim state).
 fn type_badge(badge: TypeBadge, viewed: bool, cx: &App) -> impl IntoElement {
+    use gpui_component::Sizable as _;
+
     let mut tint = badge_color(badge, cx);
     if !viewed {
         tint.a = 0.55;
     }
     let mut bg = tint;
     bg.a = 0.16;
+
+    // Kind glyph: enums read as a list of cases; everything else is a framed
+    // container (struct/class/union), distinguished from each other by tint.
+    let glyph = match badge {
+        TypeBadge::Enum => icon::enum_(),
+        _ => icon::struct_(),
+    };
 
     div()
         .flex_none()
@@ -1222,10 +1249,7 @@ fn type_badge(badge: TypeBadge, viewed: bool, cx: &App) -> impl IntoElement {
         .justify_center()
         .rounded(px(tokens::radius::SM))
         .bg(bg)
-        .text_size(px(tokens::font::UI_XS))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(tint)
-        .child(badge.letter().to_string())
+        .child(glyph.with_size(px(11.0)).text_color(tint))
 }
 
 /// The leading offset chip on a struct field child row — a faint, fixed-width,

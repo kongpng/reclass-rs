@@ -24,6 +24,8 @@
 //!
 //! Gated behind the `ui` feature.
 
+use std::collections::HashSet;
+
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -31,7 +33,7 @@ use gpui_component::popover::{Popover, PopoverState};
 use gpui_component::Sizable as _;
 
 use super::commandpalette::{default_menu_tree, CommandId, MenuNode};
-use super::design::{color, tokens};
+use super::design::{color, icon, tokens};
 
 /// The menu-bar's outcome — a top-level→leaf command was chosen. Routed by the
 /// owning [`MainWindow`](super::window::MainWindow) to `run_menu_command` (the
@@ -48,6 +50,12 @@ pub struct MenuBar {
     /// The menu tree (the shared palette tree by default). Held so the dropdowns
     /// render from the exact same data the command palette searches.
     menus: Vec<MenuNode>,
+    /// Command ids that should render a leading checkmark (checkable/toggle menu
+    /// items reflecting live app state — e.g. `view.scanner` while the scanner
+    /// pop-out is open; the C++ `QAction::setChecked`). The host
+    /// ([`MainWindow`](super::window::MainWindow)) updates this via
+    /// [`set_command_checked`](Self::set_command_checked).
+    checked: HashSet<CommandId>,
 }
 
 impl EventEmitter<MenuCommand> for MenuBar {}
@@ -57,12 +65,28 @@ impl MenuBar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         MenuBar {
             menus: default_menu_tree(),
+            checked: HashSet::new(),
         }
     }
 
     /// Construct as an [`Entity`] (the form the titlebar/window holds).
     pub fn view(cx: &mut App) -> Entity<Self> {
         cx.new(Self::new)
+    }
+
+    /// Set whether a command's menu item renders a leading checkmark (the C++
+    /// checkable `QAction`). The host calls this to reflect live toggle state —
+    /// e.g. `view.scanner` checked while the scanner pop-out is open. Re-renders
+    /// only when the state actually changed.
+    pub fn set_command_checked(&mut self, command: &str, checked: bool, cx: &mut Context<Self>) {
+        let changed = if checked {
+            self.checked.insert(command.to_string())
+        } else {
+            self.checked.remove(command)
+        };
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Emit a chosen command to the host (the C++ `action->trigger()` →
@@ -151,6 +175,12 @@ fn menu_dropdown(
     popover: Entity<PopoverState>,
     cx: &mut Context<PopoverState>,
 ) -> impl IntoElement {
+    // Snapshot the host's checked-command set once (the C++ checkable `QAction`
+    // state — e.g. `view.scanner` while the scanner pop-out is open). Read here so
+    // every row's checkmark stays in lockstep with the live app state.
+    let checked = menubar.read(cx).checked.clone();
+    let is_checked = |command: &str| checked.contains(command);
+
     let mut rows: Vec<AnyElement> = Vec::new();
     for (i, child) in children.iter().enumerate() {
         match child {
@@ -167,6 +197,7 @@ fn menu_dropdown(
                     shortcut,
                     command.clone(),
                     *enabled,
+                    is_checked(command),
                     menubar.clone(),
                     popover.clone(),
                     cx,
@@ -196,6 +227,7 @@ fn menu_dropdown(
                                 shortcut,
                                 command.clone(),
                                 *enabled,
+                                is_checked(command),
                                 menubar.clone(),
                                 popover.clone(),
                                 cx,
@@ -217,7 +249,10 @@ fn menu_dropdown(
 
 /// A clickable command row: `[checkmark slot] Label …………… [Shortcut]`.
 /// Hover overlay, `MD` radius, disabled rows greyed + inert (the C++ menu shows
-/// disabled actions). Clicking emits [`MenuCommand`] and dismisses the popover.
+/// disabled actions). When `checked`, the leading slot shows a real SVG check
+/// (the Assets-stage [`icon::check`]) — the C++ checkable `QAction` (e.g. View ▸
+/// Memory Scanner while the scanner pop-out is open). Clicking emits
+/// [`MenuCommand`] and dismisses the popover.
 #[allow(clippy::too_many_arguments)]
 fn command_row(
     key: usize,
@@ -225,6 +260,7 @@ fn command_row(
     shortcut: &str,
     command: CommandId,
     enabled: bool,
+    checked: bool,
     menubar: Entity<MenuBar>,
     popover: Entity<PopoverState>,
     cx: &Context<PopoverState>,
@@ -235,6 +271,21 @@ fn command_row(
         color::text_disabled(cx)
     };
     let muted = color::text_muted(cx);
+    let accent = color::accent(cx);
+
+    // Leading fixed-width checkmark slot — keeps every label left-aligned whether
+    // or not a row is checkable. Holds a real SVG check (accent-tinted) when this
+    // command's toggle is on; empty (but space-reserving) otherwise.
+    let check_slot = div()
+        .flex_none()
+        .w(px(tokens::font::UI_MD))
+        .h(px(tokens::font::UI_MD))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(checked, |s| {
+            s.text_color(accent).child(icon::check().xsmall())
+        });
 
     // Right-aligned keybinding hint, "Ctrl+S" → "Ctrl S" muted text (Zed shows a
     // light hint, not key-caps, in menus).
@@ -255,8 +306,8 @@ fn command_row(
         .id(("menu-item", key))
         .w_full()
         .h(px(26.0))
-        .px(px(tokens::space::MD))
-        .gap(px(tokens::space::MD))
+        .px(px(tokens::space::SM))
+        .gap(px(tokens::space::SM))
         .items_center()
         .justify_between()
         .rounded(px(tokens::radius::MD))
@@ -275,6 +326,7 @@ fn command_row(
                     popover.update(cx, |state, cx| state.dismiss(window, cx));
                 })
         })
+        .child(check_slot)
         .child(div().flex_1().min_w_0().child(label.to_string()))
         .when_some(hint, |r, h| r.child(h))
 }

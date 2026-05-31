@@ -428,39 +428,42 @@ pub fn default_entries(recent: &[(String, String, bool)]) -> Vec<SourceEntry> {
 #[cfg(feature = "ui")]
 pub use view::{SourceChooserEvent, SourceChooserPopup};
 
-/// A small left-slot glyph for a source row, chosen from the kind label /
-/// provider identifier (the C++ paints a per-provider icon; we use a clean
-/// unicode glyph since no SVG icon set is bundled — same approach as the
-/// titlebar source badge). Falls back to a generic chip.
+/// The leading SVG icon for a source row, chosen from the kind label / provider
+/// identifier (the C++ paints a per-provider icon). Maps each provider family to a
+/// verified [`IconName`](gpui_component::IconName) so the dropdown shows real icons
+/// (the round-2 unicode glyphs are replaced). Falls back to a generic data-source
+/// drive icon.
 #[cfg(feature = "ui")]
-pub fn source_glyph(kind_label: &str, provider_identifier: &str) -> &'static str {
+pub fn source_icon(kind_label: &str, provider_identifier: &str) -> gpui_component::Icon {
+    use gpui_component::{Icon, IconName};
     let key = if !provider_identifier.is_empty() {
         provider_identifier
     } else {
         kind_label
     };
     let lower = key.to_ascii_lowercase();
-    if lower.contains("kernel") {
-        "\u{229E}" // ⊞ squared plus — kernel memory
+    let name = if lower.contains("kernel") {
+        IconName::Cpu // kernel memory
     } else if lower.contains("remote") {
-        "\u{2715}" // ✕ — remote process
+        IconName::Globe // remote process
     } else if lower.contains("windbg") || lower.contains("dbg") {
-        "\u{1F50C}" // 🔌 debugger
+        IconName::SquareTerminal // debugger
     } else if lower.contains("net") || lower.contains("compat") || lower.contains("rcnet") {
-        "\u{1F50C}" // 🔌 .NET compat layer
+        IconName::Network // .NET compat layer
     } else if lower.contains("process") || lower.contains("processmemory") {
-        "\u{2637}" // ☷ — process memory
+        IconName::LayoutDashboard // process memory
     } else if lower.contains("file") {
-        "\u{1F4C4}" // 📄 file
+        IconName::File // file
     } else {
-        "\u{25A2}" // ▢ generic
-    }
+        IconName::HardDrive // generic data source
+    };
+    Icon::new(name)
 }
 
 #[cfg(feature = "ui")]
 mod view {
-    use super::{source_glyph, SourceAccept, SourceEntryKind, SourceModel};
-    use crate::ui::design::{color, tokens};
+    use super::{source_icon, SourceAccept, SourceEntryKind, SourceModel};
+    use crate::ui::design::{color, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
@@ -567,7 +570,6 @@ mod view {
                         _ => {
                             let is_sel = selected == Some(row);
                             let is_clear = e.entry_kind == SourceEntryKind::ClearAction;
-                            let glyph = source_glyph(&e.kind_label, &e.provider_identifier);
                             let row_fg = if !e.enabled {
                                 disabled
                             } else if is_clear {
@@ -603,21 +605,31 @@ mod view {
                                         this.accept_row(row, cx);
                                     }))
                                 })
-                                // Left checkmark slot (active saved source gets a ✓).
+                                // Left checkmark slot (active saved source gets a ✓ SVG).
                                 .child(
                                     div()
                                         .w(px(14.))
                                         .flex_none()
+                                        .flex()
+                                        .items_center()
                                         .text_color(accent)
-                                        .when(e.is_active, |d| d.child("\u{2713}")),
+                                        .when(e.is_active, |d| d.child(icon::check().size_3())),
                                 )
-                                // Kind glyph.
+                                // Leading kind icon (SVG): per-provider for sources,
+                                // a ✕ for the clear action.
                                 .child(
                                     div()
                                         .flex_none()
+                                        .flex()
+                                        .items_center()
                                         .w(px(16.))
                                         .text_color(if is_clear { danger } else { muted })
-                                        .child(glyph),
+                                        .child(if is_clear {
+                                            icon::close().size_3()
+                                        } else {
+                                            source_icon(&e.kind_label, &e.provider_identifier)
+                                                .size_3()
+                                        }),
                                 )
                                 // Name (+ inline plugin hint).
                                 .child(
@@ -659,10 +671,18 @@ mod view {
                 .text_size(px(tokens::font::UI_MD))
                 .when(show_filter, |this| {
                     this.child(
-                        div()
-                            .px(px(tokens::space::XS))
+                        gpui_component::h_flex()
+                            .px(px(tokens::space::SM))
                             .pb(px(tokens::space::XS))
-                            .child(Input::new(&self.input).w_full()),
+                            .gap(px(tokens::space::SM))
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(muted)
+                                    .child(icon::search().size_3()),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.input).w_full())),
                     )
                 })
                 .child(
@@ -679,9 +699,7 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        default_entries, provider_entries, SourceAccept, SourceEntry, SourceEntryKind, SourceModel,
-    };
+    use super::{default_entries, provider_entries, SourceEntryKind};
 
     #[test]
     fn provider_entries_match_pic4_list() {

@@ -70,9 +70,17 @@ pub struct EditorPalette {
     pub byte_sel: Hsla,
     /// The border color for chrome accents (chevron box, source chip outline).
     pub border: Hsla,
-    /// The crisp fold disclosure triangle (`▸`/`▾`) on expandable rows — a clear
-    /// foreground (not dim) so the fold affordance reads as a real control.
+    /// The crisp fold disclosure triangle (`▸`/`▾`) on expandable rows.
+    ///
+    /// Round-3: the disclosure control is now a crisp **SVG** chevron painted in
+    /// the icon gutter (see `mod.rs` `render_row`), so the caret baked into the
+    /// composed row text is rendered **transparent** here — only the SVG shows,
+    /// while fold-col hit-testing (column-based) is untouched. The SVG's own tint
+    /// is [`fold_chevron_icon`](Self::fold_chevron_icon).
     pub fold_chevron: Hsla,
+    /// The tint for the crisp SVG fold disclosure chevron in the icon gutter — the
+    /// clear link/accent blue so the fold affordance reads as a real control.
+    pub fold_chevron_icon: Hsla,
     /// The "active line" subtle highlight — the gentle full-row fill on the
     /// primary/cursor row (Zed's active-line background), softer than the
     /// accent-tinted selection fill so a selected row still reads as selected.
@@ -130,9 +138,13 @@ impl EditorPalette {
             heat_hot: t.red,
             byte_sel: t.link,
             border: t.border,
-            // The disclosure triangle reads in the link/accent blue — a crisp,
+            // The baked text caret is hidden (the crisp SVG chevron in the icon
+            // gutter is the disclosure control now); fold-col hit-testing is
+            // column-based, so a transparent caret glyph changes nothing there.
+            fold_chevron: gpui::transparent_black(),
+            // The SVG disclosure chevron reads in the link/accent blue — a crisp,
             // unmistakable fold control against the dim chrome around it.
-            fold_chevron: t.link,
+            fold_chevron_icon: t.link,
             // Active-line band: a barely-there foreground wash (Zed's active-line
             // bg), softer than the accent selection fill so the two are distinct.
             active_line_bg: with_alpha(t.foreground, 0.03),

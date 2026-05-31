@@ -233,7 +233,35 @@ mod view {
     use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
-    use gpui_component::ActiveTheme as _;
+    use gpui_component::{ActiveTheme as _, Icon, IconName};
+
+    /// The leading SVG icon for a context-menu command (the C++ menus paint an
+    /// icon next to each action). Maps each [`CommandId`] family to a verified
+    /// [`IconName`]; commands without a natural icon return `None` (the row keeps
+    /// an empty leading slot so labels stay aligned).
+    fn command_icon(command: &str) -> Option<IconName> {
+        let name = match command {
+            "hex.break_into_class" => IconName::Frame,
+            "hex.copy_hex" | "hex.copy_c_array" | "hex.copy_python" => IconName::Copy,
+            "hex.save_binary" => IconName::HardDrive,
+            "hex.paste" => IconName::Inbox,
+            "hex.edit" => IconName::Replace,
+            "hex.zero_fill" => IconName::Minus,
+            "hex.clear_selection" => IconName::Close,
+            "node.open_current" => IconName::ArrowRight,
+            "node.open_new" => IconName::ExternalLink,
+            "node.duplicate" => IconName::Copy,
+            "node.convert_struct"
+            | "node.convert_class"
+            | "type.convert_struct"
+            | "type.convert_class" => IconName::Replace,
+            "node.find_references" => IconName::Search,
+            "node.toggle_pin" => IconName::Star,
+            "node.delete" => IconName::Delete,
+            _ => return None,
+        };
+        Some(name)
+    }
 
     /// The menu's outcome.
     #[derive(Clone, Debug)]
@@ -327,9 +355,9 @@ mod view {
                                         this.activate(cmd.clone(), cx)
                                     }))
                             })
-                            // left check/icon slot (empty for plain actions, keeps
-                            // labels aligned with checkables).
-                            .child(check_slot(false, muted))
+                            // Leading SVG icon slot (a per-command icon, tinted to
+                            // the row color; empty keeps labels aligned).
+                            .child(icon_slot(command_icon(&cmd), row_fg))
                             .child(div().flex_1().min_w_0().child(label.clone()))
                             .child(shortcut_slot(shortcut, muted))
                             .into_any_element()
@@ -384,14 +412,28 @@ mod view {
             .rounded(px(tokens::radius::MD))
     }
 
-    /// The left check/icon slot — a fixed-width column holding a checkmark (for a
-    /// checked toggle) or nothing, so labels stay aligned.
+    /// The left check slot — a fixed-width column holding a ✓ SVG (for a checked
+    /// toggle) or nothing, so labels stay aligned.
     fn check_slot(checked: bool, color: Hsla) -> Div {
         div()
             .w(px(14.))
             .flex_none()
+            .flex()
+            .items_center()
             .text_color(color)
-            .when(checked, |d| d.child("\u{2713}"))
+            .when(checked, |d| d.child(Icon::new(IconName::Check).size_3()))
+    }
+
+    /// The left icon slot — a fixed-width column holding a leading command SVG
+    /// (tinted to `color`) or nothing, so labels stay aligned with checkables.
+    fn icon_slot(icon: Option<IconName>, color: Hsla) -> Div {
+        div()
+            .w(px(14.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .text_color(color)
+            .when_some(icon, |d, name| d.child(Icon::new(name).size_3()))
     }
 
     /// The right keybind slot — a muted, fixed end column for the shortcut hint.

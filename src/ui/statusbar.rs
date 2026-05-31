@@ -42,7 +42,10 @@
 use std::collections::HashSet;
 
 use crate::controller::RcxController;
-use crate::core::{kind_meta, NodeKind, NodeTree};
+use crate::core::{
+    is_container_kind, is_string_kind, is_vector_kind, kind_meta, size_for_kind, NodeKind,
+    NodeTree, K_KIND_META,
+};
 
 /// The resolved status-bar readout — the pure product of
 /// [`StatusInfo::for_controller`] / [`StatusInfo::from_tree`].
@@ -67,6 +70,22 @@ pub struct StatusInfo {
     /// `true` when this is the no-selection *default* readout (the viewed-struct
     /// summary) rather than a live selection — drives the dimmed render.
     pub is_default: bool,
+    /// The C++ "variant position" segment "↔ uint32_t (3/6)" — the selected
+    /// node's kind position within the same-size, non-container variant list the
+    /// `←→` type-cycle actually rotates through (`main.cpp:3063`). Empty when the
+    /// node is a container or has no sibling variants (the C++ shows "(no variants
+    /// for N bytes)" in that case, carried here too). PIC of `reclass_right_click`:
+    /// "↔ uint32_t (3/6)".
+    pub type_index: String,
+    /// The C++ type-cycle key hints "P=ptr F=float S=int U=uint" (`main.cpp:3084`)
+    /// — shown for any sized leaf (the keys that retype the selected field).
+    /// Empty for containers / the default / multi-select.
+    pub key_hints: String,
+    /// The viewed root struct/enum summary the C++ appends to the dim part
+    /// (`main.cpp:3104`): "Root: 0xNN (decimal)" for a struct, "Root: N members"
+    /// for an enum. Empty when there is no struct/enum to summarize. This is the
+    /// trailing "BATTERY_REPORTING_SCALE: 0x8 (8)" segment in the reference.
+    pub struct_size: String,
 }
 
 impl StatusInfo {
@@ -124,13 +143,21 @@ impl StatusInfo {
         // Walk to the root struct for the "Root.field" prefix.
         let root_name = root_name_of(tree, idx);
 
+        // The viewed root struct/enum summary (the C++ appends it in *every*
+        // selection branch; `main.cpp:3096`): "Root: 0xNN (dec)" / "Root: N members".
+        let struct_size = struct_size_segment(tree, view_root);
+
         if count > 1 {
-            // "TypeName ×N" — the multi-select summary (no offset detail).
+            // "TypeName ×N" — the multi-select summary (no offset detail / variant
+            // hints; the C++ `selectionChanged` slot shows just "N nodes selected").
             return StatusInfo {
                 path: format!("{type_name} \u{00D7}{count}"),
                 detail: String::new(),
                 info: format!("{count} nodes selected"),
                 is_default: false,
+                type_index: String::new(),
+                key_hints: String::new(),
+                struct_size,
             };
         }
 
@@ -159,11 +186,20 @@ impl StatusInfo {
             node.offset, size
         );
 
+        // The "↔ uint32_t (pos/total)" variant indicator + the "P=ptr F=float
+        // S=int U=uint" type-cycle key hints (`main.cpp:3063-3084`). Only shown for
+        // a *sized* leaf (containers / 0-byte kinds get neither); when a sized leaf
+        // has no sibling variants the C++ shows "(no variants for N bytes)".
+        let (type_index, key_hints) = variant_segments(node.kind, &type_name);
+
         StatusInfo {
             path,
             detail,
             info,
             is_default: false,
+            type_index,
+            key_hints,
+            struct_size,
         }
     }
 
@@ -208,6 +244,96 @@ impl StatusInfo {
             detail: String::new(),
             info,
             is_default: true,
+            // The default branch has no live selection → no variant indicator /
+            // key hints. The viewed-struct footprint is already in `info`, so the
+            // separate "Root: 0xNN (dec)" segment (a *selection* extra) stays empty.
+            type_index: String::new(),
+            key_hints: String::new(),
+            struct_size: String::new(),
+        }
+    }
+}
+
+/// The variant-cycle segments for a selected leaf's `kind`: the "↔ TypeName
+/// (pos/total)" indicator and the "P=ptr F=float S=int U=uint" type-cycle key
+/// hints (`main.cpp:3063-3088`). Returns `(type_index, key_hints)`.
+///
+/// `total` counts the kinds the `←→` cycle actually rotates through: same byte
+/// size, non-container, and — unless the current kind is itself a string/vector —
+/// excluding string/vector kinds (the exact C++ filter). `pos` is the current
+/// kind's 1-based position in that list. With `> 1` variants the indicator reads
+/// "↔ TypeName (pos/total)"; with a single variant the C++ shows "(no variants
+/// for N bytes)". Either way a sized leaf gets the key hints; a container / 0-byte
+/// kind gets neither (both empty).
+fn variant_segments(kind: NodeKind, type_name: &str) -> (String, String) {
+    let sz = size_for_kind(kind);
+    if sz <= 0 {
+        // Container / dynamic kind → no variant cycle, no hints (the C++ guards on
+        // `sz > 0`).
+        return (String::new(), String::new());
+    }
+
+    let cur_is_string = is_string_kind(kind);
+    let cur_is_vector = is_vector_kind(kind);
+    let mut pos = 0;
+    let mut total = 0;
+    for m in &K_KIND_META {
+        if m.size != sz || is_container_kind(m.kind) {
+            continue;
+        }
+        if !cur_is_string && is_string_kind(m.kind) {
+            continue;
+        }
+        if !cur_is_vector && is_vector_kind(m.kind) {
+            continue;
+        }
+        total += 1;
+        if m.kind == kind {
+            pos = total;
+        }
+    }
+
+    let type_index = if total > 1 {
+        format!("\u{2194} {type_name} ({pos}/{total})")
+    } else {
+        format!("(no variants for {sz} bytes)")
+    };
+    let key_hints = "P=ptr F=float S=int U=uint".to_string();
+    (type_index, key_hints)
+}
+
+/// The viewed root struct/enum summary segment (`main.cpp:3096`): "Root: 0xNN
+/// (decimal)" for a struct, "Root: N members" for an enum. Picks the view-root
+/// (falling back to the first top-level struct when `view_root == 0`, exactly the
+/// C++ `sizeRootId` fallback). Empty when there is no struct/enum to summarize.
+fn struct_size_segment(tree: &NodeTree, view_root: u64) -> String {
+    let id = if view_root != 0 {
+        view_root
+    } else {
+        // No explicit view-root → the first top-level struct's id (C++ fallback).
+        match first_root_idx(tree) {
+            i if i >= 0 => tree.nodes[i as usize].id,
+            _ => return String::new(),
+        }
+    };
+    let ri = tree.index_of_id(id);
+    if ri < 0 {
+        return String::new();
+    }
+    let rn = &tree.nodes[ri as usize];
+    let rname = if rn.struct_type_name.is_empty() {
+        rn.name.clone()
+    } else {
+        rn.struct_type_name.clone()
+    };
+    if rn.is_enum() {
+        format!("{rname}: {} members", rn.enum_members.len())
+    } else {
+        let span = tree.struct_span(id);
+        if span > 0 {
+            format!("{rname}: 0x{span:X} ({span})")
+        } else {
+            String::new()
         }
     }
 }
@@ -255,11 +381,12 @@ pub use view::render_status_bar;
 #[cfg(feature = "ui")]
 mod view {
     use super::StatusInfo;
-    use crate::ui::design::{color, tokens};
+    use crate::ui::design::{color, icon, tokens};
     use crate::ui::state::DataSource;
     use crate::ui::theme_apply::ThemeRegistryGlobal;
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
+    use gpui_component::{Icon, Sizable as _};
 
     /// A faint vertical hairline separating two right-hand status segments — the
     /// Zed status-bar divider (a 1px-wide muted rule with a little vertical
@@ -275,6 +402,13 @@ mod view {
     /// One muted right-hand status segment (offset/size · source · theme).
     fn segment(text: String, fg: Hsla) -> impl IntoElement {
         div().flex_none().text_color(fg).child(text)
+    }
+
+    /// A small leading icon for a status segment, sized + tinted to sit on the
+    /// `UI_XS` baseline (the status strip's chrome). Inherits its color from the
+    /// caller's `text_color` unless overridden.
+    fn segment_icon(ic: Icon) -> impl IntoElement {
+        ic.xsmall()
     }
 
     /// The pinned status-bar height (logical px). The bar is locked to exactly
@@ -336,6 +470,25 @@ mod view {
             color::text_disabled(cx)
         };
 
+        // The C++ selection extras (`reclass_right_click_on_address.png`):
+        //   "<Struct>.<field> | +0xNN  ↔ <type> (pos/total)  P=ptr F=float S=int U=uint  <Root>: 0xNN (dec)".
+        // The "|" splits the full-contrast path from the dim part; everything after
+        // is muted. These only populate for a live selection (empty in the default
+        // / multi-select branch), so the bar still reads cleanly when idle.
+        let type_index = info.type_index.clone();
+        let has_type_index = !type_index.is_empty();
+        let key_hints = info.key_hints.clone();
+        let has_key_hints = !key_hints.is_empty();
+        let struct_size = info.struct_size.clone();
+        let has_struct_size = !struct_size.is_empty();
+        // The "offset/size" spelled segment is the default branch's right context;
+        // for a live selection the compact "+0xNN" + variant cluster carry it, so
+        // only surface `info` when there's no richer detail (i.e. the default).
+        let show_info_seg = has_info && info.is_default;
+        // The dimmed type-cycle key hints sit a touch fainter than the rest (they
+        // are a hint, not a readout) — the C++ renders them in the dim part too.
+        let hint_color = color::text_disabled(cx);
+
         // Right segment 3: the active theme name (the C++ status theme/view-mode
         // readout). Read from the global registry so the bar's signature — and
         // thus the window wiring — stays unchanged.
@@ -365,34 +518,84 @@ mod view {
             .bg(color::chrome_bg(cx))
             .text_size(px(tokens::font::UI_XS))
             .text_color(muted)
-            // Left cluster: node path · compact offset suffix.
+            // Left cluster (the C++ selection line): node path · "|" · +0xNN ·
+            // "↔ <type> (pos/total)" · "P=ptr F=float S=int U=uint" · "Root: 0xNN".
+            // `min_w_0` + `overflow_hidden` let the long line clip rather than push
+            // the right cluster off-screen.
             .child(
                 gpui_component::h_flex()
-                    .flex_none()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
                     .gap(px(tokens::space::MD))
                     .items_center()
                     .when(has_path, |row| {
                         row.child(div().flex_none().text_color(path_color).child(path.clone()))
                     })
+                    // The "|" divider between the full-contrast path and the dim
+                    // part (a hairline, like the C++ separator glyph).
+                    .when(has_path && (has_detail || has_type_index), |row| {
+                        row.child(segment_sep(cx))
+                    })
                     .when(has_detail, |row| {
                         row.child(div().flex_none().text_color(muted).child(detail.clone()))
+                    })
+                    .when(has_type_index, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(muted)
+                                .child(type_index.clone()),
+                        )
+                    })
+                    .when(has_key_hints, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(hint_color)
+                                .child(key_hints.clone()),
+                        )
+                    })
+                    .when(has_struct_size, |row| {
+                        row.child(segment_sep(cx)).child(
+                            div()
+                                .flex_none()
+                                .text_color(muted)
+                                .child(struct_size.clone()),
+                        )
                     }),
             )
-            // Spacer.
-            .child(div().flex_1())
-            // Right cluster: offset/size · source · theme, hairline-separated.
+            // Right cluster: (default-only offset/size ·) source · theme,
+            // hairline-separated. Each carries a small leading SVG icon (the
+            // Assets-stage `design::icon_*` set) for Zed chrome polish.
             .child(
                 gpui_component::h_flex()
                     .flex_none()
                     .gap(px(tokens::space::MD))
                     .items_center()
-                    .when(has_info, |row| {
+                    .when(show_info_seg, |row| {
                         row.child(segment(info_seg.clone(), muted))
                             .child(segment_sep(cx))
                     })
-                    .child(segment(source_label, source_color))
+                    .child(
+                        gpui_component::h_flex()
+                            .flex_none()
+                            .gap(px(tokens::space::XS))
+                            .items_center()
+                            .text_color(source_color)
+                            .child(segment_icon(icon::source()))
+                            .child(div().flex_none().child(source_label)),
+                    )
                     .child(segment_sep(cx))
-                    .child(segment(theme_label, muted)),
+                    .child(
+                        gpui_component::h_flex()
+                            .flex_none()
+                            .gap(px(tokens::space::XS))
+                            .items_center()
+                            .text_color(muted)
+                            .child(segment_icon(icon::settings()))
+                            .child(div().flex_none().child(theme_label)),
+                    ),
             )
     }
 }
@@ -524,6 +727,14 @@ mod tests {
         // PIC3 right segment: "offset: 0x0020 · size: 4 bytes" (Int32 leaf).
         assert_eq!(info.info, "offset: 0x0020 \u{00B7} size: 4 bytes");
         assert!(!info.is_default);
+        // The C++ variant indicator + key hints (reference: "↔ uint32_t (3/6)
+        // P=ptr F=float S=int U=uint"). Int32 is the 2nd of the six 4-byte,
+        // non-container, non-string/vector variants (Hex32, Int32, UInt32, Float,
+        // Pointer32, FuncPtr32) → "↔ int32_t (2/6)".
+        assert_eq!(info.type_index, "\u{2194} int32_t (2/6)");
+        assert_eq!(info.key_hints, "P=ptr F=float S=int U=uint");
+        // The trailing viewed-struct summary (the C++ "Root: 0xNN (dec)" tail).
+        assert_eq!(info.struct_size, "UnnamedClass0: 0x24 (36)");
     }
 
     #[test]
@@ -535,6 +746,11 @@ mod tests {
         // segment reports its total span (0x24).
         assert_eq!(info.detail, "+0x00");
         assert_eq!(info.info, "offset: 0x0000 \u{00B7} size: 36 bytes");
+        // A container (Struct) has no variant cycle and no type-cycle key hints.
+        assert_eq!(info.type_index, "");
+        assert_eq!(info.key_hints, "");
+        // The struct-size tail still describes the viewed root.
+        assert_eq!(info.struct_size, "UnnamedClass0: 0x24 (36)");
     }
 
     #[test]
@@ -547,6 +763,11 @@ mod tests {
         assert_eq!(info.detail, "");
         assert_eq!(info.info, "2 nodes selected");
         assert!(!info.is_default);
+        // No per-node variant cluster on a multi-select; the struct-size tail
+        // still describes the viewed root.
+        assert_eq!(info.type_index, "");
+        assert_eq!(info.key_hints, "");
+        assert_eq!(info.struct_size, "UnnamedClass0: 0x24 (36)");
     }
 
     #[test]
@@ -585,6 +806,74 @@ mod tests {
             "Aliased".into()
         });
         assert_eq!(info.path, "Aliased \u{00D7}2");
+    }
+
+    /// Build a single-root tree of one leaf `kind` at offset 0 and read its
+    /// status. Returns the resolved [`StatusInfo`].
+    fn leaf_status(kind: NodeKind) -> StatusInfo {
+        let mut tree = NodeTree::new();
+        let n = Node {
+            kind,
+            name: "f".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        };
+        let i = tree.add_node(n);
+        let id = tree.nodes[i].id;
+        StatusInfo::from_tree(&tree, &sel(&[id]), VIEW_NONE, default_type_name)
+    }
+
+    #[test]
+    fn variant_index_matches_cpp_reference_uint32_3_of_6() {
+        // The captured C++ reference (`reclass_right_click_on_address.png`) shows
+        // "↔ uint32_t (3/6)" for a UInt32 field: of the six 4-byte non-container,
+        // non-string/vector variants (Hex32, Int32, UInt32, Float, Pointer32,
+        // FuncPtr32) UInt32 is the 3rd.
+        let info = leaf_status(NodeKind::UInt32);
+        assert_eq!(info.type_index, "\u{2194} uint32_t (3/6)");
+        assert_eq!(info.key_hints, "P=ptr F=float S=int U=uint");
+    }
+
+    #[test]
+    fn variant_index_for_8_byte_leaf_counts_all_eight() {
+        // 8-byte non-container, non-string/vector kinds: Hex64, Int64, UInt64,
+        // Double, Pointer64, FuncPtr64 (Vec2 is a vector → excluded). Pointer64 is
+        // the 5th of those six.
+        let info = leaf_status(NodeKind::Pointer64);
+        assert_eq!(info.type_index, "\u{2194} ptr64 (5/6)");
+    }
+
+    #[test]
+    fn sole_variant_size_shows_no_variants_hint_but_keeps_key_hints() {
+        // A 64-byte leaf (Mat4x4) is the only kind of its size → the C++ shows
+        // "(no variants for 64 bytes)" but still offers the type-cycle key hints.
+        let info = leaf_status(NodeKind::Mat4x4);
+        assert_eq!(info.type_index, "(no variants for 64 bytes)");
+        assert_eq!(info.key_hints, "P=ptr F=float S=int U=uint");
+    }
+
+    #[test]
+    fn enum_root_struct_size_segment_counts_members() {
+        // An enum view-root summarizes as "Name: N members" (the C++ enum branch),
+        // not a byte span.
+        let mut tree = NodeTree::new();
+        let mut e = Node {
+            // An enum is a Struct-kind node with the "enum" class keyword (there is
+            // no distinct `NodeKind::Enum`; `Node::is_enum` reads the keyword).
+            kind: NodeKind::Struct,
+            class_keyword: "enum".into(),
+            name: "Color".into(),
+            struct_type_name: "Color".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        };
+        e.enum_members = vec![("Red".into(), 0), ("Green".into(), 1), ("Blue".into(), 2)];
+        let ri = tree.add_node(e);
+        let id = tree.nodes[ri].id;
+        let info = StatusInfo::from_tree(&tree, &sel(&[id]), id, default_type_name);
+        assert_eq!(info.struct_size, "Color: 3 members");
     }
 }
 

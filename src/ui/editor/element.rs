@@ -201,23 +201,34 @@ impl Element for RowElement {
         }
 
         // Row-local click routing: on press over this row's hitbox, compute the
-        // row-local X and dispatch into the view (editor-surface.md §9).
+        // row-local X and dispatch into the view (editor-surface.md §9). The left
+        // button routes the normal click/edit/select path; the right button opens
+        // the node context menu anchored at the cursor (reclass
+        // `customContextMenuRequested`), recording the row as the menu's target.
         if let Some(hitbox) = prepaint.hitbox.take() {
             let editor = self.editor.clone();
             let line = self.line;
             let left = bounds.left();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || event.button != MouseButton::Left
-                    || !hitbox.is_hovered(window)
-                {
+                if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
                 }
-                let rel_x = f32::from(event.position.x - left).max(0.0);
-                let modifiers = event.modifiers;
-                let _ = editor.update(cx, |this, cx| {
-                    this.dispatch_row_click(line, rel_x, modifiers, window, cx);
-                });
+                match event.button {
+                    MouseButton::Left => {
+                        let rel_x = f32::from(event.position.x - left).max(0.0);
+                        let modifiers = event.modifiers;
+                        let _ = editor.update(cx, |this, cx| {
+                            this.dispatch_row_click(line, rel_x, modifiers, window, cx);
+                        });
+                    }
+                    MouseButton::Right => {
+                        let pos = event.position;
+                        let _ = editor.update(cx, |this, cx| {
+                            this.dispatch_row_context_menu(line, pos, window, cx);
+                        });
+                    }
+                    _ => {}
+                }
             });
         }
     }

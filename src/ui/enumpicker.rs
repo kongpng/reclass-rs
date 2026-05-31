@@ -189,7 +189,7 @@ pub use view::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
 mod view {
     use super::EnumPickerModel;
-    use crate::ui::design::{color, tokens};
+    use crate::ui::design::{color, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
@@ -345,13 +345,15 @@ mod view {
                         .on_click(cx.listener(move |this, _e, _window, cx| {
                             this.accept_row(row, cx);
                         }))
-                        // Left check slot: the current enum value gets a ✓.
+                        // Left check slot: the current enum value gets a ✓ SVG.
                         .child(
                             div()
                                 .w(px(14.))
                                 .flex_none()
+                                .flex()
+                                .items_center()
                                 .text_color(accent)
-                                .when(is_current, |d| d.child("\u{2713}")),
+                                .when(is_current, |d| d.child(icon::check().size_3())),
                         )
                         .child(
                             gpui_component::h_flex()
@@ -395,12 +397,20 @@ mod view {
                 )
                 .when(self.model.filter_visible(), |this| {
                     this.child(
-                        div()
+                        gpui_component::h_flex()
                             .px(px(tokens::space::MD))
                             .py(px(tokens::space::SM))
+                            .gap(px(tokens::space::SM))
+                            .items_center()
                             .border_b_1()
                             .border_color(border)
-                            .child(Input::new(&self.input).w_full()),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(muted)
+                                    .child(icon::search().size_3()),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.input).w_full())),
                     )
                 })
                 .child(

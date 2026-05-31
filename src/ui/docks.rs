@@ -60,8 +60,12 @@ pub struct LayoutHandles {
 ///   "+" sentinel, source icons, view-mode toggle, and the editor),
 /// - **left dock** = the workspace / project tree ([`WorkspacePanel`]),
 /// - **bottom dock** = the real memory scanner
-///   ([`ScannerPanel`](super::scannerpanel::ScannerPanel)), open by default so its
-///   search controls + results table are visible (PIC3/PIC6).
+///   ([`ScannerPanel`](super::scannerpanel::ScannerPanel)), **closed by default** —
+///   the C++ memory scanner is a separate pop-out summoned on demand
+///   (`reclass_memory_scanner.png` shows it as its own detached window, hidden
+///   until requested), not an always-present panel. It is revealed by
+///   View ▸ Memory Scanner / `Ctrl+Shift+M`
+///   ([`toggle_scanner_dock`](super::window::MainWindow::toggle_scanner_dock)).
 ///
 /// Mirrors the verified gpui-component `DockArea` construction pattern
 /// (`examples/dock.rs`): build `DockItem::tabs(...)` of `Arc<dyn PanelView>`
@@ -84,16 +88,19 @@ pub fn build_default_layout(
     let workspace = WorkspacePanel::view(window, cx);
     let left = DockItem::tabs(vec![Arc::new(workspace.clone())], &weak, window, cx);
 
-    // Bottom: the real memory-scanner panel (`ScannerPanel`), open by default so
-    // its search controls + results table are visible (PIC3/PIC6 show the scanner
-    // docked at the bottom of the workspace).
+    // Bottom: the real memory-scanner panel (`ScannerPanel`), **closed by
+    // default**. The C++ scanner is a separate pop-out summoned on demand
+    // (`reclass_memory_scanner.png`), so the window must launch with NO scanner
+    // visible; View ▸ Memory Scanner / `Ctrl+Shift+M` toggles it
+    // (`MainWindow::toggle_scanner_dock`). The panel is still built + registered
+    // here so the toggle has it ready — only its `open` flag starts `false`.
     let scanner = Arc::new(super::scannerpanel::ScannerPanel::view(window, cx));
     let bottom = DockItem::tabs(vec![scanner], &weak, window, cx);
 
     dock_area.update(cx, |area, cx| {
         area.set_center(center, window, cx);
         area.set_left_dock(left, Some(px(280.)), true, window, cx);
-        area.set_bottom_dock(bottom, Some(px(320.)), true, window, cx);
+        area.set_bottom_dock(bottom, Some(px(320.)), false, window, cx);
     });
 
     LayoutHandles {

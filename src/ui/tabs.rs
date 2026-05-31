@@ -25,13 +25,16 @@
 //!
 //! **Styling (Zed tab bar; `_design/zed_ui_spec.md` §5.6).** The strip is drawn
 //! directly as a flat `chrome_bg` bar with a 1px bottom `border`. Each tab is a
-//! bespoke row — source icon, middle-elided title, and a trailing slot that holds
-//! the **modified dot** at rest and a **close ✕** on hover (Zed's reveal-on-hover
-//! close). The **active** tab lifts to `tab_active` (backgroundAlt) and carries a
-//! 2px `accent` top edge; inactive tabs are `text_muted` and lighten by a hover
-//! overlay. A trailing **"+"** affordance opens a new document. The dual
-//! tree/rendered view-mode toggle is a Zed **segmented control** anchored at the
-//! bottom of the body ("Reclass" | "Code", as in the C++ bottom view tabs).
+//! bespoke row — a real-SVG **source icon** (`design::icon`, full opacity = live,
+//! dimmed = disconnected), a middle-elided title, and a trailing slot that holds
+//! the **modified dot** at rest and a reveal-on-hover **close ✕** (an
+//! [`IconName::Close`] SVG). The **active** tab lifts to `tab_active`
+//! (backgroundAlt) with full-contrast text and carries a 2px `accent` top edge;
+//! inactive tabs are `text_muted` and lighten by a hover overlay. A trailing
+//! SVG **"+"** affordance opens a new document. The dual tree/rendered view-mode
+//! toggle is a Zed **segmented control** anchored at the bottom of the body
+//! ("Reclass" | "Code", each with its own glyph) — the selected segment lifts out
+//! of a recessed track, as in the C++ bottom view tabs.
 //!
 //! In **rendered** mode the body shows the real generated C/C++ (the
 //! [`render_cpp_tree`] codegen) as a scrollable, read-only Zed code editor with a
@@ -43,12 +46,11 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::dock::{Panel, PanelControl, PanelEvent, TitleStyle};
-use gpui_component::{Icon, IconName};
+use gpui_component::{Icon, IconName, Sizable as _};
 
-use super::design::{color, tokens};
+use super::design::{color, icon, tokens};
 use super::editor::RcxEditor;
 use super::state::{DataSource, DocId, SourceKind, ViewMode};
-use super::titlebar::source_icon;
 use crate::generator::render_cpp_tree;
 
 /// Tab-strip height (logical px). The C++ dock tab bar was a fixed 37px
@@ -339,8 +341,8 @@ impl DocumentArea {
     ) -> impl IntoElement {
         let id = entry.id;
         let group_name = SharedString::from(format!("rcx-tab-{}", id.get()));
-        // Per-tab source icon (full opacity = live, dimmed = disconnected).
-        let icon = source_icon(entry.source.kind, entry.source.live, cx);
+        // Per-tab source icon — a real SVG (full opacity = live, dimmed = off).
+        let source_badge = source_icon(entry.source.kind, entry.source.live, cx);
 
         // Trailing slot: the modified dot at rest, the close ✕ on hover. Both
         // occupy the same fixed-width slot so the title never shifts.
@@ -368,7 +370,7 @@ impl DocumentArea {
             .invisible()
             .group_hover(group_name.clone(), |d| d.visible())
             .hover(|d| d.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
-            .child(Icon::new(IconName::Close).size_3())
+            .child(icon::close().xsmall())
             // Swallow the press so closing a tab doesn't also activate it (the
             // close click must not bubble to the tab's `on_click`).
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -401,17 +403,23 @@ impl DocumentArea {
             .border_r_1()
             .border_color(color::border(cx))
             .text_size(px(tokens::font::UI_SM))
-            // Selected: lift to the elevated tab bg + brighter text; inactive:
-            // muted text that lightens on hover (no border change — spec §7).
+            // Selected: lift to the elevated tab bg + full-contrast text so the
+            // active tab reads as a connected surface (Zed active-tab); inactive:
+            // muted text that lightens by a hover overlay only (no border change —
+            // spec §5.6/§7), so the strip stays calm until pointed at.
             .map(|t| {
                 if selected {
-                    t.bg(color::elevated_bg(cx)).text_color(color::text(cx))
+                    t.bg(color::elevated_bg(cx))
+                        .text_color(color::text(cx))
+                        .font_weight(FontWeight::MEDIUM)
                 } else {
                     t.text_color(color::text_muted(cx))
-                        .hover(|s| s.bg(color::hover_overlay(cx)))
+                        .hover(|s| s.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
                 }
             })
-            // The 2px accent top edge marks the active tab (spec §5.6).
+            // The 2px accent top edge marks the active tab (spec §5.6; the C++
+            // active-tab accent rail). Drawn as an overlaid bar so it sits flush
+            // on the tab's top regardless of padding.
             .when(selected, |t| {
                 t.child(
                     div()
@@ -423,7 +431,7 @@ impl DocumentArea {
                         .bg(color::accent(cx)),
                 )
             })
-            .child(icon)
+            .child(source_badge)
             .child(
                 div()
                     .flex_1()
@@ -438,8 +446,8 @@ impl DocumentArea {
             }))
     }
 
-    /// The trailing "+" affordance — a ghost icon button that opens a new
-    /// document (the C++ sentinel "+" click; app-shell §8).
+    /// The trailing "+" affordance — a ghost icon button (real SVG) that opens a
+    /// new document (the C++ sentinel "+" click; app-shell §8).
     fn render_new_tab_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rcx-new-tab")
@@ -451,68 +459,71 @@ impl DocumentArea {
             .h_full()
             .text_color(color::text_muted(cx))
             .hover(|d| d.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
-            .child(Icon::new(IconName::Plus).size_4())
+            .child(icon::plus().small())
             .on_click(cx.listener(|this, _e, window, cx| {
                 this.on_new_tab(window, cx);
             }))
     }
 
     /// The dual view-mode toggle, styled as a Zed **segmented control** —
-    /// "Reclass" (tree) | "Code" (rendered C/C++). Matches the C++ bottom view
-    /// tabs (PIC5/PIC2); the selected segment lifts to a soft inset surface.
+    /// "Reclass" (tree) | "Code" (rendered C/C++), each with a real SVG glyph.
+    /// Matches the C++ bottom view tabs (PIC5/PIC2; `reclass_view_click_active`):
+    /// the track is a recessed pill and the **selected segment lifts** out of it
+    /// to the elevated surface for a clear, high-contrast active state.
     fn render_view_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view_mode = self.active_entry().map(|e| e.view_mode).unwrap_or_default();
         let has_doc = !self.tabs.is_empty();
 
-        // One segment of the control. Every segment ALWAYS renders its label (the
-        // QA flagged invisible labels): a generous min width so the text never
-        // collapses, `flex_none` so it doesn't shrink to nothing, and a strong
-        // contrast pair — the selected segment lifts to `selected_bg` with full
-        // `text` foreground (accent text on the elevated bg read as near-invisible),
-        // inactive segments are `text_muted` and brighten + show a hover overlay.
-        let segment = |label: &'static str, this_mode: ViewMode, cx: &mut Context<Self>| {
-            let selected = view_mode == this_mode;
-            div()
-                .id(label)
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(SEGMENT_H))
-                .min_w(px(64.0))
-                .px(px(tokens::space::LG))
-                .rounded(px(tokens::radius::MD))
-                .text_size(px(tokens::font::UI_SM))
-                .map(|s| {
-                    if selected {
-                        // Soft-accent inset for the active segment + full-contrast text.
-                        s.bg(color::selected_bg(cx))
-                            .text_color(color::text(cx))
-                            .font_weight(FontWeight::MEDIUM)
-                    } else {
-                        s.text_color(color::text_muted(cx))
-                            .hover(|h| h.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
-                    }
-                })
-                .child(label)
-                .when(has_doc && !selected, |s| {
-                    s.on_click(cx.listener(|this, _e, _window, cx| {
-                        this.toggle_view_mode(cx);
-                    }))
-                })
-        };
-
-        // A 1px divider between the two segments so the control reads as a clear
-        // two-up toggle (reclass PIC1/PIC5 "Reclass | C/C++").
-        let divider = div()
-            .flex_none()
-            .w(px(tokens::border::THIN))
-            .h(px(SEGMENT_H - tokens::space::MD))
-            .bg(color::border(cx));
+        // One segment of the control. Every segment ALWAYS renders its glyph +
+        // label (a generous min width + `flex_none` so the text never collapses).
+        // The selected segment LIFTS out of the recessed track to the elevated
+        // surface (a 1px border + soft shadow + full-contrast text), the way a Zed
+        // segmented control reads; inactive segments are `text_muted` over the
+        // track and brighten with a hover overlay. The active segment ignores
+        // clicks (it is already shown); only the inactive one toggles.
+        let segment =
+            |label: &'static str, glyph: Icon, this_mode: ViewMode, cx: &mut Context<Self>| {
+                let selected = view_mode == this_mode;
+                gpui_component::h_flex()
+                    .id(label)
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(tokens::space::XS))
+                    .h(px(SEGMENT_H))
+                    .min_w(px(72.0))
+                    .px(px(tokens::space::LG))
+                    .rounded(px(tokens::radius::SM))
+                    .text_size(px(tokens::font::UI_SM))
+                    .child(glyph.xsmall())
+                    .child(label)
+                    .map(|s| {
+                        if selected {
+                            // Lift to the elevated surface — a bordered, shadowed
+                            // pill with full-contrast text (the active segment).
+                            s.bg(color::elevated_bg(cx))
+                                .border_1()
+                                .border_color(color::border(cx))
+                                .shadow_sm()
+                                .text_color(color::text(cx))
+                                .font_weight(FontWeight::MEDIUM)
+                        } else {
+                            // Transparent over the track; brighten on hover.
+                            s.text_color(color::text_muted(cx)).hover(|h| {
+                                h.bg(color::hover_overlay(cx)).text_color(color::text(cx))
+                            })
+                        }
+                    })
+                    .when(has_doc && !selected, |s| {
+                        s.on_click(cx.listener(|this, _e, _window, cx| {
+                            this.toggle_view_mode(cx);
+                        }))
+                    })
+            };
 
         // The strip carries an explicit bg + top border so it never reads as
         // overlapped by the scanner dock above; the segmented control is a
-        // bordered pill so both labels + the divider sit on one visible row.
+        // recessed track (`chrome_bg`, 1px border) the active segment lifts out of.
         gpui_component::h_flex()
             .id("rcx-view-toggle")
             .flex_none()
@@ -527,14 +538,14 @@ impl DocumentArea {
                 gpui_component::h_flex()
                     .flex_none()
                     .items_center()
+                    .gap(px(tokens::space::XXS))
                     .p(px(tokens::space::XXS))
                     .rounded(px(tokens::radius::MD))
                     .border_1()
                     .border_color(color::border(cx))
-                    .bg(color::elevated_bg(cx))
-                    .child(segment("Reclass", ViewMode::Tree, cx))
-                    .child(divider)
-                    .child(segment("Code", ViewMode::Rendered, cx)),
+                    .bg(color::content_bg(cx))
+                    .child(segment("Reclass", icon::struct_(), ViewMode::Tree, cx))
+                    .child(segment("Code", icon::function(), ViewMode::Rendered, cx)),
             )
     }
 
@@ -976,9 +987,37 @@ impl Render for DocumentArea {
     }
 }
 
+/// Map a [`SourceKind`] to its tab source-icon as a real SVG (the
+/// `drawTabSourceIcon` per-tab provider badge; app-shell §8). Replaces the
+/// round-2 text-glyph stand-in with a crisp [`design::icon`](icon) SVG.
+///
+/// Liveness mirrors `provider && provider->isValid()`: a live source paints at
+/// the full tab foreground, a disconnected one dims to a muted, alpha-reduced
+/// tint (the C++ ×0.40 live opacity) — the "No source" plug also reads dimmed.
+fn source_icon(kind: SourceKind, live: bool, cx: &App) -> Icon {
+    // Domain → SVG: a file is a document, a buffer/snapshot is memory/storage,
+    // a process is the gear (matching the C++ ⚙), and "no source" reuses the
+    // neutral data-store glyph rendered dimmed (the plug fallback).
+    let svg = match kind {
+        SourceKind::None => Icon::new(IconName::HardDrive),
+        SourceKind::File => Icon::new(IconName::File),
+        SourceKind::Buffer => icon::hex(), // MemoryStick — an in-memory buffer.
+        SourceKind::Snapshot => icon::database(), // HardDrive — a captured store.
+        SourceKind::Process => icon::settings(), // gear — a live process.
+    };
+    // None is never "live": always dim the plug fallback.
+    let lit = live && kind != SourceKind::None;
+    let tint = if lit {
+        color::text(cx)
+    } else {
+        // Disconnected / no-source: muted, alpha-reduced (the C++ dim).
+        color::text_disabled(cx)
+    };
+    svg.flex_none().text_color(tint).small()
+}
+
 /// A tiny extension so the area can map [`SourceKind`] → its tab source-icon
-/// without exposing the titlebar glyph helper everywhere. (Kept for the tab/icon
-/// workflow to swap glyphs for the real SVG assets.)
+/// as a real SVG. (Kept as the public tab/icon hook for the titlebar + scanner.)
 pub fn tab_source_icon(kind: SourceKind, live: bool, cx: &App) -> impl IntoElement {
     source_icon(kind, live, cx)
 }
@@ -1014,9 +1053,6 @@ mod tests {
             self.ids.push(id);
             self.active = self.ids.len() - 1;
             id
-        }
-        fn index_of(&self, id: DocId) -> Option<usize> {
-            self.ids.iter().position(|&x| x == id)
         }
         fn activate(&mut self, ix: usize) {
             if ix < self.ids.len() {

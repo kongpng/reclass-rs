@@ -31,14 +31,15 @@ pub mod palette;
 pub mod selection;
 pub mod tab_cycle;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::ActiveTheme;
+use gpui_component::{ActiveTheme, Icon, IconName, WindowExt as _};
 
 use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
 use crate::core::linemeta::K_COMMAND_ROW_ID;
-use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta};
-use crate::ui::design;
+use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
+use crate::ui::{design, tooltip};
 
 use element::{RowElement, RowPaint};
 use geometry::CellMetrics;
@@ -58,7 +59,26 @@ actions!(
         EditorTabPrev,
         EditorEscape,
         EditorUndo,
-        EditorRedo
+        EditorRedo,
+        // Node context-menu / accelerator actions (the C++ node right-click menu,
+        // reclass_right_click_on_address.png). Each dispatches against the focused
+        // `RcxEditor` and acts on the current context-target node (the row that was
+        // right-clicked, else the primary-selected row). The PopupMenu items below
+        // are wired to these same actions so menu-click and keyboard agree.
+        EditorNewClass,
+        EditorPtrToNewClass,
+        EditorCycleTypePrev,
+        EditorCycleTypeNext,
+        EditorRename,
+        EditorChangeType,
+        EditorInsertBelow,
+        EditorInsertAbove,
+        EditorConvertPtr,
+        EditorToggleBigEndian,
+        EditorDuplicate,
+        EditorDelete,
+        EditorFold,
+        EditorCopyCStruct,
     ]
 );
 
@@ -94,6 +114,13 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-z", EditorRedo, Some("RcxEditor")),
         KeyBinding::new("ctrl-shift-z", EditorRedo, Some("RcxEditor")),
         KeyBinding::new("ctrl-y", EditorRedo, Some("RcxEditor")),
+        // Node context-menu accelerators (the C++ menu's right-aligned hints:
+        // Rename=F2, Change Type=T, Duplicate=Ctrl+D, Delete=Delete).
+        KeyBinding::new("f2", EditorRename, Some("RcxEditor")),
+        KeyBinding::new("t", EditorChangeType, Some("RcxEditor")),
+        KeyBinding::new("cmd-d", EditorDuplicate, Some("RcxEditor")),
+        KeyBinding::new("ctrl-d", EditorDuplicate, Some("RcxEditor")),
+        KeyBinding::new("delete", EditorDelete, Some("RcxEditor")),
     ]
 }
 
@@ -120,8 +147,39 @@ pub struct RcxEditor {
     relative_offsets: bool,
     /// Measured monospace cell metrics (updated each frame from the font).
     metrics: CellMetrics,
+    /// The node-row context menu (`editor.cpp` `customContextMenuRequested`,
+    /// reclass_right_click_on_address.png). When `Some`, a built [`PopupMenu`] is
+    /// shown anchored at `context_menu_pos`; the right-clicked node is recorded in
+    /// `context_target` so the menu's actions act on the correct row. Cleared on
+    /// dismiss / after a menu action runs.
+    context_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
+    context_menu_pos: Point<Pixels>,
+    _context_menu_sub: Option<Subscription>,
+    /// The node the context menu / accelerators target — the right-clicked node's
+    /// `(display-line, node_idx, node_id)`. Set on right-mouse-down over a row;
+    /// keyboard accelerators fall back to the primary-selected row when this is
+    /// `None`.
+    context_target: Option<ContextTarget>,
+    /// The open TypeSelector popup subscription (Change Type / `T` / type-token
+    /// click → the menus-agent `TypeSelectorPopup`, consumed via the contract).
+    _type_selector_sub: Option<Subscription>,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+}
+
+/// The node a context-menu / accelerator action targets — captured on
+/// right-mouse-down over a row so the menu's wired controller ops act on the
+/// right node regardless of the current multi-selection.
+#[derive(Copy, Clone, Debug)]
+struct ContextTarget {
+    /// The display line that was right-clicked (for inline-rename positioning).
+    line: usize,
+    /// The node's index into the tree (`controller_mut()` op argument).
+    node_idx: usize,
+    /// The node's stable id (`convert_to_typed_pointer` argument).
+    node_id: u64,
+    /// The node's current kind (for the quick type-cycler label + Change Type seed).
+    kind: NodeKind,
 }
 
 /// The active inline-edit: the field entity + the line it overlays (so the row
@@ -149,6 +207,11 @@ impl RcxEditor {
             last_tab_target: None,
             relative_offsets: true,
             metrics: CellMetrics::new(8.0, 16.0),
+            context_menu: None,
+            context_menu_pos: Point::default(),
+            _context_menu_sub: None,
+            context_target: None,
+            _type_selector_sub: None,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
@@ -179,6 +242,8 @@ impl RcxEditor {
         self.controller.refresh();
         self.editing = None;
         self.byte_sel.clear();
+        self.close_context_menu(cx);
+        self.context_target = None;
         cx.notify();
     }
 
@@ -814,8 +879,18 @@ impl RcxEditor {
         // text starts at the same column whether or not a glyph is present — the
         // icon lives OUTSIDE the composed text columns, so hit-testing/fold math is
         // untouched.
+        //
+        // Round-3: the round-2 text-glyph markers (◆ ▦ → # • ƒ) + the fold caret
+        // are now crisp SVGs (design::icon_* / `IconName`, registered by the
+        // Assets stage). Fold-head rows paint the disclosure chevron here
+        // (`ChevronRight` collapsed / `ChevronDown` expanded) — the row text's own
+        // baked caret is rendered transparent via `palette.fold_chevron` so only
+        // this SVG shows, while fold-col hit-testing (column-based) is untouched.
+        // Leaf node rows paint their per-kind icon. The icon size is clamped to the
+        // gutter cell box so the column math is unchanged.
         {
-            let mut icon = div()
+            let icon_px = (self.metrics.line_height * 0.62).clamp(10.0, 18.0);
+            let mut gutter = div()
                 .flex_shrink_0()
                 .w(px(ICON_CELLS * self.metrics.cell_width))
                 .h(px(self.metrics.line_height))
@@ -823,12 +898,28 @@ impl RcxEditor {
                 .flex_row()
                 .items_center()
                 .justify_center();
-            if let Some(kg) = geometry::kind_glyph(&lm) {
-                icon = icon
-                    .text_color(palette.role_color(kg.role))
-                    .child(SharedString::from(kg.glyph.to_string()));
+            if lm.fold_head {
+                // The crisp disclosure chevron (the real fold affordance).
+                let name = if lm.fold_collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                };
+                gutter = gutter.child(
+                    Icon::new(name)
+                        .size(px(icon_px))
+                        .text_color(palette.fold_chevron_icon),
+                );
+            } else if let Some(kg) = geometry::kind_glyph(&lm) {
+                // The per-kind SVG marker, tinted by the glyph's semantic role so a
+                // theme switch retints it (same role→color mapping as before).
+                gutter = gutter.child(
+                    Icon::new(kind_icon_name(lm.node_kind))
+                        .size(px(icon_px))
+                        .text_color(palette.role_color(kg.role)),
+                );
             }
-            row = row.child(icon);
+            row = row.child(gutter);
         }
 
         // The text element (static) — always painted as the base layer; it owns
@@ -839,6 +930,65 @@ impl RcxEditor {
             editor: cx.entity().downgrade(),
             line: idx,
         });
+
+        // Address-format hover popover (reclass_address_hover.png + PIC5 "Base
+        // Address"): on the class-header command row, an invisible interactive
+        // overlay sits over the base-address span and shows the address-format card
+        // on hover. Positioned in the row's own coordinate space, so it clears the
+        // address margin + the kind-icon gutter (both precede the row text) before
+        // the per-column offset — exactly like the inline-edit overlay.
+        if lm.line_kind == LineKind::CommandRow {
+            let text = self.line_text_owned(idx);
+            let addr = crate::compose::command_row_addr_span(&text);
+            if addr.valid && addr.end > addr.start {
+                let hex_digits = self
+                    .controller
+                    .last_result()
+                    .layout
+                    .offset_hex_digits
+                    .max(0) as f32;
+                let margin = if hex_digits > 0.0 {
+                    hex_digits + 2.0
+                } else {
+                    0.0
+                };
+                let cell = self.metrics.cell_width;
+                let left = px((margin + ICON_CELLS + addr.start.max(0) as f32) * cell);
+                let width = px(((addr.end - addr.start).max(1) as f32) * cell);
+                let base_address = self.controller.last_result().layout.base_address;
+                let module: SharedString = self.controller.document().provider.name().into();
+                // Forward a left mouse-down on the overlay back into the normal row
+                // click routing: the overlay's hitbox occludes the row-text hitbox,
+                // so without this the base-address inline edit (the `BaseAddress`
+                // hit-test target) would stop working under the tooltip strip. The
+                // overlay starts at the address span's first column (`left`), so
+                // dispatching a row-local X just inside it reliably resolves to the
+                // BaseAddress span — the same begin-edit the bare text click gives.
+                let addr_click_x = f32::from(left) + cell * 0.5;
+                row = row.child(
+                    div()
+                        .id(("rcx-addr-hover", idx))
+                        .absolute()
+                        .top_0()
+                        .left(left)
+                        .h(px(self.metrics.line_height))
+                        .w(width)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                this.on_row_mouse_down(idx, addr_click_x, e.modifiers, window, cx);
+                            }),
+                        )
+                        .tooltip(move |_window, cx| {
+                            cx.new(|_| AddressFormatTooltip {
+                                base_address,
+                                module: module.clone(),
+                            })
+                            .into()
+                        }),
+                );
+            }
+        }
 
         // Inline-edit overlay positioned at the edited column — offset by the
         // address-margin width so it lands over the field, not the margin.
@@ -884,6 +1034,500 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.on_row_mouse_down(line, rel_x, modifiers, window, cx);
+    }
+
+    // ── Node context menu (reclass `customContextMenuRequested`) ──
+
+    /// Right-mouse-down entry point invoked by [`RowElement`] (window-space
+    /// position). Records the right-clicked row as the menu's [`ContextTarget`],
+    /// commits any active edit, ensures the node is selected, then opens the Zed
+    /// [`PopupMenu`](gpui_component::menu::PopupMenu) anchored at the cursor
+    /// (reclass_right_click_on_address.png). Rows with no real node (command row /
+    /// footer / synthetic) do not open a node menu.
+    pub(crate) fn dispatch_row_context_menu(
+        &mut self,
+        line: usize,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_some() {
+            self.commit_active_edit(window, cx);
+        }
+        let Some(lm) = self.line_meta(line).cloned() else {
+            return;
+        };
+        // Only real node rows get the node menu (command/footer/synthetic rows
+        // have their own affordances and no node ops).
+        if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+            return;
+        }
+        let target = ContextTarget {
+            line,
+            node_idx: lm.node_idx as usize,
+            node_id: lm.node_id,
+            kind: lm.node_kind,
+        };
+        self.context_target = Some(target);
+
+        // Right-click selects the node (single-select) if it is not already part
+        // of the selection — matches the reclass behaviour where the menu acts on
+        // the clicked node.
+        let already_selected = self
+            .controller
+            .selected_ids()
+            .iter()
+            .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id);
+        if !already_selected {
+            self.controller
+                .handle_node_click(line as i64, lm.node_id, CtrlMods::NONE);
+            let _ = self.controller.take_events();
+        }
+
+        self.open_context_menu(target, pos, window, cx);
+    }
+
+    /// Build + show the node context menu at `pos`. Each item dispatches one of
+    /// the `Editor*` actions (handled on this view), so menu-click and the bound
+    /// accelerators share one code path. Item layout mirrors the C++ menu
+    /// (reclass_right_click_on_address.png): New Class · Ptr to New Class · the
+    /// `← cur ↔ alt →` quick type-cycler · Rename · Change Type · Insert ▸ ·
+    /// Convert ▸ · Big endian · Static ▸ · Duplicate · Delete · Fold ▸ · Copy ▸ ·
+    /// Tracking ▸ · Copy as C Struct, with leading SVG icons + accelerator hints.
+    fn open_context_menu(
+        &mut self,
+        target: ContextTarget,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cur_name = crate::core::kind_to_string(target.kind);
+        let alt_name = crate::core::kind_to_string(alt_kind_for(target.kind));
+        let cycle_label = format!("\u{2190} {cur_name}  \u{2194}  {alt_name} \u{2192}");
+        let is_container = crate::core::is_container_kind(target.kind);
+
+        let editor_focus = self.focus_handle.clone();
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
+            menu.min_w(px(220.0))
+                // Dispatch the menu's actions to the editor's focus context (the
+                // `RcxEditor` key context that registers the `Editor*` handlers).
+                .action_context(editor_focus.clone())
+                .menu_with_icon("New Class", IconName::Frame, Box::new(EditorNewClass))
+                .menu_with_icon(
+                    "Ptr to New Class",
+                    IconName::ArrowRight,
+                    Box::new(EditorPtrToNewClass),
+                )
+                .separator()
+                // The "← <curType> ↔ <altType> →" quick type-cycler row: clicking
+                // it cycles the node's kind forward (the C++ in-place type stepper).
+                .menu_with_icon(
+                    cycle_label.clone(),
+                    IconName::ChevronDown,
+                    Box::new(EditorCycleTypeNext),
+                )
+                .separator()
+                .menu_with_icon("Rename", IconName::SquareTerminal, Box::new(EditorRename))
+                .menu_with_icon("Change Type", IconName::Frame, Box::new(EditorChangeType))
+                .separator()
+                .submenu("Insert", mw, mcx, |sub, _w, _cx| {
+                    sub.menu_with_icon("Insert Below", IconName::Plus, Box::new(EditorInsertBelow))
+                        .menu_with_icon("Insert Above", IconName::Plus, Box::new(EditorInsertAbove))
+                })
+                .submenu("Convert", mw, mcx, |sub, _w, _cx| {
+                    sub.menu_with_icon(
+                        "To Pointer (New Class)",
+                        IconName::ArrowRight,
+                        Box::new(EditorConvertPtr),
+                    )
+                })
+                .menu_with_check("Big endian", false, Box::new(EditorToggleBigEndian))
+                .submenu("Static", mw, mcx, |sub, _w, _cx| {
+                    // Static-address submenu (graceful stub — no logic op yet).
+                    sub.label("(no static address)")
+                })
+                .separator()
+                .menu_with_icon("Duplicate", IconName::Copy, Box::new(EditorDuplicate))
+                .menu_with_icon("Delete", IconName::Delete, Box::new(EditorDelete))
+                .separator()
+                .submenu("Fold", mw, mcx, move |sub, _w, _cx| {
+                    sub.menu_with_icon_and_disabled(
+                        "Toggle Fold",
+                        IconName::ChevronRight,
+                        Box::new(EditorFold),
+                        !is_container,
+                    )
+                })
+                .submenu("Copy", mw, mcx, |sub, _w, _cx| {
+                    // Copy variants beyond C-struct are graceful stubs.
+                    sub.label("(copy)")
+                })
+                .submenu("Tracking", mw, mcx, |sub, _w, _cx| sub.label("(tracking)"))
+                .menu_with_icon(
+                    "Copy as C Struct",
+                    IconName::SquareTerminal,
+                    Box::new(EditorCopyCStruct),
+                )
+        });
+
+        // Dismiss (click-away / Esc on the menu) closes + clears state.
+        self._context_menu_sub =
+            Some(cx.subscribe(&menu, |this, _menu, _ev: &DismissEvent, cx| {
+                this.context_menu = None;
+                this._context_menu_sub = None;
+                cx.notify();
+            }));
+        self.context_menu_pos = pos;
+        self.context_menu = Some(menu);
+        // Keep editor focus so the menu's dispatched actions land in the
+        // `RcxEditor` key context (the menu builds its actions to dispatch up the
+        // focus tree; the editor is the focused element).
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Close the context menu (if any) and drop its subscription.
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            self._context_menu_sub = None;
+            cx.notify();
+        }
+    }
+
+    /// The node a context-menu / accelerator action targets: the recorded
+    /// right-click target, else the primary-selected row (so the accelerators work
+    /// from the keyboard alone). Re-validates the recorded `node_idx` against the
+    /// current tree (a prior mutation may have shifted indices).
+    fn action_target(&self) -> Option<ContextTarget> {
+        if let Some(t) = self.context_target {
+            // Re-validate the index → id mapping still holds.
+            let tree = self.controller.tree();
+            if (t.node_idx) < tree.nodes.len() && tree.nodes[t.node_idx].id == t.node_id {
+                return Some(t);
+            }
+            // Index moved: recover by id.
+            let idx = tree.index_of_id(t.node_id);
+            if idx >= 0 {
+                let n = &tree.nodes[idx as usize];
+                return Some(ContextTarget {
+                    line: t.line,
+                    node_idx: idx as usize,
+                    node_id: t.node_id,
+                    kind: n.kind,
+                });
+            }
+        }
+        // Fall back to the primary-selected line's node.
+        let line = self.first_selected_line()?;
+        let lm = self.line_meta(line)?;
+        if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+            return None;
+        }
+        Some(ContextTarget {
+            line,
+            node_idx: lm.node_idx as usize,
+            node_id: lm.node_id,
+            kind: lm.node_kind,
+        })
+    }
+
+    // ── Context-menu / accelerator action handlers ──
+
+    fn action_new_class(&mut self, _: &EditorNewClass, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        // "New Class": insert a new struct member after the target (or at the
+        // parent tail when no target). Uses the parent + offset of the target.
+        if let Some(t) = self.action_target() {
+            let (parent_id, offset) = self.insert_anchor(t.node_idx);
+            self.controller
+                .insert_node(parent_id, offset, NodeKind::Struct, "NewClass");
+        } else {
+            self.controller.insert_node(
+                self.controller.view_root_id(),
+                -1,
+                NodeKind::Struct,
+                "NewClass",
+            );
+        }
+        self.apply_document(cx);
+    }
+
+    fn action_ptr_to_new_class(
+        &mut self,
+        _: &EditorPtrToNewClass,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        // "Ptr to New Class": convert the target node into a typed pointer to a
+        // fresh class (the C++ `convertToTypedPointer`).
+        if let Some(t) = self.action_target() {
+            self.controller.convert_to_typed_pointer(t.node_id);
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_cycle_type_next(
+        &mut self,
+        _: &EditorCycleTypeNext,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller
+                .change_node_kind(t.node_idx, alt_kind_for(t.kind));
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_cycle_type_prev(
+        &mut self,
+        _: &EditorCycleTypePrev,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller
+                .change_node_kind(t.node_idx, prev_kind_for(t.kind));
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_rename(&mut self, _: &EditorRename, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        // Rename (F2): begin an inline rename on the target row's Name span (the
+        // C++ menu's Rename opens the in-place name edit).
+        if let Some(t) = self.action_target() {
+            self.begin_inline_edit(t.line, EditTarget::Name, window, cx);
+        }
+    }
+
+    fn action_change_type(
+        &mut self,
+        _: &EditorChangeType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.open_type_selector(t, window, cx);
+        }
+    }
+
+    fn action_insert_below(
+        &mut self,
+        _: &EditorInsertBelow,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            let (parent_id, offset) = self.insert_anchor(t.node_idx);
+            self.controller
+                .insert_node(parent_id, offset, NodeKind::Hex64, "");
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_insert_above(
+        &mut self,
+        _: &EditorInsertAbove,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller
+                .insert_node_above(t.node_idx, NodeKind::Hex64, "");
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_convert_ptr(
+        &mut self,
+        _: &EditorConvertPtr,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller.convert_to_typed_pointer(t.node_id);
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_toggle_big_endian(
+        &mut self,
+        _: &EditorToggleBigEndian,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Graceful stub: no controller op for endianness in this stage; close
+        // cleanly (the item renders + closes, the C++ contract for un-wired items).
+        self.close_context_menu(cx);
+    }
+
+    fn action_duplicate(&mut self, _: &EditorDuplicate, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller.duplicate_node(t.node_idx);
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_delete(&mut self, _: &EditorDelete, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller.remove_node(t.node_idx);
+            self.context_target = None;
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_fold(&mut self, _: &EditorFold, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller.toggle_collapse(t.node_idx);
+            self.after_mutation(cx);
+        }
+    }
+
+    fn action_copy_c_struct(
+        &mut self,
+        _: &EditorCopyCStruct,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Graceful stub: the C-struct serializer is a later workflow; close cleanly.
+        self.close_context_menu(cx);
+    }
+
+    /// The `(parent_id, offset)` to insert a sibling *after* `node_idx`: same
+    /// parent, offset just past the node so the new member lands right below it.
+    fn insert_anchor(&self, node_idx: usize) -> (u64, i32) {
+        let tree = self.controller.tree();
+        if node_idx >= tree.nodes.len() {
+            return (self.controller.view_root_id(), -1);
+        }
+        let n = &tree.nodes[node_idx];
+        let size = crate::core::size_for_kind(n.kind).max(0);
+        (n.parent_id, n.offset + size)
+    }
+
+    // ── Change Type → TypeSelector popup (contract: menus agent PROVIDES) ──
+
+    /// Open the [`TypeSelectorPopup`](crate::ui::typeselectorpopup::TypeSelectorPopup)
+    /// over `target`'s current kind and subscribe to its outcome. On
+    /// [`Chosen`](crate::ui::typeselectorpopup::TypeSelectorEvent::Chosen) apply the
+    /// kind via `change_node_kind` then the chosen [`Modifier`]
+    /// (pointer/array/etc.) via the matching controller ops + `apply_document`; on
+    /// Cancel close the dialog. Opened through `window.open_dialog` (the same
+    /// pattern window.rs uses for the command palette).
+    fn open_type_selector(
+        &mut self,
+        target: ContextTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
+        let popup = TypeSelectorPopup::view(target.kind, window, cx);
+        let focus = popup.read(cx).focus_handle(cx);
+        let node_idx = target.node_idx;
+        let node_id = target.node_id;
+        self._type_selector_sub = Some(cx.subscribe_in(
+            &popup,
+            window,
+            move |this, _p, ev: &TypeSelectorEvent, window, cx| match ev {
+                TypeSelectorEvent::Chosen { kind, modifier } => {
+                    window.close_dialog(cx);
+                    this._type_selector_sub = None;
+                    this.apply_type_choice(node_idx, node_id, *kind, *modifier, cx);
+                }
+                TypeSelectorEvent::Cancel => {
+                    window.close_dialog(cx);
+                    this._type_selector_sub = None;
+                }
+            },
+        ));
+        let popup_for_modal = popup.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .w(px(420.))
+                .margin_top(px(120.))
+                .close_button(false)
+                .child(popup_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Apply a TypeSelector choice: set the base kind, then the chosen modifier
+    /// (the existing `typeselectorpopup::Modifier`: pointer/double-pointer/array)
+    /// via the controller ops, then recompose. Resolves the node by id first so a
+    /// kind change that shifts indices does not desync the modifier step.
+    fn apply_type_choice(
+        &mut self,
+        node_idx: usize,
+        node_id: u64,
+        kind: NodeKind,
+        modifier: Option<crate::ui::typeselectorpopup::Modifier>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::typeselectorpopup::Modifier;
+        // Base kind first.
+        self.controller.change_node_kind(node_idx, kind);
+        // Then the modifier (pointer/array) via the existing controller ops,
+        // re-resolving the node id (change_node_kind may have shifted indices).
+        match modifier {
+            Some(Modifier::Pointer) | Some(Modifier::PointerPointer) => {
+                self.controller.convert_to_typed_pointer(node_id);
+            }
+            Some(Modifier::Array(count)) => {
+                let idx = self.controller.tree().index_of_id(node_id);
+                if idx >= 0 {
+                    self.controller
+                        .change_node_kind(idx as usize, NodeKind::Array);
+                    let _ = count; // element count is applied via the array header edit path
+                }
+            }
+            Some(Modifier::None) | None => {}
+        }
+        self.apply_document(cx);
+    }
+}
+
+/// The "alternate" kind for the quick type-cycler (`← cur ↔ alt →`) and the
+/// forward `T`-less cycle: steps to the next kind in the [`NodeKind`] table,
+/// wrapping. This is the in-place type stepper the C++ menu's `← type ↔ type →`
+/// row drives (a quick toggle between adjacent primitive types).
+fn alt_kind_for(kind: NodeKind) -> NodeKind {
+    let i = kind as u8 as usize;
+    let n = crate::core::K_KIND_META.len();
+    crate::core::K_KIND_META[(i + 1) % n].kind
+}
+
+/// The previous kind in the table (the `←` half of the cycler), wrapping.
+fn prev_kind_for(kind: NodeKind) -> NodeKind {
+    let i = kind as u8 as usize;
+    let n = crate::core::K_KIND_META.len();
+    crate::core::K_KIND_META[(i + n - 1) % n].kind
+}
+
+/// The SVG icon ([`IconName`]) for a node-kind gutter marker — the crisp
+/// replacement for the round-2 text glyphs (`geometry::kind_glyph`'s ◆ ▦ → # • ƒ).
+/// Driven by node kind so struct/array/pointer/fnptr/hex/value each read at a
+/// glance, matching the reclass per-node tree icons (PIC2) + a Zed outline.
+fn kind_icon_name(kind: NodeKind) -> IconName {
+    use NodeKind::*;
+    match kind {
+        Struct => IconName::Frame,
+        Array => IconName::LayoutDashboard,
+        Pointer32 | Pointer64 => IconName::ArrowRight,
+        FuncPtr32 | FuncPtr64 => IconName::SquareTerminal,
+        Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => IconName::MemoryStick,
+        _ => IconName::Dash,
     }
 }
 
@@ -947,6 +1591,22 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_escape))
             .on_action(cx.listener(Self::action_undo))
             .on_action(cx.listener(Self::action_redo))
+            // Node context-menu / accelerator action handlers (menu-click and the
+            // bound F2/T/Ctrl+D/Delete accelerators dispatch the same actions).
+            .on_action(cx.listener(Self::action_new_class))
+            .on_action(cx.listener(Self::action_ptr_to_new_class))
+            .on_action(cx.listener(Self::action_cycle_type_next))
+            .on_action(cx.listener(Self::action_cycle_type_prev))
+            .on_action(cx.listener(Self::action_rename))
+            .on_action(cx.listener(Self::action_change_type))
+            .on_action(cx.listener(Self::action_insert_below))
+            .on_action(cx.listener(Self::action_insert_above))
+            .on_action(cx.listener(Self::action_convert_ptr))
+            .on_action(cx.listener(Self::action_toggle_big_endian))
+            .on_action(cx.listener(Self::action_duplicate))
+            .on_action(cx.listener(Self::action_delete))
+            .on_action(cx.listener(Self::action_fold))
+            .on_action(cx.listener(Self::action_copy_c_struct))
             .on_mouse_down_out(cx.listener(|this, _e: &MouseDownEvent, window, cx| {
                 // Clicking outside the editor commits an active edit.
                 if this.editing.is_some() {
@@ -964,12 +1624,113 @@ impl Render for RcxEditor {
                 .size_full()
                 .track_scroll(&self.scroll),
             )
+            // The node context menu: a Zed PopupMenu floated at the right-click
+            // position via the deferred-overlay pattern (gpui_cookbook.md §"deferred
+            // overlays"), so it draws above the rows and snaps within the window.
+            .when_some(self.context_menu.clone(), |this, menu| {
+                let pos = self.context_menu_pos;
+                this.child(
+                    deferred(
+                        anchored()
+                            .position(pos)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(menu),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }
 
 /// Apply an alpha to an `Hsla` (heat/byte-sel overlays are translucent fills).
 fn with_alpha(c: Hsla, a: f32) -> Hsla {
     Hsla { a, ..c }
+}
+
+/// The address-format hover popover (reclass_address_hover.png + PIC5 "Base
+/// Address"): a small Zed elevated card listing the accepted base-address formats
+/// + the operator/hex hints. Built inline with [`design`] tokens (no ad-hoc hex);
+/// shown when the user hovers the class-header base-address region. Rendered as a
+/// gpui tooltip view (the `.tooltip(..)` closure returns this entity).
+pub struct AddressFormatTooltip {
+    /// The current base address (shown as the worked "hex address" example).
+    base_address: u64,
+    /// The active data-source / module label (e.g. `app.exe`), for the module
+    /// examples; empty falls back to a generic `<module>`.
+    module: SharedString,
+}
+
+impl AddressFormatTooltip {
+    fn module_name(&self) -> String {
+        let m = self.module.trim();
+        if m.is_empty() {
+            "<module>".to_string()
+        } else {
+            m.to_string()
+        }
+    }
+}
+
+impl Render for AddressFormatTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use design::{color, tokens};
+        let module = self.module_name();
+        // The format rows: each is (example, dim explanation). The example reads in
+        // the editor mono number hue, the explanation in muted UI text.
+        let rows: Vec<(String, &'static str)> = vec![
+            (format!("0x{:X}", self.base_address), "hex address"),
+            (module.clone(), "module base"),
+            (format!("{module} + 0x1A0"), "module + offset"),
+            (format!("[{module} + 0x58]"), "follow pointer"),
+            ("ntdll!Symbol".to_string(), "PDB symbol"),
+        ];
+
+        let number = color::syntax_number(cx);
+        let muted = color::text_muted(cx);
+
+        let mut card = design::elevated_surface(cx)
+            .p(px(tokens::space::LG))
+            .flex()
+            .flex_col()
+            .gap(px(tokens::space::XS))
+            .max_w(px(tooltip::MAX_W))
+            .text_size(px(tokens::font::UI_SM));
+
+        for (example, explain) in rows {
+            card = card.child(
+                gpui_component::h_flex()
+                    .w_full()
+                    .gap(px(tokens::space::MD))
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family(tokens::font::MONO_FAMILY)
+                            .text_color(number)
+                            .child(SharedString::from(example)),
+                    )
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .child(SharedString::from(format!("\u{2014} {explain}"))),
+                    ),
+            );
+        }
+
+        // The operator + hex hints (PIC5 footer of the address tooltip).
+        card = card
+            .child(
+                div()
+                    .pt(px(tokens::space::SM))
+                    .mt(px(tokens::space::XS))
+                    .border_t_1()
+                    .border_color(color::border(cx))
+                    .text_color(muted)
+                    .child("Operators: + - * << >> & | ^"),
+            )
+            .child(div().text_color(muted).child("All numbers are hexadecimal"));
+
+        card
+    }
 }
 
 #[cfg(test)]

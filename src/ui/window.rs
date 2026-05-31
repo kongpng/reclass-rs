@@ -48,8 +48,10 @@ use super::workspace::{WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspacePane
 use crate::theme::ThemeManager;
 
 // App-level actions. Mirrors Zed: the command palette opens on Ctrl+Shift+P / F1
-// (`command_palette::Toggle` in Zed's default keymap).
-actions!(rcx_app, [OpenCommandPalette]);
+// (`command_palette::Toggle` in Zed's default keymap). `ToggleScanner` shows/hides
+// the bottom memory-scanner dock (the C++ pop-out summoned on demand; bound to
+// Ctrl+Shift+M and View ▸ Memory Scanner).
+actions!(rcx_app, [OpenCommandPalette, ToggleScanner]);
 
 /// The application's root view — the C++ `MainWindow` (app-shell §6).
 pub struct MainWindow {
@@ -168,6 +170,9 @@ impl MainWindow {
         // Observe the initial editor(s) so a row selection re-renders the window
         // (and thus refreshes the status bar; see [`Self::observe_editors`]).
         win.observe_editors(cx);
+        // Reflect the initial scanner-dock state in the View menu (closed by
+        // default ⇒ View ▸ Memory Scanner starts unchecked).
+        win.sync_scanner_menu_checked(cx);
         // Rebuild the workspace model from the seeded document, then show the
         // start page over the workspace (the C++ deferred `showStartPage`).
         win.rebuild_workspace(cx);
@@ -265,14 +270,21 @@ impl MainWindow {
 
             // ── View ──
             "view.command_palette" => self.open_command_palette(&OpenCommandPalette, window, cx),
-            "view.scanner" | "view.symbols" | "view.bookmarks" => {
-                // Dock toggles for the secondary panels land with the dock
-                // workflow; the workspace dock toggle below is the wired one.
+            // The memory scanner is the C++ pop-out summoned on demand — toggle the
+            // bottom dock open/closed (closed by default; `Ctrl+Shift+M` mirrors).
+            "view.scanner" => self.toggle_scanner_dock(&ToggleScanner, window, cx),
+            "view.symbols" | "view.bookmarks" => {
+                // The symbols/bookmarks secondary panels land with their dock
+                // workflow; the scanner + workspace toggles are the wired ones.
                 tracing::debug!(command = %cmd, "menu command: dock toggle not yet wired");
             }
             "view.reset_windows" => {
-                // Reset to the default layout — show the workspace dock.
+                // Reset to the default layout — show the workspace dock and hide
+                // the scanner pop-out (its default-closed state; the C++ canonical
+                // "Reset Windows" placement).
                 self.apply_layout_preset(LayoutPreset::Workspace, window, cx);
+                self.set_bottom_dock_open(false, window, cx);
+                self.sync_scanner_menu_checked(cx);
             }
 
             // The view-mode dual toggle (Tree ⇄ rendered C/C++) is exposed through
@@ -367,6 +379,55 @@ impl MainWindow {
             self.layout_preset = preset;
             cx.notify();
         }
+    }
+
+    // ── Memory-scanner pop-out (the C++ summoned-on-demand scanner window) ──
+
+    /// `true` when the bottom memory-scanner dock is currently open. Drives the
+    /// View ▸ Memory Scanner checkmark.
+    pub fn scanner_open(&self, cx: &App) -> bool {
+        self.dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Bottom, cx)
+    }
+
+    /// Toggle the bottom memory-scanner dock open/closed (the C++ scanner pop-out,
+    /// summoned via View ▸ Memory Scanner / `Ctrl+Shift+M`). The dock is closed by
+    /// default (see [`docks::build_default_layout`]), so the first invocation shows
+    /// it. Mirrors [`Self::set_left_dock_open`] but for [`DockPlacement::Bottom`],
+    /// and refreshes the menu-bar checkmark so the menu reflects the new state.
+    pub fn toggle_scanner_dock(
+        &mut self,
+        _: &ToggleScanner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self.scanner_open(cx);
+        self.set_bottom_dock_open(!open, window, cx);
+        self.sync_scanner_menu_checked(cx);
+        cx.notify();
+    }
+
+    /// Open/close the bottom scanner dock to a specific state (drives `set_open`
+    /// on the underlying `Dock`). Mirrors [`Self::set_left_dock_open`].
+    fn set_bottom_dock_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let dock_area = self.dock_area.clone();
+        dock_area.update(cx, |area, cx| {
+            if area.is_dock_open(DockPlacement::Bottom, cx) != open {
+                if let Some(dock) = area.bottom_dock().cloned() {
+                    dock.update(cx, |d, cx| d.set_open(open, window, cx));
+                }
+            }
+        });
+    }
+
+    /// Push the scanner-open state into the menu bar so View ▸ Memory Scanner
+    /// renders a checkmark while the dock is visible (the C++ checkable action).
+    fn sync_scanner_menu_checked(&mut self, cx: &mut Context<Self>) {
+        let open = self.scanner_open(cx);
+        self.menubar.update(cx, |mb, cx| {
+            mb.set_command_checked("view.scanner", open, cx);
+        });
     }
 
     // ── View mode (the dual tree/rendered toggle; app-shell §6/§16) ──
@@ -811,6 +872,7 @@ impl Render for MainWindow {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::open_command_palette))
+            .on_action(cx.listener(Self::toggle_scanner_dock))
             // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
             .child(titlebar)
             // ── Row 2: the content column — the docking workspace + the
@@ -896,6 +958,18 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
         Some("RcxWindow"),
     ));
     bindings.push(KeyBinding::new("f1", OpenCommandPalette, Some("RcxWindow")));
+    // Toggle the memory-scanner pop-out (the C++ summoned-on-demand scanner;
+    // closed by default). Ctrl+Shift+M shows/hides the bottom scanner dock.
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-m",
+        ToggleScanner,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-m",
+        ToggleScanner,
+        Some("RcxWindow"),
+    ));
     cx.bind_keys(bindings);
 
     // Run borderless: request CLIENT-side decorations so the OS/window-manager
