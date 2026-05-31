@@ -464,26 +464,37 @@ impl DocumentArea {
         let view_mode = self.active_entry().map(|e| e.view_mode).unwrap_or_default();
         let has_doc = !self.tabs.is_empty();
 
+        // One segment of the control. Every segment ALWAYS renders its label (the
+        // QA flagged invisible labels): a generous min width so the text never
+        // collapses, `flex_none` so it doesn't shrink to nothing, and a strong
+        // contrast pair — the selected segment lifts to `selected_bg` with full
+        // `text` foreground (accent text on the elevated bg read as near-invisible),
+        // inactive segments are `text_muted` and brighten + show a hover overlay.
         let segment = |label: &'static str, this_mode: ViewMode, cx: &mut Context<Self>| {
             let selected = view_mode == this_mode;
             div()
                 .id(label)
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .h(px(SEGMENT_H))
+                .min_w(px(64.0))
                 .px(px(tokens::space::LG))
                 .rounded(px(tokens::radius::MD))
                 .text_size(px(tokens::font::UI_SM))
                 .map(|s| {
                     if selected {
-                        // Soft elevated inset for the active segment + accent text.
-                        s.bg(color::elevated_bg(cx)).text_color(color::accent(cx))
+                        // Soft-accent inset for the active segment + full-contrast text.
+                        s.bg(color::selected_bg(cx))
+                            .text_color(color::text(cx))
+                            .font_weight(FontWeight::MEDIUM)
                     } else {
                         s.text_color(color::text_muted(cx))
-                            .hover(|h| h.text_color(color::text(cx)))
+                            .hover(|h| h.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
                     }
                 })
+                .child(label)
                 .when(has_doc && !selected, |s| {
                     s.on_click(cx.listener(|this, _e, _window, cx| {
                         this.toggle_view_mode(cx);
@@ -491,19 +502,40 @@ impl DocumentArea {
                 })
         };
 
+        // A 1px divider between the two segments so the control reads as a clear
+        // two-up toggle (reclass PIC1/PIC5 "Reclass | C/C++").
+        let divider = div()
+            .flex_none()
+            .w(px(tokens::border::THIN))
+            .h(px(SEGMENT_H - tokens::space::MD))
+            .bg(color::border(cx));
+
+        // The strip carries an explicit bg + top border so it never reads as
+        // overlapped by the scanner dock above; the segmented control is a
+        // bordered pill so both labels + the divider sit on one visible row.
         gpui_component::h_flex()
             .id("rcx-view-toggle")
             .flex_none()
             .h(px(VIEW_TOGGLE_H))
             .w_full()
             .items_center()
-            .px(px(tokens::space::MD))
-            .gap(px(tokens::space::XS))
+            .px(px(tokens::space::LG))
             .bg(color::chrome_bg(cx))
             .border_t_1()
             .border_color(color::border(cx))
-            .child(segment("Reclass", ViewMode::Tree, cx))
-            .child(segment("Code", ViewMode::Rendered, cx))
+            .child(
+                gpui_component::h_flex()
+                    .flex_none()
+                    .items_center()
+                    .p(px(tokens::space::XXS))
+                    .rounded(px(tokens::radius::MD))
+                    .border_1()
+                    .border_color(color::border(cx))
+                    .bg(color::elevated_bg(cx))
+                    .child(segment("Reclass", ViewMode::Tree, cx))
+                    .child(divider)
+                    .child(segment("Code", ViewMode::Rendered, cx)),
+            )
     }
 
     /// The body for the active tab: the editor (tree mode) or the rendered C/C++
@@ -617,7 +649,7 @@ impl DocumentArea {
             .w_full()
             .flex_none()
             .h(line_h)
-            .items_start()
+            .items_center()
             .child(
                 // Line-number gutter: muted, right-aligned, fixed width.
                 div()
@@ -628,11 +660,17 @@ impl DocumentArea {
                     .child(div().w_full().text_right().child(number.to_string())),
             )
             .child(
-                // Source column. A trailing space keeps a blank line from
-                // collapsing to zero height; preserve leading indentation.
-                div()
+                // Source column. The highlight spans must sit INLINE on one row,
+                // so the column is itself a horizontal flex (a bare `div()`
+                // defaults to block/column layout and stacks each `.flex_none()`
+                // span vertically). A trailing space keeps a blank line from
+                // collapsing to zero height; the per-span runs preserve leading
+                // indentation as plain whitespace spans.
+                gpui_component::h_flex()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
+                    .items_center()
                     .pr(px(tokens::space::LG))
                     .whitespace_nowrap()
                     .children(if spans.is_empty() {

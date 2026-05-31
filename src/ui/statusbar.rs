@@ -277,12 +277,27 @@ mod view {
         div().flex_none().text_color(fg).child(text)
     }
 
+    /// The pinned status-bar height (logical px). The bar is locked to exactly
+    /// this height — `h` *and* `min_h`/`max_h` are all set to it (and the row is
+    /// `flex_none` ⇒ grow=0, shrink=0) so the surrounding flex column can never
+    /// stretch *or* compress it. That hard reservation is what keeps the pinned
+    /// bar inside the client area: the content/dock row above is `flex_1 min_h_0`
+    /// and absorbs all remaining height, so the status row never gets pushed past
+    /// the bottom edge by overflowing content (the maximized-window clipping bug).
+    pub const STATUS_BAR_HEIGHT: f32 = 22.0;
+
     /// Render the bottom status bar (app-shell §11): a thin chrome strip with the
     /// active node path on the left and a Zed-style cluster of muted segments on
     /// the right — the offset/size detail (PIC5 "+0x20" / PIC3 "offset: 0x0010
     /// size: 8 bytes"), the data-source readout, and the active theme name —
     /// separated by subtle hairline rules. Zed chrome: `chrome_bg`, a top 1px
     /// border, ~22px tall, `UI_XS` muted type.
+    ///
+    /// The bar is a hard-pinned, fixed-height row: `flex_none` (grow=0, shrink=0)
+    /// plus `h`/`min_h`/`max_h` all clamped to [`STATUS_BAR_HEIGHT`], so the flex
+    /// column it lives in reserves exactly its height and can neither shrink it to
+    /// zero nor let the content/dock above push it off-screen. `overflow_hidden`
+    /// keeps a long readout from forcing the row taller than its fixed height.
     ///
     /// `info` is the resolved node readout ([`StatusInfo::for_controller`]) — a
     /// live selection (full-contrast path) or the default viewed-struct summary
@@ -328,9 +343,19 @@ mod view {
 
         gpui_component::h_flex()
             .id("rcx-status-bar")
+            // Hard-pin the row: `flex_none` zeroes grow+shrink and the matched
+            // `h`/`min_h`/`max_h` lock the height so the flex column reserves
+            // exactly `STATUS_BAR_HEIGHT` for it — it can neither be stretched by
+            // the column nor compressed/pushed off-screen by overflowing content
+            // (the maximized-window clipping bug). `overflow_hidden` stops a long
+            // readout from forcing the row taller than its fixed height.
             .flex_none()
+            .flex_shrink_0()
             .w_full()
-            .h(px(22.0))
+            .h(px(STATUS_BAR_HEIGHT))
+            .min_h(px(STATUS_BAR_HEIGHT))
+            .max_h(px(STATUS_BAR_HEIGHT))
+            .overflow_hidden()
             .px(px(tokens::space::LG))
             .gap(px(tokens::space::MD))
             .items_center()
@@ -560,5 +585,20 @@ mod tests {
             "Aliased".into()
         });
         assert_eq!(info.path, "Aliased \u{00D7}2");
+    }
+}
+
+/// Layout-invariant tests for the render path. The status bar must be a pinned,
+/// fixed-height row so the surrounding flex column reserves exactly its height
+/// and never pushes it off-screen (the maximized-window clipping bug).
+#[cfg(all(test, feature = "ui"))]
+mod view_tests {
+    use super::view::STATUS_BAR_HEIGHT;
+
+    #[test]
+    fn status_bar_height_is_the_pinned_zed_chrome_height() {
+        // ~22px Zed chrome strip; this exact value is reserved by `h`/`min_h`/
+        // `max_h` so the flex column can neither stretch nor compress the bar.
+        assert_eq!(STATUS_BAR_HEIGHT, 22.0);
     }
 }

@@ -512,7 +512,7 @@ mod view {
     use gpui_component::table::{
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
-    use gpui_component::{Disableable as _, IconName, Sizable as _};
+    use gpui_component::{Disableable as _, Sizable as _};
 
     use super::{
         filter_rows, split_address_dim, value_type_entries, CondEntry, ScanMode, ScanRow,
@@ -1022,16 +1022,20 @@ mod view {
     /// with a trailing chevron, sitting in the toolbar like the reclass scan-type
     /// / type / scan combos. Built on a gpui-component `Button` (which is
     /// `Selectable` — the bound `Popover::trigger` requires) so it inherits the
-    /// themed control look + the open/selected highlight. The trailing chevron is
-    /// a real `ChevronDown` icon (Zed combo affordance) rather than a glyph.
+    /// themed control look + the open/selected highlight.
+    ///
+    /// The chevron is a text glyph appended to the label rather than an
+    /// [`IconName`] icon: this app does not bundle the gpui-component SVG icon
+    /// assets (no asset source is registered; see `main.rs`), so an `.icon(...)`
+    /// would paint an empty box. A `"⌄"` glyph reads as the combo affordance with
+    /// no missing-asset artifact.
     fn dropdown_trigger(id: impl Into<SharedString>, text: impl Into<SharedString>) -> Button {
         let id: SharedString = id.into();
         let text: SharedString = text.into();
         Button::new(SharedString::from(format!("scanner-trig-{id}")))
             .outline()
             .small()
-            .label(text)
-            .icon(IconName::ChevronDown)
+            .label(SharedString::from(format!("{text}  ⌄")))
     }
 
     impl Render for ScannerPanel {
@@ -1245,7 +1249,6 @@ mod view {
                                             Button::new("scanner-scan")
                                                 .primary()
                                                 .small()
-                                                .icon(IconName::Search)
                                                 .label("Scan")
                                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                                     this.run_scan(cx)
@@ -1254,7 +1257,6 @@ mod view {
                                         .child(
                                             Button::new("scanner-rescan")
                                                 .small()
-                                                .icon(IconName::Redo)
                                                 .label("Re-scan")
                                                 .disabled(!has_results)
                                                 .on_click(cx.listener(|this, _e, _w, cx| {
@@ -1357,6 +1359,12 @@ mod view {
                     div()
                         .flex_1()
                         .min_h_0()
+                        // The DataTable's own table/head/row colors fall back to
+                        // gpui-component's (light) defaults until the theme seeds
+                        // them (theme_apply.rs). Paint the dark content bg behind
+                        // the table so the body never flashes a near-white block
+                        // inside the dark dock (the QA "glaring light rectangle").
+                        .bg(color::content_bg(cx))
                         .border_t_1()
                         .border_color(color::border(cx))
                         .child(DataTable::new(&self.table).bordered(false).small()),
@@ -1375,7 +1383,6 @@ mod view {
                         .child(
                             Button::new("scanner-goto")
                                 .small()
-                                .icon(IconName::ArrowRight)
                                 .label("Go to Address")
                                 .disabled(!has_selection)
                                 .on_click(cx.listener(|this, _e, _w, cx| this.go_to_selected(cx))),
@@ -1383,7 +1390,6 @@ mod view {
                         .child(
                             Button::new("scanner-copy")
                                 .small()
-                                .icon(IconName::Copy)
                                 .label("Copy Address")
                                 .disabled(!has_selection)
                                 .on_click(cx.listener(|this, _e, _w, cx| this.copy_selected(cx))),

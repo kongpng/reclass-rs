@@ -190,12 +190,19 @@ pub enum SpanRole {
     /// so the fold affordance reads as a real disclosure control (the task's "crisp
     /// disclosure triangle for expandable nodes" + the reclass/Zed outline look).
     FoldChevron,
+    /// A *dimmed* node-kind icon — the kind glyph drawn in the icon gutter of an
+    /// expandable container row (struct/array fold head). Quieter than the leaf
+    /// kind glyphs so it never competes with the crisp fold disclosure triangle,
+    /// while still giving every node row a type marker for reclass parity.
+    KindIconDim,
 }
 
 /// A small node-kind glyph prefixing a row's icon gutter — the Zed-outline-style
-/// kind marker the editor draws to the left of each leaf row (struct / pointer /
-/// array / hex / fnptr / value), distinct from the fold disclosure triangle which
-/// stays the affordance for expandable container rows.
+/// kind marker the editor draws to the left of EVERY node row (struct / pointer /
+/// array / hex / fnptr / value), like the reclass project tree's per-node type
+/// icons (PIC2) and a Zed outline. On expandable container rows it is drawn in a
+/// quieter (dimmed) role so it never competes with the crisp fold disclosure
+/// triangle, which remains the *interactive* fold affordance.
 ///
 /// Backed by single monospace glyphs (no SVG assets are bundled, cookbook §"Icon"),
 /// chosen to read at the 13px editor size: `◆` struct, `→` pointer, `ƒ` fnptr,
@@ -207,12 +214,19 @@ pub struct KindGlyph {
     pub role: SpanRole,
 }
 
-/// The kind glyph for a leaf row, or `None` for rows that carry no node icon
-/// (command row, footer, continuation/member sub-rows, and expandable container
-/// rows whose disclosure triangle is their affordance instead). Pure, tested.
+/// The kind glyph for a node row, or `None` for rows that carry no node icon
+/// (command row, footer, continuation/member sub-rows, synthetic `node_id == 0`).
+///
+/// Every *real* node row gets a type marker for reclass/Zed-outline parity —
+/// including expandable container rows (struct/array fold heads), which the
+/// earlier build left blank so the gutter looked unused when the default-opened
+/// struct happened to be all-pointer members. Container rows render the glyph in
+/// the quiet [`SpanRole::KindIconDim`] role so it sits *behind* the crisp fold
+/// disclosure triangle (the real fold affordance) instead of duelling with it.
+/// Pure, tested.
 pub fn kind_glyph(lm: &LineMeta) -> Option<KindGlyph> {
     use crate::core::NodeKind::*;
-    // Chrome / structural rows have no kind icon.
+    // Chrome / structural / sub-rows carry no kind icon.
     if matches!(lm.line_kind, LineKind::CommandRow | LineKind::Footer)
         || lm.is_continuation
         || lm.is_member_line
@@ -220,10 +234,18 @@ pub fn kind_glyph(lm: &LineMeta) -> Option<KindGlyph> {
     {
         return None;
     }
-    // Expandable container rows (struct/array headers): the crisp fold triangle is
-    // their affordance, so the icon gutter stays empty (avoids a double marker).
+    // Expandable container rows (struct/array fold heads): still carry a kind
+    // marker, but drawn dim so it complements — not competes with — the crisp fold
+    // disclosure triangle painted in the row text.
     if lm.fold_head {
-        return None;
+        let glyph = match lm.node_kind {
+            Array => '\u{25A6}', // ▦ — an array
+            _ => '\u{25C6}',     // ◆ — a struct/class (the usual container)
+        };
+        return Some(KindGlyph {
+            glyph,
+            role: SpanRole::KindIconDim,
+        });
     }
     let (glyph, role) = match lm.node_kind {
         Struct => ('\u{25C6}', SpanRole::Type), // ◆ — a struct/class
@@ -1156,6 +1178,61 @@ mod tests {
     }
 
     #[test]
+    fn kind_glyph_paints_for_scalar_leaf_rows() {
+        // The QA verification: scalar/leaf rows (int/float/bool/double) DO render a
+        // kind glyph — the `•` value marker — in the loud Value role (not dim, not
+        // suppressed). This is what makes the icon gutter visibly in use when a
+        // struct has scalar members (vs. the all-pointer default-opened struct).
+        for kind in [
+            NodeKind::Int32,
+            NodeKind::Int64,
+            NodeKind::UInt8,
+            NodeKind::Float,
+            NodeKind::Double,
+            NodeKind::Bool,
+        ] {
+            let kg = kind_glyph(&node_field_line(1, kind))
+                .unwrap_or_else(|| panic!("scalar kind {kind:?} must paint a glyph"));
+            assert_eq!(
+                kg.glyph, '\u{2022}',
+                "scalar kind {kind:?} uses the • marker"
+            );
+            assert_eq!(
+                kg.role,
+                SpanRole::Value,
+                "scalar glyph is the loud Value role"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_glyph_dim_marker_on_expandable_container_rows() {
+        // Stronger reclass parity (PIC2's per-node tree icons): expandable container
+        // rows (struct/array fold heads) STILL carry a kind marker, drawn in the
+        // quiet `KindIconDim` role so the icon gutter is never empty — but quieter
+        // than leaf glyphs so it complements the crisp fold disclosure triangle.
+        let mut s_head = field_line(0, NodeKind::Struct);
+        s_head.line_kind = LineKind::Header;
+        s_head.fold_head = true;
+        s_head.node_id = 7;
+        assert_eq!(
+            kind_glyph(&s_head),
+            Some(KindGlyph {
+                glyph: '\u{25C6}',
+                role: SpanRole::KindIconDim,
+            }),
+            "struct fold head paints a dim ◆ marker"
+        );
+        let mut a_head = field_line(0, NodeKind::Array);
+        a_head.line_kind = LineKind::Header;
+        a_head.fold_head = true;
+        a_head.node_id = 8;
+        let kg = kind_glyph(&a_head).expect("array fold head paints a marker");
+        assert_eq!(kg.glyph, '\u{25A6}', "array fold head uses the ▦ marker");
+        assert_eq!(kg.role, SpanRole::KindIconDim, "container marker is dim");
+    }
+
+    #[test]
     fn kind_glyph_none_for_chrome_fold_and_sub_rows() {
         // Command row / footer: no node icon.
         let cmd = LineMeta {
@@ -1169,13 +1246,6 @@ mod tests {
             ..LineMeta::default()
         };
         assert_eq!(kind_glyph(&footer), None);
-        // Expandable container row (fold head): the disclosure triangle is its
-        // affordance, so the icon gutter stays empty (no double marker).
-        let mut header = field_line(0, NodeKind::Struct);
-        header.line_kind = LineKind::Header;
-        header.fold_head = true;
-        header.node_id = 7;
-        assert_eq!(kind_glyph(&header), None);
         // Continuation / member / synthetic (node_id 0) rows: none.
         let mut cont = field_line(1, NodeKind::Int32);
         cont.is_continuation = true;

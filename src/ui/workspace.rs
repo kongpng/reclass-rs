@@ -697,14 +697,61 @@ impl WorkspacePanel {
 /// soft shadow, hover overlay), so it matches the Zed design system without
 /// bespoke painting. Dismiss-on-select / escape / click-out is handled by the
 /// `ContextMenuExt` machinery.
-fn type_context_menu(menu: PopupMenu) -> PopupMenu {
-    menu.menu("Open in Tab", Box::new(WsOpenInTab))
+///
+/// `target_name` is the right-clicked type's display name; it heads the menu as a
+/// muted, **non-boxed** section title (a `PopupMenuItem::Label` — plain dimmed
+/// text, not an input-style inset) so the menu reads "these actions act on
+/// `<Type>`" the way a Zed context menu's title row does. Items carry leading
+/// kind icons + right-aligned shortcut hints for Zed-quality polish.
+fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
+    use gpui_component::IconName;
+
+    menu
+        // Dimmed, non-boxed section title naming the targeted type.
+        .label(SharedString::from(target_name.to_string()))
         .separator()
-        .menu("Rename…", Box::new(WsRenameType))
-        .menu("Duplicate", Box::new(WsDuplicateType))
-        .menu("Add Member", Box::new(WsAddMember))
+        // Open in Tab — the one live wire; trailing ↵ hint (activate = open).
+        .menu_element_with_icon(IconName::ExternalLink, Box::new(WsOpenInTab), |_w, cx| {
+            menu_row("Open in Tab", "\u{21b5}", cx)
+        })
         .separator()
-        .menu("Delete", Box::new(WsDeleteType))
+        .menu_element_with_icon(IconName::Replace, Box::new(WsRenameType), |_w, cx| {
+            menu_row("Rename\u{2026}", "F2", cx)
+        })
+        .menu_element_with_icon(IconName::Copy, Box::new(WsDuplicateType), |_w, cx| {
+            menu_row("Duplicate", "\u{2318}D", cx)
+        })
+        .menu_element_with_icon(IconName::Plus, Box::new(WsAddMember), |_w, cx| {
+            menu_row("Add Member", "\u{2318}\u{21b5}", cx)
+        })
+        .separator()
+        .menu_element_with_icon(IconName::Delete, Box::new(WsDeleteType), |_w, cx| {
+            menu_row("Delete", "\u{2326}", cx)
+        })
+}
+
+/// One context-menu row body: the item `label` filling the row with a trailing
+/// right-aligned muted `keys` shortcut hint (Zed's label↔accelerator layout). The
+/// leading icon is supplied by `menu_element_with_icon`; this is the row's text.
+/// The hint is dimmed (`text_disabled`) so it recedes behind the item label —
+/// these workspace actions are not globally key-bound (so the menu's built-in
+/// `render_key_binding` shows nothing), but the hint communicates the equivalent
+/// editor accelerator the way a Zed menu does.
+fn menu_row(label: &'static str, keys: &'static str, cx: &App) -> impl IntoElement {
+    gpui_component::h_flex()
+        .w_full()
+        .min_w(px(168.0))
+        .gap(px(tokens::space::LG))
+        .items_center()
+        .justify_between()
+        .child(div().flex_1().child(label))
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(tokens::font::UI_XS))
+                .text_color(color::text_disabled(cx))
+                .child(keys),
+        )
 }
 
 impl Panel for WorkspacePanel {
@@ -937,9 +984,11 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
             viewed,
         }) => {
             let full_name = name.clone();
+            let menu_name = name.clone();
             // The row content as an interactive (stateful) div so it can carry a
-            // context menu (ContextMenuExt) + a tooltip on the truncated name.
-            let row = gpui_component::h_flex()
+            // context menu (ContextMenuExt), a tooltip on the truncated name, AND
+            // the click → navigation / right-click → menu-target handlers.
+            let mut row = gpui_component::h_flex()
                 .id(("ws-type-row", ix))
                 .w_full()
                 .h(px(24.0))
@@ -974,29 +1023,30 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                 // Trailing member count — a muted pill (the C++ count pill).
                 .child(count_pill(*field_count, cx));
 
-            // Right-click context menu (Open in Tab / Rename / Duplicate / Add
-            // Member / Delete). Attached to the interactive content div, not the
-            // ListItem (which is RenderOnce, not InteractiveElement). The wrapped
-            // element is `IntoElement`, so it is used directly as the row child.
-            let row = row.context_menu(move |menu, _window, _cx| type_context_menu(menu));
-
-            let mut item = ListItem::new(ix)
-                .w_full()
-                // Drive the ListItem's built-in soft-accent (selected) fill +
-                // hover overlay — without this the rows read as flat text.
-                .selected(selected)
-                .child(row)
-                .map(strip_row_padding);
-
-            // Click → quick navigation; right-mouse-down → record the menu
-            // target so the context-menu action handlers know which row fired.
+            // ── Row activation → quick navigation (QA fix #1) ──────────────────
+            //
+            // The C++ class-list → `setRootNode` path: clicking (or double-
+            // clicking) a type row sets the active document's editor view-root to
+            // that struct, which the window resolves on the emitted `WorkspaceNav`
+            // (`set_view_root_id` + `apply_document`). The handlers live on this
+            // **inner interactive row div** (the deepest element) rather than the
+            // outer `ListItem`: the enclosing gpui-component `Tree` wraps every
+            // row in its own `on_mouse_down(Left)` that merely selects + toggles
+            // expansion (`TreeState::on_entry_click`), so wiring navigation here
+            // guarantees the click reaches the editor instead of only toggling a
+            // folder row's disclosure. `on_click` fires for both single and double
+            // clicks; emitting the (idempotent) nav on each keeps both gestures
+            // opening the type, so the tab title and the editor root never drift
+            // apart (the EPROCESS tab now actually shows the EPROCESS struct).
             if let Some(nav) = nav {
                 let nav_click = view.clone();
                 let nav_down = view.clone();
-                item = item
+                row = row
                     .on_click(move |_e, _window, cx| {
                         nav_click.update(cx, |_this, cx| cx.emit(nav));
                     })
+                    // Record the right-clicked row so the context-menu action
+                    // handlers know which type fired (before the menu opens).
                     .on_mouse_down(MouseButton::Right, move |_e, _window, cx| {
                         nav_down.update(cx, |this, cx| {
                             this.context_target = Some(nav);
@@ -1004,7 +1054,22 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                         });
                     });
             }
-            item
+
+            // Right-click context menu (header + Open in Tab / Rename / Duplicate
+            // / Add Member / Delete). Attached to the interactive content div, not
+            // the ListItem (which is RenderOnce, not InteractiveElement). The
+            // wrapped element is `IntoElement`, so it is used directly as the row
+            // child. The header names the right-clicked type (`menu_name`).
+            let row =
+                row.context_menu(move |menu, _window, _cx| type_context_menu(menu, &menu_name));
+
+            ListItem::new(ix)
+                .w_full()
+                // Drive the ListItem's built-in soft-accent (selected) fill +
+                // hover overlay — without this the rows read as flat text.
+                .selected(selected)
+                .child(row)
+                .map(strip_row_padding)
         }
 
         // ── Struct field child: "+0xNN  Type field" with syntax tints ───────

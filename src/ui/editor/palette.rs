@@ -77,6 +77,11 @@ pub struct EditorPalette {
     /// primary/cursor row (Zed's active-line background), softer than the
     /// accent-tinted selection fill so a selected row still reads as selected.
     pub active_line_bg: Hsla,
+    /// The dimmed node-kind icon drawn in the icon gutter of an expandable
+    /// container row (struct/array fold head) — a quiet muted marker that gives
+    /// every node row a type icon (reclass parity) without competing with the
+    /// crisp fold disclosure triangle.
+    pub kind_icon_dim: Hsla,
 }
 
 impl EditorPalette {
@@ -131,6 +136,10 @@ impl EditorPalette {
             // Active-line band: a barely-there foreground wash (Zed's active-line
             // bg), softer than the accent selection fill so the two are distinct.
             active_line_bg: with_alpha(t.foreground, 0.03),
+            // Container-row kind marker: a quiet muted glyph (≈40% alpha) so the
+            // gutter reads as "in use" on every node row, yet stays well behind the
+            // crisp fold disclosure triangle's accent blue.
+            kind_icon_dim: with_alpha(t.muted_foreground, 0.45),
         }
     }
 
@@ -157,6 +166,7 @@ impl EditorPalette {
             SpanRole::HeatWarm => self.heat_warm,
             SpanRole::HeatHot => self.heat_hot,
             SpanRole::FoldChevron => self.fold_chevron,
+            SpanRole::KindIconDim => self.kind_icon_dim,
         }
     }
 

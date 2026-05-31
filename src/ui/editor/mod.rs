@@ -804,13 +804,16 @@ impl RcxEditor {
         }
 
         // Node-kind icon gutter — a small Zed-outline-style kind glyph (struct ◆ /
-        // pointer → / array ▦ / fnptr ƒ / hex # / value •) prefixing each leaf row,
-        // distinguishing node types at a glance like the reclass tree + Zed
-        // outline. Expandable container rows carry no glyph here; their crisp fold
-        // disclosure triangle (painted in the row text) is the affordance instead.
-        // Reserved on EVERY row (a fixed `ICON_CELLS` width) so the row text starts
-        // at the same column whether or not a glyph is present — the icon lives
-        // OUTSIDE the composed text columns, so hit-testing/fold math is untouched.
+        // pointer → / array ▦ / fnptr ƒ / hex # / value •) prefixing each node row,
+        // distinguishing node types at a glance like the reclass project tree
+        // (PIC2's per-node icons) + Zed outline. Leaf rows paint a loud kind-tinted
+        // glyph; expandable container rows paint the SAME marker in the quiet
+        // `KindIconDim` role so the gutter is never empty, while their crisp fold
+        // disclosure triangle (painted in the row text) stays the interactive fold
+        // affordance. Reserved on EVERY row (a fixed `ICON_CELLS` width) so the row
+        // text starts at the same column whether or not a glyph is present — the
+        // icon lives OUTSIDE the composed text columns, so hit-testing/fold math is
+        // untouched.
         {
             let mut icon = div()
                 .flex_shrink_0()
