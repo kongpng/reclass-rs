@@ -11,8 +11,8 @@
 //! [`build_default_layout`] assembles the canonical layout: the center is the
 //! real MDI [`DocumentArea`](super::tabs::DocumentArea) (tab strip + "+" sentinel
 //! + source icons + view-mode toggle + editor), the left dock is the real
-//! [`WorkspacePanel`](super::workspace::WorkspacePanel), and the bottom dock is a
-//! [`PlaceholderPanel`] scanner stub. It returns [`LayoutHandles`] the window
+//! [`WorkspacePanel`](super::workspace::WorkspacePanel), and the bottom dock is the
+//! real [`ScannerPanel`](super::scannerpanel::ScannerPanel). It returns [`LayoutHandles`] the window
 //! wires + observes. The dock drag overlay + per-dock toolbars (app-shell §9)
 //! come later; the seam is the layout builder + the [`MAIN_DOCK_AREA`] id/version
 //! used by `dump`/`load`.
@@ -23,7 +23,6 @@ use gpui::*;
 use gpui_component::dock::{DockArea, DockItem};
 use std::sync::Arc;
 
-use super::panels::{PanelKind, PlaceholderPanel};
 use super::tabs::DocumentArea;
 use super::workspace::WorkspacePanel;
 
@@ -60,14 +59,15 @@ pub struct LayoutHandles {
 /// - **center** = the MDI document-tab area ([`DocumentArea`] — the tab strip,
 ///   "+" sentinel, source icons, view-mode toggle, and the editor),
 /// - **left dock** = the workspace / project tree ([`WorkspacePanel`]),
-/// - **bottom dock** = memory scanner ([`PanelKind::Scanner`] placeholder),
-///   closed by default (the C++ scanner dock is hidden until toggled; §10).
+/// - **bottom dock** = the real memory scanner
+///   ([`ScannerPanel`](super::scannerpanel::ScannerPanel)), open by default so its
+///   search controls + results table are visible (PIC3/PIC6).
 ///
 /// Mirrors the verified gpui-component `DockArea` construction pattern
 /// (`examples/dock.rs`): build `DockItem::tabs(...)` of `Arc<dyn PanelView>`
 /// panels against a `WeakEntity<DockArea>`, then `set_center` / `set_left_dock`
 /// / `set_bottom_dock`. Sizes follow the C++ defaults (workspace ~280px wide,
-/// scanner ~360px tall). Returns the [`LayoutHandles`] the window wires.
+/// scanner ~320px tall). Returns the [`LayoutHandles`] the window wires.
 pub fn build_default_layout(
     dock_area: &Entity<DockArea>,
     window: &mut Window,
@@ -84,14 +84,16 @@ pub fn build_default_layout(
     let workspace = WorkspacePanel::view(window, cx);
     let left = DockItem::tabs(vec![Arc::new(workspace.clone())], &weak, window, cx);
 
-    // Bottom: memory scanner (closed by default, like the C++ hidden scanner dock).
-    let scanner = Arc::new(PlaceholderPanel::view(PanelKind::Scanner, cx));
+    // Bottom: the real memory-scanner panel (`ScannerPanel`), open by default so
+    // its search controls + results table are visible (PIC3/PIC6 show the scanner
+    // docked at the bottom of the workspace).
+    let scanner = Arc::new(super::scannerpanel::ScannerPanel::view(window, cx));
     let bottom = DockItem::tabs(vec![scanner], &weak, window, cx);
 
     dock_area.update(cx, |area, cx| {
         area.set_center(center, window, cx);
         area.set_left_dock(left, Some(px(280.)), true, window, cx);
-        area.set_bottom_dock(bottom, Some(px(360.)), false, window, cx);
+        area.set_bottom_dock(bottom, Some(px(320.)), true, window, cx);
     });
 
     LayoutHandles {

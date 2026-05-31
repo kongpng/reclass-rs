@@ -31,12 +31,36 @@ use gpui::*;
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::input::{Input, InputState};
 use gpui_component::list::ListItem;
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::tree::{tree, TreeItem, TreeState};
 
 use crate::core::{kind_to_string, NodeKind, NodeTree};
 use crate::ui::design::{color, tokens};
 
 use super::state::DocId;
+
+// ── Context-menu actions (the C++ workspace-tree `QMenu`, `main.cpp:7221`) ────
+//
+// The Zed-style right-click menu (gpui-component `ContextMenuExt` + `PopupMenu`)
+// dispatches a gpui `Action` per item; these are the workspace tree's items. The
+// panel handles them on its tracked-focus root (`on_action`), reading the
+// right-clicked row from `context_target`. "Open in Tab" is wired to the live
+// `WorkspaceNav` quick-navigation request; the mutating items (rename / dup /
+// delete / add-member) are graceful stubs (the menu opens, the item shows, and
+// the action closes the menu cleanly) until the controller seam lands — the
+// workspace model is read-only here (it carries only the `NodeTree`), so this
+// surface intentionally does not mutate the project.
+actions!(
+    rcx_workspace,
+    [
+        WsOpenInTab,
+        WsRenameType,
+        WsDuplicateType,
+        WsDeleteType,
+        WsAddMember
+    ]
+);
 
 /// The badge a workspace row shows — the C++ `S`/`E`/`F` letter badge
 /// (`WorkspaceDelegate::paint`), generalized to distinguish unions.
@@ -553,6 +577,10 @@ pub struct WorkspacePanel {
     /// alongside the tree items so the render closure can paint Zed rows. Shared
     /// via [`Rc`] into the (re-created each frame) render closure.
     row_meta: Rc<HashMap<SharedString, RowMetaKind>>,
+    /// The type row a right-click context menu targets (the C++ menu's "node
+    /// under the cursor"). Set on right-mouse-down over a type row; read by the
+    /// context-menu action handlers. `None` when no row was right-clicked.
+    context_target: Option<WorkspaceNav>,
     focus_handle: FocusHandle,
 }
 
@@ -574,6 +602,7 @@ impl WorkspacePanel {
             search,
             tree_state,
             row_meta: Rc::new(HashMap::new()),
+            context_target: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -611,6 +640,71 @@ impl WorkspacePanel {
         });
         cx.notify();
     }
+
+    // ── Context-menu action handlers ─────────────────────────────────────────
+    //
+    // Dispatched by the `PopupMenu` built in `type_context_menu`; the targeted
+    // row was recorded in `context_target` on right-mouse-down. "Open in Tab"
+    // routes the live `WorkspaceNav` quick-navigation request; the mutating items
+    // are graceful no-op stubs (the workspace model is read-only on this surface)
+    // so the menu still opens, the item shows, and selecting it closes the menu
+    // cleanly without a half-wired mutation.
+
+    /// "Open in Tab" — the C++ default `node.open_current`: emit the navigation
+    /// request the window already resolves (set the doc's view-root + activate
+    /// its tab). The only context item with a live wire on this surface.
+    fn action_open_in_tab(
+        &mut self,
+        _: &WsOpenInTab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(nav) = self.context_target {
+            cx.emit(nav);
+        }
+    }
+
+    /// "Rename" — graceful stub (`node.rename` lives in the controller, not on
+    /// this read-only surface). Consumes the action so the menu closes.
+    fn action_rename(&mut self, _: &WsRenameType, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// "Duplicate" — graceful stub (`node.duplicate`).
+    fn action_duplicate(
+        &mut self,
+        _: &WsDuplicateType,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// "Delete" — graceful stub (`node.delete`).
+    fn action_delete(&mut self, _: &WsDeleteType, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// "Add Member" — graceful stub (`node.add_member`).
+    fn action_add_member(
+        &mut self,
+        _: &WsAddMember,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+}
+
+/// Build the type-row right-click [`PopupMenu`] (the C++ workspace-tree `QMenu`,
+/// `main.cpp:7221` — Open / Rename / Duplicate / Delete / Add Member). Each item
+/// dispatches its workspace action; the panel handles them. Rendered by
+/// gpui-component on the shared elevated-surface look (6px radius, 1px border,
+/// soft shadow, hover overlay), so it matches the Zed design system without
+/// bespoke painting. Dismiss-on-select / escape / click-out is handled by the
+/// `ContextMenuExt` machinery.
+fn type_context_menu(menu: PopupMenu) -> PopupMenu {
+    menu.menu("Open in Tab", Box::new(WsOpenInTab))
+        .separator()
+        .menu("Rename…", Box::new(WsRenameType))
+        .menu("Duplicate", Box::new(WsDuplicateType))
+        .menu("Add Member", Box::new(WsAddMember))
+        .separator()
+        .menu("Delete", Box::new(WsDeleteType))
 }
 
 impl Panel for WorkspacePanel {
@@ -640,6 +734,14 @@ impl Render for WorkspacePanel {
         gpui_component::v_flex()
             .id("rcx-workspace-panel")
             .track_focus(&self.focus_handle)
+            .key_context("RcxWorkspace")
+            // Context-menu actions dispatched by the row right-click `PopupMenu`
+            // bubble to here (the menu is a child of this tracked-focus subtree).
+            .on_action(cx.listener(Self::action_open_in_tab))
+            .on_action(cx.listener(Self::action_rename))
+            .on_action(cx.listener(Self::action_duplicate))
+            .on_action(cx.listener(Self::action_delete))
+            .on_action(cx.listener(Self::action_add_member))
             .size_full()
             .bg(color::panel_bg(cx))
             .text_color(color::text(cx))
@@ -655,28 +757,18 @@ impl Render for WorkspacePanel {
                         let is_folder = entry.is_folder();
                         let is_expanded = entry.is_expanded();
 
-                        let row = render_row(
+                        render_row(RowCtx {
                             ix,
-                            item.label.clone(),
+                            label: item.label.clone(),
                             kind,
                             depth,
                             is_folder,
                             is_expanded,
                             selected,
+                            nav,
+                            view: &view,
                             cx,
-                        );
-
-                        // Type rows route a quick-navigation request up to the
-                        // window on click; section + field rows are inert (the
-                        // C++ RoleSectionHeader bands / non-navigable children).
-                        if let Some(nav) = nav {
-                            let view = view.clone();
-                            row.on_click(move |_e, _window, cx| {
-                                view.update(cx, |_this, cx| cx.emit(nav));
-                            })
-                        } else {
-                            row
-                        }
+                        })
                     })
                     .px(px(tokens::space::SM))
                     .py(px(tokens::space::XS)),
@@ -791,17 +883,42 @@ impl WorkspacePanel {
 /// [`RowMetaKind`]: a band header, a top-level type (badge + name + count
 /// pill), or a struct field child (syntax-tinted "Type field"). Falls back to
 /// the flat label when no metadata is found (should not happen in practice).
-#[allow(clippy::too_many_arguments)]
-fn render_row(
+///
+/// The per-row interaction polish lives here so each kind opts in correctly:
+/// - **selected/hover** — type + field rows pass `selected` to the [`ListItem`]
+///   so its built-in soft-accent (`list_active`) fill + `list_hover` overlay
+///   paint (section rows stay flat); the selected type's *name* also brightens.
+/// - **click** — type rows route a [`WorkspaceNav`] quick-navigation request.
+/// - **right-click** — type rows record the targeted row in `context_target`
+///   and open the Zed context menu (`type_context_menu`).
+/// - **tooltip** — type + field rows show the full (untruncated) name on hover.
+struct RowCtx<'a> {
     ix: usize,
     label: SharedString,
-    kind: Option<&RowMetaKind>,
+    kind: Option<&'a RowMetaKind>,
     depth: usize,
     is_folder: bool,
     is_expanded: bool,
     selected: bool,
-    cx: &App,
-) -> ListItem {
+    nav: Option<WorkspaceNav>,
+    view: &'a Entity<WorkspacePanel>,
+    cx: &'a mut App,
+}
+
+fn render_row(ctx: RowCtx<'_>) -> ListItem {
+    let RowCtx {
+        ix,
+        label,
+        kind,
+        depth,
+        is_folder,
+        is_expanded,
+        selected,
+        nav,
+        view,
+        cx,
+    } = ctx;
+
     // Left indent: a per-depth step that leaves room for indent guides.
     let indent = px(tokens::space::LG) * depth as f32;
 
@@ -819,7 +936,11 @@ fn render_row(
             field_count,
             viewed,
         }) => {
+            let full_name = name.clone();
+            // The row content as an interactive (stateful) div so it can carry a
+            // context menu (ContextMenuExt) + a tooltip on the truncated name.
             let row = gpui_component::h_flex()
+                .id(("ws-type-row", ix))
                 .w_full()
                 .h(px(24.0))
                 .pl(indent)
@@ -832,8 +953,10 @@ fn render_row(
                 .child(type_badge(*badge, *viewed, cx))
                 // Name — truncates; brighter when selected, muted otherwise so
                 // the active row reads as content-forward (Zed list behavior).
+                // Hovering shows the full name (req: tooltip on truncated names).
                 .child(
                     div()
+                        .id(("ws-type-name", ix))
                         .flex_1()
                         .min_w_0()
                         .truncate()
@@ -843,12 +966,45 @@ fn render_row(
                         } else {
                             color::text_muted(cx)
                         })
-                        .child(SharedString::from(name.clone())),
+                        .child(SharedString::from(name.clone()))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(full_name.clone()).build(window, cx)
+                        }),
                 )
                 // Trailing member count — a muted pill (the C++ count pill).
                 .child(count_pill(*field_count, cx));
 
-            ListItem::new(ix).w_full().child(row).map(strip_row_padding)
+            // Right-click context menu (Open in Tab / Rename / Duplicate / Add
+            // Member / Delete). Attached to the interactive content div, not the
+            // ListItem (which is RenderOnce, not InteractiveElement). The wrapped
+            // element is `IntoElement`, so it is used directly as the row child.
+            let row = row.context_menu(move |menu, _window, _cx| type_context_menu(menu));
+
+            let mut item = ListItem::new(ix)
+                .w_full()
+                // Drive the ListItem's built-in soft-accent (selected) fill +
+                // hover overlay — without this the rows read as flat text.
+                .selected(selected)
+                .child(row)
+                .map(strip_row_padding);
+
+            // Click → quick navigation; right-mouse-down → record the menu
+            // target so the context-menu action handlers know which row fired.
+            if let Some(nav) = nav {
+                let nav_click = view.clone();
+                let nav_down = view.clone();
+                item = item
+                    .on_click(move |_e, _window, cx| {
+                        nav_click.update(cx, |_this, cx| cx.emit(nav));
+                    })
+                    .on_mouse_down(MouseButton::Right, move |_e, _window, cx| {
+                        nav_down.update(cx, |this, cx| {
+                            this.context_target = Some(nav);
+                            cx.notify();
+                        });
+                    });
+            }
+            item
         }
 
         // ── Struct field child: "+0xNN  Type field" with syntax tints ───────
@@ -861,15 +1017,26 @@ fn render_row(
             type_name,
             field_name,
         }) => {
+            // The full "Type field" string, shown as a tooltip when truncated.
+            let full = if field_name.is_empty() {
+                type_name.clone()
+            } else {
+                format!("{type_name} {field_name}")
+            };
             let row = gpui_component::h_flex()
+                .id(("ws-field-row", ix))
                 .w_full()
                 .h(px(22.0))
-                .pl(indent + px(tokens::space::LG))
+                .pl(indent)
                 .pr(px(tokens::space::XS))
                 .gap(px(tokens::space::SM))
                 .items_center()
                 .text_size(px(tokens::font::UI_SM))
                 .min_w_0()
+                // Indent guide — a thin vertical rule marking the nesting level,
+                // so a struct's members read as a connected group (the C++ tree
+                // branch lines) rather than a flat list.
+                .child(indent_guide(cx))
                 // Offset chip — faint, right-aligned in a fixed gutter so the
                 // type names line up regardless of offset magnitude (the
                 // editor's `offset_hex_digits`-aligned address column).
@@ -889,14 +1056,20 @@ fn render_row(
                             .text_color(color::text_muted(cx))
                             .child(SharedString::from(field_name.clone())),
                     )
-                });
+                })
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx));
 
-            ListItem::new(ix).w_full().child(row).map(strip_row_padding)
+            ListItem::new(ix)
+                .w_full()
+                .selected(selected)
+                .child(row)
+                .map(strip_row_padding)
         }
 
         // ── Fallback (no metadata) — the flat label. ────────────────────────
         None => ListItem::new(ix)
             .w_full()
+            .selected(selected)
             .child(div().pl(indent).child(label))
             .map(strip_row_padding),
     }
@@ -906,6 +1079,25 @@ fn render_row(
 /// indent) is exact; keep its hover / selected fill + radius.
 fn strip_row_padding(li: ListItem) -> ListItem {
     li.p_0().rounded(px(tokens::radius::MD))
+}
+
+/// A single nesting indent guide — a thin, faint vertical rule occupying the
+/// disclosure column width, so a struct's expanded members read as a connected
+/// group hanging off their parent (the C++ tree branch lines), in the muted
+/// border tint so it recedes (Zed indent guides).
+fn indent_guide(cx: &App) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(12.0))
+        .h_full()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .w(px(tokens::border::THIN))
+                .h_full()
+                .bg(color::border(cx)),
+        )
 }
 
 /// A PINNED / ALL TYPES band header: a small uppercase muted caption, padded so
@@ -922,18 +1114,25 @@ fn section_row(label: SharedString, cx: &App) -> impl IntoElement {
         .child(SharedString::from(label.to_uppercase()))
 }
 
-/// The disclosure chevron for a row: a ▸ / ▾ glyph for folders (types with
+/// The disclosure chevron for a row: a crisp ▸ / ▾ glyph for folders (types with
 /// field children), or a same-width spacer for leaves so names align. Asset-free
-/// (no SVG bundle) — a Unicode triangle tinted muted.
+/// (no SVG bundle) — a Unicode triangle. Collapsed chevrons are faint and the
+/// expanded one is brighter (the active disclosure reads forward), matching Zed's
+/// tree twisties; the fixed 12px box keeps every name column aligned.
 fn disclosure(is_folder: bool, is_expanded: bool, cx: &App) -> impl IntoElement {
     div()
         .flex_none()
         .w(px(12.0))
+        .h(px(12.0))
         .flex()
         .items_center()
         .justify_center()
         .text_size(px(tokens::font::UI_XS))
-        .text_color(color::text_muted(cx))
+        .text_color(if is_expanded {
+            color::text(cx)
+        } else {
+            color::text_muted(cx)
+        })
         .when(is_folder, |this| {
             this.child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
         })

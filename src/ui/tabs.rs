@@ -33,6 +33,11 @@
 //! tree/rendered view-mode toggle is a Zed **segmented control** anchored at the
 //! bottom of the body ("Reclass" | "Code", as in the C++ bottom view tabs).
 //!
+//! In **rendered** mode the body shows the real generated C/C++ (the
+//! [`render_cpp_tree`] codegen) as a scrollable, read-only Zed code editor with a
+//! muted line-number gutter and One Dark syntax highlighting — reclass PIC3's
+//! right pane (see [`DocumentArea::render_code_view`]).
+//!
 //! Gated behind the `ui` feature.
 
 use gpui::prelude::FluentBuilder as _;
@@ -44,6 +49,7 @@ use super::design::{color, tokens};
 use super::editor::RcxEditor;
 use super::state::{DataSource, DocId, SourceKind, ViewMode};
 use super::titlebar::source_icon;
+use crate::generator::render_cpp_tree;
 
 /// Tab-strip height (logical px). The C++ dock tab bar was a fixed 37px
 /// (`MenuBarStyle::sizeFromContents` `CT_TabBarTab`, app-shell §3); Zed runs a
@@ -500,10 +506,13 @@ impl DocumentArea {
             .child(segment("Code", ViewMode::Rendered, cx))
     }
 
-    /// The body for the active tab: the editor (tree mode) or a rendered-output
-    /// placeholder (rendered mode). The real rendered C/C++ Scintilla view is
-    /// added with the editor/codegen workflow; here the toggle switches surfaces
-    /// faithfully and the rendered side shows the generated text affordance.
+    /// The body for the active tab: the editor (tree mode) or the rendered C/C++
+    /// code view (rendered mode).
+    ///
+    /// The rendered side wires the fully-implemented codegen
+    /// ([`render_cpp_tree`]) and presents it like reclass PIC3's right pane — a
+    /// scrollable, read-only Zed code editor with a muted line-number gutter and
+    /// One Dark syntax highlighting (see [`Self::render_code_view`]).
     fn render_body(&self, cx: &Context<Self>) -> AnyElement {
         let Some(entry) = self.active_entry() else {
             return div()
@@ -518,8 +527,40 @@ impl DocumentArea {
 
         match entry.view_mode {
             ViewMode::Tree => entry.editor.clone().into_any_element(),
-            ViewMode::Rendered => div()
-                .id("rcx-rendered-view")
+            ViewMode::Rendered => self.render_code_view(entry, cx),
+        }
+    }
+
+    /// The rendered C/C++ pane (reclass PIC3, right side) — a scrollable,
+    /// read-only Zed code editor.
+    ///
+    /// Wires the real generator: it reads the active tab's editor → controller →
+    /// tree + view root and calls [`render_cpp_tree`] with the document's
+    /// [`TypeAliases`](crate::generator::TypeAliases) (the per-kind display-name
+    /// overrides) and `emit_asserts = false`. The output is split into lines and
+    /// rendered with a muted, right-aligned line-number gutter plus per-line One
+    /// Dark syntax highlighting (keywords magenta, types yellow, numbers orange,
+    /// strings green, trailing `// 0x..` comments dim green-gray).
+    ///
+    /// When there is no struct root (a fresh/empty document) the generator
+    /// returns an empty string; we show a centered muted placeholder instead.
+    fn render_code_view(&self, entry: &DocEntry, cx: &Context<Self>) -> AnyElement {
+        let ed = entry.editor.read(cx);
+        let tree = ed.controller().tree();
+        let root = ed.controller().view_root_id();
+        // The document's per-kind name overrides feed the renderer's type names.
+        let aliases = &ed.controller().document().type_aliases;
+        let aliases = if aliases.is_empty() {
+            None
+        } else {
+            Some(aliases)
+        };
+        let source = render_cpp_tree(tree, root, aliases, /* emit_asserts */ false);
+
+        // Empty (no struct root / non-struct view) → graceful placeholder.
+        if source.trim().is_empty() {
+            return div()
+                .id("rcx-code-view-empty")
                 .size_full()
                 .flex()
                 .items_center()
@@ -528,13 +569,301 @@ impl DocumentArea {
                 .text_color(color::text_muted(cx))
                 .font_family(tokens::font::MONO_FAMILY)
                 .text_size(px(tokens::font::EDITOR_SIZE))
-                .child(format!(
-                    "// Rendered C/C++ for {} (generated view)",
-                    entry.title
-                ))
-                .into_any_element(),
+                .child("// nothing to render — open or build a struct")
+                .into_any_element();
         }
+
+        // Gutter width grows with the line count so the digits stay right-aligned
+        // and the source column never shifts (Zed gutter behaviour).
+        let line_count = source.lines().count().max(1);
+        let digits = ((line_count as f32).log10().floor() as usize) + 1;
+        let gutter_w = px(digits as f32 * 8.5 + 24.0);
+        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+
+        let gutter_fg = color::syntax_address(cx);
+
+        let rows: Vec<AnyElement> = source
+            .lines()
+            .enumerate()
+            .map(|(i, line)| self.render_code_line(i + 1, line, gutter_w, line_h, gutter_fg, cx))
+            .collect();
+
+        gpui_component::v_flex()
+            .id("rcx-code-view")
+            .size_full()
+            .bg(color::content_bg(cx))
+            .overflow_scroll()
+            .font_family(tokens::font::MONO_FAMILY)
+            .text_size(px(tokens::font::EDITOR_SIZE))
+            .py(px(tokens::space::SM))
+            .children(rows)
+            .into_any_element()
     }
+
+    /// One rendered source line: the muted right-aligned line-number gutter +
+    /// the syntax-highlighted source spans (a per-line tokenizer pass).
+    fn render_code_line(
+        &self,
+        number: usize,
+        line: &str,
+        gutter_w: Pixels,
+        line_h: Pixels,
+        gutter_fg: Hsla,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let spans = highlight_cpp_line(line, cx);
+
+        gpui_component::h_flex()
+            .w_full()
+            .flex_none()
+            .h(line_h)
+            .items_start()
+            .child(
+                // Line-number gutter: muted, right-aligned, fixed width.
+                div()
+                    .flex_none()
+                    .w(gutter_w)
+                    .pr(px(tokens::space::LG))
+                    .text_color(gutter_fg)
+                    .child(div().w_full().text_right().child(number.to_string())),
+            )
+            .child(
+                // Source column. A trailing space keeps a blank line from
+                // collapsing to zero height; preserve leading indentation.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .pr(px(tokens::space::LG))
+                    .whitespace_nowrap()
+                    .children(if spans.is_empty() {
+                        vec![div().child(" ").into_any_element()]
+                    } else {
+                        spans
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+/// Coarse C/C++ token kind for the per-line highlighter.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum CodeTok {
+    /// `struct`/`class`/`void`/`const`/`unsigned`/`#pragma`/`#include`/… — purple.
+    Keyword,
+    /// `uint32_t`/`int64_t`/`float`/PascalCase user types — yellow.
+    Type,
+    /// numeric / hex literals — orange.
+    Number,
+    /// `// …` trailing offset comments — dim green-gray.
+    Comment,
+    /// `"…"` / `<…>` string-ish runs — green.
+    String,
+    /// everything else (identifiers, punctuation, whitespace) — content text.
+    Plain,
+}
+
+/// C/C++ keywords (highlighted purple) the generator emits.
+const CPP_KEYWORDS: &[&str] = &[
+    "struct",
+    "class",
+    "enum",
+    "union",
+    "void",
+    "const",
+    "unsigned",
+    "signed",
+    "static",
+    "inline",
+    "namespace",
+    "public",
+    "private",
+    "protected",
+    "typedef",
+    "using",
+    "template",
+    "char",
+    "bool",
+    "short",
+    "int",
+    "long",
+    "double",
+    "wchar_t",
+    "sizeof",
+];
+
+/// Builtin scalar type names (highlighted yellow). User struct names are caught
+/// by the PascalCase / `_t`-suffix heuristic in [`classify_word`].
+const CPP_TYPES: &[&str] = &[
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "__int128",
+    "_Float16",
+    "float",
+    "size_t",
+    "intptr_t",
+    "uintptr_t",
+];
+
+/// Classify a single identifier-ish word for the highlighter.
+fn classify_word(word: &str) -> CodeTok {
+    if CPP_KEYWORDS.contains(&word) {
+        return CodeTok::Keyword;
+    }
+    if CPP_TYPES.contains(&word) {
+        return CodeTok::Type;
+    }
+    // Numeric / hex literal (e.g. `0x70`, `16`, `4ull`).
+    let bytes = word.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_digit) {
+        return CodeTok::Number;
+    }
+    // Heuristic "looks like a user type": leading uppercase letter or a `_t`
+    // suffix (struct/class names + `*_t` aliases the user emits) → yellow.
+    let first = word.chars().next();
+    if first.is_some_and(|c| c.is_ascii_uppercase()) || word.ends_with("_t") {
+        return CodeTok::Type;
+    }
+    CodeTok::Plain
+}
+
+/// Map a token kind to its One Dark syntax color (all via design tokens — no
+/// ad-hoc hex). Keyword purple, type yellow, number orange, string green,
+/// comment dim green-gray.
+fn tok_color(tok: CodeTok, cx: &gpui::App) -> Hsla {
+    match tok {
+        CodeTok::Keyword => color::syntax_keyword(cx),
+        CodeTok::Type => color::syntax_type(cx),
+        CodeTok::Number => color::syntax_number(cx),
+        CodeTok::Comment => color::syntax_comment(cx),
+        CodeTok::String => color::syntax_string(cx),
+        CodeTok::Plain => color::text(cx),
+    }
+}
+
+/// A simple per-line C/C++ tokenizer → colored spans (One Dark).
+///
+/// Splits a line into word / number / string / comment / punctuation runs and
+/// classifies each (keyword/type/number/string/comment) so the rendered pane
+/// reads like a Zed code editor. Whitespace is preserved as plain spans so
+/// indentation and column alignment survive.
+fn highlight_cpp_line(line: &str, cx: &gpui::App) -> Vec<AnyElement> {
+    let mut spans: Vec<AnyElement> = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    let push = |spans: &mut Vec<AnyElement>, text: String, tok: CodeTok| {
+        if text.is_empty() {
+            return;
+        }
+        spans.push(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(tok_color(tok, cx))
+                .child(text)
+                .into_any_element(),
+        );
+    };
+
+    while i < n {
+        let c = chars[i];
+
+        // Trailing `// …` comment — everything to end of line (the offset notes).
+        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
+            let rest: String = chars[i..].iter().collect();
+            push(&mut spans, rest, CodeTok::Comment);
+            break;
+        }
+
+        // `#pragma` / `#include` preprocessor line → keyword purple to first ws.
+        if c == '#' && (i == 0 || chars[..i].iter().all(|c| c.is_whitespace())) {
+            let mut j = i;
+            while j < n && !chars[j].is_whitespace() {
+                j += 1;
+            }
+            push(&mut spans, chars[i..j].iter().collect(), CodeTok::Keyword);
+            i = j;
+            continue;
+        }
+
+        // `"…"` string literal.
+        if c == '"' {
+            let mut j = i + 1;
+            while j < n && chars[j] != '"' {
+                j += 1;
+            }
+            if j < n {
+                j += 1; // include closing quote
+            }
+            push(&mut spans, chars[i..j].iter().collect(), CodeTok::String);
+            i = j;
+            continue;
+        }
+
+        // `<…>` include path after a `#include` keyword → treat as a string.
+        if c == '<' {
+            let mut j = i + 1;
+            while j < n && chars[j] != '>' {
+                j += 1;
+            }
+            if j < n && chars[..i].iter().collect::<String>().contains('#') {
+                j += 1;
+                push(&mut spans, chars[i..j].iter().collect(), CodeTok::String);
+                i = j;
+                continue;
+            }
+        }
+
+        // Whitespace run (preserved as plain).
+        if c.is_whitespace() {
+            let mut j = i;
+            while j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            push(&mut spans, chars[i..j].iter().collect(), CodeTok::Plain);
+            i = j;
+            continue;
+        }
+
+        // Word / number run (identifier chars, plus a hex/number body).
+        if c.is_alphanumeric() || c == '_' {
+            let mut j = i;
+            while j < n && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            let tok = classify_word(&word);
+            push(&mut spans, word, tok);
+            i = j;
+            continue;
+        }
+
+        // Punctuation / operator run (everything else) — plain content text.
+        let mut j = i;
+        while j < n
+            && !chars[j].is_alphanumeric()
+            && chars[j] != '_'
+            && !chars[j].is_whitespace()
+            && chars[j] != '"'
+            && !(chars[j] == '/' && j + 1 < n && chars[j + 1] == '/')
+        {
+            j += 1;
+        }
+        if j == i {
+            j += 1;
+        }
+        push(&mut spans, chars[i..j].iter().collect(), CodeTok::Plain);
+        i = j;
+    }
+
+    spans
 }
 
 impl Panel for DocumentArea {

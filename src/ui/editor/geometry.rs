@@ -185,6 +185,55 @@ pub enum SpanRole {
     HeatCold,
     HeatWarm,
     HeatHot,
+    /// The fold disclosure triangle (`▸`/`▾`) on an expandable row — painted crisp
+    /// (a clear accent-leaning foreground), NOT dimmed like the surrounding hex,
+    /// so the fold affordance reads as a real disclosure control (the task's "crisp
+    /// disclosure triangle for expandable nodes" + the reclass/Zed outline look).
+    FoldChevron,
+}
+
+/// A small node-kind glyph prefixing a row's icon gutter — the Zed-outline-style
+/// kind marker the editor draws to the left of each leaf row (struct / pointer /
+/// array / hex / fnptr / value), distinct from the fold disclosure triangle which
+/// stays the affordance for expandable container rows.
+///
+/// Backed by single monospace glyphs (no SVG assets are bundled, cookbook §"Icon"),
+/// chosen to read at the 13px editor size: `◆` struct, `→` pointer, `ƒ` fnptr,
+/// `▦` array, `#` hex, `•` plain value. The `role` drives its color via the
+/// palette so a theme switch retints it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KindGlyph {
+    pub glyph: char,
+    pub role: SpanRole,
+}
+
+/// The kind glyph for a leaf row, or `None` for rows that carry no node icon
+/// (command row, footer, continuation/member sub-rows, and expandable container
+/// rows whose disclosure triangle is their affordance instead). Pure, tested.
+pub fn kind_glyph(lm: &LineMeta) -> Option<KindGlyph> {
+    use crate::core::NodeKind::*;
+    // Chrome / structural rows have no kind icon.
+    if matches!(lm.line_kind, LineKind::CommandRow | LineKind::Footer)
+        || lm.is_continuation
+        || lm.is_member_line
+        || lm.node_id == 0
+    {
+        return None;
+    }
+    // Expandable container rows (struct/array headers): the crisp fold triangle is
+    // their affordance, so the icon gutter stays empty (avoids a double marker).
+    if lm.fold_head {
+        return None;
+    }
+    let (glyph, role) = match lm.node_kind {
+        Struct => ('\u{25C6}', SpanRole::Type), // ◆ — a struct/class
+        Array => ('\u{25A6}', SpanRole::Type),  // ▦ — an array
+        Pointer32 | Pointer64 => ('\u{2192}', SpanRole::Keyword), // → — a pointer
+        FuncPtr32 | FuncPtr64 => ('\u{0192}', SpanRole::FnPtr), // ƒ — a function ptr
+        Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => ('#', SpanRole::Dim), // # — raw hex
+        _ => ('\u{2022}', SpanRole::Value),     // • — a plain value field
+    };
+    Some(KindGlyph { glyph, role })
 }
 
 /// Whether a node kind renders its type token as a function-pointer (One Dark
@@ -331,6 +380,24 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
                     &mut layers,
                     narrow_value_at_first_chip(lm, vs),
                     SpanRole::Value,
+                );
+            }
+
+            // Crisp fold disclosure triangle (`▸`/`▾`): compose emits it as
+            // `" ▸ "` / `" ▾ "` in the fold prefix (col 1 of the K_FOLD_COL=3
+            // region) on expandable rows. Paint that single glyph in the crisp
+            // `FoldChevron` role so the affordance reads as a real disclosure
+            // control instead of dim chrome (the task's "crisp disclosure triangle
+            // for expandable nodes"). Sits above the hex-dim/tree-connector layers.
+            if lm.fold_head {
+                push(
+                    &mut layers,
+                    ColumnSpan {
+                        start: 1,
+                        end: 2,
+                        valid: true,
+                    },
+                    SpanRole::FoldChevron,
                 );
             }
 
@@ -1056,6 +1123,93 @@ mod tests {
     fn margin_empty_when_no_digits() {
         assert_eq!(fmt_margin_text(0x40, 0, 0, false, true), "");
         assert_eq!(fmt_margin_text(0x40, 0, -1, false, false), "");
+    }
+
+    /// A leaf field row with a real (non-zero) node id, so `kind_glyph` treats it
+    /// as a true node row rather than a synthetic one.
+    fn node_field_line(depth: i32, kind: NodeKind) -> LineMeta {
+        LineMeta {
+            node_id: 42,
+            ..field_line(depth, kind)
+        }
+    }
+
+    #[test]
+    fn kind_glyph_distinguishes_node_types() {
+        // Leaf rows get a per-kind glyph; container/fold rows and chrome get none.
+        let ptr = node_field_line(1, NodeKind::Pointer64);
+        assert_eq!(
+            kind_glyph(&ptr),
+            Some(KindGlyph {
+                glyph: '\u{2192}',
+                role: SpanRole::Keyword
+            })
+        );
+        let fnptr = node_field_line(1, NodeKind::FuncPtr64);
+        assert_eq!(kind_glyph(&fnptr).unwrap().role, SpanRole::FnPtr);
+        let hex = node_field_line(1, NodeKind::Hex64);
+        assert_eq!(kind_glyph(&hex).unwrap().glyph, '#');
+        let val = node_field_line(1, NodeKind::Int32);
+        assert_eq!(kind_glyph(&val).unwrap().glyph, '\u{2022}');
+        let arr = node_field_line(1, NodeKind::Array);
+        assert_eq!(kind_glyph(&arr).unwrap().glyph, '\u{25A6}');
+    }
+
+    #[test]
+    fn kind_glyph_none_for_chrome_fold_and_sub_rows() {
+        // Command row / footer: no node icon.
+        let cmd = LineMeta {
+            line_kind: LineKind::CommandRow,
+            node_id: crate::core::linemeta::K_COMMAND_ROW_ID,
+            ..LineMeta::default()
+        };
+        assert_eq!(kind_glyph(&cmd), None);
+        let footer = LineMeta {
+            line_kind: LineKind::Footer,
+            ..LineMeta::default()
+        };
+        assert_eq!(kind_glyph(&footer), None);
+        // Expandable container row (fold head): the disclosure triangle is its
+        // affordance, so the icon gutter stays empty (no double marker).
+        let mut header = field_line(0, NodeKind::Struct);
+        header.line_kind = LineKind::Header;
+        header.fold_head = true;
+        header.node_id = 7;
+        assert_eq!(kind_glyph(&header), None);
+        // Continuation / member / synthetic (node_id 0) rows: none.
+        let mut cont = field_line(1, NodeKind::Int32);
+        cont.is_continuation = true;
+        cont.node_id = 5;
+        assert_eq!(kind_glyph(&cont), None);
+        let synthetic = field_line(1, NodeKind::Int32); // node_id defaults to 0
+        assert_eq!(kind_glyph(&synthetic), None);
+    }
+
+    #[test]
+    fn fold_head_row_paints_crisp_chevron_role() {
+        // A fold-head header row must paint the disclosure glyph (col 1) in the
+        // crisp FoldChevron role, not leave it as dim chrome.
+        let mut lm = field_line(0, NodeKind::Struct);
+        lm.line_kind = LineKind::Header;
+        lm.fold_head = true;
+        lm.node_id = 3;
+        // compose emits " ▾ " in the fold prefix; col 1 is the arrow.
+        let text = " \u{25BE} Player                              {";
+        let runs = style_runs(&lm, text, 14, 22);
+        let chevron = runs
+            .iter()
+            .find(|r| r.role == SpanRole::FoldChevron)
+            .expect("fold-head row paints a FoldChevron run");
+        assert_eq!(chevron.start, 1);
+        assert_eq!(chevron.end, 2);
+    }
+
+    #[test]
+    fn non_fold_row_has_no_chevron_run() {
+        let lm = field_line(1, NodeKind::Int32);
+        let text = "   int32         field                  100";
+        let runs = style_runs(&lm, text, 14, 22);
+        assert!(!runs.iter().any(|r| r.role == SpanRole::FoldChevron));
     }
 
     #[test]

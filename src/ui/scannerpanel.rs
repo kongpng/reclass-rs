@@ -443,9 +443,10 @@ pub fn format_scan_address(addr: u64) -> String {
     format!("{hi:08X}`{lo:08X}")
 }
 
-/// One result row's display strings — the Address column (with backtick) and the
-/// formatted Value column. Built from a [`ScanResult`] + the form's last-scan
-/// snapshot.
+/// One result row's display strings — the Address column (with backtick), the
+/// formatted Value column, and the Previous column (the value before the last
+/// rescan, the C++ third column in PIC6). Built from a [`ScanResult`] + the
+/// form's last-scan snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanRow {
     /// Absolute address (the row's stable key + goto target).
@@ -454,15 +455,24 @@ pub struct ScanRow {
     pub address_text: String,
     /// The formatted value string (`ScannerForm::format_value`).
     pub value_text: String,
+    /// The formatted previous-value string (empty before any rescan).
+    pub previous_text: String,
 }
 
 impl ScanRow {
-    /// Build a row from a result + the form (for the value formatting).
+    /// Build a row from a result + the form (for the value formatting). The
+    /// Previous column is the prior value snapshot a rescan records on the
+    /// [`ScanResult`] (`previous_value`); empty on a first scan.
     pub fn from_result(form: &ScannerForm, r: &ScanResult) -> ScanRow {
         ScanRow {
             address: r.address,
             address_text: format_scan_address(r.address),
             value_text: form.format_value(&r.scan_value),
+            previous_text: if r.previous_value.is_empty() {
+                String::new()
+            } else {
+                form.format_value(&r.previous_value)
+            },
         }
     }
 }
@@ -505,11 +515,11 @@ mod view {
     use gpui_component::{Disableable as _, IconName, Sizable as _};
 
     use super::{
-        filter_rows, split_address_dim, value_type_entries, CondEntry, ScanRow, ScannerForm,
-        FAST_SCAN_ALIGNMENTS,
+        filter_rows, split_address_dim, value_type_entries, CondEntry, ScanMode, ScanRow,
+        ScannerForm, FAST_SCAN_ALIGNMENTS,
     };
     use crate::provider::Provider;
-    use crate::scanner::{run_scan, NullObserver, ScanResult, ValueType};
+    use crate::scanner::{run_scan, NullObserver, ScanCondition, ScanResult, ValueType};
     use crate::ui::design::{color, tokens};
 
     /// A "go to this address" request raised when a result row is activated
@@ -520,9 +530,12 @@ mod view {
         pub address: u64,
     }
 
-    /// The two result columns (`scannerpanel.cpp:633` — `setColumnCount(2)`).
+    /// The result columns. The C++ scanner table is 2 columns (Address, Value);
+    /// PIC6 additionally surfaces a Previous column (the pre-rescan value), so
+    /// the port shows three: Address / Value / Previous.
     const COL_ADDRESS: usize = 0;
     const COL_VALUE: usize = 1;
+    const COL_PREVIOUS: usize = 2;
 
     /// The [`TableDelegate`] backing the results [`DataTable`]: owns the displayed
     /// rows and paints the Address cell with the dimmed leading-zero prefix (the
@@ -540,7 +553,7 @@ mod view {
 
     impl TableDelegate for ScanResultsDelegate {
         fn columns_count(&self, _cx: &App) -> usize {
-            2
+            3
         }
 
         fn rows_count(&self, _cx: &App) -> usize {
@@ -549,7 +562,10 @@ mod view {
 
         fn column(&self, col_ix: usize, _cx: &App) -> Column {
             match col_ix {
-                COL_VALUE => Column::new("value", "Value").width(px(220.)).sortable(),
+                COL_VALUE => Column::new("value", "Value").width(px(160.)).sortable(),
+                COL_PREVIOUS => Column::new("previous", "Previous")
+                    .width(px(160.))
+                    .sortable(),
                 _ => Column::new("address", "Address").width(px(176.)).sortable(),
             }
         }
@@ -564,6 +580,9 @@ mod view {
             let asc = !matches!(sort, ColumnSort::Descending);
             match col_ix {
                 COL_ADDRESS => self.rows.sort_by_key(|r| r.address),
+                COL_PREVIOUS => self
+                    .rows
+                    .sort_by(|a, b| a.previous_text.cmp(&b.previous_text)),
                 _ => self.rows.sort_by(|a, b| a.value_text.cmp(&b.value_text)),
             }
             if !asc {
@@ -601,15 +620,22 @@ mod view {
                     )
             } else {
                 // Numeric / hex value column: monospace, right-aligned so digits
-                // line up the way the original scanner table presents them.
+                // line up the way the original scanner table presents them. The
+                // Previous column is dimmed (it's the stale, pre-rescan value).
+                let (text, muted) = if col_ix == COL_PREVIOUS {
+                    (row.previous_text.clone(), true)
+                } else {
+                    (row.value_text.clone(), false)
+                };
                 div()
                     .w_full()
                     .flex()
                     .justify_end()
                     .font_family(tokens::font::MONO_FAMILY)
                     .text_size(px(tokens::font::EDITOR_SIZE))
-                    .text_color(color::text(cx))
-                    .child(row.value_text.clone())
+                    .when(muted, |d| d.text_color(color::text_muted(cx)))
+                    .when(!muted, |d| d.text_color(color::text(cx)))
+                    .child(text)
             }
         }
 
@@ -617,10 +643,10 @@ mod view {
             let Some(row) = self.rows.get(row_ix) else {
                 return String::new();
             };
-            if col_ix == COL_ADDRESS {
-                row.address_text.clone()
-            } else {
-                row.value_text.clone()
+            match col_ix {
+                COL_ADDRESS => row.address_text.clone(),
+                COL_PREVIOUS => row.previous_text.clone(),
+                _ => row.value_text.clone(),
             }
         }
     }
@@ -647,8 +673,10 @@ mod view {
         /// The currently-selected result row (drives the footer goto/copy
         /// buttons), tracked from [`TableEvent::SelectRow`].
         selected_row: Option<usize>,
-        /// Controlled-open state for the toolbar dropdown popovers (condition /
-        /// value-type / fast-scan), so picking an item dismisses the popover.
+        /// Controlled-open state for the toolbar dropdown popovers (scan-type /
+        /// condition / value-type / fast-scan), so picking an item dismisses the
+        /// popover.
+        mode_open: bool,
         cond_open: bool,
         type_open: bool,
         align_open: bool,
@@ -725,6 +753,7 @@ mod view {
                 provider: None,
                 status: String::new(),
                 selected_row: None,
+                mode_open: false,
                 cond_open: false,
                 type_open: false,
                 align_open: false,
@@ -758,6 +787,19 @@ mod view {
         fn set_value_type(&mut self, vt: ValueType, cx: &mut Context<Self>) {
             self.form.value_type = vt;
             self.type_open = false;
+            cx.notify();
+        }
+
+        /// Pick the scan **type** (Value vs Signature) from the dedicated
+        /// scan-type dropdown (PIC3/PIC6). Signature selects the C++ "Exact Sig"
+        /// sentinel condition; Value falls back to the default Exact Value
+        /// condition (so the condition/type/align controls re-appear).
+        fn set_scan_mode(&mut self, mode: ScanMode, cx: &mut Context<Self>) {
+            self.form.condition = match mode {
+                ScanMode::Signature => CondEntry::Signature,
+                ScanMode::Value => CondEntry::Value(ScanCondition::ExactValue),
+            };
+            self.mode_open = false;
             cx.notify();
         }
 
@@ -795,7 +837,10 @@ mod view {
         /// engine, formats the rows, and refreshes the table + status line.
         fn run_scan(&mut self, cx: &mut Context<Self>) {
             let Some(provider) = self.provider.clone() else {
-                self.status = "No source attached".to_string();
+                // No live data source wired yet (a provider is attached from the
+                // document; see window.rs). Surface the graceful hint instead of
+                // attempting a scan.
+                self.status = "No data source — attach a process or file to scan".to_string();
                 cx.notify();
                 return;
             };
@@ -888,7 +933,17 @@ mod view {
             });
         }
 
-        /// The currently-selected condition entry's display label.
+        /// The scan-type dropdown label (PIC3/PIC6: "Signature" vs "Value").
+        fn mode_label(&self) -> &'static str {
+            match self.form.mode() {
+                ScanMode::Signature => "Signature",
+                ScanMode::Value => "Value",
+            }
+        }
+
+        /// The currently-selected condition entry's display label. In Signature
+        /// mode the scan-type dropdown owns the label, so the condition reads as
+        /// the implicit "Exact Value".
         fn cond_label(&self) -> &'static str {
             CondEntry::entries()
                 .iter()
@@ -988,11 +1043,50 @@ mod view {
             let cur_type = self.form.value_type;
             let cur_align = self.form.alignment.max(1);
 
+            let cur_mode = self.form.mode();
+
             // A weak handle to self so the popover content (which renders in the
             // PopoverState context) can drive the panel reducer on a pick.
             let panel = cx.entity().downgrade();
 
-            // ── Condition dropdown (the C++ scan-type / condition combo) ──
+            // ── Scan-type dropdown (the C++ `m_modeCombo`: Value vs Signature) ──
+            let mode_popover = Popover::new("scanner-mode-pop")
+                .anchor(Anchor::TopLeft)
+                .open(self.mode_open)
+                .on_open_change(cx.listener(|this, open: &bool, _w, cx| {
+                    this.mode_open = *open;
+                    cx.notify();
+                }))
+                .trigger(dropdown_trigger("mode", self.mode_label()))
+                .content({
+                    let panel = panel.clone();
+                    move |_state, _window, cx| {
+                        let mut menu = dropdown_menu(cx);
+                        for (i, (mode, name)) in [
+                            (ScanMode::Value, "Value"),
+                            (ScanMode::Signature, "Signature"),
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            let mode = *mode;
+                            let panel = panel.clone();
+                            menu = menu.child(
+                                dropdown_row(("mode-row", i), *name, mode == cur_mode, cx)
+                                    .on_click(move |_e, _w, cx| {
+                                        panel
+                                            .update(cx, |this, cx| this.set_scan_mode(mode, cx))
+                                            .ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    }
+                });
+
+            // ── Condition dropdown (the C++ condition combo). In Value mode it
+            // offers the real value conditions only (the Signature sentinel lives
+            // in the scan-type dropdown above). ──
             let cond_popover = Popover::new("scanner-cond-pop")
                 .anchor(Anchor::TopLeft)
                 .open(self.cond_open)
@@ -1000,12 +1094,19 @@ mod view {
                     this.cond_open = *open;
                     cx.notify();
                 }))
-                .trigger(dropdown_trigger("cond", self.cond_label()))
+                .trigger(dropdown_trigger(
+                    "cond",
+                    format!("Scan: {}", self.cond_label()),
+                ))
                 .content({
                     let panel = panel.clone();
                     move |_state, _window, cx| {
                         let mut menu = dropdown_menu(cx);
-                        for (i, (entry, name)) in CondEntry::entries().iter().enumerate() {
+                        for (i, (entry, name)) in CondEntry::entries()
+                            .iter()
+                            .filter(|(c, _)| !matches!(c, CondEntry::Signature))
+                            .enumerate()
+                        {
                             let entry = *entry;
                             let panel = panel.clone();
                             menu = menu.child(
@@ -1082,9 +1183,24 @@ mod view {
                 });
 
             // ── Status line: muted "N results" / "Copied ..." (the C++ result
-            // count line). Blank before the first scan; the scan path always sets
-            // `status` afterwards, so an empty status means "nothing scanned yet". ──
-            let status_text = self.status.clone();
+            // count line). The scan path sets `status`; before the first scan it
+            // is blank, so fall back to a count ("N results") and — when there is
+            // no live data source — the graceful "attach a process or file to
+            // scan" hint (live scanning needs a provider wired from the document,
+            // out of scope here). ──
+            let has_provider = self.provider.is_some();
+            let status_text = if !self.status.is_empty() {
+                self.status.clone()
+            } else if !has_provider {
+                "No data source — attach a process or file to scan".to_string()
+            } else {
+                let n = self.all_rows.len();
+                if n == 1 {
+                    "1 result".to_string()
+                } else {
+                    format!("{n} results")
+                }
+            };
 
             gpui_component::v_flex()
                 .id("rcx-scanner-panel")
@@ -1114,8 +1230,11 @@ mod view {
                                         .gap(px(tokens::space::MD))
                                         .flex_wrap()
                                         .items_center()
-                                        .child(cond_popover)
+                                        // Scan-type (Value/Signature) is always shown.
+                                        .child(mode_popover)
+                                        // Value mode: Type / Scan-condition / Align.
                                         .when(vis.type_enabled, |row| row.child(type_popover))
+                                        .when(vis.type_enabled, |row| row.child(cond_popover))
                                         .when(vis.type_enabled, |row| row.child(align_popover)),
                                 )
                                 .child(
@@ -1546,11 +1665,13 @@ mod tests {
                 address: 0x1000,
                 address_text: "00000000`00001000".to_string(),
                 value_text: "42".to_string(),
+                previous_text: String::new(),
             },
             ScanRow {
                 address: 0x2000,
                 address_text: "00000000`00002000".to_string(),
                 value_text: "1337".to_string(),
+                previous_text: String::new(),
             },
         ];
         // Match by value.

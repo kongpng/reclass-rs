@@ -70,6 +70,13 @@ pub struct EditorPalette {
     pub byte_sel: Hsla,
     /// The border color for chrome accents (chevron box, source chip outline).
     pub border: Hsla,
+    /// The crisp fold disclosure triangle (`▸`/`▾`) on expandable rows — a clear
+    /// foreground (not dim) so the fold affordance reads as a real control.
+    pub fold_chevron: Hsla,
+    /// The "active line" subtle highlight — the gentle full-row fill on the
+    /// primary/cursor row (Zed's active-line background), softer than the
+    /// accent-tinted selection fill so a selected row still reads as selected.
+    pub active_line_bg: Hsla,
 }
 
 impl EditorPalette {
@@ -99,9 +106,15 @@ impl EditorPalette {
             enum_chip: t.link,
             tree_conn: t.muted_foreground,
             // Soft accent-tinted selection fill (not the hard text-selection bg).
-            selection_bg: with_alpha(t.primary, 0.14),
+            // The reclass active row is a clear band; Zed uses a gentle accent
+            // fill — 0.20 reads as a real "this row is selected" surface against
+            // the dark editor paper while staying soft (zed_ui_spec.md §5.4).
+            selection_bg: with_alpha(t.primary, 0.20),
             accent: t.primary,
-            hover_bg: t.list_hover,
+            // Hover overlay: the theme `list_hover` is tuned for the dense UI
+            // lists; lift it a touch so the per-row hover is visible over the
+            // darker editor paper (the editor paper is `background.darker`).
+            hover_bg: with_alpha(t.foreground, 0.05),
             caret: t.caret,
             paper: darker(t.background, 0.06),
             gutter_bg: darker(t.background, 0.06),
@@ -112,6 +125,12 @@ impl EditorPalette {
             heat_hot: t.red,
             byte_sel: t.link,
             border: t.border,
+            // The disclosure triangle reads in the link/accent blue — a crisp,
+            // unmistakable fold control against the dim chrome around it.
+            fold_chevron: t.link,
+            // Active-line band: a barely-there foreground wash (Zed's active-line
+            // bg), softer than the accent selection fill so the two are distinct.
+            active_line_bg: with_alpha(t.foreground, 0.03),
         }
     }
 
@@ -137,6 +156,7 @@ impl EditorPalette {
             SpanRole::HeatCold => self.heat_cold,
             SpanRole::HeatWarm => self.heat_warm,
             SpanRole::HeatHot => self.heat_hot,
+            SpanRole::FoldChevron => self.fold_chevron,
         }
     }
 

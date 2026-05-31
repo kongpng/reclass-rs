@@ -74,6 +74,13 @@ const DEFAULT_CELL_RATIO: f32 = 0.6;
 /// lists. Both the painted rows and the hit-test metrics derive from this.
 const EDITOR_LINE_HEIGHT: f32 = 1.5;
 
+/// Width (in monospace cells) of the node-kind icon gutter rendered between the
+/// address margin and the row text. It sits OUTSIDE the composed text columns, so
+/// it never disturbs hit-testing/fold/inline-edit column math (those resolve
+/// against the row-text element's own left edge); the inline-edit overlay simply
+/// adds this offset alongside the address-margin offset.
+const ICON_CELLS: f32 = 2.0;
+
 /// The key bindings for the editor surface (bound in the `RcxEditor` context).
 /// Returned so the app can register them once at startup alongside the inline
 /// field bindings ([`inline_edit::field_key_bindings`]).
@@ -153,12 +160,41 @@ impl RcxEditor {
     }
 
     /// Replace the controlled document and recompose (opening/switching a tab).
+    ///
+    /// Picks a sensible **default view root** before the first compose: when the
+    /// document declares top-level structs (a multi-struct `.rcx`), compose with
+    /// `view_root_id == 0` would otherwise stack *every* root in the grid and the
+    /// class header would name whichever top-level struct happens to sort first
+    /// (e.g. `_LIST_ENTRY` ahead of the project's `_EPROCESS`). Instead we focus
+    /// the **first declared top-level struct** — the project's main root — so the
+    /// editor opens on one struct with a correct header (the C++ rebinds the active
+    /// tab's view root the same way; window.rs relies on this "picks a view root").
     pub fn set_document(&mut self, doc: RcxDocument, cx: &mut Context<Self>) {
         self.controller = RcxController::new(doc);
+        if self.controller.view_root_id() == 0 {
+            if let Some(root_id) = self.default_view_root_id() {
+                self.controller.set_view_root_id(root_id);
+            }
+        }
         self.controller.refresh();
         self.editing = None;
         self.byte_sel.clear();
         cx.notify();
+    }
+
+    /// The id of the project's main root struct — the **first declared top-level
+    /// `Struct`** (`children_of(0)` is the root list in declaration/offset order,
+    /// the exact set `compose` walks). `None` when the tree has no top-level
+    /// struct, in which case the view falls back to the all-roots default.
+    fn default_view_root_id(&self) -> Option<u64> {
+        let tree = self.controller.tree();
+        for &idx in tree.children_of(0).iter() {
+            let n = &tree.nodes[idx];
+            if n.kind == crate::core::NodeKind::Struct {
+                return Some(n.id);
+            }
+        }
+        None
     }
 
     /// Read access to the engine (status bar / tests).
@@ -670,19 +706,28 @@ impl RcxEditor {
         let selected = self.is_row_selected(&lm);
         let hovered = self.hovered_line == Some(idx);
 
-        let bg = if selected {
-            Some(palette.selection_bg)
-        } else if hovered {
-            Some(palette.hover_bg)
-        } else {
-            None
-        };
-
         let editing_here = self
             .editing
             .as_ref()
             .filter(|e| e.line == idx)
             .map(|e| (e.field.clone(), e.col_start));
+        // The "active line" (Zed's active-line bg / reclass's highlighted current
+        // row): the row currently being edited, even when it is not part of the
+        // multi-selection. A selected row already carries the louder accent fill.
+        let active_line = editing_here.is_some();
+
+        // Row background precedence (§7): the accent-tinted selection fill wins,
+        // then the subtle active-line band, then the hover overlay. Each is a
+        // distinct, visible surface against the dark editor paper.
+        let bg = if selected {
+            Some(palette.selection_bg)
+        } else if active_line {
+            Some(palette.active_line_bg)
+        } else if hovered {
+            Some(palette.hover_bg)
+        } else {
+            None
+        };
 
         let mut row = div()
             .id(("rcx-row", idx))
@@ -758,6 +803,31 @@ impl RcxEditor {
             );
         }
 
+        // Node-kind icon gutter — a small Zed-outline-style kind glyph (struct ◆ /
+        // pointer → / array ▦ / fnptr ƒ / hex # / value •) prefixing each leaf row,
+        // distinguishing node types at a glance like the reclass tree + Zed
+        // outline. Expandable container rows carry no glyph here; their crisp fold
+        // disclosure triangle (painted in the row text) is the affordance instead.
+        // Reserved on EVERY row (a fixed `ICON_CELLS` width) so the row text starts
+        // at the same column whether or not a glyph is present — the icon lives
+        // OUTSIDE the composed text columns, so hit-testing/fold math is untouched.
+        {
+            let mut icon = div()
+                .flex_shrink_0()
+                .w(px(ICON_CELLS * self.metrics.cell_width))
+                .h(px(self.metrics.line_height))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center();
+            if let Some(kg) = geometry::kind_glyph(&lm) {
+                icon = icon
+                    .text_color(palette.role_color(kg.role))
+                    .child(SharedString::from(kg.glyph.to_string()));
+            }
+            row = row.child(icon);
+        }
+
         // The text element (static) — always painted as the base layer; it owns
         // the hitbox + row-local click routing back into the view.
         let row_paint = self.build_row_paint(idx, palette);
@@ -781,7 +851,11 @@ impl RcxEditor {
             } else {
                 0.0
             };
-            let left = px((margin + col_start.max(0) as f32) * self.metrics.cell_width);
+            // The overlay is positioned in the row's own coordinate space, so it
+            // must clear BOTH the address margin and the kind-icon gutter (both
+            // precede the row-text element) before the per-column offset.
+            let left =
+                px((margin + ICON_CELLS + col_start.max(0) as f32) * self.metrics.cell_width);
             row = row.child(
                 div()
                     .absolute()
@@ -1070,5 +1144,45 @@ mod tests {
             .selected_ids()
             .iter()
             .any(|&id| crate::controller::strip_sel_pub(id) == node_id));
+    }
+
+    #[test]
+    fn default_view_root_picks_first_top_level_struct() {
+        // Issue 3 (default root): a multi-struct .rcx with several top-level
+        // structs must open focused on the FIRST declared root struct (the
+        // project's main struct), not stack every root / name a stray one. This
+        // mirrors `RcxEditor::default_view_root_id` — the first `children_of(0)`
+        // node whose kind is Struct.
+        use crate::core::{Node, NodeKind};
+        let mut doc = RcxDocument::new();
+        // First declared top-level struct — the intended default root.
+        let main_idx = doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "_EPROCESS".into(),
+            struct_type_name: "_EPROCESS".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let main_id = doc.tree.nodes[main_idx].id;
+        // A second top-level struct that must NOT become the default root.
+        doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "_LIST_ENTRY".into(),
+            struct_type_name: "_LIST_ENTRY".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let c = RcxController::new(doc);
+        // Replicate the editor's default-root selection over the same accessors.
+        let picked = c
+            .tree()
+            .children_of(0)
+            .iter()
+            .map(|&i| &c.tree().nodes[i])
+            .find(|n| n.kind == NodeKind::Struct)
+            .map(|n| n.id);
+        assert_eq!(picked, Some(main_id), "must pick the first declared root");
     }
 }
