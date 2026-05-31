@@ -525,30 +525,70 @@ mod view {
 
     impl Render for CommandPalette {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            use gpui_component::button::{Button, ButtonVariants as _};
+            // Visual treatment mirrors Zed's command palette (crates/command_palette
+            // `render_match`): an elevated rounded modal; each row is an inset item
+            // with the command name on the left and key-cap chips on the right
+            // (`justify_between`), a subtle highlight on the selected row.
             let selected = self.model.selected();
-            let rows: Vec<_> = (0..self.model.row_count())
-                .map(|row| {
-                    let label = self.model.label_at(row).unwrap_or_default();
-                    let enabled = self
-                        .model
-                        .ranked()
-                        .get(row)
-                        .map(|e| e.enabled)
-                        .unwrap_or(true);
-                    let is_sel = selected == Some(row);
-                    Button::new(("palette-row", row))
-                        .ghost()
-                        .w_full()
-                        .selected(is_sel)
-                        .when(!enabled, |b| b.text_color(cx.theme().muted_foreground))
-                        .label(label)
-                        .on_click(cx.listener(move |this, _e, _window, cx| {
-                            this.click_row(row, cx);
-                        }))
-                        .into_any_element()
-                })
+            let entries: Vec<(String, String, bool)> = self
+                .model
+                .ranked()
+                .iter()
+                .map(|e| (e.path.clone(), e.shortcut.clone(), e.enabled))
                 .collect();
+
+            let fg = cx.theme().foreground;
+            let muted = cx.theme().muted_foreground;
+            let border = cx.theme().border;
+            let sel_bg = hsla(0., 0., 1., 0.09);
+            let cap_bg = hsla(0., 0., 1., 0.06);
+
+            let rows = entries.into_iter().enumerate().map(|(row, (path, shortcut, enabled))| {
+                let is_sel = selected == Some(row);
+                let name_color = if enabled { fg } else { muted };
+                let caps: Vec<AnyElement> = if shortcut.is_empty() {
+                    Vec::new()
+                } else {
+                    shortcut
+                        .split('+')
+                        .map(|k| {
+                            div()
+                                .px_1()
+                                .h(px(18.))
+                                .min_w(px(18.))
+                                .rounded_sm()
+                                .bg(cap_bg)
+                                .border_1()
+                                .border_color(border)
+                                .text_xs()
+                                .text_color(muted)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(k.trim().to_string())
+                                .into_any_element()
+                        })
+                        .collect()
+                };
+                div()
+                    .id(("palette-row", row))
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .py(px(5.))
+                    .rounded_md()
+                    .when(is_sel, |d| d.bg(sel_bg))
+                    .when(!is_sel, |d| d.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _e, _window, cx| this.click_row(row, cx)))
+                    .child(div().text_color(name_color).child(path))
+                    .child(gpui_component::h_flex().gap_1().children(caps))
+                    .into_any_element()
+            });
 
             gpui_component::v_flex()
                 .id("rcx-command-palette")
@@ -558,15 +598,27 @@ mod view {
                 .on_action(cx.listener(Self::on_up))
                 .on_action(cx.listener(Self::on_confirm))
                 .on_action(cx.listener(Self::on_cancel))
-                .w(px(560.))
-                .h(px(380.))
+                .w(px(580.))
+                .max_h(px(460.))
                 .bg(cx.theme().popover)
+                .rounded_lg()
                 .border_1()
-                .border_color(cx.theme().border)
-                .child(Input::new(&self.input).w_full())
+                .border_color(border)
+                .shadow_lg()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .px_2()
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(border)
+                        .child(Input::new(&self.input).w_full()),
+                )
                 .child(
                     gpui_component::v_flex()
                         .id("rcx-command-palette-list")
+                        .p_1()
+                        .gap(px(2.))
                         .flex_1()
                         .min_h_0()
                         .overflow_y_hidden()
