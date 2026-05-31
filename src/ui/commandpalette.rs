@@ -543,52 +543,55 @@ mod view {
             let sel_bg = hsla(0., 0., 1., 0.09);
             let cap_bg = hsla(0., 0., 1., 0.06);
 
-            let rows = entries.into_iter().enumerate().map(|(row, (path, shortcut, enabled))| {
-                let is_sel = selected == Some(row);
-                let name_color = if enabled { fg } else { muted };
-                let caps: Vec<AnyElement> = if shortcut.is_empty() {
-                    Vec::new()
-                } else {
-                    shortcut
-                        .split('+')
-                        .map(|k| {
-                            div()
-                                .px_1()
-                                .h(px(18.))
-                                .min_w(px(18.))
-                                .rounded_sm()
-                                .bg(cap_bg)
-                                .border_1()
-                                .border_color(border)
-                                .text_xs()
-                                .text_color(muted)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(k.trim().to_string())
-                                .into_any_element()
-                        })
-                        .collect()
-                };
-                div()
-                    .id(("palette-row", row))
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_2()
-                    .py(px(5.))
-                    .rounded_md()
-                    .when(is_sel, |d| d.bg(sel_bg))
-                    .when(!is_sel, |d| d.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _e, _window, cx| this.click_row(row, cx)))
-                    .child(div().text_color(name_color).child(path))
-                    .child(gpui_component::h_flex().gap_1().children(caps))
-                    .into_any_element()
-            });
+            let rows = entries
+                .into_iter()
+                .enumerate()
+                .map(|(row, (path, shortcut, enabled))| {
+                    let is_sel = selected == Some(row);
+                    let name_color = if enabled { fg } else { muted };
+                    let caps: Vec<AnyElement> = if shortcut.is_empty() {
+                        Vec::new()
+                    } else {
+                        shortcut
+                            .split('+')
+                            .map(|k| {
+                                div()
+                                    .px_1()
+                                    .h(px(18.))
+                                    .min_w(px(18.))
+                                    .rounded_sm()
+                                    .bg(cap_bg)
+                                    .border_1()
+                                    .border_color(border)
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(k.trim().to_string())
+                                    .into_any_element()
+                            })
+                            .collect()
+                    };
+                    div()
+                        .id(("palette-row", row))
+                        .flex()
+                        .flex_row()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .py(px(5.))
+                        .rounded_md()
+                        .when(is_sel, |d| d.bg(sel_bg))
+                        .when(!is_sel, |d| d.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _e, _window, cx| this.click_row(row, cx)))
+                        .child(div().text_color(name_color).child(path))
+                        .child(gpui_component::h_flex().gap_1().children(caps))
+                        .into_any_element()
+                });
 
             gpui_component::v_flex()
                 .id("rcx-command-palette")

@@ -5,6 +5,12 @@
 //! `startpage.h`, `titlebar.*`. **FOUNDATION** — this stage establishes the
 //! shared scaffolding every other UI piece plugs into (ARCHITECTURE §5):
 //!
+//! - [`design`] — the shared **Zed design system**: spacing/radius/border/
+//!   shadow/type tokens + semantic color accessors (reading `cx.theme()`) +
+//!   small reusable surface builders. Every surface uses it for a consistent,
+//!   themeable look (written spec: `_design/zed_ui_spec.md`).
+//! - [`menubar`] / [`statusbar`] — pre-declared chrome stubs the chrome surface
+//!   stage fills in (menu row, bottom status strip).
 //! - [`state`] — the gpui-free application-state types (open documents/tabs,
 //!   active document, active data source, selection, theme handle), with the
 //!   window-level reducers unit-tested headlessly.
@@ -26,6 +32,7 @@
 
 pub mod commandpalette;
 pub mod contextmenu;
+pub mod design;
 pub mod dialogs;
 pub mod docks;
 pub mod editor;
@@ -34,6 +41,7 @@ pub mod findbar;
 pub mod fuzzy;
 pub mod gotoaddress;
 pub mod hextoolbar;
+pub mod menubar;
 pub mod messagebox;
 pub mod optionsdialog;
 pub mod panels;
@@ -42,6 +50,7 @@ pub mod scannerpanel;
 pub mod sourcechooser;
 pub mod startpage;
 pub mod state;
+pub mod statusbar;
 pub mod tabs;
 pub mod theme_apply;
 pub mod titlebar;

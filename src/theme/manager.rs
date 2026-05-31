@@ -613,6 +613,8 @@ mod tests {
                 "Light",
                 "VS2022 Dark",
                 "Warm",
+                // zed_one_dark.json sorts last ('z' > 'w'); appended cleanly.
+                "Zed One Dark",
             ]
         );
     }

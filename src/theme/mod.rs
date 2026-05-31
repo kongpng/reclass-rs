@@ -9,7 +9,7 @@
 //!   `to_json` / `from_json` derivation pipeline.
 //! - [`manager`] — [`ThemeManager`]: built-in + user themes, current selection,
 //!   CRUD, persistence, preview, and the `themeChanged` observer registry.
-//! - [`defaults`] — the 8 shipped default theme JSON files, embedded.
+//! - [`defaults`] — the shipped default theme JSON files, embedded.
 //! - `editor` — the GPUI `ThemeEditor` view (behind the `ui` feature).
 //!
 //! Logic (`color` / `model` / `manager`) builds with `--no-default-features`

@@ -159,27 +159,27 @@ pub fn render_titlebar(
         .text_color(cx.theme().foreground)
         .child("Reclass");
 
-    // Workspace layout-toggle pair — exclusive (`m_btnLayoutOff`/`m_btnLayoutOn`).
-    // Glyphs stand in for the `layout-sidebar-left(-off).svg` icons.
-    let layout_off = {
+    // Workspace (sidebar) toggle — a single clean ghost icon button (Zed's panel
+    // toggle), replacing the crude exclusive glyph pair. Selected = sidebar shown.
+    let sidebar_open = preset == LayoutPreset::Workspace;
+    let sidebar_btn = {
         let cb = on_layout.clone();
-        chrome_toggle(
-            "layout-off",
-            "\u{25AF}", // ▯ editor-only
-            preset == LayoutPreset::Off,
-            "Hide workspace",
-            move |w, cx| cb(LayoutPreset::Off, w, cx),
-        )
-    };
-    let layout_on = {
-        let cb = on_layout.clone();
-        chrome_toggle(
-            "layout-on",
-            "\u{25A8}", // ▨ editor + sidebar
-            preset == LayoutPreset::Workspace,
-            "Show workspace",
-            move |w, cx| cb(LayoutPreset::Workspace, w, cx),
-        )
+        let next = if sidebar_open {
+            LayoutPreset::Off
+        } else {
+            LayoutPreset::Workspace
+        };
+        Button::new("toggle-sidebar")
+            .ghost()
+            .small()
+            .selected(sidebar_open)
+            .child("\u{258C}") // ▌ left panel
+            .tooltip(if sidebar_open {
+                "Hide workspace"
+            } else {
+                "Show workspace"
+            })
+            .on_click(move |_e, w, cx| cb(next, w, cx))
     };
 
     // View-mode toggle (tree ⇄ rendered C/C++). A single button labelled with the
@@ -204,26 +204,23 @@ pub fn render_titlebar(
 
     TitleBar::new()
         .child(app_label)
-        // The menu bar lands with the menu workflow; reserve its slot.
-        .child(div().flex_none().w_2())
         // Stretch pushes the controls to the right.
         .child(div().flex_1())
         .child(
             gpui_component::h_flex()
                 .flex_none()
-                .gap_1()
+                .gap_2()
                 .items_center()
-                .child(layout_off)
-                .child(layout_on)
-                .child(div().w_2())
+                .when(has_doc && !title.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(title.clone()),
+                    )
+                })
                 .child(view_btn)
-                .child(div().w_2())
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(title),
-                ),
+                .child(sidebar_btn),
         )
 }
 

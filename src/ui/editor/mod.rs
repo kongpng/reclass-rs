@@ -650,7 +650,12 @@ impl RcxEditor {
         // address column). Fixed width from `offset_hex_digits` so EVERY row's
         // main text starts at the same column; `lm.offset_text` is pre-padded by
         // compose (continuation rows render the "·" marker, header/footer blank).
-        let addr_cols = self.controller.last_result().layout.offset_hex_digits.max(0) as f32;
+        let addr_cols = self
+            .controller
+            .last_result()
+            .layout
+            .offset_hex_digits
+            .max(0) as f32;
         if addr_cols > 0.0 {
             row = row.child(
                 div()
@@ -675,8 +680,17 @@ impl RcxEditor {
         // Inline-edit overlay positioned at the edited column — offset by the
         // address-margin width so it lands over the field, not the margin.
         if let Some((field, col_start)) = editing_here {
-            let hex_digits = self.controller.last_result().layout.offset_hex_digits.max(0) as f32;
-            let margin = if hex_digits > 0.0 { hex_digits + 2.0 } else { 0.0 };
+            let hex_digits = self
+                .controller
+                .last_result()
+                .layout
+                .offset_hex_digits
+                .max(0) as f32;
+            let margin = if hex_digits > 0.0 {
+                hex_digits + 2.0
+            } else {
+                0.0
+            };
             let left = px((margin + col_start.max(0) as f32) * self.metrics.cell_width);
             row = row.child(
                 div()

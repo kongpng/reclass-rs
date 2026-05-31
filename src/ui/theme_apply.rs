@@ -85,6 +85,28 @@ pub enum UiColor {
     DangerForeground,
     Warning,
     WarningForeground,
+    // Primary button / brand accent (the Zed-blue action color).
+    Primary,
+    PrimaryForeground,
+    PrimaryHover,
+    PrimaryActive,
+    // Named accent palette (gpui-component's `blue`/`green`/… roles). The bespoke
+    // editor surface reads these for SYNTAX coloring (see `ui/editor/palette.rs`),
+    // so we drive them from our theme's syntax/marker fields rather than leaving
+    // them at the gpui-component built-in defaults. Without this, theme switches
+    // would not retint editor syntax.
+    Blue,
+    BlueLight,
+    Green,
+    GreenLight,
+    Cyan,
+    CyanLight,
+    Yellow,
+    YellowLight,
+    Red,
+    RedLight,
+    Magenta,
+    MagentaLight,
 }
 
 /// One resolved palette assignment: a gpui-component color field + the concrete
@@ -114,6 +136,25 @@ mod fallback {
     pub const SURFACE: Color = Color::rgb(0x25, 0x25, 0x25);
     pub const BUTTON: Color = Color::rgb(0x33, 0x33, 0x33);
     pub const HOVER: Color = Color::rgb(0x2a, 0x2a, 0x2a);
+    // Accent palette fallbacks (Zed One Dark-ish), for themes that omit the
+    // corresponding syntax field. These only bite for sparse user themes; the
+    // accent-blue and red roles always derive from always-present fields
+    // (indHoverSpan / markerPtr), so they need no fallback const here.
+    pub const GREEN: Color = Color::rgb(0x98, 0xc3, 0x79); // string/value green
+    pub const CYAN: Color = Color::rgb(0x56, 0xb6, 0xc2); // preproc / class cyan
+    pub const YELLOW: Color = Color::rgb(0xe5, 0xc0, 0x7b); // type / rtti yellow
+    pub const MAGENTA: Color = Color::rgb(0xc6, 0x78, 0xdd); // keyword purple
+}
+
+/// Lighten a [`Color`] toward white by `f` (0..1) for the `*_light` accent roles.
+/// `f = 0` keeps the color; `f = 1` is white.
+fn lighten(c: Color, f: f32) -> Color {
+    let mix = |ch: u8| -> u8 {
+        (ch as f32 + (255.0 - ch as f32) * f)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgb(mix(c.r), mix(c.g), mix(c.b))
 }
 
 /// Resolve our [`Theme`] into the concrete gpui-component palette assignments —
@@ -155,6 +196,21 @@ pub fn resolve_palette(theme: &Theme) -> Vec<PaletteEntry> {
     let marker_error = theme.marker_error.unwrap_or(Color::rgb(0x5a, 0x1d, 0x1d));
     let marker_ptr = theme.marker_ptr.unwrap_or(Color::rgb(0xf4, 0x47, 0x47));
     let marker_cycle = theme.marker_cycle.unwrap_or(Color::rgb(0xe8, 0xa3, 0x5c));
+
+    // Accent palette → gpui-component's named accent roles, which the bespoke
+    // editor surface reads for SYNTAX coloring. We bind each gpui role to the
+    // theme's closest semantic syntax/marker field so a theme switch retints the
+    // editor. `link` (= indHoverSpan) is the brand blue; primary/accent buttons
+    // ride it too.
+    let blue = link; // brand accent blue (indHoverSpan)
+    let magenta = theme.syntax_keyword.unwrap_or(fallback::MAGENTA);
+    let green = theme.syntax_string.unwrap_or(fallback::GREEN);
+    let green_light = theme.syntax_comment.unwrap_or(fallback::GREEN);
+    let cyan = theme.syntax_preproc.unwrap_or(fallback::CYAN);
+    let yellow = theme.syntax_type.unwrap_or(fallback::YELLOW);
+    let red = marker_ptr;
+    // Primary action color = the focus/brand blue (Zed's action blue).
+    let primary = border_focused;
 
     use UiColor::*;
     vec![
@@ -320,6 +376,72 @@ pub fn resolve_palette(theme: &Theme) -> Vec<PaletteEntry> {
             field: WarningForeground,
             color: foreground,
         },
+        // ── Primary / brand accent (Zed action blue) ──
+        PaletteEntry {
+            field: Primary,
+            color: primary,
+        },
+        PaletteEntry {
+            field: PrimaryForeground,
+            color: background,
+        },
+        PaletteEntry {
+            field: PrimaryHover,
+            color: lighten(primary, 0.12),
+        },
+        PaletteEntry {
+            field: PrimaryActive,
+            color: lighten(primary, 0.20),
+        },
+        // ── Named accent palette → editor syntax roles ──
+        PaletteEntry {
+            field: Blue,
+            color: blue,
+        },
+        PaletteEntry {
+            field: BlueLight,
+            color: lighten(blue, 0.18),
+        },
+        PaletteEntry {
+            field: Green,
+            color: green,
+        },
+        PaletteEntry {
+            field: GreenLight,
+            color: green_light,
+        },
+        PaletteEntry {
+            field: Cyan,
+            color: cyan,
+        },
+        PaletteEntry {
+            field: CyanLight,
+            color: lighten(cyan, 0.18),
+        },
+        PaletteEntry {
+            field: Yellow,
+            color: yellow,
+        },
+        PaletteEntry {
+            field: YellowLight,
+            color: lighten(yellow, 0.18),
+        },
+        PaletteEntry {
+            field: Red,
+            color: red,
+        },
+        PaletteEntry {
+            field: RedLight,
+            color: lighten(red, 0.18),
+        },
+        PaletteEntry {
+            field: Magenta,
+            color: magenta,
+        },
+        PaletteEntry {
+            field: MagentaLight,
+            color: lighten(magenta, 0.18),
+        },
     ]
 }
 
@@ -405,6 +527,22 @@ fn apply_entry(colors: &mut gpui_component::ThemeColor, entry: &PaletteEntry) {
         DangerForeground => colors.danger_foreground = c,
         Warning => colors.warning = c,
         WarningForeground => colors.warning_foreground = c,
+        Primary => colors.primary = c,
+        PrimaryForeground => colors.primary_foreground = c,
+        PrimaryHover => colors.primary_hover = c,
+        PrimaryActive => colors.primary_active = c,
+        Blue => colors.blue = c,
+        BlueLight => colors.blue_light = c,
+        Green => colors.green = c,
+        GreenLight => colors.green_light = c,
+        Cyan => colors.cyan = c,
+        CyanLight => colors.cyan_light = c,
+        Yellow => colors.yellow = c,
+        YellowLight => colors.yellow_light = c,
+        Red => colors.red = c,
+        RedLight => colors.red_light = c,
+        Magenta => colors.magenta = c,
+        MagentaLight => colors.magenta_light = c,
     }
 }
 
@@ -435,8 +573,20 @@ impl ThemeRegistryGlobal {
     /// persistent settings store is a later step.
     pub fn get(cx: &mut gpui::App) -> std::rc::Rc<std::cell::RefCell<crate::theme::ThemeManager>> {
         if !cx.has_global::<ThemeRegistryGlobal>() {
+            // Seed the launch selection to "Zed One Dark" (the port's native
+            // Zed One Dark theme) so the app opens on it. The manager's generic
+            // fallback (first "VS2022" built-in) is unchanged — this only sets
+            // the persisted `"theme"` key the constructor reads. A real
+            // persistent settings store will replace `MemSettings` later; until
+            // then this is the app's default theme.
+            let mut settings = crate::theme::MemSettings::new();
+            crate::theme::SettingsStore::set(
+                &mut settings,
+                "theme",
+                super::design::DEFAULT_THEME_NAME,
+            );
             let manager = crate::theme::ThemeManager::new(
-                Box::new(crate::theme::MemSettings::new()),
+                Box::new(settings),
                 crate::theme::ThemeManager::default_builtin_dir(),
                 crate::theme::ThemeManager::default_user_dir(),
             );
@@ -490,6 +640,18 @@ pub fn apply_theme(theme: &Theme, window: &mut gpui::Window, cx: &mut gpui::App)
     for entry in &palette {
         apply_entry(&mut gtheme.colors, entry);
     }
+
+    // Zed-like global typography + surface geometry (design tokens). Comfortable
+    // ~14px UI text, a real monospace for the editor, small radii on elevated
+    // surfaces, restrained shadows. See `ui/design.rs` for the token source.
+    use super::design::tokens;
+    gtheme.font_family = tokens::font::UI_FAMILY.into();
+    gtheme.font_size = gpui::px(tokens::font::UI_MD);
+    gtheme.mono_font_family = tokens::font::MONO_FAMILY.into();
+    gtheme.mono_font_size = gpui::px(tokens::font::EDITOR_SIZE);
+    gtheme.radius = gpui::px(tokens::radius::MD);
+    gtheme.radius_lg = gpui::px(tokens::radius::LG);
+    gtheme.shadow = true;
 
     window.refresh();
 }
@@ -624,6 +786,73 @@ mod tests {
             // Core fields always present.
             assert!(lookup(&p, UiColor::Background).is_some(), "{}", t.name);
             assert!(lookup(&p, UiColor::Foreground).is_some(), "{}", t.name);
+            // The named accent palette (editor SYNTAX roles) always resolves too.
+            for f in [
+                UiColor::Primary,
+                UiColor::Blue,
+                UiColor::Green,
+                UiColor::Cyan,
+                UiColor::Yellow,
+                UiColor::Red,
+                UiColor::Magenta,
+            ] {
+                assert!(lookup(&p, f).is_some(), "{}: {:?} unresolved", t.name, f);
+            }
         }
+    }
+
+    #[test]
+    fn accent_palette_binds_to_syntax_fields() {
+        // The named accent roles the editor reads for syntax must follow the
+        // theme's syntax/marker/accent fields (a theme switch retints the editor).
+        // Use a theme that actually ships the syntax fields.
+        let t = Theme::from_json(&serde_json::json!({
+            "name": "Syntax",
+            "syntaxKeyword": "#c678dd",
+            "syntaxString": "#98c379",
+            "syntaxPreproc": "#56b6c2",
+            "syntaxType": "#e5c07b",
+            "markerPtr": "#e06c75",
+            "indHoverSpan": "#61afef",
+            "borderFocused": "#61afef"
+        }));
+        let p = resolve_palette(&t);
+        // Magenta = syntaxKeyword, Green = syntaxString, Cyan = syntaxPreproc,
+        // Yellow = syntaxType, Red = markerPtr, Blue = indHoverSpan, Primary = borderFocused.
+        assert_eq!(lookup(&p, UiColor::Magenta), t.syntax_keyword);
+        assert_eq!(lookup(&p, UiColor::Green), t.syntax_string);
+        assert_eq!(lookup(&p, UiColor::Cyan), t.syntax_preproc);
+        assert_eq!(lookup(&p, UiColor::Yellow), t.syntax_type);
+        assert_eq!(lookup(&p, UiColor::Red), t.marker_ptr);
+        assert_eq!(lookup(&p, UiColor::Blue), t.ind_hover_span);
+        assert_eq!(lookup(&p, UiColor::Primary), t.border_focused);
+    }
+
+    #[test]
+    fn zed_one_dark_maps_to_one_dark_colors() {
+        // The bundled Zed One Dark theme resolves onto the expected One Dark hues.
+        let json = crate::theme::DEFAULT_THEMES
+            .iter()
+            .find(|(name, _)| *name == "zed_one_dark.json")
+            .map(|(_, j)| *j)
+            .expect("zed_one_dark default present");
+        let t = Theme::from_json(&serde_json::from_str(json).unwrap());
+        assert_eq!(t.name, "Zed One Dark");
+        let p = resolve_palette(&t);
+        // Core One Dark chrome.
+        assert_eq!(lookup(&p, UiColor::Background), Color::parse("#282c34"));
+        assert_eq!(lookup(&p, UiColor::Foreground), Color::parse("#c8ccd4"));
+        assert_eq!(lookup(&p, UiColor::Border), Color::parse("#3b414d"));
+        assert_eq!(
+            lookup(&p, UiColor::MutedForeground),
+            Color::parse("#828997")
+        );
+        // Accent blue + syntax purple/green/yellow.
+        assert_eq!(lookup(&p, UiColor::Primary), Color::parse("#61afef"));
+        assert_eq!(lookup(&p, UiColor::Magenta), Color::parse("#c678dd"));
+        assert_eq!(lookup(&p, UiColor::Green), Color::parse("#98c379"));
+        assert_eq!(lookup(&p, UiColor::Yellow), Color::parse("#e5c07b"));
+        // Dark mode inferred from the dark background.
+        assert!(is_dark(&t));
     }
 }
