@@ -1163,7 +1163,13 @@ impl RcxEditor {
         // on hover. Positioned in the row's own coordinate space, so it clears the
         // address margin + the kind-icon gutter (both precede the row text) before
         // the per-column offset — exactly like the inline-edit overlay.
-        if lm.line_kind == LineKind::CommandRow {
+        // Suppress the hover overlay while this command row's base address is being
+        // inline-edited — otherwise its interactive hitbox sits ON TOP of the edit
+        // field, occluding it (the field opens but is hidden behind the tooltip
+        // strip and never receives the click/focus). Skipping it while editing lets
+        // the `BaseAddress` field render + focus.
+        let editing_this_row = self.editing.as_ref().map(|e| e.line) == Some(idx);
+        if lm.line_kind == LineKind::CommandRow && !editing_this_row {
             let text = self.line_text_owned(idx);
             let addr = crate::compose::command_row_addr_span(&text);
             if addr.valid && addr.end > addr.start {
@@ -1179,7 +1185,7 @@ impl RcxEditor {
                     0.0
                 };
                 let cell = self.metrics.cell_width;
-                let left = px((margin + ICON_CELLS + addr.start.max(0) as f32) * cell);
+                let left = px((margin + addr.start.max(0) as f32) * cell);
                 let width = px(((addr.end - addr.start).max(1) as f32) * cell);
                 let base_address = self.controller.last_result().layout.base_address;
                 let module: SharedString = self.controller.document().provider.name().into();
@@ -1210,6 +1216,12 @@ impl RcxEditor {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                // Stop the row-text element's global mouse handler from
+                                // ALSO running for this same click — otherwise it
+                                // re-enters `on_row_mouse_down` with the active edit set
+                                // and commits/closes the base-address field the instant
+                                // it opens (the address edit appeared to "do nothing").
+                                cx.stop_propagation();
                                 this.on_row_mouse_down(idx, addr_click_x, e.modifiers, window, cx);
                             }),
                         )
@@ -1249,14 +1261,16 @@ impl RcxEditor {
             // NAME column and does not slide one column left onto the type token
             // (item 3: the earlier overlay covered only the address margin, not the
             // per-target column nor the accent border).
-            let left = px(BORDER_L_PX + (margin + ICON_CELLS + col_start.max(0) as f32) * cell);
+            let left = px(BORDER_L_PX + (margin + col_start.max(0) as f32) * cell);
             // The opaque band spans the edited column `[col_start, col_end)` (a
             // generous minimum so short seeds still get a visible field box).
             let editing_width = ((col_end - col_start).max(0) as f32).max(6.0);
-            // The inline field paints over the static row text. Give it an OPAQUE
-            // paper-colored band so the column's static glyphs (the type token, the
-            // pre-edit name) do not bleed through behind the seeded text — without
-            // this the field reads as garbled overlap ("int64_teateTime"), item 3.
+            // The inline field paints over the static row text. Give it a FULLY
+            // OPAQUE editor-paper band (not the semi-transparent active-line fill,
+            // which let the column's static glyphs — the type token / pre-edit name —
+            // bleed through behind the seeded text and read as garbled overlap
+            // "hexChex64"/"int64_teateTime"). A 1px accent ring + slight rounding make
+            // it read as a Zed inline input.
             row = row.child(
                 div()
                     .absolute()
@@ -1264,7 +1278,10 @@ impl RcxEditor {
                     .left(left)
                     .h(px(self.metrics.line_height))
                     .w(px((editing_width + 1.0) * cell))
-                    .bg(palette.active_line_fill())
+                    .bg(palette.paper)
+                    .border_1()
+                    .border_color(palette.accent)
+                    .rounded_sm()
                     // The field entity's own `Render` carries the focus/key-context
                     // wrapper (`.track_focus` + `.key_context("RcxFieldInput")` +
                     // every `.on_action(..)` field handler). Embedding the entity —
