@@ -548,10 +548,21 @@ fn command_row(
         .when(enabled, |r| {
             r.cursor_pointer()
                 .hover(|s| s.bg(color::hover_overlay(cx)))
-                .on_click(cx.listener(move |this, _ev, _window, cx| {
-                    cx.stop_propagation();
-                    this.choose_command(command.clone(), cx);
-                }))
+                // Dispatch on mouse-DOWN, not click (mouse-up). A fly-out submenu
+                // panel (Import/Export/Examples/Data Source) is a `deferred` child
+                // positioned OUTSIDE the top-level dropdown's bounds, so pressing a
+                // fly-out item triggers the dropdown's `on_mouse_down_out` (a
+                // down-outside-me close) which tears the row down BEFORE its
+                // mouse-up/click could fire — leaving every submenu item a no-op.
+                // Acting on the down event runs the command in the same dispatch
+                // pass, before the close takes effect next frame.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.choose_command(command.clone(), cx);
+                    }),
+                )
         })
         .child(check_slot)
         .child(div().flex_1().min_w_0().child(label.to_string()))
