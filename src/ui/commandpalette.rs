@@ -246,19 +246,33 @@ pub struct SourceMenuEntry {
     pub active: bool,
 }
 
+/// Build one Recent-Files menu row label: the 1-based index + the file name,
+/// "1  foo.rcx" (the C++ `&%1  %2` numbered accelerator label;
+/// `updateRecentFilesMenu`, main.cpp:8790, minus the `&` mnemonic). Pure;
+/// unit-tested. `index` is the zero-based position in the recent list.
+fn recent_menu_label(index: usize, file_name: &str) -> String {
+    format!("{}  {}", index + 1, file_name)
+}
+
 /// The Reclass menu bar as data, with the **dynamic** Recent-Files and saved
 /// Data-Source rows supplied by the host. `default_menu_tree()` passes empties
 /// (the construction-time tree); the window rebuilds with live data via
 /// [`MenuBar::set_menus`](crate::ui::menubar::MenuBar::set_menus).
 pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -> Vec<MenuNode> {
     use MenuNode as N;
-    // Recent Files children — the C++ shows "(empty)" disabled when none.
+    // Recent Files children — the C++ shows "(empty)" disabled when none, and
+    // otherwise renders each row as "&N  filename" (a 1-based accelerator index +
+    // the file name; `updateRecentFilesMenu`, main.cpp:8790). We mirror the
+    // numbered prefix so the menu reads "1  foo.rcx", "2  bar.rcx", … (the `&`
+    // mnemonic is dropped — this port shows the bare number, matching the rest of
+    // the bar's de-mnemonic'd titles).
     let recent_children: Vec<MenuNode> = if recent.is_empty() {
         vec![N::disabled_item("(empty)", "", "file.recent.empty")]
     } else {
         recent
             .iter()
-            .map(|e| N::item(&e.label, "", &e.command))
+            .enumerate()
+            .map(|(i, e)| N::item(&recent_menu_label(i, &e.label), "", &e.command))
             .collect()
     };
     // Data Source children — the registered built-in providers, then any saved
@@ -1167,6 +1181,44 @@ mod tests {
             .find(|e| e.command == "file.recent.empty")
             .expect("empty placeholder present");
         assert!(!placeholder.enabled);
+    }
+
+    #[test]
+    fn recent_menu_label_numbers_rows_one_based() {
+        use super::recent_menu_label;
+        assert_eq!(recent_menu_label(0, "foo.rcx"), "1  foo.rcx");
+        assert_eq!(recent_menu_label(1, "bar.rcx"), "2  bar.rcx");
+        assert_eq!(recent_menu_label(9, "tenth.rcx"), "10  tenth.rcx");
+    }
+
+    #[test]
+    fn recent_submenu_rows_render_numbered_labels() {
+        use super::{menu_tree_with, RecentMenuEntry};
+        let recent = vec![
+            RecentMenuEntry {
+                label: "alpha.rcx".into(),
+                command: "file.recent.0".into(),
+            },
+            RecentMenuEntry {
+                label: "beta.rcx".into(),
+                command: "file.recent.1".into(),
+            },
+        ];
+        let entries = flatten_menu_bar(&menu_tree_with(&recent, &[]));
+        // The flattened path carries the numbered display label (the C++
+        // "&N  filename" rendered as "N  filename").
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "File > Recent Files > 1  alpha.rcx"),
+            "first recent row should be numbered '1  alpha.rcx'"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "File > Recent Files > 2  beta.rcx"),
+            "second recent row should be numbered '2  beta.rcx'"
+        );
     }
 
     #[test]

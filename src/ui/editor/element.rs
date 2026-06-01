@@ -247,16 +247,24 @@ impl Element for RowElement {
             // Byte-selection drag (item 11): while the left button is held and the
             // pointer moves over this row's hitbox, extend the armed byte selection
             // to the byte under the cursor. The editor decides whether a selection
-            // is armed (a no-op otherwise), so this is cheap.
+            // is armed (a no-op otherwise), so this is cheap. When NOT dragging, the
+            // same move drives the hover popup (item 13): the editor resolves the
+            // hovered column → value-history / disasm / struct-preview card.
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble || !event.dragging() || !hitbox.is_hovered(window)
-                {
+                if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
                 }
                 let rel_x = f32::from(event.position.x - left).max(0.0);
-                let _ = editor.update(cx, |this, cx| {
-                    this.dispatch_row_drag(line, rel_x, window, cx);
-                });
+                if event.dragging() {
+                    let _ = editor.update(cx, |this, cx| {
+                        this.dispatch_row_drag(line, rel_x, window, cx);
+                    });
+                } else {
+                    let pos = event.position;
+                    let _ = editor.update(cx, |this, cx| {
+                        this.dispatch_row_hover(line, rel_x, pos, window, cx);
+                    });
+                }
             });
         }
     }

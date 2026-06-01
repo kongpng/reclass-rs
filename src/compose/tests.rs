@@ -11,8 +11,8 @@
 
 use super::{
     array_elem_count_span_for, array_elem_type_span_for, command_row_root_name_span,
-    command_row_src_span, compose, compose_default, pointer_kind_span_for, pointer_target_span_for,
-    ComposeResult, LineGeometry, K_FOLD_COL,
+    command_row_src_span, compose, compose_default, format_preview, pointer_kind_span_for,
+    pointer_target_span_for, ComposeResult, LineGeometry, K_FOLD_COL,
 };
 use crate::core::linemeta::{find_chip, K_COMMAND_ROW_ID};
 use crate::core::{ChipKind, LineKind, LineMeta, Node, NodeKind, NodeTree};
@@ -1976,4 +1976,54 @@ fn line_geometry_command_row_flush_left() {
         ..Default::default()
     };
     assert_eq!(LineGeometry::for_line(&lm).prefix_width, 0);
+}
+
+// ── format_preview unit tests (port of `compose.cpp:18-56` formatPreview) ───
+
+#[test]
+fn format_preview_single_float() {
+    // 1.0f little-endian = 0x3F800000.
+    let d: [u8; 4] = [0x00, 0x00, 0x80, 0x3F];
+    assert_eq!(format_preview(&d, 4, &[NodeKind::Float]), "1.0000f");
+}
+
+#[test]
+fn format_preview_single_uint32_hex() {
+    // 0x12345678 little-endian.
+    let d: [u8; 4] = [0x78, 0x56, 0x34, 0x12];
+    assert_eq!(format_preview(&d, 4, &[NodeKind::UInt32]), "0x12345678");
+}
+
+#[test]
+fn format_preview_single_pointer64_nullptr() {
+    let d: [u8; 8] = [0; 8];
+    assert_eq!(format_preview(&d, 8, &[NodeKind::Pointer64]), "nullptr");
+}
+
+#[test]
+fn format_preview_float_x2_lanes() {
+    // Lane 0 = -99999+f overflow cap (1e6f), lane 1 = -0.0f.
+    let mut d = [0u8; 8];
+    d[0..4].copy_from_slice(&(1.0e6f32).to_le_bytes());
+    d[4..8].copy_from_slice(&(-0.0f32).to_le_bytes());
+    let out = format_preview(&d, 8, &[NodeKind::Float, NodeKind::Float]);
+    assert_eq!(out, "99999+f, -0.000f");
+}
+
+#[test]
+fn format_preview_utf8_printable_only() {
+    let d = *b"Hi\x00\x00\x00\x00\x00\x00";
+    assert_eq!(format_preview(&d, 8, &[NodeKind::UTF8]), "\"Hi\"");
+}
+
+#[test]
+fn format_preview_utf8_nonprintable_first_is_empty() {
+    let d = [0x01u8, b'A', 0, 0, 0, 0, 0, 0];
+    assert_eq!(format_preview(&d, 8, &[NodeKind::UTF8]), "");
+}
+
+#[test]
+fn format_preview_empty_kinds() {
+    let d = [0u8; 4];
+    assert_eq!(format_preview(&d, 4, &[]), "");
 }

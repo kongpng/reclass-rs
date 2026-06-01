@@ -119,6 +119,29 @@ actions!(
         // Collapse-all / expand-all (item 19).
         EditorCollapseAll,
         EditorExpandAll,
+        // Shift+Up/Down — extend the node multi-selection (range-select, the C++
+        // `nodeClicked(.., ShiftModifier)` keyboard path). Distinct from plain
+        // Up/Down (which REPLACE the selection) and Ctrl+Shift+Up/Down (reorder).
+        EditorSelectUp,
+        EditorSelectDown,
+        // Shift+PageUp/Down/Home/End — extend the selection to the page/document
+        // bound (the modified-nav variants; editor.cpp handleNormalKey passes the
+        // live modifiers into nodeClicked for PageUp/Down/Home/End too).
+        EditorSelectPageUp,
+        EditorSelectPageDown,
+        EditorSelectHome,
+        EditorSelectEnd,
+        // Ctrl+A — select all sibling nodes of the current node (editor.cpp
+        // `Key_A` + ControlModifier → range-select first..last).
+        EditorSelectAll,
+        // Ctrl+C / Ctrl+X / Ctrl+V — node-level clipboard (copy/cut/paste the
+        // selected nodes as a portable `rcx-clipboard/v1` blob). The editor-surface
+        // ctrl-c/x/v (the field-input ones are scoped to RcxFieldInput).
+        EditorCopyNodes,
+        EditorCutNodes,
+        EditorPasteNodes,
+        // Ctrl+Shift+C — copy the current node's address (`0x{addr:X}`) as text.
+        EditorCopyAddress,
     ]
 );
 
@@ -199,7 +222,41 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         // Collapse-all / expand-all (item 19).
         KeyBinding::new("ctrl-shift-[", EditorCollapseAll, Some("RcxEditor")),
         KeyBinding::new("ctrl-shift-]", EditorExpandAll, Some("RcxEditor")),
+        // Shift+arrow / Shift+page / Shift+Home/End — extend the node selection.
+        // The more-specific shift chords take priority over the plain nav
+        // bindings above (gpui longest-modifier-match), and over `ctrl-shift-up`
+        // (reorder) since that adds ctrl.
+        KeyBinding::new("shift-up", EditorSelectUp, Some("RcxEditor")),
+        KeyBinding::new("shift-down", EditorSelectDown, Some("RcxEditor")),
+        KeyBinding::new("shift-pageup", EditorSelectPageUp, Some("RcxEditor")),
+        KeyBinding::new("shift-pagedown", EditorSelectPageDown, Some("RcxEditor")),
+        KeyBinding::new("shift-home", EditorSelectHome, Some("RcxEditor")),
+        KeyBinding::new("shift-end", EditorSelectEnd, Some("RcxEditor")),
+        // Ctrl+A select-all siblings.
+        KeyBinding::new("ctrl-a", EditorSelectAll, Some("RcxEditor")),
+        KeyBinding::new("cmd-a", EditorSelectAll, Some("RcxEditor")),
+        // Node clipboard (copy/cut/paste). Ctrl+Shift+C (copy address) is bound
+        // BEFORE ctrl-c so the more-specific chord matches first.
+        KeyBinding::new("ctrl-shift-c", EditorCopyAddress, Some("RcxEditor")),
+        KeyBinding::new("cmd-shift-c", EditorCopyAddress, Some("RcxEditor")),
+        KeyBinding::new("ctrl-c", EditorCopyNodes, Some("RcxEditor")),
+        KeyBinding::new("cmd-c", EditorCopyNodes, Some("RcxEditor")),
+        KeyBinding::new("ctrl-x", EditorCutNodes, Some("RcxEditor")),
+        KeyBinding::new("cmd-x", EditorCutNodes, Some("RcxEditor")),
+        KeyBinding::new("ctrl-v", EditorPasteNodes, Some("RcxEditor")),
+        KeyBinding::new("cmd-v", EditorPasteNodes, Some("RcxEditor")),
     ]
+}
+
+/// Events the editor surface emits up to its host (the window/tab shell). The C++
+/// `RcxEditor` raised Qt signals the `MainWindow` connected to; gpui's
+/// [`EventEmitter`] is the analogue. The host subscribes via `cx.subscribe`.
+#[derive(Clone, Debug)]
+pub enum RcxEditorEvent {
+    /// Ctrl+Click on a navigable type/name token requests opening that node's
+    /// referenced struct (`ref_id`) in a NEW editor tab (item 11, the C++
+    /// `openTypeInNewTabRequested`). The host creates the tab + sets its view root.
+    OpenTypeInNewTab { ref_id: u64 },
 }
 
 /// The bespoke editor surface view.
@@ -216,6 +273,32 @@ pub struct RcxEditor {
     byte_sel: ByteSelection,
     /// The line the mouse is hovering (for the hover-row background; §7).
     hovered_line: Option<usize>,
+    /// The open hover popup (item 13), if the cursor is over a qualifying value
+    /// column (heated value / func-or-void pointer / typed pointer). Cleared when
+    /// the cursor leaves the value region or moves to a non-qualifying row.
+    hover_popup: Option<HoverPopupState>,
+    /// The moving end of a keyboard range-selection (Shift+arrows/page/home/end).
+    /// The C++ tracks the Scintilla caret line; here we mirror it so Shift-nav
+    /// extends from the last caret position rather than from `first_selected_line`
+    /// (which would otherwise collapse the moving end to the lowest selected row).
+    /// Reset to the landed line on any plain (non-shift) navigation/click.
+    caret_line: Option<usize>,
+    /// The row a left-button drag started on (set on row mouse-down), and whether
+    /// that press landed on the hex byte grid. When the drag did NOT start on the
+    /// byte grid, a drag onto another row range-selects the NODES between the
+    /// anchor and the current row (item 8) instead of extending the byte
+    /// selection. `None` clears on mouse-up / the next non-drag interaction.
+    drag_anchor_line: Option<usize>,
+    drag_on_byte_grid: bool,
+    /// The node-clipboard payload (the `rcx-clipboard/v1` blob written by
+    /// EditorCopy/Cut). gpui's clipboard is text-only here, so the serialized blob
+    /// also lands on the system clipboard; this field is the in-process fast path
+    /// the paste handler reads first (and the test seam).
+    node_clipboard: Option<String>,
+    /// The background refresh-pump task (item 1). A spawned gpui loop that ticks
+    /// `pump_refresh` on the controller's adaptive interval and recomposes when
+    /// memory changed. Held so it is cancelled when the view is dropped.
+    _refresh_task: Task<()>,
     /// `m_lastTabTarget` — persists across edit-begins so Tab continues the cycle.
     last_tab_target: Option<EditTarget>,
     /// `m_relativeOffsets` (editor.h:244) — the address-margin mode. **Defaults to
@@ -286,6 +369,28 @@ struct ContextTarget {
     kind: NodeKind,
 }
 
+/// The kind of hover popup shown over a row's value column (item 13). The C++
+/// `applyHoverCursor` opens one of three popups depending on the node:
+/// value-history (heated changed values), disasm/hex-dump (func/void pointers),
+/// or struct-preview (typed pointer).
+#[derive(Clone, Debug)]
+enum HoverPopupKind {
+    /// A changed-value history list (newest → oldest), the heat graph analogue.
+    ValueHistory { lines: Vec<String> },
+    /// Disassembly of the code at a function pointer's target (title "Disassembly")
+    /// or a hex dump at a void pointer's target (title "Hex Dump").
+    TitleBody { title: String, body: String },
+}
+
+/// An open hover popup (item 13): which row anchored it, the cursor position to
+/// float it near, and its content.
+#[derive(Clone, Debug)]
+struct HoverPopupState {
+    line: usize,
+    pos: Point<Pixels>,
+    kind: HoverPopupKind,
+}
+
 /// The active inline-edit: the field entity + the line it overlays (so the row
 /// builder can swap in the editable element on the right line/column).
 struct EditingField {
@@ -312,6 +417,12 @@ impl RcxEditor {
             editing: None,
             byte_sel: ByteSelection::new(),
             hovered_line: None,
+            hover_popup: None,
+            caret_line: None,
+            drag_anchor_line: None,
+            drag_on_byte_grid: false,
+            node_clipboard: None,
+            _refresh_task: Self::spawn_refresh_loop(cx),
             last_tab_target: None,
             relative_offsets: true,
             compact_columns: false,
@@ -398,6 +509,62 @@ impl RcxEditor {
     pub fn apply_document(&mut self, cx: &mut Context<Self>) {
         self.controller.refresh();
         cx.notify();
+    }
+
+    /// The default base refresh cadence (ms) before the adaptive engine widens it.
+    /// Matches the C++ default timer interval; the engine backs off to
+    /// `refresh_interval_max_ms` when idle / blurred (`apply_adaptive_interval`).
+    const REFRESH_BASE_MS: u64 = 200;
+
+    /// Spawn the live value-refresh loop (item 1). A self-rescheduling foreground
+    /// timer that drives the controller's adaptive refresh engine
+    /// (`pump_refresh` → `on_refresh_tick`/`read_pages`/`on_read_complete`) without
+    /// any user input, then recomposes + repaints whenever a read landed (so typed
+    /// values, ASCII/hex previews, float interps, enum labels, and the changed-byte
+    /// heat all track live process/file memory). The C++ `RcxEditor` is driven by a
+    /// `QTimer` the controller owns; gpui has no widget timer, so the editor view
+    /// owns the loop and ticks the engine itself. No-op for dead/snapshot sources
+    /// (`pump_refresh` returns `false` quickly — only live providers read).
+    fn spawn_refresh_loop(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let interval = this
+                    .read_with(cx, |this, _| {
+                        let ms = this.controller.refresh_interval_ms();
+                        if ms > 0 {
+                            ms as u64
+                        } else {
+                            Self::REFRESH_BASE_MS
+                        }
+                    })
+                    .unwrap_or(Self::REFRESH_BASE_MS);
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(interval.max(1)))
+                    .await;
+                // Tick the engine on the entity; recompose only when a read landed.
+                let alive = this.update(cx, |this, cx| this.refresh_tick(cx)).is_ok();
+                if !alive {
+                    break; // the editor entity was dropped — stop the loop.
+                }
+            }
+        })
+    }
+
+    /// One refresh tick (item 1): pump the engine and, if memory changed, re-apply
+    /// the composed document. Skips work while inline-editing (the engine itself
+    /// also early-returns then, but recomposing under an active edit would yank the
+    /// overlay). Returns nothing; called from the spawned loop.
+    fn refresh_tick(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
+        if self.controller.pump_refresh() {
+            // A read landed and the snapshot/heat changed — recompose + repaint so
+            // the live values + changed-byte heat appear without user input.
+            self.controller.refresh();
+            let _ = self.controller.take_events();
+            cx.notify();
+        }
     }
 
     pub fn byte_selection(&self) -> &ByteSelection {
@@ -586,6 +753,13 @@ impl RcxEditor {
             self.byte_sel.clear();
         }
 
+        // Record the drag anchor for row drag-select (item 8). Whether the press
+        // landed on the hex byte grid decides the drag mode: byte-selection extend
+        // vs node range-select.
+        let on_byte_grid = self.byte_addr_for_hit(&lm, &text, hit.col).is_some();
+        self.drag_anchor_line = Some(line);
+        self.drag_on_byte_grid = on_byte_grid;
+
         // Fold-prefix click → toggle collapse via the controller.
         if hit.in_fold_col {
             if lm.node_idx >= 0 {
@@ -621,6 +795,36 @@ impl RcxEditor {
                 .selected_ids()
                 .iter()
                 .any(|&id| crate::controller::strip_sel_pub(id) == node_id);
+
+        // Item 11: Ctrl+Click (ctrl WITHOUT shift) on a Type/Name/PointerTarget
+        // token of a navigable Header row → open the referenced struct in a NEW
+        // tab. Restricted to Header lines (the parent row that has children) so a
+        // child member row under an expanded parent doesn't fire (matches the C++
+        // `openTypeInNewTabRequested` guard). Emits up to the host shell, which
+        // owns tab creation. Falls through to plain Ctrl-toggle selection when the
+        // node has no struct ref.
+        if modifiers.control && !modifiers.shift {
+            if let Some(target) = hit.target {
+                if matches!(
+                    target,
+                    EditTarget::Type | EditTarget::Name | EditTarget::PointerTarget
+                ) && lm.line_kind == LineKind::Header
+                    && lm.node_idx >= 0
+                {
+                    let ref_id = {
+                        let tree = self.controller.tree();
+                        tree.nodes
+                            .get(lm.node_idx as usize)
+                            .map(|n| n.ref_id)
+                            .unwrap_or(0)
+                    };
+                    if ref_id != 0 && self.controller.tree().index_of_id(ref_id) >= 0 {
+                        cx.emit(RcxEditorEvent::OpenTypeInNewTab { ref_id });
+                        return;
+                    }
+                }
+            }
+        }
 
         // Picker-target interception (the C++ `beginInlineEdit` early-returns for
         // these, emitting a popup request instead — editor.cpp:3535-3573). These
@@ -702,6 +906,12 @@ impl RcxEditor {
         };
         self.controller
             .handle_node_click(line as i64, node_id, mods);
+        // Track the moving caret so a subsequent Shift+arrow/page/home/end extends
+        // from THIS click (items 2/3). A shift-click moves the caret to the clicked
+        // row; a plain click reseeds it there.
+        if node_id != 0 && node_id != K_COMMAND_ROW_ID {
+            self.caret_line = Some(line);
+        }
         self.after_mutation(cx);
     }
 
@@ -858,11 +1068,34 @@ impl RcxEditor {
                 geometry::byte_for_col(&text, span.end),
             )
         };
-        let initial = text
-            .get(start_byte..end_byte)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let raw_span = text.get(start_byte..end_byte).unwrap_or("");
+
+        // Item 7: editing the VALUE of a hex node is a fixed-length per-byte
+        // overwrite (hex digits, space-separated). Detect it here and seed the
+        // field with the UNTRIMMED, fixed-length `"NN NN …"` string so the
+        // overwrite positions line up with the rendered bytes. Other targets seed
+        // the trimmed token as before.
+        let hex_overwrite_mode =
+            if target == EditTarget::Value && lm.node_idx >= 0 && is_hex_preview(lm.node_kind) {
+                let byte_count = if lm.line_byte_count > 0 {
+                    lm.line_byte_count as usize
+                } else {
+                    crate::core::size_for_kind(lm.node_kind).max(0) as usize
+                };
+                if byte_count > 0 {
+                    Some(inline_edit::HexOverwrite::Hex { byte_count })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        // Both ordinary tokens and the hex-overwrite seed are the trimmed span: the
+        // hex VALUE column is exactly `"NN NN …"` (single inter-byte spaces), so
+        // trimming only the outer column padding preserves the fixed-length string
+        // the overwrite positions index against.
+        let initial = raw_span.trim().to_string();
 
         let resolved_addr = lm.offset_addr;
         let node_idx = lm.node_idx;
@@ -916,6 +1149,11 @@ impl RcxEditor {
         // Arm the caret blink with a solid caret so the field shows an immediate,
         // continuously-visible cursor the moment editing begins (BUG 2).
         field.update(cx, |f, cx| f.arm_caret(cx));
+        // Item 7: switch the field into fixed-length hex/ASCII overwrite mode AFTER
+        // arming (so the begin-edit select-all is replaced by a caret at offset 0).
+        if let Some(mode) = hex_overwrite_mode {
+            field.update(cx, |f, _cx| f.set_hex_overwrite(mode));
+        }
         cx.notify();
     }
 
@@ -1514,6 +1752,7 @@ impl RcxEditor {
         if let Some((line, node_id)) = found {
             self.controller
                 .handle_node_click(line as i64, node_id, CtrlMods::NONE);
+            self.caret_line = Some(line);
             self.scroll.scroll_to_item(line, ScrollStrategy::Center);
             self.after_mutation(cx);
             return;
@@ -1634,35 +1873,374 @@ impl RcxEditor {
     }
 
     fn action_nav_home(&mut self, _: &EditorNavHome, _w: &mut Window, cx: &mut Context<Self>) {
-        // Jump to the first data node.
-        let result = self.controller.last_result();
-        for (i, lm) in result.meta.iter().enumerate() {
-            if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation {
-                let node_id = lm.node_id;
-                self.controller
-                    .handle_node_click(i as i64, node_id, CtrlMods::NONE);
-                self.scroll.scroll_to_item(i, ScrollStrategy::Top);
-                self.after_mutation(cx);
-                return;
-            }
-        }
+        self.jump_to_bound(false, false, cx);
     }
 
     fn action_nav_end(&mut self, _: &EditorNavEnd, _w: &mut Window, cx: &mut Context<Self>) {
-        // Jump to the last data node (excluding footers).
+        self.jump_to_bound(true, false, cx);
+    }
+
+    /// Home/End (and the Shift-extending variants). `to_end` picks the last data
+    /// node (excluding footers) vs the first; `extend` ranges the selection from
+    /// the anchor instead of replacing it (item 3). Mirrors editor.cpp `Key_Home`/
+    /// `Key_End` (which pass `NoModifier`) plus the Shift+Home/End extension.
+    fn jump_to_bound(&mut self, to_end: bool, extend: bool, cx: &mut Context<Self>) {
         let result = self.controller.last_result();
-        for (i, lm) in result.meta.iter().enumerate().rev() {
+        let n = result.meta.len();
+        let indices: Box<dyn Iterator<Item = usize>> = if to_end {
+            Box::new((0..n).rev())
+        } else {
+            Box::new(0..n)
+        };
+        for i in indices {
+            let lm = &result.meta[i];
             if lm.node_id != 0
                 && lm.node_id != K_COMMAND_ROW_ID
                 && !lm.is_continuation
                 && lm.line_kind != LineKind::Footer
             {
                 let node_id = lm.node_id;
-                self.controller
-                    .handle_node_click(i as i64, node_id, CtrlMods::NONE);
-                self.scroll.scroll_to_item(i, ScrollStrategy::Center);
+                let mods = if extend {
+                    CtrlMods {
+                        ctrl: false,
+                        shift: true,
+                    }
+                } else {
+                    CtrlMods::NONE
+                };
+                self.controller.handle_node_click(i as i64, node_id, mods);
+                self.caret_line = Some(i);
+                self.scroll.scroll_to_item(
+                    i,
+                    if to_end {
+                        ScrollStrategy::Center
+                    } else {
+                        ScrollStrategy::Top
+                    },
+                );
                 self.after_mutation(cx);
                 return;
+            }
+        }
+    }
+
+    /// Shift+arrow / Shift+page navigation (items 2/3): walk `dir * step` from the
+    /// moving caret to the next navigable node and EXTEND the selection to it (the
+    /// C++ `nodeClicked(.., ShiftModifier)` keyboard path) rather than replacing it.
+    /// Does NOT auto-append a field at the end (that is the plain-Down affordance).
+    fn navigate_node_extend(&mut self, dir: i32, step: usize, cx: &mut Context<Self>) {
+        let count = self.controller.last_result().meta.len();
+        if count == 0 {
+            return;
+        }
+        // Start from the moving caret if we have one, else the primary selection.
+        let start = self
+            .caret_line
+            .or_else(|| self.first_selected_line())
+            .map(|l| l as i64)
+            .unwrap_or(if dir > 0 { 0 } else { count as i64 });
+        let mut i = start + dir as i64 * step.max(1) as i64;
+        // Clamp into range so a big page-step still lands on the nearest node.
+        if i < 0 {
+            i = 0;
+        }
+        if i as usize >= count {
+            i = count as i64 - 1;
+        }
+        let mut found: Option<(usize, u64)> = None;
+        // Search toward the bound from the (clamped) target; if the clamped row
+        // is not navigable, walk back toward the caret.
+        let probe_dir = if dir > 0 { 1 } else { -1 };
+        let mut j = i;
+        while j >= 0 && (j as usize) < count {
+            let lm = &self.controller.last_result().meta[j as usize];
+            if lm.node_id != 0
+                && lm.node_id != K_COMMAND_ROW_ID
+                && lm.line_kind != LineKind::Footer
+                && !lm.is_continuation
+            {
+                found = Some((j as usize, lm.node_id));
+                break;
+            }
+            j -= probe_dir as i64;
+            // Don't walk past the caret origin.
+            if (probe_dir > 0 && j < start) || (probe_dir < 0 && j > start) {
+                break;
+            }
+        }
+        if let Some((line, node_id)) = found {
+            self.controller.handle_node_click(
+                line as i64,
+                node_id,
+                CtrlMods {
+                    ctrl: false,
+                    shift: true,
+                },
+            );
+            self.caret_line = Some(line);
+            self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+            self.after_mutation(cx);
+        }
+    }
+
+    fn action_select_up(&mut self, _: &EditorSelectUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_node_extend(-1, 1, cx);
+    }
+    fn action_select_down(
+        &mut self,
+        _: &EditorSelectDown,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_node_extend(1, 1, cx);
+    }
+    fn action_select_page_up(
+        &mut self,
+        _: &EditorSelectPageUp,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_node_extend(-1, self.page_step(), cx);
+    }
+    fn action_select_page_down(
+        &mut self,
+        _: &EditorSelectPageDown,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_node_extend(1, self.page_step(), cx);
+    }
+    fn action_select_home(
+        &mut self,
+        _: &EditorSelectHome,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.jump_to_bound(false, true, cx);
+    }
+    fn action_select_end(&mut self, _: &EditorSelectEnd, _w: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_bound(true, true, cx);
+    }
+
+    /// Ctrl+A — select all sibling nodes of the current node (item 5). Mirrors
+    /// editor.cpp `Key_A`: plain-click the first navigable data row to seed the
+    /// anchor, then Shift-click the last to range-select everything between
+    /// (continuation/footer/command rows are skipped by `insert_range`/click).
+    fn action_select_all(&mut self, _: &EditorSelectAll, _w: &mut Window, cx: &mut Context<Self>) {
+        let result = self.controller.last_result();
+        let mut first: Option<(usize, u64)> = None;
+        let mut last: Option<(usize, u64)> = None;
+        for (i, lm) in result.meta.iter().enumerate() {
+            if lm.node_id == 0
+                || lm.node_id == K_COMMAND_ROW_ID
+                || lm.is_continuation
+                || lm.line_kind == LineKind::Footer
+            {
+                continue;
+            }
+            if first.is_none() {
+                first = Some((i, lm.node_id));
+            }
+            last = Some((i, lm.node_id));
+        }
+        let (Some((fi, fid)), Some((li, lid))) = (first, last) else {
+            return;
+        };
+        self.controller
+            .handle_node_click(fi as i64, fid, CtrlMods::NONE);
+        if li != fi {
+            self.controller.handle_node_click(
+                li as i64,
+                lid,
+                CtrlMods {
+                    ctrl: false,
+                    shift: true,
+                },
+            );
+        }
+        self.caret_line = Some(li);
+        self.after_mutation(cx);
+    }
+
+    // ── Node clipboard (item 4) ──
+
+    /// The set of selected `node_idx` in stable offset/declaration order (so a
+    /// copy preserves the on-screen ordering of a multi-selection). Built from the
+    /// composed meta (which is already in display order) intersected with the
+    /// controller's selection set.
+    fn selected_node_indices_ordered(&self) -> Vec<usize> {
+        let result = self.controller.last_result();
+        let sel = self.controller.selected_ids();
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for lm in result.meta.iter() {
+            if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+                continue;
+            }
+            if !seen.insert(lm.node_id) {
+                continue;
+            }
+            if sel
+                .iter()
+                .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
+            {
+                out.push(lm.node_idx as usize);
+            }
+        }
+        out
+    }
+
+    /// Serialize the selected nodes into a portable `rcx-clipboard/v1` blob. Each
+    /// node is flattened via [`Node::to_json`] (the same per-node schema the `.rcx`
+    /// saver uses), wrapped in a versioned envelope. Returns `None` when nothing
+    /// node-like is selected. Pure helper (unit-tested).
+    fn serialize_selected_nodes(&self) -> Option<String> {
+        let idxs = self.selected_node_indices_ordered();
+        if idxs.is_empty() {
+            return None;
+        }
+        let tree = self.controller.tree();
+        let nodes: Vec<serde_json::Value> = idxs
+            .iter()
+            .filter_map(|&i| tree.nodes.get(i))
+            .map(|n| n.to_json())
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        let envelope = serde_json::json!({
+            "format": "rcx-clipboard/v1",
+            "nodes": nodes,
+        });
+        serde_json::to_string(&envelope).ok()
+    }
+
+    /// Parse an `rcx-clipboard/v1` blob into the list of [`Node`]s it carries.
+    /// Returns `None` for any non-clipboard / malformed text (so a plain text
+    /// clipboard does not spuriously paste nodes). Pure helper (unit-tested).
+    fn parse_clipboard_nodes(blob: &str) -> Option<Vec<crate::core::Node>> {
+        let v: serde_json::Value = serde_json::from_str(blob).ok()?;
+        if v.get("format").and_then(|f| f.as_str()) != Some("rcx-clipboard/v1") {
+            return None;
+        }
+        let arr = v.get("nodes")?.as_array()?;
+        let nodes: Vec<crate::core::Node> = arr.iter().map(crate::core::Node::from_json).collect();
+        (!nodes.is_empty()).then_some(nodes)
+    }
+
+    fn action_copy_nodes(&mut self, _: &EditorCopyNodes, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(blob) = self.serialize_selected_nodes() {
+            self.node_clipboard = Some(blob.clone());
+            cx.write_to_clipboard(ClipboardItem::new_string(blob));
+        }
+    }
+
+    fn action_cut_nodes(&mut self, _: &EditorCutNodes, _w: &mut Window, cx: &mut Context<Self>) {
+        let Some(blob) = self.serialize_selected_nodes() else {
+            return;
+        };
+        self.node_clipboard = Some(blob.clone());
+        cx.write_to_clipboard(ClipboardItem::new_string(blob));
+        // Delete the cut nodes (highest idx first so earlier indices stay valid).
+        let mut idxs = self.selected_node_indices_ordered();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in idxs {
+            self.controller.remove_node(idx);
+        }
+        self.controller.clear_selection();
+        self.context_target = None;
+        self.apply_document(cx);
+    }
+
+    fn action_paste_nodes(
+        &mut self,
+        _: &EditorPasteNodes,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Prefer the in-process blob; fall back to the system clipboard so a copy
+        // from another window/instance also pastes.
+        let blob = self.node_clipboard.clone().or_else(|| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .map(|t| t.to_string())
+        });
+        let Some(blob) = blob else {
+            return;
+        };
+        let Some(nodes) = Self::parse_clipboard_nodes(&blob) else {
+            return;
+        };
+        // Insert under the current node's PARENT at its tail (so paste lands next
+        // to the cursor), falling back to the view-root struct.
+        let (parent_id, base_off) = match self.current_node() {
+            Some((_l, lm)) => {
+                let tree = self.controller.tree();
+                let idx = tree.index_of_id(lm.node_id);
+                if idx >= 0 {
+                    let n = &tree.nodes[idx as usize];
+                    let sz = crate::core::size_for_kind(n.kind).max(0);
+                    (n.parent_id, n.offset + sz)
+                } else {
+                    (self.controller.view_root_id(), -1)
+                }
+            }
+            None => (self.controller.view_root_id(), -1),
+        };
+        if parent_id == 0 {
+            return;
+        }
+        // Lay the pasted nodes out contiguously from `base_off` (or the parent's
+        // tail when base_off < 0), reparented under `parent_id` with fresh ids.
+        let mut cursor = if base_off >= 0 {
+            base_off
+        } else {
+            self.container_tail(parent_id)
+        };
+        for src in &nodes {
+            let mut n = src.clone();
+            n.id = self.controller.tree_mut().reserve_id();
+            n.parent_id = parent_id;
+            n.offset = cursor;
+            // Children are not carried by the flat v1 blob; drop any dangling
+            // ref/children state so the pasted node is self-contained.
+            n.ref_id = 0;
+            n.collapsed = true;
+            let sz = crate::core::size_for_kind(n.kind).max(0);
+            cursor += sz.max(1);
+            self.controller.push_command(crate::core::Command::Insert {
+                node: n,
+                off_adjs: Vec::new(),
+            });
+        }
+        self.apply_document(cx);
+    }
+
+    /// The aligned tail offset of a container (max child end). Used as the paste
+    /// anchor when there is no cursor node.
+    fn container_tail(&self, parent_id: u64) -> i32 {
+        let tree = self.controller.tree();
+        tree.children_of(parent_id)
+            .iter()
+            .map(|&ci| {
+                let c = &tree.nodes[ci];
+                c.offset + crate::core::size_for_kind(c.kind).max(0)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Ctrl+Shift+C — copy the current node's offset address as `0x{addr:X}`
+    /// (item 10, editor.cpp `Key_C` + Ctrl+Shift). No-op when no node / addr 0.
+    fn action_copy_address(
+        &mut self,
+        _: &EditorCopyAddress,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            if lm.offset_addr != 0 {
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{:X}", lm.offset_addr)));
             }
         }
     }
@@ -1765,6 +2343,26 @@ impl RcxEditor {
             self.controller.set_view_root_id(ref_id);
             self.controller.clear_selection();
             self.apply_document(cx);
+            // Item 12: don't just re-root — NAVIGATE to the definition. After the
+            // recompose, find the landed struct's header row, select it, and scroll
+            // it into view (the C++ smoothScrollToNodeId + setFocusNode). The view
+            // root is line 0's command row; the struct's first data row is the
+            // definition body, so land on the first navigable node under the new
+            // root.
+            let target_line = self.controller.last_result().meta.iter().position(|lm| {
+                lm.node_id != 0
+                    && lm.node_id != K_COMMAND_ROW_ID
+                    && !lm.is_continuation
+                    && lm.line_kind != LineKind::Footer
+            });
+            if let Some(line) = target_line {
+                let node_id = self.controller.last_result().meta[line].node_id;
+                self.controller
+                    .handle_node_click(line as i64, node_id, CtrlMods::NONE);
+                self.caret_line = Some(line);
+                self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                self.after_mutation(cx);
+            }
         }
     }
 
@@ -2419,18 +3017,354 @@ impl RcxEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.byte_sel.is_active() {
+        // A drag never fires while an inline edit owns the surface.
+        if self.editing.is_some() {
+            return;
+        }
+        // Mode 1 — the drag started on the hex byte grid: extend the armed byte
+        // selection to the byte under the cursor (the original behavior).
+        if self.drag_on_byte_grid && self.byte_sel.is_active() {
+            let Some(lm) = self.line_meta(line).cloned() else {
+                return;
+            };
+            let text = self.line_text_owned(line);
+            let col = self.metrics.col_containing_x(rel_x);
+            if let Some(addr) = self.byte_addr_for_hit(&lm, &text, col) {
+                self.byte_sel.shift_extend_to(addr);
+                cx.notify();
+            }
+            return;
+        }
+
+        // Mode 2 — the drag started OFF the byte grid (item 8): range-select the
+        // NODES between the anchor row and the current row. Shift-clicking the
+        // landed row with the anchor already set drives the controller's
+        // `insert_range` (the same path mouse Shift-click and Shift-arrow use), so
+        // a drag paints a contiguous node multi-selection.
+        let Some(anchor) = self.drag_anchor_line else {
+            return;
+        };
+        if line == anchor {
             return;
         }
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
-        let text = self.line_text_owned(line);
-        let col = self.metrics.col_containing_x(rel_x);
-        if let Some(addr) = self.byte_addr_for_hit(&lm, &text, col) {
-            self.byte_sel.shift_extend_to(addr);
+        if lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID || lm.is_continuation {
+            return;
+        }
+        // Seed the anchor with a plain click on the anchor row's node (if the
+        // selection lost it), then shift-extend to the dragged row so the range
+        // spans [anchor, line]. `handle_node_click` keys the range off the
+        // controller's `anchor_line`, which the initial mouse-down already set, so
+        // a single shift-click here paints the full range.
+        let node_id = lm.node_id;
+        self.controller.handle_node_click(
+            line as i64,
+            node_id,
+            CtrlMods {
+                ctrl: false,
+                shift: true,
+            },
+        );
+        self.caret_line = Some(line);
+        self.after_mutation(cx);
+    }
+
+    // ── Hover popups (item 13, editor.cpp applyHoverCursor) ──
+
+    /// Resolve the hover popup for the row/column under the cursor (item 13).
+    /// Called on every non-dragging mouse-move over a row. Updates `hovered_line`
+    /// (the row hover band) and, when the cursor is over the VALUE column of a
+    /// qualifying node, opens one of three popups: a value-history list for a
+    /// heated changed value, a disasm/hex-dump for a function/void pointer, or a
+    /// struct-preview for a collapsed typed pointer. Otherwise the popup is cleared.
+    pub(crate) fn dispatch_row_hover(
+        &mut self,
+        line: usize,
+        rel_x: f32,
+        pos: Point<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed_band = self.hovered_line != Some(line);
+        if changed_band {
+            self.hovered_line = Some(line);
+        }
+        // Hover popups are gated by the same toggle as the hover band, and
+        // suppressed while editing (the field owns the surface then).
+        let want = if self.hover_effects && self.editing.is_none() {
+            self.compute_hover_popup(line, rel_x, pos)
+        } else {
+            None
+        };
+        let changed_popup = match (&self.hover_popup, &want) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.line != b.line || !hover_kind_eq(&a.kind, &b.kind),
+            _ => true,
+        };
+        if changed_popup {
+            self.hover_popup = want;
+        }
+        if changed_band || changed_popup {
             cx.notify();
         }
+    }
+
+    /// Compute the hover popup (if any) for the value column under `(line, rel_x)`.
+    /// Pure-ish (reads the controller's tree/provider/value-history); returns the
+    /// popup state to show, or `None`. Mirrors the kind selection in editor.cpp
+    /// `applyHoverCursor` (value history vs disasm/hex vs struct preview).
+    fn compute_hover_popup(
+        &self,
+        line: usize,
+        rel_x: f32,
+        pos: Point<Pixels>,
+    ) -> Option<HoverPopupState> {
+        let lm = self.line_meta(line)?.clone();
+        if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+            return None;
+        }
+        if lm.line_kind == LineKind::Footer {
+            return None;
+        }
+        // Only fire when the cursor is over the VALUE column.
+        let text = self.line_text_owned(line);
+        let (type_w, name_w) = geometry::effective_widths(&lm);
+        let vs = crate::compose::value_span_for(&lm, type_w, name_w);
+        if !vs.valid {
+            return None;
+        }
+        let col = self.metrics.col_containing_x(rel_x);
+        if col < vs.start || col >= vs.end {
+            // The value column may run to the end of a long line; allow hovering
+            // anywhere from the value start to the line end.
+            if col < vs.start {
+                return None;
+            }
+        }
+        let _ = text;
+
+        let kind = lm.node_kind;
+        let is_fp = crate::core::is_func_ptr(kind);
+        let is_void_ptr = matches!(kind, NodeKind::Pointer32 | NodeKind::Pointer64)
+            && lm.pointer_target_name.is_empty();
+
+        // 1) Function / void pointer → disasm / hex-dump of the TARGET (item 13).
+        if is_fp || is_void_ptr {
+            if let Some(state) = self.pointer_disasm_popup(&lm, is_fp, pos) {
+                return Some(state);
+            }
+            // No readable target — fall through (no popup).
+            return None;
+        }
+
+        // 1b) Collapsed TYPED pointer → struct-preview card (item 13): the first
+        // few lines of the referenced struct composed at the pointer's target.
+        let is_typed_ptr = matches!(kind, NodeKind::Pointer32 | NodeKind::Pointer64)
+            && !lm.pointer_target_name.is_empty();
+        if is_typed_ptr && lm.fold_collapsed {
+            if let Some(state) = self.struct_preview_popup(&lm, pos) {
+                return Some(state);
+            }
+        }
+
+        // 2) Heated changed value with >1 distinct sample → value-history list.
+        if lm.heat_level > 0 {
+            if let Some(hist) = self.controller.value_history().get(&lm.node_id) {
+                if hist.unique_count() > 1 {
+                    let mut lines: Vec<String> = Vec::new();
+                    hist.for_each_with_time(|v, _t| {
+                        if lines.len() < crate::core::value_history::K_CAPACITY {
+                            lines.push(v.to_string());
+                        }
+                    });
+                    if lines.len() > 1 {
+                        return Some(HoverPopupState {
+                            line,
+                            pos,
+                            kind: HoverPopupKind::ValueHistory { lines },
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Build the disasm/hex-dump popup for a function/void pointer node by reading
+    /// the pointer value, then the bytes at the target (item 13). `None` when the
+    /// pointer is null/unreadable. Reads through the controller's live provider.
+    fn pointer_disasm_popup(
+        &self,
+        lm: &LineMeta,
+        is_fp: bool,
+        pos: Point<Pixels>,
+    ) -> Option<HoverPopupState> {
+        let prov = &self.controller.document().provider;
+        let is64 = matches!(lm.node_kind, NodeKind::FuncPtr64 | NodeKind::Pointer64);
+        let ptr_val = if is64 {
+            prov.read_u64(lm.offset_addr)
+        } else {
+            u64::from(prov.read_u32(lm.offset_addr))
+        };
+        if ptr_val == 0 || ptr_val == u64::MAX || (!is64 && ptr_val == 0xFFFF_FFFF) {
+            return None;
+        }
+        const MAX_READ: i32 = 128;
+        let bytes = prov.read_bytes(ptr_val, MAX_READ);
+        if bytes.is_empty() || bytes.iter().all(|&b| b == 0) {
+            return None;
+        }
+        let (title, mut body) = if is_fp {
+            (
+                "Disassembly".to_string(),
+                crate::disasm::disassemble(&bytes, ptr_val, if is64 { 64 } else { 32 }, MAX_READ),
+            )
+        } else {
+            (
+                "Hex Dump".to_string(),
+                crate::disasm::hex_dump(&bytes, ptr_val, MAX_READ),
+            )
+        };
+        // Cap at 6 lines so the popup stays compact (the C++ kMaxLines).
+        const MAX_LINES: usize = 6;
+        if body.lines().count() > MAX_LINES {
+            let kept: Vec<&str> = body.lines().take(MAX_LINES).collect();
+            body = format!("{}\n...", kept.join("\n"));
+        }
+        if body.trim().is_empty() {
+            return None;
+        }
+        Some(HoverPopupState {
+            line: 0,
+            pos,
+            kind: HoverPopupKind::TitleBody { title, body },
+        })
+    }
+
+    /// Build the struct-preview popup for a collapsed typed pointer (item 13):
+    /// compose the referenced struct at the pointer target and show its first few
+    /// data lines (skipping the command row). `None` when the pointer has no valid
+    /// struct ref. Mirrors editor.cpp's struct-preview popup.
+    fn struct_preview_popup(&self, lm: &LineMeta, pos: Point<Pixels>) -> Option<HoverPopupState> {
+        let ref_id = {
+            let tree = self.controller.tree();
+            let n = tree.nodes.get(lm.node_idx as usize)?;
+            n.ref_id
+        };
+        if ref_id == 0 || self.controller.tree().index_of_id(ref_id) < 0 {
+            return None;
+        }
+        // Compose the referenced struct (same flags the live view uses for layout).
+        let cr = self.controller.document().compose(
+            ref_id,
+            self.compact_columns,
+            self.tree_lines(),
+            true,
+            self.type_hints(),
+            self.show_comments(),
+        );
+        // Skip line 0 (the command row); take the first few non-empty data lines.
+        const MAX_LINES: usize = 5;
+        let body: String = cr
+            .text
+            .split('\n')
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .take(MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if body.trim().is_empty() {
+            return None;
+        }
+        Some(HoverPopupState {
+            line: 0,
+            pos,
+            kind: HoverPopupKind::TitleBody {
+                title: lm.pointer_target_name.clone(),
+                body,
+            },
+        })
+    }
+
+    /// Render the open hover popup (item 13) as a small elevated card anchored near
+    /// the cursor, using [`design`] tokens (no ad-hoc hex). Value-history lists the
+    /// changed values newest-first; the title/body card shows disasm / hex-dump.
+    fn render_hover_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.hover_popup.as_ref()?;
+        let palette = EditorPalette::from_theme(cx);
+        let card = match &state.kind {
+            HoverPopupKind::ValueHistory { lines } => {
+                let rows: Vec<AnyElement> = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        div()
+                            .text_size(px(design::tokens::font::EDITOR_SIZE))
+                            .font_family(design::tokens::font::mono_family())
+                            // Newest sample reads in the bright value hue; older
+                            // samples fade to the dim text (the heat-history graph).
+                            .text_color(if i == 0 { palette.text } else { palette.dim })
+                            .child(v.clone())
+                            .into_any_element()
+                    })
+                    .collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(design::tokens::space::XS))
+                    .child(
+                        div()
+                            .text_size(px(design::tokens::font::UI_XS))
+                            .text_color(palette.dim)
+                            .child("Value history"),
+                    )
+                    .children(rows)
+            }
+            HoverPopupKind::TitleBody { title, body } => {
+                let body_rows: Vec<AnyElement> = body
+                    .lines()
+                    .map(|l| {
+                        div()
+                            .text_size(px(design::tokens::font::EDITOR_SIZE))
+                            .font_family(design::tokens::font::mono_family())
+                            .text_color(palette.number)
+                            .child(l.to_string())
+                            .into_any_element()
+                    })
+                    .collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(design::tokens::space::XS))
+                    .child(
+                        div()
+                            .text_size(px(design::tokens::font::UI_XS))
+                            .text_color(palette.dim)
+                            .child(title.clone()),
+                    )
+                    .children(body_rows)
+            }
+        };
+        Some(
+            deferred(
+                anchored()
+                    .position(state.pos + point(px(12.0), px(16.0)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(
+                        card.bg(palette.gutter_bg)
+                            .border_1()
+                            .border_color(palette.border)
+                            .rounded(px(design::tokens::radius::MD))
+                            .px(px(design::tokens::space::SM))
+                            .py(px(design::tokens::space::XS))
+                            .shadow_md(),
+                    ),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
     }
 
     // ── Node context menu (reclass `customContextMenuRequested`) ──
@@ -2776,11 +3710,39 @@ impl RcxEditor {
 
     fn action_delete(&mut self, _: &EditorDelete, _w: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
-        if let Some(t) = self.action_target() {
-            self.controller.remove_node(t.node_idx);
-            self.context_target = None;
-            self.apply_document(cx);
+        // Item 6: delete the ENTIRE multi-selection, not just the single target.
+        // The C++ `Key_Delete` emits `deleteSelectedRequested` whenever the
+        // selection set is non-empty (iterating every selected node). Gather all
+        // selected node indices and remove them highest-first so earlier indices
+        // stay valid across the splices. A right-click context target that is NOT
+        // part of the selection still deletes just that node (the menu acts on the
+        // clicked row).
+        let mut idxs = self.selected_node_indices_ordered();
+        if idxs.is_empty() {
+            // Fall back to the single context/primary target (menu Delete on an
+            // unselected right-clicked row).
+            if let Some(t) = self.action_target() {
+                idxs.push(t.node_idx);
+            }
+        } else if let Some(t) = self.context_target {
+            // A right-click on a row OUTSIDE the current selection targets just
+            // that node (dispatch_row_context_menu only auto-selects when the row
+            // was unselected, so if it is not in the set, honor the single target).
+            if !idxs.contains(&t.node_idx) {
+                idxs = vec![t.node_idx];
+            }
         }
+        if idxs.is_empty() {
+            return;
+        }
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        idxs.dedup();
+        for idx in idxs {
+            self.controller.remove_node(idx);
+        }
+        self.controller.clear_selection();
+        self.context_target = None;
+        self.apply_document(cx);
     }
 
     fn action_fold(&mut self, _: &EditorFold, _w: &mut Window, cx: &mut Context<Self>) {
@@ -3460,6 +4422,8 @@ impl Focusable for RcxEditor {
     }
 }
 
+impl EventEmitter<RcxEditorEvent> for RcxEditor {}
+
 impl Render for RcxEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Measure the monospace cell once per frame so hit-test/overlay column math
@@ -3570,6 +4534,19 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_go_to_definition))
             .on_action(cx.listener(Self::action_collapse_all))
             .on_action(cx.listener(Self::action_expand_all))
+            // Shift-extending navigation (items 2/3) + Ctrl+A (5) + node
+            // clipboard (4) + copy-address (10).
+            .on_action(cx.listener(Self::action_select_up))
+            .on_action(cx.listener(Self::action_select_down))
+            .on_action(cx.listener(Self::action_select_page_up))
+            .on_action(cx.listener(Self::action_select_page_down))
+            .on_action(cx.listener(Self::action_select_home))
+            .on_action(cx.listener(Self::action_select_end))
+            .on_action(cx.listener(Self::action_select_all))
+            .on_action(cx.listener(Self::action_copy_nodes))
+            .on_action(cx.listener(Self::action_cut_nodes))
+            .on_action(cx.listener(Self::action_paste_nodes))
+            .on_action(cx.listener(Self::action_copy_address))
             .on_mouse_down_out(cx.listener(|this, _e: &MouseDownEvent, window, cx| {
                 // Clicking outside the editor commits an active edit.
                 if this.editing.is_some() {
@@ -3629,12 +4606,37 @@ impl Render for RcxEditor {
                     .with_priority(1),
                 )
             })
+            // Hover popups (item 13): value-history / disasm / hex-dump card,
+            // floated near the cursor over the hovered value column.
+            .children(self.render_hover_popup(cx))
     }
 }
 
 /// Apply an alpha to an `Hsla` (heat/byte-sel overlays are translucent fills).
 fn with_alpha(c: Hsla, a: f32) -> Hsla {
     Hsla { a, ..c }
+}
+
+/// Structural equality for two hover popup kinds (item 13) — used to avoid
+/// re-notifying when the cursor moves within the same popup target.
+fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
+    match (a, b) {
+        (
+            HoverPopupKind::ValueHistory { lines: la },
+            HoverPopupKind::ValueHistory { lines: lb },
+        ) => la == lb,
+        (
+            HoverPopupKind::TitleBody {
+                title: ta,
+                body: ba,
+            },
+            HoverPopupKind::TitleBody {
+                title: tb,
+                body: bb,
+            },
+        ) => ta == tb && ba == bb,
+        _ => false,
+    }
 }
 
 /// The address-format hover popover (reclass_address_hover.png + PIC5 "Base
@@ -3978,5 +4980,67 @@ mod tests {
             .find(|n| n.kind == NodeKind::Struct)
             .map(|n| n.id);
         assert_eq!(picked, Some(main_id), "must pick the first declared root");
+    }
+
+    // ── Node clipboard (item 4) ──
+
+    #[test]
+    fn clipboard_blob_round_trips_node_fields() {
+        // A serialized `rcx-clipboard/v1` blob parses back into the same node
+        // fields (kind/name/offset/comment) — the copy→paste fidelity contract.
+        use crate::core::{Node, NodeKind};
+        let n = Node {
+            kind: NodeKind::Int32,
+            name: "health".into(),
+            offset: 8,
+            comment: "hp".into(),
+            ..Node::default()
+        };
+        let envelope = serde_json::json!({
+            "format": "rcx-clipboard/v1",
+            "nodes": [n.to_json()],
+        });
+        let blob = serde_json::to_string(&envelope).unwrap();
+        let parsed = super::RcxEditor::parse_clipboard_nodes(&blob).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, NodeKind::Int32);
+        assert_eq!(parsed[0].name, "health");
+        assert_eq!(parsed[0].offset, 8);
+        assert_eq!(parsed[0].comment, "hp");
+    }
+
+    #[test]
+    fn clipboard_rejects_non_rcx_text() {
+        // A plain-text clipboard (or wrong format tag) must NOT parse as nodes, so
+        // a generic copy does not spuriously paste structure.
+        assert!(super::RcxEditor::parse_clipboard_nodes("just some text").is_none());
+        assert!(super::RcxEditor::parse_clipboard_nodes("{\"format\":\"other\"}").is_none());
+        assert!(
+            super::RcxEditor::parse_clipboard_nodes("{\"format\":\"rcx-clipboard/v1\"}").is_none(),
+            "missing nodes array"
+        );
+    }
+
+    // ── Hover popup equality (item 13) ──
+
+    #[test]
+    fn hover_kind_eq_distinguishes_content_and_variant() {
+        use super::{hover_kind_eq, HoverPopupKind};
+        let a = HoverPopupKind::ValueHistory {
+            lines: vec!["1".into(), "2".into()],
+        };
+        let a2 = HoverPopupKind::ValueHistory {
+            lines: vec!["1".into(), "2".into()],
+        };
+        let b = HoverPopupKind::ValueHistory {
+            lines: vec!["1".into(), "3".into()],
+        };
+        let t = HoverPopupKind::TitleBody {
+            title: "Disassembly".into(),
+            body: "nop".into(),
+        };
+        assert!(hover_kind_eq(&a, &a2), "same content compares equal");
+        assert!(!hover_kind_eq(&a, &b), "different lines differ");
+        assert!(!hover_kind_eq(&a, &t), "different variants differ");
     }
 }

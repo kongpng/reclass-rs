@@ -943,6 +943,81 @@ fn node_type_name(tree: &NodeTree, n: &Node) -> String {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Value preview for type hints (`compose.cpp:18-56` — the file-local
+// `formatPreview`). Formats raw bytes as the suggested type using the `fmt::`
+// formatters. Faithful port, but — exactly like the C++ — it has no live
+// caller: `formatPreview` is dead code in `compose.cpp` (only self-recursion at
+// :61), and the TypeHint chip text is the bare `formatHint` type name
+// (`compose.cpp:547`; `test_chips.cpp:209` asserts no '[' in the chip text).
+// Kept (and unit-tested) for parity; `#[allow(dead_code)]` mirrors that status.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+fn format_preview(data: &[u8], len: i32, kinds: &[NodeKind]) -> String {
+    use crate::format as fmt;
+
+    let Some(&k) = kinds.first() else {
+        return String::new();
+    };
+
+    // Native-byte-order loads, matching the C++ `detail::loadU*/loadF*`
+    // (`typeinfer.h:48-61`), i.e. little-endian on x86_64.
+    let load_u16 = |d: &[u8]| -> u16 { u16::from_le_bytes([d[0], d[1]]) };
+    let load_u32 = |d: &[u8]| -> u32 { u32::from_le_bytes([d[0], d[1], d[2], d[3]]) };
+    let load_u64 =
+        |d: &[u8]| -> u64 { u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]) };
+    let load_f32 = |d: &[u8]| -> f32 { f32::from_bits(load_u32(d)) };
+    let load_f64 = |d: &[u8]| -> f64 { f64::from_bits(load_u64(d)) };
+
+    if kinds.len() == 1 {
+        return match k {
+            NodeKind::Float => fmt::fmt_float(load_f32(data)),
+            NodeKind::Double => fmt::fmt_double(load_f64(data)),
+            NodeKind::Int32 => fmt::fmt_int32(load_u32(data) as i32),
+            NodeKind::UInt32 => fmt::fmt_uint32(load_u32(data)),
+            NodeKind::Int16 => fmt::fmt_int16(load_u16(data) as i16),
+            NodeKind::UInt16 => fmt::fmt_uint16(load_u16(data)),
+            NodeKind::Int64 => fmt::fmt_int64(load_u64(data) as i64),
+            NodeKind::UInt64 => fmt::fmt_uint64(load_u64(data)),
+            NodeKind::Pointer64 => fmt::fmt_pointer64(load_u64(data)),
+            NodeKind::Pointer32 => fmt::fmt_pointer32(load_u32(data)),
+            NodeKind::Bool => fmt::fmt_bool(data[0]),
+            NodeKind::UTF8 => {
+                let n = len.min(8).max(0) as usize;
+                let mut s = String::new();
+                for &c in data.iter().take(n) {
+                    if (0x20..=0x7E).contains(&c) {
+                        s.push(c as char);
+                    } else {
+                        break;
+                    }
+                }
+                if s.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{s}\"")
+                }
+            }
+            _ => String::new(),
+        };
+    }
+
+    // Split: show each part (uniform split into `kinds.len()` lanes).
+    let part_sz = len / kinds.len() as i32;
+    let part_sz_usize = part_sz.max(0) as usize;
+    let parts: Vec<String> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, &lane)| {
+            let start = i * part_sz_usize;
+            let slice = data.get(start..).unwrap_or(&[]);
+            format_preview(slice, part_sz, std::slice::from_ref(&lane))
+        })
+        .collect();
+    parts.join(", ")
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Chip sanitize helper (`compose.cpp:394-404`).
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -1203,6 +1278,13 @@ fn compose_leaf(
                     let suggestions = crate::core::infer_types(&b, &Default::default(), 3);
                     if let Some(first) = suggestions.first() {
                         if first.strength >= 3 {
+                            // Plain type name only, matching `compose.cpp:547`
+                            // (`QString hint = formatHint(suggestions[0])`).
+                            // The chip pill carries the "suggested type" signal —
+                            // no value-preview, no brackets. (`test_chips.cpp:209`
+                            // asserts the chip text contains no '['.) `formatPreview`
+                            // is dead code in the C++ too: kept here for parity but
+                            // never reaches a live chip.
                             let hint = crate::core::format_hint(first);
                             let kinds = first.kinds.clone();
                             push_chip(&mut line_text, &mut lm, ChipKind::TypeHint, &hint, |c| {
@@ -1225,12 +1307,18 @@ fn compose_leaf(
                     }
                 }
                 if !comment_text.is_empty() {
-                    let sanitized = sanitize_chip(&comment_text);
+                    // Raw comment text — no glyph prefix, matching
+                    // `compose.cpp:586` (`pushChip(ChipKind::Comment, commentText)`).
+                    // The green pill already marks it as a user comment; a "// " /
+                    // "/ " prefix doubled the signal (C++ comment at 581-585) and
+                    // `test_chips.cpp:284` asserts the chip text is the raw comment.
+                    // `push_chip` calls `sanitize_chip` internally (collapses
+                    // embedded \r\n\t so the chip stays on one row).
                     push_chip(
                         &mut line_text,
                         &mut lm,
                         ChipKind::Comment,
-                        &sanitized,
+                        &comment_text,
                         |_| {},
                     );
                 }

@@ -226,12 +226,71 @@ pub fn build_groups(entries: &[RecentEntry], filter: &str) -> Vec<Group> {
         .collect()
 }
 
+/// Compute the day delta between two unix timestamps (seconds), used to bucket a
+/// recent file by its last-modified time (the C++ `buildGroups` compared
+/// `QFileInfo::lastModified()` against `now`; `startpage.h:236`). `now` and
+/// `modified` are seconds-since-epoch; the result is the number of *whole days*
+/// between them, floored at 0 (a file modified "in the future" — clock skew —
+/// reads as today). Pure + clock-free so it stays unit-testable.
+pub fn age_days_from_secs(now_secs: u64, modified_secs: u64) -> i64 {
+    if modified_secs >= now_secs {
+        return 0;
+    }
+    const DAY: u64 = 24 * 60 * 60;
+    ((now_secs - modified_secs) / DAY) as i64
+}
+
+/// The `fileSelected` payload an example row carries (so the host can tell it
+/// apart from a real recent path): the example's `file.example.<name>` command
+/// key — the same id the File ▸ Examples submenu dispatches. The host matches the
+/// `file.example.` prefix and routes it through `open_example` instead of
+/// `open_project`. Pure; unit-tested.
+pub fn example_select_key(name: &str) -> String {
+    format!("file.example.{name}")
+}
+
+/// Build the start page's **Examples** entries — one [`RecentEntry`] per bundled
+/// example, flagged `is_example` so [`bucket_for`] files them under
+/// [`Bucket::Examples`] (the C++ start page always lists the bundled examples
+/// regardless of the recent-files list; `loadEntries`'s example pass). The window
+/// appends these to the mapped recent entries so the Examples bucket is never
+/// empty (the audited gap: `recent_entries()` only mapped `recent_files`, leaving
+/// the Examples infra dead).
+///
+/// The `dir_path` is left empty — bundled examples have no on-disk home the user
+/// recognizes; `file_name` is the example's display name (the row label) and
+/// `path` carries its [`example_select_key`] (`file.example.<name>`) so a click's
+/// `fileSelected` payload routes back through `open_example`. `age_days` is
+/// irrelevant (examples always bucket to Examples) and left at 0.
+pub fn example_entries() -> Vec<RecentEntry> {
+    crate::ui::examples::examples()
+        .iter()
+        .map(|(name, _)| RecentEntry {
+            path: example_select_key(name),
+            file_name: (*name).to_string(),
+            dir_path: String::new(),
+            age_days: 0,
+            is_example: true,
+        })
+        .collect()
+}
+
 /// The events the start page raises (the C++ signals, `startpage.h`).
 #[derive(Clone, Debug)]
 pub enum StartPageEvent {
     /// An action card was clicked (`newClass`/`openProject`/`importSource`/…).
     Card(StartCard),
-    /// A recent-files entry was clicked (`fileSelected(path)`).
+    /// A recent-files / example entry was clicked (`fileSelected(path)`).
+    ///
+    /// For a real recent file the payload is its on-disk path (the host opens it
+    /// via `open_project`). For a **bundled example** (an [`RecentEntry`] with
+    /// `is_example`) the payload is its `file.example.<name>` command key
+    /// ([`example_select_key`]) — a bundled example has no real on-disk path, so
+    /// the host recognises the `file.example.` prefix and routes it through
+    /// `open_example` (materialize-then-open) instead. This keeps a single
+    /// `fileSelected` signal (so the consumer's match stays stable) while letting
+    /// the Examples bucket actually open its example, the parity fix for the
+    /// audited gap (examples previously tried to open a non-existent path).
     FileSelected(String),
     /// ESC or outside-click — no specific action (`dismissed`).
     Dismissed,
@@ -422,6 +481,10 @@ impl StartPage {
                     .h(px(30.))
                     .cursor_pointer()
                     .on_click(cx.listener(move |_this, _e, _window, cx| {
+                        // One `fileSelected` signal for both kinds: the payload is
+                        // either a real path (recents) or an example's
+                        // `file.example.<name>` key ([`example_entries`] set it for
+                        // examples). The host routes by the prefix.
                         cx.emit(StartPageEvent::FileSelected(path.clone()));
                     }))
                     .child(
@@ -592,7 +655,10 @@ mod tests {
     // Import only the gpui-free data items under test — NOT `super::*`, which
     // would pull the module's `gpui::*` glob into the `#[test]` hygiene
     // expansion and overflow the type-recursion budget (see lib.rs note).
-    use super::{bucket_for, build_groups, Bucket, RecentEntry, StartCard};
+    use super::{
+        age_days_from_secs, bucket_for, build_groups, example_entries, example_select_key, Bucket,
+        RecentEntry, StartCard,
+    };
 
     fn entry(name: &str, dir: &str, age: i64, example: bool) -> RecentEntry {
         RecentEntry {
@@ -692,6 +758,72 @@ mod tests {
 
         // No match → no groups.
         assert!(build_groups(&entries, "zzz").is_empty());
+    }
+
+    #[test]
+    fn age_days_from_secs_floors_to_whole_days() {
+        const DAY: u64 = 24 * 60 * 60;
+        let now = 100 * DAY + 12345; // arbitrary "now"
+                                     // Same instant → 0 (today).
+        assert_eq!(age_days_from_secs(now, now), 0);
+        // 12 hours ago → still today (sub-day delta floors to 0).
+        assert_eq!(age_days_from_secs(now, now - DAY / 2), 0);
+        // Exactly one day ago → 1 (yesterday).
+        assert_eq!(age_days_from_secs(now, now - DAY), 1);
+        // 9 days ago → 9 (older than a week).
+        assert_eq!(age_days_from_secs(now, now - 9 * DAY), 9);
+        // A "future" mtime (clock skew) → clamped to 0, never negative.
+        assert_eq!(age_days_from_secs(now, now + DAY), 0);
+    }
+
+    #[test]
+    fn age_days_drives_the_expected_buckets() {
+        // The day delta from `age_days_from_secs` flows straight into `bucket_for`.
+        const DAY: u64 = 24 * 60 * 60;
+        let now = 1_000 * DAY;
+        let mk = |secs_ago: u64| RecentEntry {
+            path: "/p/a.rcx".into(),
+            file_name: "a.rcx".into(),
+            dir_path: "/p".into(),
+            age_days: age_days_from_secs(now, now - secs_ago),
+            is_example: false,
+        };
+        assert_eq!(bucket_for(&mk(0)), Bucket::Today);
+        assert_eq!(bucket_for(&mk(DAY)), Bucket::Yesterday);
+        assert_eq!(bucket_for(&mk(3 * DAY)), Bucket::ThisWeek);
+        assert_eq!(bucket_for(&mk(20 * DAY)), Bucket::ThisMonth);
+        assert_eq!(bucket_for(&mk(90 * DAY)), Bucket::Older);
+    }
+
+    #[test]
+    fn example_entries_are_flagged_and_bucket_to_examples() {
+        let ex = example_entries();
+        // One entry per bundled example, every one flagged is_example.
+        assert_eq!(ex.len(), crate::ui::examples::examples().len());
+        assert!(!ex.is_empty(), "expected bundled examples");
+        for e in &ex {
+            assert!(e.is_example, "example entry must be flagged");
+            assert!(!e.file_name.is_empty());
+            // The click payload is the example's `file.example.<name>` key, so the
+            // host routes it through `open_example` (not `open_project`).
+            assert_eq!(e.path, example_select_key(&e.file_name));
+            assert!(e.path.starts_with("file.example."));
+            // Every example, whatever its age, files under the Examples bucket.
+            assert_eq!(bucket_for(e), Bucket::Examples);
+        }
+        // Built into groups (mixed with a recent), the examples form their own
+        // trailing bucket — never collapsed into Today (the audited gap).
+        let mut all = vec![RecentEntry {
+            path: "/p/today.rcx".into(),
+            file_name: "today.rcx".into(),
+            dir_path: "/p".into(),
+            age_days: 0,
+            is_example: false,
+        }];
+        all.extend(ex);
+        let groups = build_groups(&all, "");
+        assert_eq!(groups.first().map(|g| g.bucket), Some(Bucket::Today));
+        assert_eq!(groups.last().map(|g| g.bucket), Some(Bucket::Examples));
     }
 
     #[test]

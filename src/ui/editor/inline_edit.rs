@@ -55,8 +55,42 @@ actions!(
         FieldPaste,
         FieldCopy,
         FieldCut,
+        // Item 9: while editing, Up/Down/PageUp/PageDown must NOT bubble to the
+        // RcxEditor context (where they trigger NODE navigation mid-edit). These
+        // bindings swallow the keys on the field context — a no-op that consumes
+        // the event so the cursor stays in the field. C++ `handleEditKey` returns
+        // `true` for these keys to block line navigation.
+        FieldSwallowVert,
     ]
 );
+
+/// Hex/ASCII overwrite-edit mode (item 7). A fixed-length per-byte editor that
+/// matches the C++ `handleHexEditKey`: typing overwrites one position in place
+/// (a hex digit per nibble, or one ASCII char per byte) and advances; the content
+/// length never changes; backspace/delete reset a position rather than splicing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HexOverwrite {
+    /// Editing the hex byte string `"NN NN NN …"` — `byte_count` bytes, rendered
+    /// as 2 hex digits per byte separated by single spaces. Only `[0-9A-Fa-f]`
+    /// accepted; typed digits upper-cased; the cursor skips the space separators.
+    Hex { byte_count: usize },
+    /// Editing the ASCII preview `"........"` — `byte_count` printable chars (one
+    /// per byte). Only `0x20..=0x7E` accepted; reset char is `'.'`.
+    Ascii { byte_count: usize },
+}
+
+impl HexOverwrite {
+    /// The reset character a backspace/delete writes (`'0'` hex, `'.'` ascii).
+    fn reset_char(self) -> char {
+        match self {
+            HexOverwrite::Hex { .. } => '0',
+            HexOverwrite::Ascii { .. } => '.',
+        }
+    }
+    fn is_hex(self) -> bool {
+        matches!(self, HexOverwrite::Hex { .. })
+    }
+}
 
 /// Outcome of a key/commit interaction the host editor reacts to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +132,9 @@ pub struct FieldInput {
     selection_color: Hsla,
     /// Set by an action handler; drained by the host to learn what to do next.
     pending_outcome: Option<EditOutcome>,
+    /// Hex/ASCII overwrite mode (item 7). `None` = ordinary free-text editing;
+    /// `Some(..)` = fixed-length per-byte overwrite (hex digits / ASCII chars).
+    hex_overwrite: Option<HexOverwrite>,
 
     // ── Caret blink (BUG 2) ──
     /// Whether the caret quad is drawn this frame. Kept SOLID-visible (`true`)
@@ -144,12 +181,72 @@ impl FieldInput {
             text_color,
             selection_color,
             pending_outcome: None,
+            hex_overwrite: None,
             // The caret starts solid-visible; the blink timer is armed when the
             // field is focused / on the first reset (begin-edit calls `notify_edit`).
             blink_visible: true,
             blink_epoch: 0,
             _blink_task: Task::ready(()),
         }
+    }
+
+    /// Enable hex/ASCII overwrite mode on this field (item 7). The host calls this
+    /// right after [`new`] when the edited target is a hex node Value (hex mode) or
+    /// an ASCII preview (ascii mode). Places the caret on the first editable
+    /// position (skipping a leading space is unnecessary — the string starts with a
+    /// digit/char). The content is taken as-is from the seed (it is the live
+    /// fixed-length `"NN NN …"` / `"…"` string the row shows).
+    pub fn set_hex_overwrite(&mut self, mode: HexOverwrite) {
+        self.hex_overwrite = Some(mode);
+        // Start with the caret at offset 0 (a digit/char, never a space) and no
+        // selection — overwrite mode does not select-all on begin.
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+    }
+
+    /// Whether this field is in hex/ASCII overwrite mode (item 7).
+    pub fn is_hex_overwrite(&self) -> bool {
+        self.hex_overwrite.is_some()
+    }
+
+    /// Advance/clamp helper: the next caret offset moving right by one, skipping a
+    /// space separator in hex mode, clamped to the last data position.
+    fn ow_next(&self, off: usize) -> usize {
+        ow_next_in(
+            &self.content,
+            self.hex_overwrite.map(|m| m.is_hex()).unwrap_or(false),
+            off,
+        )
+    }
+
+    /// The previous caret offset moving left by one, skipping a space separator in
+    /// hex mode, clamped to 0.
+    fn ow_prev(&self, off: usize) -> usize {
+        ow_prev_in(
+            &self.content,
+            self.hex_overwrite.map(|m| m.is_hex()).unwrap_or(false),
+            off,
+        )
+    }
+
+    /// Overwrite the single char at byte offset `at` with `ch` (no length change).
+    /// Returns the new caret offset (advanced one position, space-skipping).
+    fn overwrite_at(&mut self, at: usize, ch: char, cx: &mut Context<Self>) {
+        if at >= self.content.len() {
+            return;
+        }
+        let mut s: Vec<char> = self.content.chars().collect();
+        // The content is ASCII (hex digits/spaces or printable ASCII), so char and
+        // byte indices coincide; guard anyway.
+        if at < s.len() {
+            s[at] = ch;
+            self.content = s.into_iter().collect::<String>().into();
+        }
+        let next = self.ow_next(at);
+        self.selected_range = next..next;
+        self.selection_reversed = false;
+        self.restart_blink(cx);
+        cx.notify();
     }
 
     /// Whether the caret quad should be painted this frame (BUG 2). Solid while
@@ -235,6 +332,11 @@ impl FieldInput {
     // ── editing actions (mirror gpui/examples/input.rs) ──
 
     fn left(&mut self, _: &FieldLeft, _: &mut Window, cx: &mut Context<Self>) {
+        // Item 7: overwrite mode moves one position left, skipping space separators.
+        if self.hex_overwrite.is_some() {
+            self.move_to(self.ow_prev(self.cursor_offset()), cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -242,6 +344,10 @@ impl FieldInput {
         }
     }
     fn right(&mut self, _: &FieldRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.hex_overwrite.is_some() {
+            self.move_to(self.ow_next(self.cursor_offset()), cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
         } else {
@@ -255,16 +361,49 @@ impl FieldInput {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
     fn select_all(&mut self, _: &FieldSelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        // Overwrite mode has no free-text selection — Ctrl+A is a no-op there
+        // (the C++ hex editor ignores it), keeping the fixed-length invariant.
+        if self.hex_overwrite.is_some() {
+            return;
+        }
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }
     fn home(&mut self, _: &FieldHome, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
     }
+    /// Item 9: swallow Up/Down/PageUp/PageDown during an active edit so they do
+    /// not bubble to the editor surface and navigate between NODES. The single-
+    /// line inline field has no vertical motion, so this is a deliberate no-op that
+    /// merely consumes the event (mirrors C++ `handleEditKey` returning `true` for
+    /// these keys). The blink is restarted so the caret stays solid on the keypress.
+    fn swallow_vert(&mut self, _: &FieldSwallowVert, _: &mut Window, cx: &mut Context<Self>) {
+        self.restart_blink(cx);
+    }
     fn end(&mut self, _: &FieldEnd, _: &mut Window, cx: &mut Context<Self>) {
+        // Overwrite mode: the last editable position is the final char, not past it.
+        if self.hex_overwrite.is_some() {
+            self.move_to(self.content.len().saturating_sub(1), cx);
+            return;
+        }
         self.move_to(self.content.len(), cx);
     }
     fn backspace(&mut self, _: &FieldBackspace, window: &mut Window, cx: &mut Context<Self>) {
+        // Item 7: overwrite mode RESETS the previous position (no splice / length
+        // change) and moves there — matching C++ `handleHexEditKey` Backspace.
+        if let Some(mode) = self.hex_overwrite {
+            let cur = self.cursor_offset();
+            if cur == 0 {
+                return;
+            }
+            let prev = self.ow_prev(cur);
+            // Write the reset char at `prev`, then leave the caret on `prev`.
+            self.set_char_at(prev, mode.reset_char());
+            self.selected_range = prev..prev;
+            self.restart_blink(cx);
+            cx.notify();
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -275,6 +414,20 @@ impl FieldInput {
         self.replace_text_in_range(None, "", window, cx);
     }
     fn delete(&mut self, _: &FieldDelete, window: &mut Window, cx: &mut Context<Self>) {
+        // Item 7: overwrite mode RESETS the current position in place.
+        if let Some(mode) = self.hex_overwrite {
+            let at = self.cursor_offset();
+            // Skip space separators in hex mode (nothing to reset there).
+            if mode.is_hex() && self.content.as_bytes().get(at) == Some(&b' ') {
+                return;
+            }
+            if at < self.content.len() {
+                self.set_char_at(at, mode.reset_char());
+                self.restart_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -283,6 +436,15 @@ impl FieldInput {
             self.select_to(next, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+    }
+
+    /// Overwrite the char at `at` in place (no caret move, no length change).
+    fn set_char_at(&mut self, at: usize, ch: char) {
+        let mut s: Vec<char> = self.content.chars().collect();
+        if at < s.len() {
+            s[at] = ch;
+            self.content = s.into_iter().collect::<String>().into();
+        }
     }
     fn commit(&mut self, _: &FieldCommit, _: &mut Window, cx: &mut Context<Self>) {
         self.pending_outcome = Some(EditOutcome::Commit(self.to_commit()));
@@ -475,6 +637,36 @@ impl EntityInputHandler for FieldInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Item 7: in hex/ASCII overwrite mode, character input does NOT splice —
+        // it overwrites one position in place (fixed length) and advances. Filter
+        // accepted characters (hex digits / printable ASCII), upper-casing hex.
+        if let Some(mode) = self.hex_overwrite {
+            for ch in new_text.chars() {
+                let at = self
+                    .cursor_offset()
+                    .min(self.content.len().saturating_sub(1));
+                // Skip a space separator under the caret (hex mode) before writing.
+                let at = if mode.is_hex() && self.content.as_bytes().get(at) == Some(&b' ') {
+                    (at + 1).min(self.content.len().saturating_sub(1))
+                } else {
+                    at
+                };
+                let accepted = match mode {
+                    HexOverwrite::Hex { .. } => {
+                        ch.is_ascii_hexdigit().then(|| ch.to_ascii_uppercase())
+                    }
+                    HexOverwrite::Ascii { .. } => {
+                        let c = ch as u32;
+                        (0x20..=0x7E).contains(&c).then_some(ch)
+                    }
+                };
+                if let Some(c) = accepted {
+                    self.overwrite_at(at, c, cx);
+                }
+            }
+            self.marked_range.take();
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -574,6 +766,34 @@ pub fn splice_text(content: &str, range: Range<usize>, new_text: &str) -> (Strin
     out.push_str(&content[end..]);
     let cursor = start + new_text.len();
     (out, cursor)
+}
+
+/// Item 7 (pure): the caret offset one position to the RIGHT in a fixed-length
+/// overwrite buffer, skipping a single space separator when `is_hex`, clamped to
+/// the last editable char (`len-1`). The buffer is ASCII (hex digits/spaces or
+/// printable ASCII) so byte and char indices coincide.
+pub fn ow_next_in(content: &str, is_hex: bool, off: usize) -> usize {
+    let bytes = content.as_bytes();
+    let mut n = off + 1;
+    if is_hex && n < bytes.len() && bytes[n] == b' ' {
+        n += 1;
+    }
+    let last = content.len().saturating_sub(1);
+    n.min(last)
+}
+
+/// Item 7 (pure): the caret offset one position to the LEFT, skipping a single
+/// space separator when `is_hex`, clamped to 0.
+pub fn ow_prev_in(content: &str, is_hex: bool, off: usize) -> usize {
+    if off == 0 {
+        return 0;
+    }
+    let bytes = content.as_bytes();
+    let mut n = off - 1;
+    if is_hex && bytes.get(n) == Some(&b' ') {
+        n = n.saturating_sub(1);
+    }
+    n
 }
 
 /// The custom element that shapes + paints the field text + caret/selection and
@@ -785,6 +1005,7 @@ impl Render for FieldInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::swallow_vert))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -816,6 +1037,12 @@ pub fn field_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", FieldCopy, Some("RcxFieldInput")),
         KeyBinding::new("cmd-x", FieldCut, Some("RcxFieldInput")),
         KeyBinding::new("ctrl-x", FieldCut, Some("RcxFieldInput")),
+        // Item 9: block vertical / page navigation during edit (swallowed here so
+        // they don't reach the editor's node-nav bindings).
+        KeyBinding::new("up", FieldSwallowVert, Some("RcxFieldInput")),
+        KeyBinding::new("down", FieldSwallowVert, Some("RcxFieldInput")),
+        KeyBinding::new("pageup", FieldSwallowVert, Some("RcxFieldInput")),
+        KeyBinding::new("pagedown", FieldSwallowVert, Some("RcxFieldInput")),
     ]
 }
 
@@ -824,7 +1051,7 @@ mod tests {
     // Import only the items under test — NOT `super::*`, which would pull the
     // module's `gpui::*` glob into the `#[test]` hygiene expansion and explode
     // the type-recursion budget on this nightly+gpui combination.
-    use super::{splice_text, EditCommit};
+    use super::{ow_next_in, ow_prev_in, splice_text, EditCommit};
     use crate::compose::EditTarget;
 
     #[test]
@@ -881,5 +1108,38 @@ mod tests {
         // always passes char-aligned offsets, but the splice must never panic).
         assert_eq!(splice_text("ab", 5..9, "Z"), ("abZ".to_string(), 3));
         assert_eq!(splice_text("ab", 1..9, "Z"), ("aZ".to_string(), 2));
+    }
+
+    #[test]
+    fn hex_overwrite_right_skips_space_separators() {
+        // "00 11 22" — moving right from the second nibble of byte 0 (offset 1)
+        // must land on the FIRST nibble of byte 1 (offset 3), skipping the space.
+        let s = "00 11 22";
+        assert_eq!(ow_next_in(s, true, 0), 1); // 0→1 within a byte
+        assert_eq!(ow_next_in(s, true, 1), 3); // 1→(skip space at 2)→3
+        assert_eq!(ow_next_in(s, true, 3), 4);
+        assert_eq!(ow_next_in(s, true, 4), 6); // skip the space at 5
+                                               // Clamp at the last data char (offset len-1 = 7), never past it.
+        assert_eq!(ow_next_in(s, true, 7), 7);
+    }
+
+    #[test]
+    fn hex_overwrite_left_skips_space_separators() {
+        let s = "00 11 22";
+        assert_eq!(ow_prev_in(s, true, 0), 0); // clamp at start
+        assert_eq!(ow_prev_in(s, true, 1), 0);
+        assert_eq!(ow_prev_in(s, true, 3), 1); // 3→(skip space at 2)→1
+        assert_eq!(ow_prev_in(s, true, 4), 3);
+        assert_eq!(ow_prev_in(s, true, 6), 4); // 6→(skip space at 5)→4
+    }
+
+    #[test]
+    fn ascii_overwrite_has_no_space_skipping() {
+        // ASCII preview "...." moves one position at a time, no separators.
+        let s = "....";
+        assert_eq!(ow_next_in(s, false, 0), 1);
+        assert_eq!(ow_next_in(s, false, 3), 3); // clamp at len-1
+        assert_eq!(ow_prev_in(s, false, 2), 1);
+        assert_eq!(ow_prev_in(s, false, 0), 0);
     }
 }

@@ -50,7 +50,156 @@ use super::titlebar::{self, LayoutPreset};
 use super::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
 };
-use crate::theme::ThemeManager;
+use crate::theme::{SettingsStore, ThemeManager};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DiskSettings — the disk-backed app settings store (the QSettings replacement)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A JSON-file-backed [`SettingsStore`] — the Rust port's equivalent of the C++
+/// `QSettings("Reclass", "Reclass")` shared app settings.
+///
+/// The C++ app persists everything (recent files, theme, view toggles, editor
+/// font, go-to-address recents, refresh interval, MCP autostart, …) through one
+/// `QSettings` instance. The port previously had only the in-memory
+/// [`MemSettings`](crate::theme::MemSettings), so NOTHING survived a relaunch.
+/// This is the single disk-backed store the window owns and threads to every
+/// persistence consumer.
+///
+/// Storage is a flat `key → string` JSON object at
+/// `<config_dir>/Reclass/settings.json` (`<config_dir>` from the same
+/// `directories::ProjectDirs` the theme manager uses, so the location matches
+/// the rest of the app). Reads are served from an in-memory cache; every
+/// [`set`](SettingsStore::set) writes the whole object back to disk
+/// (small file, infrequent writes — the same write-through `QSettings` does).
+/// List-valued keys (recent files, go-to recents) are stored as `\n`-joined
+/// strings via [`get_list`](DiskSettings::get_list) / [`set_list`].
+pub struct DiskSettings {
+    path: std::path::PathBuf,
+    map: std::collections::HashMap<String, String>,
+}
+
+impl DiskSettings {
+    /// The on-disk settings file path — `<config>/Reclass/settings.json`.
+    /// `<config>` is `ProjectDirs::config_dir()` for org/app "Reclass"/"Reclass"
+    /// (matching [`ThemeManager::default_user_dir`]); falls back to a temp dir.
+    pub fn default_path() -> std::path::PathBuf {
+        let base = directories::ProjectDirs::from("", "Reclass", "Reclass")
+            .map(|d| d.config_dir().to_path_buf())
+            .unwrap_or_else(|| std::env::temp_dir().join("Reclass"));
+        let _ = std::fs::create_dir_all(&base);
+        base.join("settings.json")
+    }
+
+    /// Open (or create) the disk store at the default path, loading any existing
+    /// keys. A missing/corrupt file yields an empty store (the C++ `QSettings`
+    /// "fresh defaults" behaviour) rather than failing.
+    pub fn open_default() -> Self {
+        Self::open_at(Self::default_path())
+    }
+
+    /// Open the store at an explicit path (used by tests with a temp file).
+    pub fn open_at(path: std::path::PathBuf) -> Self {
+        let map = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| {
+                serde_json::from_str::<std::collections::HashMap<String, String>>(&s).ok()
+            })
+            .unwrap_or_default();
+        DiskSettings { path, map }
+    }
+
+    /// Persist the in-memory map back to disk (whole-object write-through).
+    /// Best-effort: a write failure is logged, not propagated (matching the C++
+    /// `QSettings` which silently no-ops on an unwritable backing store).
+    fn flush(&self) {
+        match serde_json::to_string_pretty(&self.map) {
+            Ok(text) => {
+                if let Some(parent) = self.path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&self.path, text) {
+                    tracing::warn!(path = %self.path.display(), error = %e, "settings flush failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "settings serialize failed"),
+        }
+    }
+
+    /// Read a list-valued key (C++ `QStringList`), stored `\n`-joined. Empty
+    /// segments are dropped; a missing key yields an empty list.
+    pub fn get_list(&self, key: &str) -> Vec<String> {
+        self.map
+            .get(key)
+            .map(|s| {
+                s.split('\n')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Write a list-valued key (C++ `QStringList`), stored `\n`-joined, and
+    /// flush. Empty entries are dropped so they round-trip with [`get_list`].
+    pub fn set_list(&mut self, key: &str, values: &[String]) {
+        let joined = values
+            .iter()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.map.insert(key.to_string(), joined);
+        self.flush();
+    }
+
+    /// Read a bool key with a default (C++ `value(key, default).toBool()`).
+    pub fn get_bool(&self, key: &str, default: bool) -> bool {
+        self.map
+            .get(key)
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(default)
+    }
+
+    /// Write a bool key (`"true"`/`"false"`) and flush.
+    pub fn set_bool(&mut self, key: &str, value: bool) {
+        self.map.insert(
+            key.to_string(),
+            if value { "true" } else { "false" }.to_string(),
+        );
+        self.flush();
+    }
+}
+
+impl SettingsStore for DiskSettings {
+    fn get(&self, key: &str) -> Option<String> {
+        self.map.get(key).cloned()
+    }
+    fn set(&mut self, key: &str, value: &str) {
+        self.map.insert(key.to_string(), value.to_string());
+        self.flush();
+    }
+}
+
+/// QSettings key names (the C++ `QSettings(...).value("<key>")` strings) so the
+/// Rust store reads/writes the SAME logical keys the C++ app uses. Kept in one
+/// place so every consumer agrees on the spelling.
+mod settings_keys {
+    pub const RECENT_FILES: &str = "recentFiles";
+    pub const FONT: &str = "font";
+    pub const COMPACT_COLUMNS: &str = "compactColumns";
+    pub const TREE_LINES: &str = "treeLines";
+    pub const RELATIVE_OFFSETS: &str = "relativeOffsets";
+    pub const TYPE_HINTS: &str = "typeHints";
+    pub const SHOW_COMMENTS: &str = "showComments";
+    pub const HOVER_EFFECTS: &str = "hoverEffects";
+    pub const MINIMAP: &str = "minimap";
+    pub const THEME: &str = "theme";
+    pub const REFRESH_MS: &str = "refreshMs";
+    pub const AUTO_START_MCP: &str = "autoStartMcp";
+    pub const BRACE_WRAP: &str = "braceWrap";
+    pub const GENERATOR_ASSERTS: &str = "generatorAsserts";
+}
 
 // App-level actions. Mirrors Zed: the command palette opens on Ctrl+Shift+P / F1
 // (`command_palette::Toggle` in Zed's default keymap). `ToggleScanner` shows/hides
@@ -153,9 +302,33 @@ pub struct MainWindow {
     mcp_running: bool,
     /// Recent Go-to-Address formulas (the C++ `GotoAddressDialog` recent list).
     /// Most-recent-first, deduped, capped. Loaded into the dialog on open and
-    /// pushed on accept. Session-scoped (the port has no persistent settings
-    /// store yet; see [`set_editor_font`](Self::set_editor_font)).
+    /// pushed on accept. Persisted via [`settings`](Self::settings).
     goto_recent: Vec<String>,
+    /// The disk-backed app settings store (the C++ `QSettings("Reclass",
+    /// "Reclass")` replacement). Owns recent-files / font / view-toggle
+    /// persistence across launches. Shared, interior-mutable so async closures
+    /// (file pickers) can persist after the borrow of `self` ends.
+    settings: Rc<RefCell<DiskSettings>>,
+    /// The bottom-dock memory [`ScannerPanel`] handle (the C++ summon-on-demand
+    /// scanner). Held so the window can feed it the active document's provider —
+    /// previously dropped (`..` in the `LayoutHandles` destructure), so the
+    /// scanner could never scan.
+    scanner: Entity<super::scannerpanel::ScannerPanel>,
+    /// Live subscription to an open Tools ▸ Options dialog — kept so its
+    /// Apply/Cancel events fire while shown (mirrors [`goto_sub`](Self::goto_sub)).
+    options_sub: Option<Subscription>,
+    /// Persisted MCP autostart preference (the C++ `autoStartMcp` setting). Owned
+    /// here so Options can toggle + persist it; the MCP label reflects
+    /// [`mcp_running`](Self::mcp_running) which this seeds on startup.
+    auto_start_mcp: bool,
+    /// Persisted generated-code brace-wrap + size-assert prefs (the C++
+    /// `braceWrap` / `generatorAsserts`). Applied to code export; persisted via
+    /// the disk store.
+    brace_wrap: bool,
+    generator_asserts: bool,
+    /// Persisted refresh interval (ms) (the C++ `refreshMs`). Pushed into the
+    /// active controllers when Options applies; persisted via the disk store.
+    refresh_ms: i32,
 }
 
 /// The seven checkable View-menu options (the C++ View menu defaults; the
@@ -193,6 +366,35 @@ impl Default for ViewOptions {
 }
 
 impl ViewOptions {
+    /// Load the persisted view-option toggles from the disk store, falling back
+    /// to the C++ defaults for any unset key (the C++ `settings.value(key,
+    /// default).toBool()` pattern; main.cpp:1336-1411).
+    fn load(store: &DiskSettings) -> Self {
+        let d = ViewOptions::default();
+        ViewOptions {
+            compact_columns: store.get_bool(settings_keys::COMPACT_COLUMNS, d.compact_columns),
+            tree_lines: store.get_bool(settings_keys::TREE_LINES, d.tree_lines),
+            relative_offsets: store.get_bool(settings_keys::RELATIVE_OFFSETS, d.relative_offsets),
+            type_hints: store.get_bool(settings_keys::TYPE_HINTS, d.type_hints),
+            show_comments: store.get_bool(settings_keys::SHOW_COMMENTS, d.show_comments),
+            hover_effects: store.get_bool(settings_keys::HOVER_EFFECTS, d.hover_effects),
+            minimap: store.get_bool(settings_keys::MINIMAP, d.minimap),
+        }
+    }
+
+    /// The QSettings key one option persists under (the C++ `setValue(key, …)`).
+    fn key(opt: ViewOpt) -> &'static str {
+        match opt {
+            ViewOpt::CompactColumns => settings_keys::COMPACT_COLUMNS,
+            ViewOpt::TreeLines => settings_keys::TREE_LINES,
+            ViewOpt::RelativeOffsets => settings_keys::RELATIVE_OFFSETS,
+            ViewOpt::TypeHints => settings_keys::TYPE_HINTS,
+            ViewOpt::ShowComments => settings_keys::SHOW_COMMENTS,
+            ViewOpt::HoverEffects => settings_keys::HOVER_EFFECTS,
+            ViewOpt::Minimap => settings_keys::MINIMAP,
+        }
+    }
+
     fn get(&self, opt: ViewOpt) -> bool {
         match opt {
             ViewOpt::CompactColumns => self.compact_columns,
@@ -464,11 +666,43 @@ impl MainWindow {
             workspace,
             modules,
             bookmarks,
-            // The scanner handle is wired by its owning code path; ignore any
-            // additional layout handles here so this destructuring stays robust
-            // as docks.rs grows.
+            // KEEP the scanner handle (previously dropped via `..`): the window
+            // must feed it the active document's provider + wire result rows, or
+            // it can never scan. Any future handles still tolerate `..`.
+            scanner,
             ..
         } = docks::build_default_layout(&dock_area, window, cx);
+
+        // Open the disk-backed app settings store (the QSettings replacement)
+        // and load the persisted across-launch state from it.
+        let settings = Rc::new(RefCell::new(DiskSettings::open_default()));
+        let recent_files: Vec<std::path::PathBuf> = settings
+            .borrow()
+            .get_list(settings_keys::RECENT_FILES)
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let editor_font = settings
+            .borrow()
+            .get(settings_keys::FONT)
+            .filter(|s| !s.is_empty())
+            // The C++ default font is JetBrains Mono (main.cpp:1311).
+            .unwrap_or_else(|| "JetBrains Mono".to_string());
+        let view_opts = ViewOptions::load(&settings.borrow());
+        let goto_recent = crate::ui::gotoaddress::load_recent(&*settings.borrow());
+        // Tools ▸ Options persisted prefs (the C++ refreshMs/autoStartMcp/
+        // braceWrap/generatorAsserts QSettings keys).
+        let (auto_start_mcp, brace_wrap, generator_asserts, refresh_ms) = {
+            let s = settings.borrow();
+            (
+                s.get_bool(settings_keys::AUTO_START_MCP, true),
+                s.get_bool(settings_keys::BRACE_WRAP, false),
+                s.get_bool(settings_keys::GENERATOR_ASSERTS, false),
+                s.get(settings_keys::REFRESH_MS)
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(super::optionsdialog::REFRESH_DEFAULT),
+            )
+        };
 
         // Seed window state with the initial document tab (the C++ "never leave a
         // blank window"; app-shell §8 step 9). The center `DocumentArea` already
@@ -481,10 +715,19 @@ impl MainWindow {
         let layout_preset =
             LayoutPreset::for_visible(dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
 
-        // Apply the current theme to gpui-component (themes.md §4.16). Record the
-        // active theme name in the state (the theme handle).
+        // Apply the active theme to gpui-component (themes.md §4.16). The
+        // ThemeManager global is seeded with a fresh in-memory store on every
+        // launch (so its persisted "theme" key is lost across restarts); restore
+        // the selection from OUR disk store here so the saved theme survives a
+        // relaunch. Record the resulting active theme name in the state.
         {
-            let tm = theme_manager.borrow();
+            let saved_theme = settings.borrow().get(settings_keys::THEME);
+            let mut tm = theme_manager.borrow_mut();
+            if let Some(name) = saved_theme {
+                if let Some(idx) = tm.themes().iter().position(|t| t.name == name) {
+                    tm.set_current(idx);
+                }
+            }
             let current = tm.current().clone();
             state.set_theme_name(&current.name);
             super::theme_apply::apply_theme(&current, window, cx);
@@ -540,6 +783,52 @@ impl MainWindow {
         )
         .detach();
 
+        // ── Wire the bookmarks dock row actions (the C++ bookmark-row click →
+        // navigate, right-click → Navigate/Remove). ──
+        cx.subscribe_in(
+            &bookmarks,
+            window,
+            |this, _bm, ev: &super::bookmarkspanel::BookmarkAction, window, cx| {
+                this.on_bookmark_action(ev.clone(), window, cx);
+            },
+        )
+        .detach();
+
+        // ── Wire the scanner dock result-row navigation (the C++ result-row
+        // double-click → jump the editor to the address). ──
+        cx.subscribe_in(
+            &scanner,
+            window,
+            |this, _sc, ev: &super::scannerpanel::ScannerNav, window, cx| {
+                this.navigate_active_editor_to_address(ev.address, window, cx);
+            },
+        )
+        .detach();
+
+        // ── Wire the modules dock row activation (double-click → set the active
+        // document's base address to the module base). ──
+        cx.subscribe_in(
+            &modules,
+            window,
+            |this, _md, ev: &super::modulespanel::ModuleAction, window, cx| {
+                if let super::modulespanel::ModuleAction::Activate { base, .. } = ev {
+                    this.navigate_active_editor_to_address(*base, window, cx);
+                }
+            },
+        )
+        .detach();
+
+        // ── Window focus drives the controller's adaptive refresh throttle
+        // (slow on blur; the C++ `setWindowState(focused, visible)`;
+        // controller.cpp:5474). gpui has no separate "minimized" signal here, so
+        // we map activation → focused and treat the window as visible while it
+        // exists; a blurred window backs off the read cadence. ──
+        cx.observe_window_activation(window, |this, window, cx| {
+            let focused = window.is_window_active();
+            this.set_controllers_window_state(focused, true, cx);
+        })
+        .detach();
+
         let mut win = MainWindow {
             state,
             dock_area,
@@ -555,12 +844,22 @@ impl MainWindow {
             editor_observers: Vec::new(),
             goto_sub: None,
             presentation: false,
-            view_opts: ViewOptions::default(),
-            recent_files: Vec::new(),
-            // The C++ default font is JetBrains Mono (main.cpp:1311).
-            editor_font: "JetBrains Mono".to_string(),
-            mcp_running: false,
-            goto_recent: Vec::new(),
+            // View toggles, recent files, the editor font, and go-to recents are
+            // loaded from the disk store above (persisted across launches).
+            view_opts,
+            recent_files,
+            editor_font,
+            // The MCP "running" flag is seeded from the persisted autostart pref
+            // (the C++ `autoStartMcp` drives the initial Start/Stop label).
+            mcp_running: auto_start_mcp,
+            goto_recent,
+            settings,
+            scanner,
+            options_sub: None,
+            auto_start_mcp,
+            brace_wrap,
+            generator_asserts,
+            refresh_ms,
         };
 
         // Observe the initial editor(s) so a row selection re-renders the window
@@ -580,9 +879,23 @@ impl MainWindow {
         // option checked except Comments; the Project dock open; the right-dock
         // panels + presentation closed). Mirrors `sync_scanner_menu_checked`.
         win.sync_view_menu_checked(cx);
+        // Realign the initial editor tab(s) to the persisted view options (the
+        // C++ applies each saved view setting to the first editor on startup).
+        let initial_editors: Vec<Entity<super::editor::RcxEditor>> = win
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        for editor in &initial_editors {
+            win.apply_view_opts_to_editor(editor, cx);
+        }
         // Rebuild the workspace model from the seeded document, then show the
         // start page over the workspace (the C++ deferred `showStartPage`).
         win.rebuild_workspace(cx);
+        // Seed the docks for the initial (empty) document.
+        win.refresh_docks_for_active(cx);
         win.show_start_page(window, cx);
         win
     }
@@ -856,7 +1169,7 @@ impl MainWindow {
                 cx,
             ),
             "tools.mcp" => self.toggle_mcp(window, cx),
-            "tools.options" => self.notify("Options dialog is wired elsewhere.", window, cx),
+            "tools.options" => self.open_options_dialog(window, cx),
             "tools.profiler" => self.notify(
                 "Performance Profiler is not available in this port yet.",
                 window,
@@ -894,6 +1207,13 @@ impl MainWindow {
             other if other.starts_with("file.recent.") => {
                 self.open_recent_by_command(other, window, cx);
             }
+            // Switch the active saved data source (`source.saved.<INDEX>`) — the
+            // C++ `m_sourceMenu` saved-source rows route to
+            // `controller->switchToSavedSource(idx)`. Previously these rows fell
+            // into the catch-all and did nothing.
+            other if other.starts_with("source.saved.") => {
+                self.switch_saved_source_by_command(other, window, cx);
+            }
 
             // ── Anything still unmapped: graceful, logged no-op. ──
             other => {
@@ -912,15 +1232,24 @@ impl MainWindow {
         self.dismiss_start_page(cx);
         let title = kind.title();
         let doc = seed_root_doc(kind);
+        let mut new_editor: Option<Entity<super::editor::RcxEditor>> = None;
         self.document_area.update(cx, |area, cx| {
             area.push_document(title, window, cx);
             // Push the seeded tree into the just-created tab's editor.
             if let Some(editor) = area.active_editor().cloned() {
                 editor.update(cx, |ed, cx| ed.set_document(doc, cx));
+                new_editor = Some(editor);
             }
         });
+        // Realign the fresh editor to the window's (persisted) view options so a
+        // new tab honours the current compact-columns/tree-lines/etc. state.
+        if let Some(editor) = new_editor {
+            self.apply_view_opts_to_editor(&editor, cx);
+        }
         self.state.open_document(title);
         self.rebuild_workspace(cx);
+        // A fresh doc has the NullProvider — clear the docks accordingly.
+        self.refresh_docks_for_active(cx);
         self.observe_editors(cx);
     }
 
@@ -1150,8 +1479,66 @@ impl MainWindow {
     ) {
         self.set_right_dock_open(true, window, cx);
         self.sync_view_menu_checked(cx);
+        // Populate the bookmarks dock with the controller's current list (the C++
+        // `refreshBookmarksDock`); previously the panel stayed empty after Add.
+        self.refresh_docks_for_active(cx);
         self.sync_dirty_state(cx);
         self.notify(format!("Bookmarked: {name} → {formula}"), window, cx);
+        cx.notify();
+    }
+
+    /// Handle a bookmarks-dock row action (the C++ bookmark-row click → navigate,
+    /// right-click → Navigate / Remove): navigate the active editor to the
+    /// bookmark's address formula, or remove the bookmark at its index + refresh
+    /// the dock.
+    fn on_bookmark_action(
+        &mut self,
+        ev: super::bookmarkspanel::BookmarkAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::bookmarkspanel::BookmarkAction;
+        match ev {
+            BookmarkAction::Navigate { formula } => {
+                // Reuse the go-to-address resolve/navigate path so `<mod>+0x..` /
+                // `[ptr]` forms resolve against the live provider.
+                self.commit_goto(&formula, 0, window, cx);
+            }
+            BookmarkAction::Remove { index } => {
+                if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+                    editor.update(cx, |ed, cx| {
+                        ed.controller_mut().remove_bookmark(index);
+                        ed.apply_document(cx);
+                    });
+                }
+                self.refresh_docks_for_active(cx);
+                self.sync_dirty_state(cx);
+                cx.notify();
+            }
+            // Header "+" → open the same Add-Bookmark prompt the Edit menu uses.
+            BookmarkAction::Add => self.prompt_add_bookmark(window, cx),
+        }
+    }
+
+    /// Navigate the active editor to an absolute address (the scanner result-row
+    /// / module-row jump target): rebase the active tree to `addr` + recompose.
+    fn navigate_active_editor_to_address(
+        &mut self,
+        addr: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first.", window, cx);
+            return;
+        };
+        editor.update(cx, |ed, cx| {
+            let tree = &mut ed.controller_mut().document_mut().tree;
+            tree.base_address = addr;
+            ed.apply_document(cx);
+        });
+        self.rebuild_workspace(cx);
+        self.notify(format!("Jumped to 0x{addr:X}"), window, cx);
         cx.notify();
     }
 
@@ -1162,11 +1549,11 @@ impl MainWindow {
     /// editor surface owns no live family setter in this port, so the window owns
     /// the selection + persisted setting + the Font submenu ✓.
     fn set_editor_font(&mut self, family: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // The port has no app-wide persistent settings store yet (theme settings
-        // use an in-memory MemSettings), so the selection lives on the window;
-        // the Font submenu ✓ reflects it. Persistence lands with the settings
-        // store wiring.
         self.editor_font = family.to_string();
+        // Persist the selection to the disk store so it survives a relaunch (the
+        // C++ `settings.setValue("font", family)`; main.cpp:1311). Loaded back in
+        // the ctor.
+        self.settings.borrow_mut().set(settings_keys::FONT, family);
         self.sync_font_menu_checked(cx);
         self.notify(format!("Editor font: {family}"), window, cx);
     }
@@ -1206,6 +1593,123 @@ impl MainWindow {
             "MCP Server stopped."
         };
         self.notify(msg, window, cx);
+    }
+
+    /// Tools ▸ Options — open the [`OptionsDialog`] seeded from the live window
+    /// state, subscribe to its Apply event, and on accept apply each field to
+    /// the live window/editors/controllers + persist via the disk store (the
+    /// C++ `showOptionsDialog` → apply + `QSettings::setValue`).
+    fn open_options_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use super::optionsdialog::{OptionsDialog, OptionsEvent, OptionsResult};
+        let themes: Vec<String> = self
+            .theme_manager
+            .borrow()
+            .themes()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        let theme_index = self.theme_manager.borrow().current_index();
+        let current = OptionsResult {
+            theme_index,
+            font_name: self.editor_font.clone(),
+            menu_bar_title_case: true,
+            show_icon: false,
+            auto_start_mcp: self.auto_start_mcp,
+            refresh_ms: self.refresh_ms,
+            generator_asserts: self.generator_asserts,
+            brace_wrap: self.brace_wrap,
+        };
+        let dialog = cx.new(|cx| OptionsDialog::new(current, themes, window, cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        self.options_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            |this, _d, ev: &OptionsEvent, window, cx| match ev {
+                OptionsEvent::Apply(result) => {
+                    let result = result.clone();
+                    window.close_dialog(cx);
+                    this.apply_options(result, window, cx);
+                }
+                OptionsEvent::Cancel => window.close_dialog(cx),
+            },
+        ));
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(640.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Apply an accepted [`OptionsResult`] to the live app + persist every field
+    /// (the C++ Options "OK" path). Theme + font reuse the existing switch/set
+    /// helpers (which persist on their own); the remaining fields persist here.
+    fn apply_options(
+        &mut self,
+        result: super::optionsdialog::OptionsResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Theme (the C++ `m_themeCombo` → `setCurrent`). `switch_theme` re-styles
+        // + records the active name; persist it via the disk store under "theme".
+        let theme_name = self
+            .theme_manager
+            .borrow()
+            .themes()
+            .get(result.theme_index)
+            .map(|t| t.name.clone());
+        if let Some(name) = theme_name {
+            self.switch_theme(result.theme_index, window, cx);
+            self.sync_theme_menu_checked(cx);
+            self.settings.borrow_mut().set(settings_keys::THEME, &name);
+        }
+        // Font (reuses `set_editor_font`, which persists "font" + syncs the menu).
+        if result.font_name != self.editor_font && !result.font_name.is_empty() {
+            self.set_editor_font(&result.font_name.clone(), window, cx);
+        }
+        // Refresh interval — push into every controller + persist "refreshMs".
+        self.refresh_ms = result.refresh_ms.clamp(
+            super::optionsdialog::REFRESH_MIN,
+            super::optionsdialog::REFRESH_MAX,
+        );
+        self.settings
+            .borrow_mut()
+            .set(settings_keys::REFRESH_MS, &self.refresh_ms.to_string());
+        // Brace-wrap (generator) — push into every controller + persist.
+        self.brace_wrap = result.brace_wrap;
+        self.settings
+            .borrow_mut()
+            .set_bool(settings_keys::BRACE_WRAP, self.brace_wrap);
+        self.generator_asserts = result.generator_asserts;
+        self.settings
+            .borrow_mut()
+            .set_bool(settings_keys::GENERATOR_ASSERTS, self.generator_asserts);
+        // Push refresh + brace-wrap into every open controller.
+        let refresh_ms = self.refresh_ms;
+        let brace_wrap = self.brace_wrap;
+        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        for editor in editors {
+            editor.update(cx, |ed, _cx| {
+                ed.controller_mut().set_refresh_interval(refresh_ms);
+                ed.controller_mut().set_brace_wrap(brace_wrap);
+            });
+        }
+        // MCP autostart — persist; reflect the label via the running flag.
+        self.auto_start_mcp = result.auto_start_mcp;
+        self.settings
+            .borrow_mut()
+            .set_bool(settings_keys::AUTO_START_MCP, self.auto_start_mcp);
+        self.notify("Options applied.", window, cx);
+        cx.notify();
     }
 
     /// Help ▸ About Reclass — a themed message box with build info + a note on the
@@ -1251,7 +1755,37 @@ impl MainWindow {
         self.recent_files.retain(|p| p != &abs);
         self.recent_files.insert(0, abs);
         self.recent_files.truncate(10);
+        // Persist the list to the disk store (the C++ `addRecentFile` →
+        // `settings.setValue("recentFiles", recent)`; main.cpp:8765) so Open
+        // Recent survives a relaunch. Loaded back in the ctor.
+        self.persist_recent_files();
         self.rebuild_menus(cx);
+    }
+
+    /// Write the in-memory recent-files list to the disk store as a
+    /// `\n`-joined `QStringList` (the C++ `recentFiles` key).
+    fn persist_recent_files(&self) {
+        let values: Vec<String> = self
+            .recent_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        self.settings
+            .borrow_mut()
+            .set_list(settings_keys::RECENT_FILES, &values);
+    }
+
+    /// The recent-files paths that still exist on disk, most-recent-first. Both
+    /// the Recent Files submenu and the start page skip entries whose file no
+    /// longer exists (the C++ `updateRecentFilesMenu` `if (!QFile::exists(path))
+    /// continue;`; main.cpp:8789). Indices map back into the stored vec so a
+    /// reopen targets the right path.
+    fn existing_recent_files(&self) -> Vec<(usize, &std::path::PathBuf)> {
+        self.recent_files
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.exists())
+            .collect()
     }
 
     /// Reopen a recent file from its `file.recent.<index>` command id.
@@ -1271,6 +1805,42 @@ impl MainWindow {
         self.open_project(&path, None, window, cx);
     }
 
+    /// Switch the active saved data source from a `source.saved.<index>` command
+    /// id (the C++ `m_sourceMenu` saved-source row → `switchToSavedSource(idx)`).
+    /// Recomposes the editor, re-derives the tab source icon, re-feeds the docks,
+    /// and rebuilds the menus so the new active row is checked.
+    fn switch_saved_source_by_command(
+        &mut self,
+        cmd: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = cmd
+            .strip_prefix("source.saved.")
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            return;
+        };
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            return;
+        };
+        editor.update(cx, |ed, cx| {
+            ed.controller_mut().switch_to_saved_source(idx);
+            ed.apply_document(cx);
+        });
+        // Re-derive the tab source icon + re-feed the docks from the new source.
+        let source = Self::source_for_controller(editor.read(cx).controller());
+        if let Some(active_id) = self.active_doc_id(cx) {
+            self.document_area.update(cx, |area, cx| {
+                area.set_source(active_id, source.clone(), cx);
+            });
+            self.state.set_source(active_id, source);
+        }
+        self.refresh_docks_for_active(cx);
+        self.rebuild_menus(cx);
+        cx.notify();
+    }
+
     // ── Dynamic menu rebuild (the C++ aboutToShow rebuilders) ──
 
     /// Rebuild the menu tree with the live Recent-Files + Data-Source rows and the
@@ -1279,10 +1849,12 @@ impl MainWindow {
     /// the checkmark state (held separately on the menu bar).
     fn rebuild_menus(&mut self, cx: &mut Context<Self>) {
         use super::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        // Skip entries whose file no longer exists (the C++
+        // `updateRecentFilesMenu` exists-filter); the command carries the
+        // ORIGINAL stored index so a reopen targets the right path.
         let recent: Vec<RecentMenuEntry> = self
-            .recent_files
-            .iter()
-            .enumerate()
+            .existing_recent_files()
+            .into_iter()
             .map(|(i, p)| RecentMenuEntry {
                 label: p
                     .file_name()
@@ -1710,10 +2282,95 @@ impl MainWindow {
         self.menubar.update(cx, |mb, cx| {
             mb.set_command_checked(opt.command_id(), value, cx);
         });
-        // The port has no app-wide persistent settings store yet (see
-        // `set_editor_font`); the window mirror keeps each flag global for the
-        // session. Persistence across launches lands with the settings store.
+        // Persist the toggle to the disk store so it survives a relaunch (the
+        // C++ `QSettings(...).setValue(key, checked)`; main.cpp:1336-1411).
+        self.settings
+            .borrow_mut()
+            .set_bool(ViewOptions::key(opt), value);
         cx.notify();
+    }
+
+    /// Push the window's current [`view_opts`](Self::view_opts) into a single
+    /// editor via the EDITOR SETTER CONTRACT. Fresh editors (the initial tab, a
+    /// `new_document`, an `open_project`) get controller/view defaults that
+    /// DISAGREE with the window's persisted view_opts, so without this a new tab
+    /// ignores the current compact-columns/tree-lines/type-hints/comments/hover/
+    /// minimap/relative-offsets state (the C++ applies every view option to all
+    /// tabs). Calling this after `set_document` realigns the editor.
+    fn apply_view_opts_to_editor(
+        &self,
+        editor: &Entity<super::editor::RcxEditor>,
+        cx: &mut Context<Self>,
+    ) {
+        let o = self.view_opts;
+        let brace_wrap = self.brace_wrap;
+        let refresh_ms = self.refresh_ms;
+        editor.update(cx, |ed, cx| {
+            ed.set_compact_columns(o.compact_columns, cx);
+            ed.set_tree_lines(o.tree_lines, cx);
+            ed.set_relative_offsets(o.relative_offsets, cx);
+            ed.set_type_hints(o.type_hints, cx);
+            ed.set_show_comments(o.show_comments, cx);
+            ed.set_hover_effects(o.hover_effects, cx);
+            ed.set_minimap(o.minimap, cx);
+            // Generator brace-wrap + the persisted refresh interval are
+            // controller-level (the C++ pushes both into every controller).
+            ed.controller_mut().set_brace_wrap(brace_wrap);
+            ed.controller_mut().set_refresh_interval(refresh_ms);
+        });
+    }
+
+    /// Feed the active document's provider into the scanner + modules docks and
+    /// the active document's bookmark list into the bookmarks dock (the C++
+    /// `ScannerPanel::set_provider` / `refreshModulesDock` / `refreshBookmarksDock`).
+    /// Called whenever the active document or its source changes so the docks
+    /// reflect reality instead of staying empty.
+    fn refresh_docks_for_active(&mut self, cx: &mut Context<Self>) {
+        let editor = self.document_area.read(cx).active_editor().cloned();
+        let Some(editor) = editor else {
+            self.scanner.update(cx, |p, _| p.set_provider(None));
+            self.modules.update(cx, |p, _| p.set_provider(None));
+            self.bookmarks.update(cx, |p, cx| p.set_bookmarks(&[], cx));
+            return;
+        };
+        let (provider, bookmarks) = {
+            let ed = editor.read(cx);
+            let ctrl = ed.controller();
+            (
+                ctrl.document().provider.clone(),
+                ctrl.document().tree.bookmarks.clone(),
+            )
+        };
+        self.scanner
+            .update(cx, |p, _| p.set_provider(Some(provider.clone())));
+        self.modules
+            .update(cx, |p, _| p.set_provider(Some(provider)));
+        self.bookmarks
+            .update(cx, |p, cx| p.set_bookmarks(&bookmarks, cx));
+    }
+
+    /// Push the window's focus/visibility into every open editor's controller so
+    /// the adaptive refresh interval throttles on blur / pauses on minimize (the
+    /// C++ `RcxController::setWindowState`; controller.cpp:5474). Called from the
+    /// gpui window-activation observer.
+    fn set_controllers_window_state(
+        &mut self,
+        focused: bool,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        for editor in editors {
+            editor.update(cx, |ed, _cx| {
+                ed.controller_mut().set_window_state(focused, visible);
+            });
+        }
     }
 
     /// Push every checkable View-menu option's current state into the menu bar so
@@ -1927,7 +2584,14 @@ impl MainWindow {
                     ed.apply_document(cx);
                 });
                 self.goto_recent = super::gotoaddress::push_recent_list(&self.goto_recent, formula);
+                // Persist the recent formulas across launches (the C++
+                // `gotoAddress/recent` key) via the disk store.
+                super::gotoaddress::store_recent(
+                    &mut *self.settings.borrow_mut(),
+                    &self.goto_recent,
+                );
                 self.rebuild_workspace(cx);
+                self.refresh_docks_for_active(cx);
                 self.notify(format!("Jumped to 0x{addr:X}"), window, cx);
                 cx.notify();
             }
@@ -1959,6 +2623,10 @@ impl MainWindow {
             Some(i) => {
                 self.switch_theme(i, window, cx);
                 self.sync_theme_menu_checked(cx);
+                // Persist the selection to the disk store ("theme" key) so it
+                // survives a relaunch (the manager's own store is wiped each
+                // launch); restored in the ctor.
+                self.settings.borrow_mut().set(settings_keys::THEME, name);
             }
             None => self.notify(format!("Unknown theme: {name}"), window, cx),
         }
@@ -2004,6 +2672,10 @@ impl MainWindow {
                 area.set_source(id, source.clone(), cx);
             });
             self.state.set_source(id, source);
+            // The provider changed — re-feed the docks + rebuild the Data Source
+            // menu rows so the new (or cleared) source is reflected.
+            self.refresh_docks_for_active(cx);
+            self.rebuild_menus(cx);
             cx.notify();
         }
     }
@@ -2171,6 +2843,10 @@ impl MainWindow {
                 // Mirror the activation into AppState if the id is known; the area
                 // and state allocate ids independently but in lockstep order.
                 self.activate_doc(id);
+                // Re-feed the docks from the newly-active document's provider +
+                // bookmarks and rebuild the dynamic menus (Data Source rows).
+                self.refresh_docks_for_active(cx);
+                self.rebuild_menus(cx);
             }
             DocAreaEvent::NewDocumentRequested => {
                 // The center opened a fresh tab (`project_new`); mirror it.
@@ -2326,9 +3002,11 @@ impl MainWindow {
     /// page). Most-recent-first; the age is left at 0 (no persisted timestamps in
     /// this port).
     fn recent_entries(&self) -> Vec<RecentEntry> {
-        self.recent_files
-            .iter()
-            .map(|p| RecentEntry {
+        // Skip entries whose file no longer exists (the C++ start-page filters
+        // the same way the Recent Files menu does; main.cpp:8789).
+        self.existing_recent_files()
+            .into_iter()
+            .map(|(_, p)| RecentEntry {
                 path: p.to_string_lossy().into_owned(),
                 file_name: p
                     .file_name()
@@ -2435,18 +3113,31 @@ impl MainWindow {
         doc.file_path = Some(path.to_path_buf());
 
         // Optionally attach the binary data source (`--data` / saved source).
+        // When no explicit --data path is given the controller AUTO-ATTACHES the
+        // active saved File source (resolved relative to the .rcx dir in `load`)
+        // inside `set_document → RcxController::new → ingestPendingSavedSources`,
+        // so the headline "all-0x0" case (a .rcx with a savedSources File entry)
+        // now populates with real values. We therefore read the resulting source
+        // BACK from the controller AFTER `set_document`, not from `doc` before it
+        // (the bug: `doc.data_path` is still None until the controller ingests).
         if let Some(dp) = data_path {
             doc.load_data_file(dp);
         }
-        let source = Self::source_for_doc(&doc);
 
         // Push the loaded document into the active editor (the C++ rebinds the
         // active tab's controller). The editor recomposes + picks a view root.
         let Some(active_id) = self.active_doc_id(cx) else {
             return false;
         };
+        let mut source = super::state::DataSource::none();
         if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
             editor.update(cx, |ed, cx| ed.set_document(doc, cx));
+            // Realign the fresh editor to the window's (persisted) view options —
+            // a new doc otherwise inherits controller/view defaults that disagree.
+            self.apply_view_opts_to_editor(&editor, cx);
+            // Derive the source icon from the controller's NOW-attached provider
+            // (post-ingest), so a .rcx's saved File source shows the File icon.
+            source = Self::source_for_controller(editor.read(cx).controller());
         }
 
         // Sync the tab title (file stem ≈ the C++ `rootName`) + source icon into
@@ -2463,6 +3154,9 @@ impl MainWindow {
         // the start page so the user lands on the document.
         self.rebuild_workspace(cx);
         self.dismiss_start_page(cx);
+        // Feed the freshly-attached provider into the scanner/modules docks and
+        // the document's bookmarks into the bookmarks dock.
+        self.refresh_docks_for_active(cx);
         // Record this project as a recent file (the C++ `addRecentFile`) so the
         // File ▸ Recent Files submenu + start page surface it on next open, and
         // propagate the (clean) dirty state into the tab.
@@ -2521,6 +3215,32 @@ impl MainWindow {
             Some(p) => DataSource::new(SourceKind::File, p.to_string_lossy().into_owned()),
             None => DataSource::none(),
         }
+    }
+
+    /// The UI [`DataSource`] for a controller AFTER it has ingested its saved
+    /// sources — preferring the active saved-source entry (its display name +
+    /// kind), falling back to the document's attached `data_path`. The C++ tab
+    /// source icon reads the active source post-attach (`refreshDocTabSourceIcon`
+    /// runs after `ingestPendingSavedSources`); reading the doc BEFORE the
+    /// controller ingested left the icon showing "no source" even when values
+    /// loaded (the bug). For a File source we keep the on-disk path so the icon +
+    /// tooltip match the attached binary.
+    fn source_for_controller(ctrl: &crate::controller::RcxController) -> super::state::DataSource {
+        use super::state::{DataSource, SourceKind};
+        let idx = ctrl.active_source_index();
+        if idx >= 0 {
+            if let Some(entry) = ctrl.saved_sources().get(idx as usize) {
+                if entry.kind == "File" {
+                    let path = if entry.file_path.is_empty() {
+                        entry.display_name.clone()
+                    } else {
+                        entry.file_path.clone()
+                    };
+                    return DataSource::new(SourceKind::File, path);
+                }
+            }
+        }
+        Self::source_for_doc(ctrl.document())
     }
 
     /// The tab title for an opened project file — its stem (the C++ titles a tab
@@ -2907,7 +3627,121 @@ mod tests {
     // Headless tests for the pure dispatch helpers added with the action-wiring.
     // These import specific items (NOT `super::*`) so the module's `gpui::*` glob
     // is not pulled into the test-hygiene expansion (see the menubar.rs note).
-    use super::{seed_root_doc, ExportKind, ImportKind, RootKind, ViewOpt, ViewOptions};
+    use super::{
+        seed_root_doc, settings_keys, DiskSettings, ExportKind, ImportKind, RootKind, ViewOpt,
+        ViewOptions,
+    };
+    use crate::theme::SettingsStore;
+
+    fn temp_settings_path() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("reclass-settings-test-{n}.json"));
+        p
+    }
+
+    #[test]
+    fn disk_settings_round_trips_scalars_lists_and_bools_across_reopen() {
+        let path = temp_settings_path();
+        {
+            let mut s = DiskSettings::open_at(path.clone());
+            s.set("font", "Consolas");
+            s.set_bool("minimap", true);
+            s.set_list(
+                "recentFiles",
+                &["/a/one.rcx".to_string(), "/b/two.rcx".to_string()],
+            );
+        }
+        // Reopen from disk — every value must survive (the QSettings semantics).
+        let s2 = DiskSettings::open_at(path.clone());
+        assert_eq!(s2.get("font").as_deref(), Some("Consolas"));
+        assert!(s2.get_bool("minimap", false));
+        assert_eq!(
+            s2.get_list("recentFiles"),
+            vec!["/a/one.rcx".to_string(), "/b/two.rcx".to_string()]
+        );
+        // A missing key falls back to the supplied default.
+        assert!(s2.get_bool("definitely-missing", true));
+        assert!(s2.get_list("definitely-missing").is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disk_settings_empty_list_round_trips_as_empty() {
+        let path = temp_settings_path();
+        let mut s = DiskSettings::open_at(path.clone());
+        // Empty + whitespace-only entries are dropped so they round-trip empty.
+        s.set_list("recentFiles", &["".to_string()]);
+        assert!(s.get_list("recentFiles").is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn view_options_load_reads_persisted_keys_and_defaults_the_rest() {
+        let path = temp_settings_path();
+        let mut s = DiskSettings::open_at(path.clone());
+        // Persist a NON-default subset; the rest must fall back to C++ defaults.
+        s.set_bool(settings_keys::TYPE_HINTS, true); // default false
+        s.set_bool(settings_keys::COMPACT_COLUMNS, false); // default true
+        let o = ViewOptions::load(&s);
+        assert!(o.type_hints, "persisted typeHints=true must load");
+        assert!(
+            !o.compact_columns,
+            "persisted compactColumns=false must load"
+        );
+        // Unset keys keep the defaults.
+        assert!(o.tree_lines);
+        assert!(o.relative_offsets);
+        assert!(o.hover_effects);
+        assert!(!o.show_comments);
+        assert!(!o.minimap);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn view_option_persist_key_matches_cpp_qsettings_key() {
+        // The keys MUST match the C++ QSettings spellings (main.cpp:1336-1411)
+        // so a project edited in either build reads the other's saved toggles.
+        assert_eq!(ViewOptions::key(ViewOpt::CompactColumns), "compactColumns");
+        assert_eq!(ViewOptions::key(ViewOpt::TreeLines), "treeLines");
+        assert_eq!(
+            ViewOptions::key(ViewOpt::RelativeOffsets),
+            "relativeOffsets"
+        );
+        assert_eq!(ViewOptions::key(ViewOpt::TypeHints), "typeHints");
+        assert_eq!(ViewOptions::key(ViewOpt::ShowComments), "showComments");
+        assert_eq!(ViewOptions::key(ViewOpt::HoverEffects), "hoverEffects");
+        assert_eq!(ViewOptions::key(ViewOpt::Minimap), "minimap");
+    }
+
+    #[test]
+    fn source_for_controller_reads_active_saved_file_source() {
+        // The #3 fix: after a controller ingests a saved File source, the tab
+        // icon must read the ACTIVE source (its file path), not the doc's
+        // pre-ingest data_path. Build a controller with a savedSources File
+        // entry pointing at a real on-disk file and assert the derived source.
+        use crate::controller::{RcxController, RcxDocument};
+        use serde_json::json;
+
+        // A real sidecar file so the auto-attach does not bail.
+        let data = temp_settings_path().with_extension("bin");
+        std::fs::write(&data, b"hello").unwrap();
+
+        let mut doc = RcxDocument::new();
+        doc.pending_saved_sources.push(json!({
+            "kind": "File",
+            "displayName": "sample.bin",
+            "filePath": data.to_string_lossy(),
+        }));
+        let ctrl = RcxController::new(doc);
+        let src = super::MainWindow::source_for_controller(&ctrl);
+        assert_eq!(src.kind, crate::ui::state::SourceKind::File);
+        assert_eq!(src.target, data.to_string_lossy());
+        let _ = std::fs::remove_file(&data);
+    }
 
     #[test]
     fn view_options_default_matches_cpp_view_menu() {
