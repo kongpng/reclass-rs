@@ -2911,6 +2911,37 @@ impl RcxController {
         (root_id, type_name)
     }
 
+    /// Editor "New Class" (`controller.cpp:3390`): create a fresh `NewClass[_N]`
+    /// class definition (8×Hex64 = 64 bytes) and convert `node_id` into an
+    /// embedded struct instance referencing it, shifting siblings to make room.
+    /// This mirrors the type-picker "+ New" composite flow — the previous editor
+    /// path inserted a bare childless `Struct`, so expanding the new class showed
+    /// an EMPTY body and the arrow keys had no child rows to descend into.
+    ///
+    /// With `node_id == 0` (no selected node / caret) the populated class is
+    /// created and made the view root, so the user still lands inside a
+    /// non-empty class rather than on an empty inline struct.
+    pub fn new_class_on_node(&mut self, node_id: u64) {
+        // `create_new: true` makes `apply_type_popup_inner` materialize the
+        // 8×Hex64 `NewClass[_N]` definition and use it as the composite target;
+        // `FieldType` then converts the node into an instance of it (+ sibling
+        // shift), exactly as the C++ "New Class" lambda does in three steps.
+        let choice = TypePopupChoice {
+            entry_kind: TypeEntryKind::Composite,
+            primitive_kind: NodeKind::Struct,
+            struct_id: 0,
+            display_name: String::new(),
+            full_text: String::new(),
+            create_new: true,
+        };
+        let mode = if node_id != 0 && self.doc.tree.index_of_id(node_id) >= 0 {
+            TypePopupMode::FieldType
+        } else {
+            TypePopupMode::Root
+        };
+        self.apply_type_popup_result(mode, node_id, choice);
+    }
+
     /// The composite [`TypePopupChoice`] entries surfaced by the type popup beyond
     /// the local named structs: every built-in [`K_COMMON_TYPES`] entry, as an
     /// importable composite (`struct_id == 0` ⇒ imported on choose). Mirrors the

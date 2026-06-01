@@ -917,6 +917,10 @@ mod view {
         Chosen {
             kind: NodeKind,
             modifier: Option<Modifier>,
+            /// `true` for the "+ New" footer button — the editor creates a fresh
+            /// populated `NewClass[_N]` (8×Hex64) and embeds the node as an
+            /// instance of it, rather than applying a bare empty `Struct`.
+            create_new: bool,
         },
         /// Dismissed (the `×`, Esc, or clicking outside).
         Cancel,
@@ -1180,6 +1184,7 @@ mod view {
             cx.emit(TypeSelectorEvent::Chosen {
                 kind: entry.primitive_kind,
                 modifier,
+                create_new: false,
             });
         }
 
@@ -1220,15 +1225,15 @@ mod view {
                 Modifier::None => None,
                 m => Some(m),
             };
-            // "+ New" (item 15): emit a Struct-kinded Chosen carrying the active
-            // modifier. NOTE: a fully distinct "create brand-new type" signal
-            // (vs picking the existing Struct primitive) needs an editor-side
-            // branch; a new enum variant would break the editor's exhaustive
-            // `TypeSelectorEvent` match (another owner's file), so this keeps the
-            // working Struct-apply path. See report notes.
+            // "+ New" (item 15): emit a Struct-kinded Chosen with `create_new`
+            // set, so the editor materializes a fresh populated `NewClass[_N]`
+            // (8×Hex64) and embeds the node as an instance of it — rather than
+            // applying a bare empty `Struct` primitive (which rendered an empty
+            // body that the arrow keys could not descend into).
             cx.emit(TypeSelectorEvent::Chosen {
                 kind: NodeKind::Struct,
                 modifier,
+                create_new: true,
             });
         }
 

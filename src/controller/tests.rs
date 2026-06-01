@@ -3164,3 +3164,79 @@ fn reevaluate_base_address_formula_relocates() {
     c.reevaluate_base_address_formula();
     assert_eq!(c.tree().base_address, 7);
 }
+
+#[test]
+fn new_class_on_node_embeds_populated_class_instance() {
+    // C++ "New Class" (controller.cpp:3390): converting a node to a New Class
+    // must (1) create a reusable class definition with 8×Hex64 default fields and
+    // (2) turn the target node into an embedded instance referencing it — NOT a
+    // bare empty struct (the user-reported "expand shows nothing / arrows can't
+    // descend"). Regression test for action_new_class.
+    let mut c = make_ctrl();
+    let target_id = find_id(&c, "field_hex");
+
+    // Count only top-level DEFINITIONS (parent_id == 0); an instance node also
+    // carries the struct_type_name, so filter by parent to avoid counting it.
+    let count_defs = |c: &RcxController| {
+        c.tree()
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.parent_id == 0
+                    && n.kind == NodeKind::Struct
+                    && n.struct_type_name.starts_with("NewClass")
+            })
+            .count()
+    };
+    let defs_before = count_defs(&c);
+
+    c.new_class_on_node(target_id);
+
+    // (1) A fresh NewClass[_N] definition now exists...
+    let def = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| {
+            n.kind == NodeKind::Struct
+                && n.struct_type_name.starts_with("NewClass")
+                && n.parent_id == 0
+        })
+        .cloned()
+        .expect("new NewClass definition created");
+    assert_eq!(
+        count_defs(&c),
+        defs_before + 1,
+        "exactly one new class definition"
+    );
+
+    // ...with 8 default Hex64 child fields (64 bytes), so expanding it is non-empty.
+    let kids: Vec<_> = c
+        .tree()
+        .nodes
+        .iter()
+        .filter(|n| n.parent_id == def.id)
+        .collect();
+    assert_eq!(kids.len(), 8, "8 default fields");
+    assert!(
+        kids.iter().all(|k| k.kind == NodeKind::Hex64),
+        "default fields are Hex64"
+    );
+
+    // (2) The target node is now an embedded Struct instance referencing the def.
+    let inst = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| n.id == target_id)
+        .expect("target node still present");
+    assert_eq!(
+        inst.kind,
+        NodeKind::Struct,
+        "target became a struct instance"
+    );
+    assert_eq!(
+        inst.ref_id, def.id,
+        "target references the new class definition"
+    );
+}

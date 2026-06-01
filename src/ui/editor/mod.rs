@@ -6077,20 +6077,14 @@ impl RcxEditor {
 
     fn action_new_class(&mut self, _: &EditorNewClass, _w: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
-        // "New Class": insert a new struct member after the target (or at the
-        // parent tail when no target). Uses the parent + offset of the target.
-        if let Some(t) = self.action_target() {
-            let (parent_id, offset) = self.insert_anchor(t.node_idx);
-            self.controller
-                .insert_node(parent_id, offset, NodeKind::Struct, "NewClass");
-        } else {
-            self.controller.insert_node(
-                self.controller.view_root_id(),
-                -1,
-                NodeKind::Struct,
-                "NewClass",
-            );
-        }
+        // "New Class" (C++ controller.cpp:3390): create a populated `NewClass[_N]`
+        // definition (8×Hex64) and embed THIS node as an instance of it. The old
+        // path inserted a bare childless `Struct`, so expanding the new class
+        // showed an EMPTY body and the arrow keys had no child rows to descend
+        // into — the user-reported "it doesn't expand on that class". Resolves to
+        // the caret/selected node (or 0 → new populated class as the view root).
+        let node_id = self.action_target().map(|t| t.node_id).unwrap_or(0);
+        self.controller.new_class_on_node(node_id);
         self.apply_document(cx);
     }
 
@@ -7080,10 +7074,22 @@ impl RcxEditor {
             &popup,
             window,
             move |this, _p, ev: &TypeSelectorEvent, window, cx| match ev {
-                TypeSelectorEvent::Chosen { kind, modifier } => {
+                TypeSelectorEvent::Chosen {
+                    kind,
+                    modifier,
+                    create_new,
+                } => {
                     window.close_dialog(cx);
                     this._type_selector_sub = None;
-                    this.apply_type_choice(node_idx, node_id, *kind, *modifier, cx);
+                    if *create_new {
+                        // "+ New": create a populated NewClass[_N] (8×Hex64) and
+                        // embed THIS node as an instance of it (same as the editor
+                        // "New Class" action) — not a bare empty struct.
+                        this.controller.new_class_on_node(node_id);
+                        this.apply_document(cx);
+                    } else {
+                        this.apply_type_choice(node_idx, node_id, *kind, *modifier, cx);
+                    }
                 }
                 TypeSelectorEvent::Cancel => {
                     window.close_dialog(cx);
