@@ -1496,7 +1496,16 @@ impl RcxEditor {
         let mut found: Option<(usize, u64)> = None;
         while i >= 0 && (i as usize) < count {
             let lm = &result.meta[i as usize];
-            if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation {
+            // The closing footer row carries the struct id but is NOT a navigable
+            // field — skip it so Down past the last field falls off the end and
+            // GROWS (rather than parking the cursor on the footer, which made the
+            // next Down navigate instead of append: the "press Down twice to
+            // re-expand" bug). The cursor then chases the freshly-appended field.
+            if lm.node_id != 0
+                && lm.node_id != K_COMMAND_ROW_ID
+                && lm.line_kind != LineKind::Footer
+                && !lm.is_continuation
+            {
                 found = Some((i as usize, lm.node_id));
                 break;
             }
@@ -1518,18 +1527,50 @@ impl RcxEditor {
         // an auto-numbered enum member, then MOVES the selection to the new node.
         // Plain Up-at-top (dir < 0) is a silent no-op.
         if dir > 0 {
-            let last_id = self
+            // Grow the ENCLOSING STRUCT of the last visible field, NOT the field /
+            // array itself. The last visible row's PARENT is that struct (a
+            // top-level array's parent is the view-root struct), so appending there
+            // grows the struct PAST the array — appending to the *array node* would
+            // instead grow the array's element count (+1 byte: the "0x80 → 0x81"
+            // bug). append_single_field appends one Hex64 at the container's aligned
+            // tail and SELECTS it, so holding Down keeps growing (the cursor chases
+            // the freshly-appended last row). Plain Up-at-top is a silent no-op.
+            let last_node_id = self
                 .controller
                 .last_result()
                 .meta
                 .iter()
                 .rev()
-                .find(|lm| lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation)
+                .find(|lm| {
+                    lm.node_id != 0
+                        && lm.node_id != K_COMMAND_ROW_ID
+                        && lm.line_kind != LineKind::Footer
+                        && !lm.is_continuation
+                })
                 .map(|lm| lm.node_id);
-            if let Some(node_id) = last_id {
-                if let Some(new_id) = self.controller.append_single_field(node_id) {
+            let view_root = self.controller.view_root_id();
+            let target = match last_node_id {
+                Some(id) => {
+                    let tree = self.controller.tree();
+                    let idx = tree.index_of_id(id);
+                    if idx >= 0 {
+                        let p = tree.nodes[idx as usize].parent_id;
+                        if p != 0 {
+                            p
+                        } else {
+                            view_root
+                        }
+                    } else {
+                        view_root
+                    }
+                }
+                None => view_root,
+            };
+            if target != 0 {
+                if let Some(new_id) = self.controller.append_single_field(target) {
                     self.apply_document(cx);
-                    // Scroll to the freshly-selected new field's line.
+                    // Scroll to the freshly-selected new field's line so the cursor
+                    // chases the new tail (the next Down grows again).
                     if let Some(line) = self
                         .controller
                         .last_result()
@@ -2012,9 +2053,16 @@ impl RcxEditor {
         // absolute addresses when the user toggles (PIC1/PIC2).
         let relative = self.relative_offsets;
         if addr_cols > 0 {
-            // Preserve compose's per-row decision of whether this row carries an
-            // offset (footers / separators are blank there).
-            let margin_text = if lm.offset_text.trim().is_empty() {
+            // The offset gutter is BLANK on the class-header (command) row — where
+            // the `[▸] source▾ <addr> struct Name {` lives — and on the closing
+            // footer row (`}; … // 0xNN`). The reference shows offsets only on the
+            // field rows between them (the header carries the base address inline,
+            // and the footer carries the total size inline, so a left "+NN" there is
+            // redundant). Field/continuation rows keep their per-row offset.
+            let margin_text = if lm.offset_text.trim().is_empty()
+                || lm.line_kind == LineKind::CommandRow
+                || lm.line_kind == LineKind::Footer
+            {
                 String::new()
             } else {
                 geometry::fmt_margin_text(
