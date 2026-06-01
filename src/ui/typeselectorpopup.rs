@@ -1383,12 +1383,24 @@ mod view {
                             super::kind_group_color(r.entry.group, &theme),
                         );
                         let is_sel = selected == Some(row);
-                        let is_current = r.entry.primitive_kind == self.current
+                        // The node's CURRENT type — the C++ pre-selects it as the
+                        // initial highlight rather than painting a separate, static
+                        // ring. We mark it only when it is NOT the moving selection,
+                        // and as a subtle dotted edge that can never be mistaken for
+                        // the (now strongly-painted) active selection (B2: the static
+                        // ring on `current` used to read as a "frozen" highlight).
+                        let is_current = !is_sel
+                            && r.entry.primitive_kind == self.current
                             && r.entry.entry_kind != EntryKind::Composite;
-                        let name_color = if r.entry.enabled {
-                            group_color
-                        } else {
+                        // Selected rows use the C++ readout: full `selected` fill +
+                        // the group-color name turns to plain text. Keep the group
+                        // color when not selected.
+                        let name_color = if !r.entry.enabled {
                             color::text_disabled(cx)
+                        } else if is_sel {
+                            color::text(cx)
+                        } else {
+                            group_color
                         };
                         let name_spans = if filtering {
                             highlighted_name(
@@ -1418,6 +1430,7 @@ mod view {
                         let keyword = r.entry.class_keyword.clone();
                         gpui_component::h_flex()
                             .id(("type-row", row))
+                            .relative()
                             .w_full()
                             .h(px(26.))
                             .px(px(tokens::space::MD))
@@ -1425,11 +1438,32 @@ mod view {
                             .items_center()
                             .rounded(px(tokens::radius::MD))
                             .text_size(px(tokens::font::UI_MD))
+                            // The MOVING selection (keyboard cursor / hover / click)
+                            // — a full `selected` fill so the highlight is plainly
+                            // visible as it moves (B2: the previous fill was too
+                            // faint to register; the C++ delegate fills the whole row
+                            // with `t.selected`). A bold group-color left bar mirrors
+                            // the C++ `kAccent` accent stripe so the active row also
+                            // reads its group at a glance.
                             .when(is_sel, |d| d.bg(sel_bg))
-                            .when(!is_sel && is_current, |d| {
-                                // The node's current type — a soft ring even when
-                                // not the active row.
-                                d.border_1().border_color(accent)
+                            .when(is_sel, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(2.5))
+                                        .rounded_l(px(tokens::radius::MD))
+                                        .bg(group_color),
+                                )
+                            })
+                            // The node's current type, when it is NOT the active
+                            // selection: a faint dotted outline that is clearly
+                            // distinct from the solid selection fill so it can never
+                            // be mistaken for a "frozen" highlight.
+                            .when(is_current, |d| {
+                                d.border_1().border_dashed().border_color(muted)
                             })
                             .when(!is_sel && r.entry.enabled, |d| d.hover(|s| s.bg(hover_bg)))
                             .when(r.entry.enabled, |d| d.cursor_pointer())

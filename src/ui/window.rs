@@ -4311,6 +4311,69 @@ pub fn open_main_window(cx: &mut App) {
     open_main_window_with(cx, StartupOptions::default());
 }
 
+/// Re-scope the editor surface's bare printable-key accelerators so they do NOT
+/// fire while an inline-edit field is focused (see the call site for the full
+/// rationale — the systemic inline-edit input bug). A binding is rewritten when it
+/// is a single keystroke, carries no ctrl/alt/cmd/fn modifier, and its key is a
+/// printable character (a 1-char key like `t`/`f`/`1`, or a named printable such as
+/// `space`/`semicolon`) — i.e. exactly the keys a user would type into a field. Its
+/// `RcxEditor` predicate becomes `RcxEditor && !RcxFieldInput`; everything else
+/// (modified accelerators, navigation/function keys) is passed through unchanged.
+fn scope_editor_text_keys_to_non_field(bindings: Vec<KeyBinding>) -> Vec<KeyBinding> {
+    // Named keys that produce a printable character (and so must reach the field's
+    // text input during an edit) but are spelled as words in the keymap.
+    fn is_named_printable(key: &str) -> bool {
+        matches!(key, "space" | "semicolon")
+    }
+    fn is_typeable_key(ks: &Keystroke) -> bool {
+        let m = &ks.modifiers;
+        // A bare key only — any "command" modifier means it can never be plain text.
+        if m.control || m.alt || m.platform || m.function {
+            return false;
+        }
+        // A single Unicode scalar (`t`, `f`, `1`, `;`, …) or a named printable. Shift
+        // alone (e.g. `shift-space`) still yields text, so it is allowed.
+        ks.key.chars().count() == 1 || is_named_printable(&ks.key)
+    }
+
+    bindings
+        .into_iter()
+        .map(|binding| {
+            // Only touch bindings scoped to exactly `RcxEditor` (the editor surface).
+            let is_editor_ctx = binding
+                .predicate()
+                .map(|p| p.to_string() == "RcxEditor")
+                .unwrap_or(false);
+            let keystrokes = binding.keystrokes();
+            let single_typeable_str = (keystrokes.len() == 1
+                && is_typeable_key(keystrokes[0].inner()))
+            .then(|| keystrokes[0].inner().unparse());
+            let Some(keystroke_str) = single_typeable_str.filter(|_| is_editor_ctx) else {
+                return binding;
+            };
+            // Reconstruct with the field-aware predicate, preserving the action and
+            // keystroke. `unparse()` round-trips a bare key to a parseable string.
+            // Both the inline-edit field (`RcxFieldInput`) and the Ctrl+F search bar
+            // (`RcxFindBar`) are text inputs mounted as descendants of the editor div,
+            // so a bare accelerator must dodge BOTH — otherwise typing e.g. `f` into
+            // the Find box would fire the editor's "quick float" instead of inserting
+            // the letter (the same ancestor-context theft as the inline-edit bug).
+            let predicate =
+                KeyBindingContextPredicate::parse("RcxEditor && !RcxFieldInput && !RcxFindBar")
+                    .expect("static predicate parses");
+            KeyBinding::load(
+                &keystroke_str,
+                binding.action().boxed_clone(),
+                Some(std::rc::Rc::new(predicate)),
+                false,
+                binding.action_input(),
+                &DummyKeyboardMapper,
+            )
+            .unwrap_or(binding)
+        })
+        .collect()
+}
+
 /// Open the main application window, optionally opening a project / attaching a
 /// data source on launch ([`StartupOptions`]). This is the entry point the
 /// binary calls with the parsed CLI; the no-arg [`open_main_window`] delegates
@@ -4336,7 +4399,30 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // Register the editor-surface + inline-field + start-page key bindings, plus
     // the dialog/popup contexts (command palette + find bar; the dialogs/pickers
     // are opened through the `Root` overlay and own their own key contexts).
-    let mut bindings = super::editor::editor_key_bindings();
+    //
+    // CROSS-CUTTING INLINE-EDIT FIX (B3/B4 + the systemic "typing does nothing" QA
+    // report): the editor surface (`RcxEditor`) binds bare printable keys as quick
+    // accelerators — `t` (change type), `f`/`s`/`u`/`p` (quick float/signed/unsigned/
+    // pointer), `1`-`5` (hex sizes), `space` (hex cycle), `semicolon` (comment).
+    // The inline-edit field (`RcxFieldInput`) is a *descendant* of the editor in the
+    // focus/dispatch tree, so when the field is focused gpui's context stack is
+    // `[…, RcxEditor, RcxFieldInput]` and those bare-key bindings — registered on the
+    // ANCESTOR `RcxEditor` — still MATCH (key_dispatch builds the predicate stack from
+    // every node on the dispatch path). A matched binding fires its action and
+    // consumes the keystroke, so the character never reaches the field's IME
+    // `replace_text_in_range`: typing `f` into a hex byte ran "quick float", typing a
+    // name with an `s`/`t`/`u`/`p` silently dropped those letters, etc. That is the
+    // root cause behind B3 (root-name rename) and the failing hex `FF` overwrite.
+    //
+    // Fix: re-scope every bare (no ctrl/alt/cmd) single printable editor accelerator
+    // to `RcxEditor && !RcxFieldInput && !RcxFindBar` (the inline field AND the
+    // Ctrl+F search box are both text inputs mounted under the editor). gpui
+    // evaluates the negations against the FULL context stack, so the binding matches
+    // when only the editor is focused but is suppressed the moment a field/find input
+    // is open — letting the keystroke fall through to that input. Modified
+    // accelerators (Ctrl+D, F2, …) and navigation keys (already shadowed by the
+    // field's deeper `RcxFieldInput` bindings) are left untouched.
+    let mut bindings = scope_editor_text_keys_to_non_field(super::editor::editor_key_bindings());
     bindings.extend(super::editor::inline_edit::field_key_bindings());
     bindings.extend(super::startpage::start_page_key_bindings());
     bindings.extend(super::commandpalette::command_palette_key_bindings());
@@ -4796,5 +4882,50 @@ mod tests {
             None
         }
         assert_eq!(find(&tree, "tools.mcp"), Some("Stop MCP Server"));
+    }
+
+    #[test]
+    fn editor_text_keys_are_scoped_off_the_inline_field() {
+        // The cross-cutting inline-edit fix: bare printable editor accelerators must
+        // be re-scoped to `RcxEditor && !RcxFieldInput` so they fall through to the
+        // focused field's text input, while modified / navigation accelerators keep
+        // their plain `RcxEditor` scope. Import the gpui binding types by name (NOT
+        // a `gpui::*` glob — see the module note) to keep test hygiene lean.
+        use gpui::{actions, KeyBinding};
+
+        actions!(rcx_test, [PrintableA, NamedSpace, ModifiedD, NavUp]);
+
+        let input = vec![
+            KeyBinding::new("t", PrintableA, Some("RcxEditor")), // bare printable → rescoped
+            KeyBinding::new("space", NamedSpace, Some("RcxEditor")), // named printable → rescoped
+            KeyBinding::new("ctrl-d", ModifiedD, Some("RcxEditor")), // modified → unchanged
+            KeyBinding::new("up", NavUp, Some("RcxEditor")),     // navigation → unchanged
+        ];
+        let out = super::scope_editor_text_keys_to_non_field(input);
+        let pred = |b: &KeyBinding| b.predicate().map(|p| p.to_string()).unwrap_or_default();
+
+        assert_eq!(
+            pred(&out[0]),
+            "RcxEditor && !RcxFieldInput && !RcxFindBar",
+            "bare `t` must dodge the field + find bar"
+        );
+        assert_eq!(
+            pred(&out[1]),
+            "RcxEditor && !RcxFieldInput && !RcxFindBar",
+            "named printable `space` must dodge the field + find bar"
+        );
+        assert_eq!(
+            pred(&out[2]),
+            "RcxEditor",
+            "`ctrl-d` is not text — left scoped to the editor"
+        );
+        assert_eq!(
+            pred(&out[3]),
+            "RcxEditor",
+            "`up` navigation is not text — left scoped"
+        );
+
+        // The keystroke + action survive the rewrite (only the predicate changes).
+        assert_eq!(out[0].keystrokes()[0].inner().key, "t");
     }
 }

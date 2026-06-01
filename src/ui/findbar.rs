@@ -266,8 +266,17 @@ mod view {
     }
 
     impl Focusable for FindBar {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
+        /// Return the FILTER INPUT's focus handle so the editor's
+        /// `window.focus(bar.focus_handle)` on Ctrl+F lands keystrokes in the
+        /// field — opening the find bar and immediately typing searches (the C++
+        /// find bar focuses its line-edit on show). Without this the bar's outer
+        /// `track_focus` div holds focus and typing does nothing (the dead-input
+        /// failure mode the cross-cutting note flags). The `RcxFindBar`
+        /// `key_context` + `on_action` handlers still fire for Enter/Shift+Enter/
+        /// Escape because the focused input is a descendant of the `track_focus`
+        /// surface.
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.input.read(cx).focus_handle(cx)
         }
     }
 

@@ -520,8 +520,17 @@ mod view {
     }
 
     impl Focusable for GotoAddressDialog {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
+        /// Return the ADDRESS INPUT's focus handle so the host's
+        /// `window.focus(dialog.focus_handle)` on open lands keystrokes in the
+        /// field — opening the dialog and immediately typing an address (the C++
+        /// `m_input->setFocus()` in the constructor). Without this the dialog card
+        /// (`track_focus(&self.focus_handle)`) holds focus and typing does nothing
+        /// (the dead-input failure mode the cross-cutting note flags). The
+        /// `RcxGotoAddress` `key_context` + capture-phase key handler still receive
+        /// Escape / Down-into-recents / Up-Down / Enter because the focused input is
+        /// a descendant of the `track_focus` card.
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.input.read(cx).focus_handle(cx)
         }
     }
 

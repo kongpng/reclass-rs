@@ -440,6 +440,15 @@ mod view {
             // and scrolls it into view, so Attach / Enter work immediately (the
             // C++ `selectPreferredProcess` + `scrollToItem`).
             this.refresh_table(cx);
+            // Focus the filter input so typing filters immediately on open (the C++
+            // `ui->filterEdit->setFocus()` in the constructor). The host opens this
+            // picker without a `window.focus(...)` call, so the focus must be set
+            // here; without it the picker card holds no input focus and typing into
+            // the filter does nothing until it is clicked (the dead-input failure
+            // mode the cross-cutting note flags). The `RcxProcessPicker`
+            // `key_context` + capture-phase Enter/Escape handler still fire because
+            // the focused filter input is a descendant of the `track_focus` card.
+            this.filter.update(cx, |input, cx| input.focus(window, cx));
             this
         }
 
@@ -627,8 +636,14 @@ mod view {
     }
 
     impl Focusable for ProcessPicker {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
+        /// Return the FILTER INPUT's focus handle so any host that opens the picker
+        /// with `window.focus(picker.focus_handle)` lands keystrokes in the filter
+        /// (the C++ `ui->filterEdit->setFocus()`); the constructor also focuses it
+        /// directly for the current host which opens without a focus call. The
+        /// `RcxProcessPicker` `key_context` + capture-phase key handler still fire
+        /// because the focused input is a descendant of the `track_focus` card.
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.filter.read(cx).focus_handle(cx)
         }
     }
 

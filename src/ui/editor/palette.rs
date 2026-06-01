@@ -156,10 +156,15 @@ impl EditorPalette {
             border: t.border,
             // B1 / items 2-3: the fold disclosure triangle (`▸`/`▾`) is the TEXT
             // glyph compose bakes into the fold prefix, painted on the row baseline
-            // (C++ has no SVG icon gutter). It reads in the link/accent color so the
-            // fold affordance is a crisp, unmistakable control against the dim
-            // chrome around it (was transparent when the SVG gutter existed).
-            fold_chevron: t.link,
+            // (C++ has no SVG icon gutter). The C++ DIMS this arrow on every fold
+            // head + the command-row chevron with the SAME `IND_HEX_DIM` treatment as
+            // the hex byte run (editor.cpp:1522-1524, 2062-2064) — so it must read as
+            // dim chrome, NOT a crisp accent-blue control. A crisp link-blue glyph
+            // here is exactly the divergence the reference screenshot diff flags as
+            // an "off-center/misaligned" chevron (the column placement matches C++
+            // byte-for-byte; the EMPHASIS was wrong). Tie it to the same faint tone
+            // the dim hex/ASCII glyphs use.
+            fold_chevron: text_faint(t.muted_foreground),
             // Active-line band: a barely-there foreground wash (Zed's active-line
             // bg), softer than the accent selection fill so the two are distinct.
             active_line_bg: with_alpha(t.foreground, 0.03),
