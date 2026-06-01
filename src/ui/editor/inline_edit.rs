@@ -50,6 +50,18 @@ actions!(
         FieldSelectAll,
         FieldHome,
         FieldEnd,
+        // Item 2 (caret-nav parity with C++ `handleEditKey`, which lets Shift+Home /
+        // Shift+End and Ctrl+Left/Right fall through to Scintilla-native handling):
+        //   Shift+Home → select to the span start (offset 0).
+        //   Shift+End  → select to the span end (content length).
+        //   Ctrl/Cmd+Left/Right → caret jumps one word toward the span edge.
+        //   Ctrl/Cmd+Shift+Left/Right → extend the selection by one word.
+        FieldSelectHome,
+        FieldSelectEnd,
+        FieldWordLeft,
+        FieldWordRight,
+        FieldSelectWordLeft,
+        FieldSelectWordRight,
         FieldCommit,
         FieldCancel,
         FieldPaste,
@@ -363,6 +375,71 @@ impl FieldInput {
     fn home(&mut self, _: &FieldHome, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
     }
+    /// Item 2: Shift+Home selects from the caret to the span start (offset 0). In
+    /// C++ this key falls through `handleEditKey` to Scintilla-native handling,
+    /// which extends the selection to the line/span start; the standalone Rust
+    /// field's content IS the span, so the span start is offset 0. Overwrite mode
+    /// has no free-text selection (the C++ hex editor swallows it), so it is a
+    /// no-op there to keep the fixed-length invariant.
+    fn select_home(&mut self, _: &FieldSelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.hex_overwrite.is_some() {
+            return;
+        }
+        self.select_to(0, cx);
+    }
+    /// Item 2: Shift+End selects from the caret to the span end (content length),
+    /// mirroring Scintilla-native Shift+End within the editable span. No-op in
+    /// overwrite mode.
+    fn select_end(&mut self, _: &FieldSelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.hex_overwrite.is_some() {
+            return;
+        }
+        self.select_to(self.content.len(), cx);
+    }
+    /// Item 2: Ctrl/Cmd+Left moves the caret one word toward the span start,
+    /// collapsing any selection (Scintilla-native word-left). Overwrite mode falls
+    /// back to a single-position move (its fixed cells have no word structure).
+    fn word_left(&mut self, _: &FieldWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.hex_overwrite.is_some() {
+            self.move_to(self.ow_prev(self.cursor_offset()), cx);
+            return;
+        }
+        self.move_to(self.previous_word_boundary(self.cursor_offset()), cx);
+    }
+    /// Item 2: Ctrl/Cmd+Right moves the caret one word toward the span end.
+    fn word_right(&mut self, _: &FieldWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.hex_overwrite.is_some() {
+            self.move_to(self.ow_next(self.cursor_offset()), cx);
+            return;
+        }
+        self.move_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
+    /// Item 2: Ctrl/Cmd+Shift+Left extends the selection by one word toward the
+    /// span start (Scintilla-native word-left-extend). No-op in overwrite mode.
+    fn select_word_left(
+        &mut self,
+        _: &FieldSelectWordLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hex_overwrite.is_some() {
+            return;
+        }
+        self.select_to(self.previous_word_boundary(self.cursor_offset()), cx);
+    }
+    /// Item 2: Ctrl/Cmd+Shift+Right extends the selection by one word toward the
+    /// span end. No-op in overwrite mode.
+    fn select_word_right(
+        &mut self,
+        _: &FieldSelectWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hex_overwrite.is_some() {
+            return;
+        }
+        self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
     /// Item 9: swallow Up/Down/PageUp/PageDown during an active edit so they do
     /// not bubble to the editor surface and navigate between NODES. The single-
     /// line inline field has no vertical motion, so this is a deliberate no-op that
@@ -478,6 +555,19 @@ impl FieldInput {
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Item 1: a double-click inside the active field selects the ENTIRE
+        // editable text — C++ `eventFilter` (editor.cpp:2758) does
+        // `setSelection(line, spanStart, line, editEndCol())` on a
+        // MouseButtonDblClick while an edit is active, i.e. a select-all of the
+        // span. Overwrite mode has no free-text selection (its select-all is a
+        // no-op preserving the fixed length), so a double-click there just places
+        // the caret like a single click.
+        if event.click_count >= 2 && self.hex_overwrite.is_none() {
+            self.is_selecting = false;
+            self.move_to(0, cx);
+            self.select_to(self.content.len(), cx);
+            return;
+        }
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -551,6 +641,16 @@ impl FieldInput {
             .char_indices()
             .find_map(|(idx, ch)| (idx >= offset).then_some(idx + ch.len_utf8()))
             .unwrap_or(self.content.len())
+    }
+
+    // Word boundaries (item 2): Scintilla-native Ctrl+Left/Right semantics. The
+    // pure cores [`prev_word_boundary_in`] / [`next_word_boundary_in`] are
+    // unit-tested headlessly; the methods just bind them to the live content.
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        prev_word_boundary_in(&self.content, offset)
+    }
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        next_word_boundary_in(&self.content, offset)
     }
 
     // utf8 ↔ utf16 (IME bridge).
@@ -838,6 +938,70 @@ pub fn ow_next_in(content: &str, is_hex: bool, off: usize) -> usize {
     n.min(last)
 }
 
+/// Item 2 (pure): a Scintilla-style "word character" — alphanumeric or `_`. Word
+/// movement groups runs of word chars together and treats every other char as a
+/// punctuation/whitespace separator.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Item 2 (pure): the caret offset for SCI_WORDLEFT starting at byte offset `off`.
+/// Scintilla moves left over any run of non-word chars, then left to the start of
+/// the preceding word-char run — i.e. it lands at the start of the word the caret
+/// is in (or, if the caret sits at a word start / in a separator, the start of the
+/// previous word). Clamped to 0. `off` is a UTF-8 byte offset on a char boundary.
+pub fn prev_word_boundary_in(content: &str, off: usize) -> usize {
+    let chars: Vec<(usize, char)> = content.char_indices().collect();
+    // Index into `chars` of the char immediately LEFT of the caret.
+    let mut i = chars.partition_point(|(idx, _)| *idx < off);
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    // Skip a run of separator chars to the left of the caret.
+    while i > 0 && !is_word_char(chars[i].1) {
+        i -= 1;
+    }
+    // If we stopped on a separator (start of string), that's the boundary.
+    if !is_word_char(chars[i].1) {
+        return chars[i].0;
+    }
+    // Skip left over the word-char run to its start.
+    while i > 0 && is_word_char(chars[i - 1].1) {
+        i -= 1;
+    }
+    chars[i].0
+}
+
+/// Item 2 (pure): the caret offset for SCI_WORDRIGHT starting at byte offset
+/// `off`. Scintilla moves right over the current run of word chars, then over the
+/// following run of non-word separators, landing at the START of the next word (or
+/// at end-of-content). Clamped to `content.len()`.
+pub fn next_word_boundary_in(content: &str, off: usize) -> usize {
+    let chars: Vec<(usize, char)> = content.char_indices().collect();
+    let len = content.len();
+    // Index into `chars` of the char at/after the caret.
+    let mut i = chars.partition_point(|(idx, _)| *idx < off);
+    if i >= chars.len() {
+        return len;
+    }
+    // If the caret is on a word char, skip the rest of that word-char run.
+    if is_word_char(chars[i].1) {
+        while i < chars.len() && is_word_char(chars[i].1) {
+            i += 1;
+        }
+    }
+    // Skip the following separator run to land on the next word's first char.
+    while i < chars.len() && !is_word_char(chars[i].1) {
+        i += 1;
+    }
+    if i >= chars.len() {
+        len
+    } else {
+        chars[i].0
+    }
+}
+
 /// Item 7 (pure): the caret offset one position to the LEFT, skipping a single
 /// space separator when `is_hex`, clamped to 0.
 pub fn ow_prev_in(content: &str, is_hex: bool, off: usize) -> usize {
@@ -1056,6 +1220,13 @@ impl Render for FieldInput {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            // Item 2: Shift+Home/End select-to-span-edge + Ctrl/Cmd word movement.
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::paste))
@@ -1085,6 +1256,31 @@ pub fn field_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-a", FieldSelectAll, Some("RcxFieldInput")),
         KeyBinding::new("home", FieldHome, Some("RcxFieldInput")),
         KeyBinding::new("end", FieldEnd, Some("RcxFieldInput")),
+        // Item 2: caret-nav parity — Shift+Home/End select to the span edge, and
+        // Ctrl/Cmd+Left/Right (+ Shift) move/extend by one word. C++ lets these
+        // fall through `handleEditKey` to Scintilla-native handling.
+        KeyBinding::new("shift-home", FieldSelectHome, Some("RcxFieldInput")),
+        KeyBinding::new("shift-end", FieldSelectEnd, Some("RcxFieldInput")),
+        KeyBinding::new("ctrl-left", FieldWordLeft, Some("RcxFieldInput")),
+        KeyBinding::new("cmd-left", FieldWordLeft, Some("RcxFieldInput")),
+        KeyBinding::new("ctrl-right", FieldWordRight, Some("RcxFieldInput")),
+        KeyBinding::new("cmd-right", FieldWordRight, Some("RcxFieldInput")),
+        KeyBinding::new(
+            "ctrl-shift-left",
+            FieldSelectWordLeft,
+            Some("RcxFieldInput"),
+        ),
+        KeyBinding::new("cmd-shift-left", FieldSelectWordLeft, Some("RcxFieldInput")),
+        KeyBinding::new(
+            "ctrl-shift-right",
+            FieldSelectWordRight,
+            Some("RcxFieldInput"),
+        ),
+        KeyBinding::new(
+            "cmd-shift-right",
+            FieldSelectWordRight,
+            Some("RcxFieldInput"),
+        ),
         KeyBinding::new("enter", FieldCommit, Some("RcxFieldInput")),
         KeyBinding::new("escape", FieldCancel, Some("RcxFieldInput")),
         KeyBinding::new("cmd-v", FieldPaste, Some("RcxFieldInput")),
@@ -1108,8 +1304,8 @@ mod tests {
     // module's `gpui::*` glob into the `#[test]` hygiene expansion and explode
     // the type-recursion budget on this nightly+gpui combination.
     use super::{
-        overwrite_paste_into, ow_next_in, ow_prev_in, sanitize_inline_paste, splice_text,
-        EditCommit,
+        next_word_boundary_in, overwrite_paste_into, ow_next_in, ow_prev_in, prev_word_boundary_in,
+        sanitize_inline_paste, splice_text, EditCommit,
     };
     use crate::compose::EditTarget;
 
@@ -1238,6 +1434,48 @@ mod tests {
         assert_eq!(ow_prev_in(s, true, 3), 1); // 3→(skip space at 2)→1
         assert_eq!(ow_prev_in(s, true, 4), 3);
         assert_eq!(ow_prev_in(s, true, 6), 4); // 6→(skip space at 5)→4
+    }
+
+    #[test]
+    fn word_left_lands_on_word_starts_and_clamps_at_zero() {
+        // Item 2: Ctrl+Left = SCI_WORDLEFT. From the end of "foo bar baz" the caret
+        // walks back to the start of each word, then clamps at 0.
+        let s = "foo bar baz";
+        assert_eq!(prev_word_boundary_in(s, s.len()), 8); // → start of "baz"
+        assert_eq!(prev_word_boundary_in(s, 8), 4); // → start of "bar"
+        assert_eq!(prev_word_boundary_in(s, 4), 0); // → start of "foo"
+        assert_eq!(prev_word_boundary_in(s, 0), 0); // clamp at start
+                                                    // Mid-word: from offset 6 (inside "bar") jump to its start (4).
+        assert_eq!(prev_word_boundary_in(s, 6), 4);
+    }
+
+    #[test]
+    fn word_right_lands_on_next_word_starts_and_clamps_at_end() {
+        // Item 2: Ctrl+Right = SCI_WORDRIGHT. From 0 it skips the current word run
+        // and the following separator, landing on the next word's start.
+        let s = "foo bar baz";
+        assert_eq!(next_word_boundary_in(s, 0), 4); // → start of "bar"
+        assert_eq!(next_word_boundary_in(s, 4), 8); // → start of "baz"
+        assert_eq!(next_word_boundary_in(s, 8), s.len()); // → end of content
+        assert_eq!(next_word_boundary_in(s, s.len()), s.len()); // clamp at end
+                                                                // Mid-word: from offset 1 (inside "foo") skip rest of word + space → 4.
+        assert_eq!(next_word_boundary_in(s, 1), 4);
+    }
+
+    #[test]
+    fn word_movement_treats_punctuation_as_separators() {
+        // Identifier-style content with non-word separators ('.', '+', spaces). The
+        // address formula "app.exe + 0x10" splits on '.', '+' and whitespace.
+        let s = "app.exe + 0x10";
+        // From start: skip "app", land on "exe".
+        assert_eq!(next_word_boundary_in(s, 0), 4);
+        // From "exe": skip ".exe"? No — caret at 4 is on "exe"; skip word then the
+        // " + " separators, landing on "0x10".
+        assert_eq!(next_word_boundary_in(s, 4), 10);
+        // Word-left from the very end lands on the start of "0x10".
+        assert_eq!(prev_word_boundary_in(s, s.len()), 10);
+        // Then on "exe".
+        assert_eq!(prev_word_boundary_in(s, 10), 4);
     }
 
     #[test]

@@ -726,6 +726,58 @@ fn flatten(layers: &[SpanStyle], n: i32) -> Vec<SpanStyle> {
     out
 }
 
+/// Item 2 (pure): the per-token **hover-span** column range to recolor link-blue
+/// on the row under the cursor — the C++ `IND_HOVER_SPAN` pass in `applyHoverCursor`
+/// (editor.cpp:4295). Returns the exact `[start,end)` char-column range of the
+/// editable token / fold arrow / footer pill the cursor is over, or `None` when the
+/// cursor is over column padding / inert chrome (no recolor).
+///
+/// The recolor span is, in `applyHoverCursor` priority order:
+///   1. the fold disclosure prefix (`0..K_FOLD_COL`) on a fold-head row,
+///   2. the footer pill (`+1`/`+10`/`+10h`/…/`Trim`/`Top`) under the column,
+///   3. the resolved edit token under the column — narrowed at the first chip for
+///      the Value column (so a pointer's trailing symbol chip keeps its own color),
+/// clamped so the returned range lies inside the resolved span the cursor is on.
+///
+/// `hit` is the [`HitInfo`](super::hit_test::HitInfo) for the cursor column; `text`
+/// is the rendered row text. Pure (column math), unit-tested below.
+pub fn hover_span_for(
+    lm: &LineMeta,
+    text: &str,
+    col: i32,
+    in_fold_col: bool,
+    target: Option<EditTarget>,
+    type_w: i32,
+    name_w: i32,
+) -> Option<(i32, i32)> {
+    // 1. Fold disclosure arrow — recolor the whole fold prefix.
+    if in_fold_col {
+        return Some((0, compose::K_FOLD_COL));
+    }
+    // 2. Footer pill under the cursor.
+    if lm.line_kind == LineKind::Footer {
+        for pill in footer_pill_spans(text) {
+            if pill.valid && col >= pill.start && col < pill.end {
+                return Some((pill.start, pill.end));
+            }
+        }
+        return None;
+    }
+    // 3. The resolved edit token under the cursor. (Footer rows already returned;
+    // the C++ explicitly skips the hover span on footer lines, editor.cpp:4296.)
+    let t = target?;
+    let mut span = resolved_span_for(lm, text, t, type_w, name_w);
+    if t == EditTarget::Value {
+        // Narrow the value at the first chip (pointer symbol / RTTI keep their hue).
+        span = narrow_value_at_first_chip(lm, span);
+    }
+    if span.valid && col >= span.start && col < span.end && span.end > span.start {
+        Some((span.start, span.end))
+    } else {
+        None
+    }
+}
+
 /// The char-column [`ColumnSpan`] for an [`EditTarget`] on a given line, mirroring
 /// the editor's authoritative `resolvedSpanFor` (editor-surface.md §8) dispatch
 /// onto the `compose` span helpers. Returns an invalid span when the target is
@@ -1519,5 +1571,95 @@ mod tests {
         assert!(value.valid && value.end > value.start);
         // Name precedes value in column order.
         assert!(name.end <= value.start);
+    }
+
+    // ── Item 2: per-token hover-span recolor range (the C++ `IND_HOVER_SPAN`) ──
+
+    #[test]
+    fn hover_span_recolors_the_name_token() {
+        // Hovering the Name token returns exactly the Name span (link-blue recolor).
+        let lm = field_line(0, NodeKind::Int32);
+        let name = resolved_span_for(&lm, "", EditTarget::Name, 14, 22);
+        let text = "int32         field                  100";
+        let span = hover_span_for(
+            &lm,
+            text,
+            name.start + 1,
+            false,
+            Some(EditTarget::Name),
+            14,
+            22,
+        )
+        .expect("hovered name token recolors");
+        assert_eq!(span, (name.start, name.end));
+    }
+
+    #[test]
+    fn hover_span_none_over_padding() {
+        // No target under the cursor → no recolor.
+        let lm = field_line(0, NodeKind::Int32);
+        let text = "int32         field                  100";
+        assert!(hover_span_for(&lm, text, 9, false, None, 14, 22).is_none());
+    }
+
+    #[test]
+    fn hover_span_is_the_fold_prefix_on_fold_head() {
+        // Item 2/3: hovering the fold arrow recolors the whole fold prefix.
+        let mut lm = field_line(0, NodeKind::Struct);
+        lm.line_kind = LineKind::Header;
+        lm.fold_head = true;
+        let text = "\u{25BE} Player                              {";
+        let span = hover_span_for(&lm, text, 0, true, None, 14, 22).expect("fold arrow recolors");
+        assert_eq!(span, (0, compose::K_FOLD_COL));
+    }
+
+    #[test]
+    fn hover_span_is_the_footer_pill_under_cursor() {
+        // Item 2/3: hovering a footer pill recolors exactly that pill's columns.
+        let lm = LineMeta {
+            line_kind: LineKind::Footer,
+            ..LineMeta::default()
+        };
+        let text = "};  +1 +10h +100h +1000h Trim Top  // 0x20 (32)";
+        let trim_start = text.find("Trim").unwrap() as i32;
+        let span = hover_span_for(&lm, text, trim_start + 1, false, None, 14, 22)
+            .expect("footer pill recolors");
+        assert_eq!(span, (trim_start, trim_start + 4));
+        // A non-pill footer column (the leading "};") does not recolor.
+        assert!(hover_span_for(&lm, text, 0, false, None, 14, 22).is_none());
+    }
+
+    #[test]
+    fn hover_span_value_narrows_at_first_chip() {
+        // Item 2: the Value hover span is narrowed at the first trailing chip so a
+        // pointer's symbol chip keeps its own color (mirrors `narrowPtrValueSpan`).
+        let mut lm = field_line(0, NodeKind::Pointer64);
+        let vs = compose::value_span_for(&lm, 14, 22);
+        // Place a symbol chip a few columns into the value span.
+        let chip_start = vs.start + 4;
+        lm.chips.push(crate::core::LineChip {
+            kind: ChipKind::Symbol,
+            start_col: chip_start,
+            end_col: chip_start + 6,
+            ..Default::default()
+        });
+        let mut text = String::new();
+        while col_len(&text) < vs.start {
+            text.push(' ');
+        }
+        text.push_str("0x7ff0 kernel32");
+        let span = hover_span_for(
+            &lm,
+            &text,
+            vs.start + 1,
+            false,
+            Some(EditTarget::Value),
+            14,
+            22,
+        )
+        .expect("pointer value recolors");
+        assert_eq!(span.0, vs.start);
+        // Narrowed: the recolor ends at the chip, not the full value span.
+        assert_eq!(span.1, chip_start);
     }
 }

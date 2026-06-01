@@ -136,6 +136,77 @@ pub fn target_at_col(
     None
 }
 
+/// The mouse-cursor shape the editor surface shows over a data row, mirroring the
+/// C++ `applyHoverCursor` decision (editor.cpp:4665): a *pointing-hand* button
+/// cursor over pick-tokens / fold arrows / footer pills, an *I-beam* text cursor
+/// over editable Name/Value/Comment text, and the default *arrow* over column
+/// padding (anywhere with no clickable token).
+///
+/// This is the column-only half of `applyHoverCursor`; the surface maps it to the
+/// platform `gpui::CursorStyle` (Arrow/IBeam/PointingHand) and calls
+/// `window.set_cursor_style`. Pure, so it is unit-tested without a display.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CursorKind {
+    /// Default arrow — over column padding / inert chrome.
+    Arrow,
+    /// Text I-beam — over editable Name/Value/Comment text tokens.
+    IBeam,
+    /// Pointing hand (a "button") — over pick-tokens (Type/Source/…), fold
+    /// disclosure arrows, and footer action pills.
+    PointingHand,
+}
+
+/// Whether an [`EditTarget`] is a *picker* token (opens a popup/picker on click)
+/// rather than an inline text edit — these get the PointingHand "button" cursor in
+/// the C++ `applyHoverCursor` switch (editor.cpp:4701): Type, Source,
+/// ArrayElementType, PointerTarget, RootClassType, TypeSelector. Everything else
+/// (Name, Value, Comment, BaseAddress, RootClassName, array index/count, static
+/// expr) is inline text → I-beam.
+pub fn is_picker_target(t: EditTarget) -> bool {
+    use EditTarget::*;
+    matches!(
+        t,
+        Type | Source | ArrayElementType | PointerTarget | RootClassType | TypeSelector
+    )
+}
+
+/// Resolve the mouse-[`CursorKind`] for a hit on a row, in `applyHoverCursor`
+/// priority order (editor.cpp:4665):
+///   1. fold-disclosure column on a fold-head → PointingHand (the fold toggle is a
+///      button),
+///   2. a footer pill (`+1`/`+10`/`+10h`/`+100h`/`+1000h`/`Trim`/`Top`) under the
+///      column → PointingHand; any other footer column → Arrow,
+///   3. a resolved edit token under the column → PointingHand for picker tokens,
+///      I-beam for inline-text tokens,
+///   4. otherwise (column padding / inert region) → Arrow.
+///
+/// `hit` is the result of [`hit_test_row`]; passing it in keeps the column math in
+/// one place (the cursor and the click route resolve against the identical hit).
+pub fn cursor_for_hit(lm: &LineMeta, text: &str, hit: HitInfo) -> CursorKind {
+    // 1. Fold disclosure arrow — a clickable toggle button.
+    if hit.in_fold_col {
+        return CursorKind::PointingHand;
+    }
+    // 2. Footer row: PointingHand over a pill, Arrow everywhere else.
+    if lm.line_kind == LineKind::Footer {
+        for pill in geometry::footer_pill_spans(text) {
+            if span_contains(pill, hit.col) {
+                return CursorKind::PointingHand;
+            }
+        }
+        return CursorKind::Arrow;
+    }
+    // 3. A resolved edit token: picker → PointingHand, inline text → IBeam.
+    if let Some(t) = hit.target {
+        if is_picker_target(t) {
+            return CursorKind::PointingHand;
+        }
+        return CursorKind::IBeam;
+    }
+    // 4. Column padding / inert chrome.
+    CursorKind::Arrow
+}
+
 /// Full hit test: pixel X (relative to the row left) + the cell metrics + the
 /// line → [`HitInfo`]. `is_fold_head` lets the caller mark fold-prefix clicks.
 pub fn hit_test_row(
@@ -515,5 +586,143 @@ mod tests {
             type_hit.col,
             type_hit.target
         );
+    }
+
+    // ── Item 1/3: cursor-shape resolution (the C++ `applyHoverCursor`) ──
+
+    #[test]
+    fn picker_targets_match_cpp_switch() {
+        use EditTarget::*;
+        // The exact set that gets PointingHand in editor.cpp:4701.
+        for t in [
+            Type,
+            Source,
+            ArrayElementType,
+            PointerTarget,
+            RootClassType,
+            TypeSelector,
+        ] {
+            assert!(is_picker_target(t), "{t:?} must be a picker token");
+        }
+        // Everything else is inline text → IBeam.
+        for t in [
+            Name,
+            Value,
+            Comment,
+            BaseAddress,
+            RootClassName,
+            ArrayIndex,
+            ArrayCount,
+            ArrayElementCount,
+            StaticExpr,
+        ] {
+            assert!(!is_picker_target(t), "{t:?} must NOT be a picker token");
+        }
+    }
+
+    #[test]
+    fn cursor_ibeam_over_name_and_value_text() {
+        // Item 1: IBeam over editable Name/Value text tokens.
+        let m = metrics();
+        let lm = field(NodeKind::Int32, 0);
+        let text = "int32         field                  100";
+        // Name column (begins at 18).
+        let name_x = (19.0 + 0.5) * m.cell_width;
+        let name_hit = hit_test_row(&lm, text, name_x, m, 14, 22);
+        assert_eq!(name_hit.target, Some(EditTarget::Name));
+        assert_eq!(cursor_for_hit(&lm, text, name_hit), CursorKind::IBeam);
+        // Value column.
+        let value_x = (42.0 + 0.5) * m.cell_width;
+        let value_hit = hit_test_row(&lm, text, value_x, m, 14, 22);
+        assert_eq!(value_hit.target, Some(EditTarget::Value));
+        assert_eq!(cursor_for_hit(&lm, text, value_hit), CursorKind::IBeam);
+    }
+
+    #[test]
+    fn cursor_pointing_hand_over_type_pick_token() {
+        // Item 1/3: PointingHand over the Type pick-token.
+        let m = metrics();
+        let lm = field(NodeKind::Int32, 0);
+        let text = "int32         field                  100";
+        let type_x = ((compose::K_FOLD_COL + 1) as f32 + 0.5) * m.cell_width;
+        let hit = hit_test_row(&lm, text, type_x, m, 14, 22);
+        assert_eq!(hit.target, Some(EditTarget::Type));
+        assert_eq!(cursor_for_hit(&lm, text, hit), CursorKind::PointingHand);
+    }
+
+    #[test]
+    fn cursor_arrow_over_column_padding() {
+        // Item 1: Arrow over padding (no clickable token) — way past the line.
+        let m = metrics();
+        let lm = field(NodeKind::Int32, 0);
+        let text = "int32         field                  100";
+        let hit = hit_test_row(&lm, text, 4000.0, m, 14, 22);
+        assert_eq!(hit.target, None);
+        assert_eq!(cursor_for_hit(&lm, text, hit), CursorKind::Arrow);
+    }
+
+    #[test]
+    fn cursor_pointing_hand_over_fold_arrow() {
+        // Item 3: PointingHand over the fold disclosure arrow.
+        let mut lm = field(NodeKind::Struct, 0);
+        lm.line_kind = LineKind::Header;
+        lm.fold_head = true;
+        let text = "\u{25BE} Player                              {";
+        let hit = hit_test_row(&lm, text, 2.0, metrics(), 14, 22); // col 0, in fold prefix
+        assert!(hit.in_fold_col);
+        assert_eq!(cursor_for_hit(&lm, text, hit), CursorKind::PointingHand);
+    }
+
+    #[test]
+    fn cursor_pointing_hand_over_footer_pill_arrow_elsewhere() {
+        // Item 3: PointingHand over a footer pill, Arrow over other footer columns.
+        let lm = LineMeta {
+            line_kind: LineKind::Footer,
+            ..LineMeta::default()
+        };
+        let text = "};  +1 +10h +100h +1000h Trim Top  // 0x20 (32)";
+        let m = metrics();
+        // Over the "Trim" pill.
+        let trim_start = text.find("Trim").unwrap() as i32; // ASCII → col == byte
+        let trim_x = (trim_start as f32 + 0.5) * m.cell_width;
+        let trim_hit = hit_test_row(&lm, text, trim_x, m, 14, 22);
+        assert_eq!(
+            cursor_for_hit(&lm, text, trim_hit),
+            CursorKind::PointingHand
+        );
+        // Over the leading "};" (not a pill) → Arrow.
+        let brace_hit = hit_test_row(&lm, text, 0.5 * m.cell_width, m, 14, 22);
+        assert_eq!(cursor_for_hit(&lm, text, brace_hit), CursorKind::Arrow);
+    }
+
+    #[test]
+    fn cursor_pointing_hand_over_command_row_selector_ibeam_over_name() {
+        // Item 1: TypeSelector/Source pick PointingHand; RootClassName/BaseAddress
+        // are inline text → IBeam, on the command row.
+        let lm = LineMeta {
+            line_kind: LineKind::CommandRow,
+            ..LineMeta::default()
+        };
+        let text = "[\u{25B8}] source\u{25BE}  0x400000  struct Foo {";
+        let m = metrics();
+        // chevron (col 0) → TypeSelector → PointingHand.
+        let chevron_hit = hit_test_row(&lm, text, 0.5 * m.cell_width, m, 14, 22);
+        assert_eq!(chevron_hit.target, Some(EditTarget::TypeSelector));
+        assert_eq!(
+            cursor_for_hit(&lm, text, chevron_hit),
+            CursorKind::PointingHand
+        );
+        // base address → BaseAddress → IBeam.
+        let addr = compose::command_row_addr_span(text);
+        let addr_x = (addr.start as f32 + 0.5) * m.cell_width;
+        let addr_hit = hit_test_row(&lm, text, addr_x, m, 14, 22);
+        assert_eq!(addr_hit.target, Some(EditTarget::BaseAddress));
+        assert_eq!(cursor_for_hit(&lm, text, addr_hit), CursorKind::IBeam);
+        // class name → RootClassName → IBeam.
+        let name = compose::command_row_root_name_span(text);
+        let name_x = (name.start as f32 + 0.5) * m.cell_width;
+        let name_hit = hit_test_row(&lm, text, name_x, m, 14, 22);
+        assert_eq!(name_hit.target, Some(EditTarget::RootClassName));
+        assert_eq!(cursor_for_hit(&lm, text, name_hit), CursorKind::IBeam);
     }
 }

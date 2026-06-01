@@ -15,6 +15,7 @@
 use gpui::*;
 
 use super::geometry::{self, CellMetrics, SpanStyle};
+use super::hit_test::{self, CursorKind};
 use super::palette::EditorPalette;
 use super::RcxEditor;
 
@@ -61,6 +62,53 @@ pub struct RowPrepaint {
     pills: Vec<PaintQuad>,
     overlays: Vec<PaintQuad>,
     hitbox: Option<Hitbox>,
+    /// The mouse-cursor shape to request over this row's hitbox while it is hovered
+    /// (the C++ `applyHoverCursor` per-column shape, items 1/3). `None` when the row
+    /// is not hovered or hover-cursor styling is suppressed (editing / hover off).
+    cursor: Option<CursorKind>,
+}
+
+/// The per-column hover decision for a row under the cursor: the cursor shape to
+/// request and the `[start,end)` char-column span to recolor link-blue (the C++
+/// `IND_HOVER_SPAN`). Resolved once in `prepaint` from the editor's live line model
+/// + the current mouse position (items 1/2/3, mirroring `applyHoverCursor`).
+struct HoverDecision {
+    cursor: CursorKind,
+    /// The token/arrow/pill span to recolor (link-blue), if any.
+    recolor: Option<(i32, i32)>,
+}
+
+impl RowElement {
+    /// Resolve the cursor shape + hover-span recolor for this row, given the
+    /// row-local mouse X (the C++ `applyHoverCursor`). Reads the editor's live line
+    /// model so hit-testing/coloring stay in lock-step with the painted columns.
+    /// Returns `None` when hover styling is suppressed (hover-effects off, or an
+    /// inline edit is active — the field owns its own cursor then).
+    fn hover_decision(&self, rel_x: f32, cx: &App) -> Option<HoverDecision> {
+        let editor = self.editor.upgrade()?;
+        let editor = editor.read(cx);
+        // Suppress hover visuals while editing or when hover-effects are off (the
+        // C++ keeps Arrow + skips the hover span in both cases; editor.cpp:4190).
+        if editor.editing.is_some() || !editor.hover_effects() {
+            return None;
+        }
+        let lm = editor.line_meta(self.line)?.clone();
+        let text = editor.line_text_owned(self.line);
+        let metrics = self.row.metrics;
+        let (type_w, name_w) = geometry::effective_widths(&lm);
+        let hit = hit_test::hit_test_row(&lm, &text, rel_x, metrics, type_w, name_w);
+        let cursor = hit_test::cursor_for_hit(&lm, &text, hit);
+        let recolor = geometry::hover_span_for(
+            &lm,
+            &text,
+            hit.col,
+            hit.in_fold_col,
+            hit.target,
+            type_w,
+            name_w,
+        );
+        Some(HoverDecision { cursor, recolor })
+    }
 }
 
 impl IntoElement for RowElement {
@@ -101,11 +149,27 @@ impl Element for RowElement {
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Self::PrepaintState {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
         let cell = self.row.metrics.cell_width;
+
+        // Per-column hover (items 1/2/3): when the cursor is over this row, resolve
+        // the cursor shape (IBeam / PointingHand / Arrow) and the hovered token's
+        // column span to recolor link-blue (the C++ `applyHoverCursor` /
+        // `IND_HOVER_SPAN`). Computed here from the live line model + current mouse
+        // position so the recolor is folded into the shaped text below, and the
+        // cursor request is carried through to `paint`.
+        let mut hover_cursor: Option<CursorKind> = None;
+        let mut hover_recolor: Option<(i32, i32)> = None;
+        if hitbox.is_hovered(window) {
+            let rel_x = f32::from(window.mouse_position().x - bounds.left()).max(0.0);
+            if let Some(d) = self.hover_decision(rel_x, cx) {
+                hover_cursor = Some(d.cursor);
+                hover_recolor = d.recolor;
+            }
+        }
 
         // Rounded pill backgrounds (footer / command-row chips). Built whether or
         // not the line has text so an empty pill list is cheap; inset vertically
@@ -139,13 +203,20 @@ impl Element for RowElement {
                 pills,
                 overlays: Vec::new(),
                 hitbox: Some(hitbox),
+                cursor: hover_cursor,
             };
         }
         let style = window.text_style();
         let font = style.font();
         let font_size = style.font_size.to_pixels(window.rem_size());
 
-        let runs = build_text_runs(&text, &self.row.runs, &self.row.palette, &font);
+        let runs = build_text_runs(
+            &text,
+            &self.row.runs,
+            &self.row.palette,
+            &font,
+            hover_recolor,
+        );
         let line = window
             .text_system()
             .shape_line(text, font_size, &runs, None);
@@ -168,6 +239,7 @@ impl Element for RowElement {
             pills,
             overlays,
             hitbox: Some(hitbox),
+            cursor: hover_cursor,
         }
     }
 
@@ -206,6 +278,20 @@ impl Element for RowElement {
         // the node context menu anchored at the cursor (reclass
         // `customContextMenuRequested`), recording the row as the menu's target.
         if let Some(hitbox) = prepaint.hitbox.take() {
+            // Per-column cursor shape over the row's hitbox (items 1/3, the C++
+            // `applyHoverCursor`): IBeam over editable Name/Value/Comment text,
+            // PointingHand over pick-tokens / fold arrows / footer pills, Arrow over
+            // column padding. Resolved in `prepaint` from the live hit test; only
+            // requested while this row is the hovered one (else the cursor is left
+            // to the default / another row's request).
+            if let Some(kind) = prepaint.cursor.take() {
+                let style = match kind {
+                    CursorKind::Arrow => CursorStyle::Arrow,
+                    CursorKind::IBeam => CursorStyle::IBeam,
+                    CursorKind::PointingHand => CursorStyle::PointingHand,
+                };
+                window.set_cursor_style(style, &hitbox);
+            }
             let editor = self.editor.clone();
             let line = self.line;
             let left = bounds.left();
@@ -274,12 +360,27 @@ impl Element for RowElement {
 /// Convert char-column colored spans into UTF-8-byte-length `TextRun`s. The spans
 /// are disjoint and sorted (guaranteed by `style_runs`); any gap defaults to the
 /// text color. `shape_line` merges identical adjacent runs implicitly.
+///
+/// `hover_recolor` is the optional `[start,end)` **char-column** span of the token
+/// under the cursor (item 2 / the C++ `IND_HOVER_SPAN`): any glyph inside it is
+/// forced to the link-blue `palette.accent`, overriding its static role color so
+/// the hovered editable token / fold arrow / footer pill reads as a link.
 fn build_text_runs(
     text: &str,
     spans: &[SpanStyle],
     palette: &EditorPalette,
     font: &Font,
+    hover_recolor: Option<(i32, i32)>,
 ) -> Vec<TextRun> {
+    // Hover-recolor byte range (link-blue). Empty/invalid → no override.
+    let hover_bytes: Option<(usize, usize)> = hover_recolor.and_then(|(s, e)| {
+        if e <= s {
+            return None;
+        }
+        let sb = geometry::byte_for_col(text, s);
+        let eb = geometry::byte_for_col(text, e);
+        (eb > sb).then_some((sb, eb))
+    });
     let mk = |len: usize, color: Hsla| TextRun {
         len,
         font: font.clone(),
@@ -288,8 +389,31 @@ fn build_text_runs(
         underline: None,
         strikethrough: None,
     };
+    // Emit a `[start,end)` byte run with `base` color, but split out any
+    // sub-portion that overlaps the hover range and paint it link-blue instead.
+    let push_colored = |runs: &mut Vec<TextRun>, start: usize, end: usize, base: Hsla| {
+        if end <= start {
+            return;
+        }
+        match hover_bytes {
+            Some((hs, he)) if he > start && hs < end => {
+                let mid_s = hs.max(start);
+                let mid_e = he.min(end);
+                if mid_s > start {
+                    runs.push(mk(mid_s - start, base));
+                }
+                runs.push(mk(mid_e - mid_s, palette.accent));
+                if end > mid_e {
+                    runs.push(mk(end - mid_e, base));
+                }
+            }
+            _ => runs.push(mk(end - start, base)),
+        }
+    };
     if spans.is_empty() {
-        return vec![mk(text.len(), palette.text)];
+        let mut runs = Vec::new();
+        push_colored(&mut runs, 0, text.len(), palette.text);
+        return runs;
     }
     let mut runs = Vec::with_capacity(spans.len());
     let mut last_byte = 0usize;
@@ -297,15 +421,20 @@ fn build_text_runs(
         let start_byte = geometry::byte_for_col(text, span.start);
         let end_byte = geometry::byte_for_col(text, span.end);
         if start_byte > last_byte {
-            runs.push(mk(start_byte - last_byte, palette.text));
+            push_colored(&mut runs, last_byte, start_byte, palette.text);
         }
         if end_byte > start_byte {
-            runs.push(mk(end_byte - start_byte, palette.role_color(span.role)));
+            push_colored(
+                &mut runs,
+                start_byte,
+                end_byte,
+                palette.role_color(span.role),
+            );
             last_byte = end_byte;
         }
     }
     if last_byte < text.len() {
-        runs.push(mk(text.len() - last_byte, palette.text));
+        push_colored(&mut runs, last_byte, text.len(), palette.text);
     }
     runs
 }

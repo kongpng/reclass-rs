@@ -1636,10 +1636,19 @@ pub fn fmt_bitfield_member(
 mod tests {
     use super::*;
     use crate::provider::BufferProvider;
+    use std::sync::Mutex;
+
+    // Serializes tests that mutate the global type-name override seam
+    // (`G_TYPE_NAME_FN`) so they can't interleave under the parallel test
+    // runner and observe each other's provider state.
+    static TYPE_NAME_SEAM_LOCK: Mutex<()> = Mutex::new(());
 
     // ── testTypeName (test_format.cpp:9-13) ──
     #[test]
     fn test_type_name() {
+        let _g = TYPE_NAME_SEAM_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let s = type_name(NodeKind::Float);
         assert_eq!(s.trim(), "float");
         assert_eq!(u16_len(&s), 14); // kColType
@@ -2074,6 +2083,9 @@ mod tests {
 
     #[test]
     fn test_type_name_override_seam() {
+        let _g = TYPE_NAME_SEAM_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         fn over(_k: NodeKind) -> String {
             "X".to_string()
         }

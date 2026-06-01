@@ -105,6 +105,12 @@ actions!(
         EditorHex128,
         EditorNavUp,
         EditorNavDown,
+        // Item 12: Ctrl+Up / Ctrl+Down — navigate to the next node AND toggle it
+        // into the multi-selection (the C++ additive nav; nodeClicked with the
+        // ControlModifier set). Distinct from plain Up/Down (REPLACE) and
+        // Ctrl+Shift+Up/Down (reorder).
+        EditorNavAddUp,
+        EditorNavAddDown,
         // Ctrl+Shift+Up/Down — reorder the active field among its siblings (the
         // C++ `moveNodeRequested`). Distinct from plain Up/Down navigation.
         EditorMoveUp,
@@ -183,6 +189,22 @@ actions!(
         EditorZoomIn,
         EditorZoomOut,
         EditorZoomReset,
+        // Item 6: enum / bitfield MEMBER row context-menu actions (Add Member
+        // Above/Below, Remove Member, Toggle Bit). They act on the context target's
+        // node_id + sub_line (the member index).
+        EditorMemberAddAbove,
+        EditorMemberAddBelow,
+        EditorMemberRemove,
+        EditorMemberToggleBit,
+        // Item 7/18/48: group the multi-selection into a Union (controller
+        // `group_into_union`).
+        EditorGroupIntoUnion,
+        // Item 8: the Static submenu actions — add a Hex64 child / a static field,
+        // edit the static expression, or dissolve a union member.
+        EditorStaticAddChild,
+        EditorStaticAddField,
+        EditorStaticEditExpr,
+        EditorStaticDissolveUnion,
     ]
 );
 
@@ -238,6 +260,14 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("5", EditorHex128, Some("RcxEditor")),
         KeyBinding::new("up", EditorNavUp, Some("RcxEditor")),
         KeyBinding::new("down", EditorNavDown, Some("RcxEditor")),
+        // Item 12: Ctrl+Up / Ctrl+Down — additive nav (move caret to the next node
+        // and toggle it into the selection). gpui exact-modifier match means the
+        // bare `up`/`down` above never fire for the ctrl chord, so these are
+        // required for the chord to work at all.
+        KeyBinding::new("ctrl-up", EditorNavAddUp, Some("RcxEditor")),
+        KeyBinding::new("ctrl-down", EditorNavAddDown, Some("RcxEditor")),
+        KeyBinding::new("cmd-up", EditorNavAddUp, Some("RcxEditor")),
+        KeyBinding::new("cmd-down", EditorNavAddDown, Some("RcxEditor")),
         // Ctrl+Shift+Up/Down reorder the field; gpui matches this more-specific
         // chord over the bare `up`/`down` navigation bindings above.
         KeyBinding::new("ctrl-shift-up", EditorMoveUp, Some("RcxEditor")),
@@ -321,6 +351,11 @@ pub struct RcxEditor {
     byte_sel: ByteSelection,
     /// The line the mouse is hovering (for the hover-row background; §7).
     hovered_line: Option<usize>,
+    /// Item 9: the NODE id under the pointer (the C++ `m_hoveredNodeId`). The hover
+    /// band lights every display line whose `node_id` matches this (so a multi-line
+    /// header/value highlights as a unit), and is suppressed when the node is
+    /// already selected. 0 = no hovered node. Cleared on viewport-leave / kbd nav.
+    hovered_node_id: u64,
     /// The open hover popup (item 13), if the cursor is over a qualifying value
     /// column (heated value / func-or-void pointer / typed pointer). Cleared when
     /// the cursor leaves the value region or moves to a non-qualifying row.
@@ -345,6 +380,21 @@ pub struct RcxEditor {
     /// begin (then `drag_started` latches so the rest of the drag extends freely).
     drag_anchor_x: f32,
     drag_started: bool,
+    /// Item 4: the char-column of the most recent value click, consumed by the next
+    /// `begin_inline_edit` to narrow a Vec2/3/4/Mat4x4 Value edit to the clicked
+    /// comma-separated component. `None` ⇒ no narrowing (keyboard-initiated edit /
+    /// non-vector node).
+    pending_click_col: Option<i32>,
+    /// Item 20: the modifiers held when the drag press landed (the C++
+    /// `m_dragInitMods`). A Ctrl+drag must ADD the dragged range to the selection
+    /// rather than replace it, so Mode-2 drag-select ORs in `ctrl: drag_init_mods`.
+    drag_init_mods: Modifiers,
+    /// Item 20: a deferred plain click on an already-selected node within a >1
+    /// selection (the C++ `m_pendingClickNodeId`/`Line`/`Mods`). The selection
+    /// collapse is postponed to mouse-RELEASE so a drag from the group keeps the
+    /// whole group; on a plain release (no drag) the pending click fires and
+    /// collapses to the clicked node. `(line, node_id, mods)`.
+    pending_click: Option<(usize, u64, Modifiers)>,
     /// The node-clipboard payload (the `rcx-clipboard/v1` blob written by
     /// EditorCopy/Cut). gpui's clipboard is text-only here, so the serialized blob
     /// also lands on the system clipboard; this field is the in-process fast path
@@ -434,6 +484,10 @@ pub struct RcxEditor {
     /// The focus-glow pulse timer task (a ~30ms foreground loop). Held so it is
     /// cancelled when the view drops / focus clears.
     _focus_glow_task: Task<()>,
+    /// Item 23: the presentation-mode smooth-scroll animation task (the C++
+    /// `m_scrollAnim`, a `QVariantAnimation` with an OutExpo curve). Held so a new
+    /// `smooth_scroll_to_node_id` cancels any in-flight glide.
+    _scroll_anim_task: Task<()>,
     /// Item 75: the third per-pane surface (`VM_Debug`). When on, the editor renders
     /// the DEBUG dump (each composed line's margin + annotated text + per-line
     /// LineMeta) instead of the structured grid. Off by default; toggled by the
@@ -496,6 +550,10 @@ struct ContextTarget {
     node_id: u64,
     /// The node's current kind (for the quick type-cycler label + Change Type seed).
     kind: NodeKind,
+    /// Item 6: the right-clicked row's `sub_line` (the C++ `subLine`) — the enum /
+    /// bitfield MEMBER index when the row is a member line, else the row's own
+    /// sub_line (0 for a plain node). Drives the member-specific context menu.
+    sub_line: i32,
 }
 
 /// The kind of hover popup shown over a row's value column (item 13). The C++
@@ -542,6 +600,11 @@ struct EditingField {
     /// `[col_start, col_end)` so it covers exactly the edited column (and occludes
     /// the static glyphs beneath it), item 3.
     col_end: i32,
+    /// Item 5: this edit is an ASCII byte-overwrite ('Edit ASCII'). The Value
+    /// commit must pass `is_ascii = true` to `set_node_value` so the text is
+    /// written per-byte as ASCII (the field opens as a Value edit then switches to
+    /// `HexOverwrite::Ascii`, so the commit target is Value with no other signal).
+    ascii_overwrite: bool,
     _subscription: Subscription,
 }
 
@@ -557,12 +620,16 @@ impl RcxEditor {
             editing: None,
             byte_sel: ByteSelection::new(),
             hovered_line: None,
+            hovered_node_id: 0,
             hover_popup: None,
             caret_line: None,
             drag_anchor_line: None,
             drag_on_byte_grid: false,
             drag_anchor_x: 0.0,
             drag_started: false,
+            pending_click_col: None,
+            drag_init_mods: Modifiers::default(),
+            pending_click: None,
             node_clipboard: None,
             _refresh_task: Self::spawn_refresh_loop(cx),
             last_tab_target: None,
@@ -590,6 +657,7 @@ impl RcxEditor {
             focus_node_id: 0,
             focus_glow_phase: 0,
             _focus_glow_task: Task::ready(()),
+            _scroll_anim_task: Task::ready(()),
             debug_view: false,
             font_family: None,
             zoom_delta: 0.0,
@@ -926,11 +994,33 @@ impl RcxEditor {
         // must travel past the dead-zone before drag-select begins.
         self.drag_anchor_x = rel_x;
         self.drag_started = false;
+        // Item 20: remember the press modifiers so a Ctrl+drag ADDS the dragged
+        // range to the selection (the C++ `m_dragInitMods`).
+        self.drag_init_mods = modifiers;
+        self.pending_click = None;
 
-        // Fold-prefix click → toggle collapse via the controller.
+        // Fold-prefix click → materialize a CYCLE/self-ref head's children, else
+        // toggle collapse (the C++ `handleMarginClick`, controller.cpp:5893): a fold
+        // head whose `M_CYCLE` marker bit is set has no children of its own, so
+        // expanding it must clone the referenced struct's children inline so they
+        // become navigable (BUG #2). After the mutation, seed the nav anchor on the
+        // toggled head's row so a subsequent Down descends into the new children.
         if hit.in_fold_col {
-            if lm.node_idx >= 0 {
-                self.controller.toggle_collapse(lm.node_idx as usize);
+            if lm.node_idx >= 0 && lm.fold_head {
+                let node_idx = lm.node_idx as usize;
+                let node_id = lm.node_id;
+                if (lm.marker_mask & (1u32 << crate::core::linemeta::M_CYCLE)) != 0 {
+                    self.controller.materialize_ref_children(node_idx);
+                } else {
+                    self.controller.toggle_collapse(node_idx);
+                }
+                // Seed the nav anchor on the toggled head (the C++
+                // setCursorPosition on the fold head) so Up/Down descends into the
+                // freshly-materialized/expanded children rather than the first
+                // ref-expanded occurrence of a repeated node_id (BUG #2 part A).
+                self.controller
+                    .handle_node_click(line as i64, node_id, CtrlMods::NONE);
+                self.caret_line = Some(line);
                 self.after_mutation(cx);
             }
             return;
@@ -1045,6 +1135,7 @@ impl RcxEditor {
                             node_idx: lm.node_idx as usize,
                             node_id: lm.node_id,
                             kind: lm.node_kind,
+                            sub_line: lm.sub_line,
                         };
                         self.open_type_selector_in_mode(ctx, target, window, cx);
                         return;
@@ -1061,9 +1152,25 @@ impl RcxEditor {
                 && !modifiers.shift
                 && !modifiers.control
             {
+                // Item 4: record the clicked column so a Vec/Mat Value edit narrows
+                // to the clicked comma-component. Cleared by begin_inline_edit.
+                self.pending_click_col = Some(hit.col);
                 self.begin_inline_edit(line, target, window, cx);
                 return;
             }
+        }
+
+        // Item 20: a PLAIN click on an already-selected node within a >1 selection
+        // DEFERS the selection collapse to mouse-release (the C++
+        // `m_pendingClickNodeId` path) so a drag that starts on the group keeps the
+        // whole group. The pending click fires (collapsing to this node) on a plain
+        // release; a drag flushes it as a shift-extend instead.
+        let plain = !modifiers.control && !modifiers.shift;
+        let multi = self.controller.selected_ids().len() > 1;
+        if plain && multi && already_selected && node_id != 0 && node_id != K_COMMAND_ROW_ID {
+            self.pending_click = Some((line, node_id, modifiers));
+            self.caret_line = Some(line);
+            return;
         }
 
         // Otherwise: selection (the controller owns Ctrl/Shift/cross-row logic).
@@ -1385,11 +1492,45 @@ impl RcxEditor {
         // hex VALUE column is exactly `"NN NN …"` (single inter-byte spaces), so
         // trimming only the outer column padding preserves the fixed-length string
         // the overwrite positions index against.
-        let initial = raw_span.trim().to_string();
+        let mut initial = raw_span.trim().to_string();
 
         let resolved_addr = lm.offset_addr;
         let node_idx = lm.node_idx;
-        let sub_line = lm.sub_line;
+        let mut sub_line = lm.sub_line;
+
+        // Item 4: editing a single component of a Vec2/Vec3/Vec4/Mat4x4 VALUE by
+        // clicking it. The value renders as a comma-joined `"x, y, z"` (Mat4x4:
+        // 16 floats flat). Narrow the seed to the clicked comma-separated component
+        // and set `sub_line` to its index so the controller's `set_node_value`
+        // routes the write to `addr + sub_line*4` as a Float (controller.rs:1469).
+        // No narrowing for keyboard edits (no click column) — the whole string is
+        // seeded and the C++ caret defaults to component 0.
+        let click_col = self.pending_click_col.take();
+        if target == EditTarget::Value
+            && lm.node_idx >= 0
+            && matches!(
+                lm.node_kind,
+                NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 | NodeKind::Mat4x4
+            )
+        {
+            let comps: Vec<&str> = raw_span.split(',').collect();
+            if comps.len() > 1 {
+                // Map the clicked display column to a component index by walking the
+                // value span char-by-char and counting commas before the click.
+                let comp = if let Some(col) = click_col {
+                    // `col` is a display column; the value span starts at span.start.
+                    let rel = (col - span.start).max(0) as usize;
+                    let span_chars: Vec<char> = raw_span.chars().collect();
+                    let upto = rel.min(span_chars.len());
+                    span_chars[..upto].iter().filter(|&&c| c == ',').count()
+                } else {
+                    0
+                };
+                let comp = comp.min(comps.len() - 1);
+                initial = comps[comp].trim().to_string();
+                sub_line = comp as i32;
+            }
+        }
         let palette = EditorPalette::from_theme(cx);
         let color = palette.text;
         // The inline-edit text-selection fill — the Zed text-selection token (NOT
@@ -1436,6 +1577,7 @@ impl RcxEditor {
             line,
             col_start: span.start,
             col_end: span.end,
+            ascii_overwrite: false,
             _subscription: subscription,
         });
         // Focus the field AFTER its element is in the render tree. Focusing a
@@ -1458,7 +1600,70 @@ impl RcxEditor {
         // the green 'Enter=Save Esc=Cancel' hint shows immediately (and any seeded
         // error paints right away).
         self.update_edit_validation(cx);
+        // Item 19: when editing a heated changed VALUE that has >1 distinct samples,
+        // proactively float the value-history popup anchored to the edit field (the
+        // C++ recreates the popup with 'Set' buttons the moment editing starts,
+        // editor.cpp:3579) — independent of the mouse position, which is where the
+        // Rust path previously only showed it.
+        self.arm_edit_value_history_popup(line, target, cx);
         cx.notify();
+    }
+
+    /// Item 19: open the value-history popup (with edit-time 'Set' buttons) anchored
+    /// to the active edit field when editing a heated VALUE with >1 distinct value
+    /// samples. No-op for non-Value targets / unheated values / a single sample.
+    fn arm_edit_value_history_popup(
+        &mut self,
+        line: usize,
+        target: EditTarget,
+        _cx: &mut Context<Self>,
+    ) {
+        if target != EditTarget::Value {
+            return;
+        }
+        let Some(lm) = self.line_meta(line).cloned() else {
+            return;
+        };
+        if lm.node_idx < 0
+            || lm.node_id == 0
+            || lm.node_id == K_COMMAND_ROW_ID
+            || lm.heat_level == 0
+        {
+            return;
+        }
+        let Some(hist) = self.controller.value_history().get(&lm.node_id) else {
+            return;
+        };
+        if hist.unique_count() <= 1 {
+            return;
+        }
+        let now = Self::now_millis();
+        let mut entries: Vec<(String, String)> = Vec::new();
+        hist.for_each_with_time(|v, t| {
+            if entries.len() < crate::core::value_history::K_CAPACITY {
+                entries.push((v.to_string(), Self::relative_age(now, t)));
+            }
+        });
+        if entries.len() <= 1 {
+            return;
+        }
+        // Anchor near the edited row: float at the row's top-left in surface space
+        // (the deferred anchor offsets by (+12,+16) for the cursor cards; here we
+        // anchor to the field row, the C++ field-anchored popup). Use the measured
+        // line height to place it at the row baseline.
+        let y = (line as f32) * self.metrics.line_height;
+        let pos = point(px(0.0), px(y));
+        self.hover_popup = Some(HoverPopupState {
+            line,
+            pos,
+            kind: HoverPopupKind::ValueHistory {
+                entries,
+                node_idx: lm.node_idx,
+                sub_line: lm.sub_line,
+                resolved_addr: lm.offset_addr,
+                set_buttons: true,
+            },
+        });
     }
 
     /// Item 71/72/68/73: recompute the live inline-edit validation + expression-
@@ -1534,10 +1739,17 @@ impl RcxEditor {
     fn resolve_edit_outcome(&mut self, outcome: EditOutcome, cx: &mut Context<Self>) {
         match outcome {
             EditOutcome::Commit(commit) => {
+                // Item 5: capture the ASCII-overwrite flag before clearing the edit
+                // state so the Value commit writes per-byte ASCII.
+                let ascii = self
+                    .editing
+                    .as_ref()
+                    .map(|e| e.ascii_overwrite)
+                    .unwrap_or(false);
                 self.editing = None;
                 self.edit_validation = None;
                 self.expr_result = None;
-                self.apply_commit(&commit, cx);
+                self.apply_commit(&commit, ascii, cx);
             }
             EditOutcome::Cancel => {
                 self.editing = None;
@@ -1556,8 +1768,9 @@ impl RcxEditor {
         };
         self.edit_validation = None;
         self.expr_result = None;
+        let ascii = editing.ascii_overwrite;
         let commit = editing.field.read(cx).to_commit();
-        self.apply_commit(&commit, cx);
+        self.apply_commit(&commit, ascii, cx);
     }
 
     /// The stable id of the node at tree index `idx` (0 if out of range).
@@ -1591,7 +1804,9 @@ impl RcxEditor {
 
     /// Route a committed edit to the matching controller mutation
     /// (editor-surface.md §1: the controller recomposes, then we refresh).
-    fn apply_commit(&mut self, commit: &EditCommit, cx: &mut Context<Self>) {
+    /// `ascii` (item 5) marks a Value commit that came from the 'Edit ASCII'
+    /// overwrite editor, so it is written per-byte as ASCII rather than parsed hex.
+    fn apply_commit(&mut self, commit: &EditCommit, ascii: bool, cx: &mut Context<Self>) {
         if commit.node_idx < 0 {
             // Command-row edits act on the *active/root class*, which has no row
             // `node_idx` of its own (the command row is synthetic, node_idx = -1).
@@ -1658,11 +1873,13 @@ impl RcxEditor {
                         commit.text.trim(),
                     );
                 } else {
+                    // Item 5: an 'Edit ASCII' overwrite commit writes per-byte ASCII
+                    // (is_ascii=true) so the text isn't mis-parsed as hex.
                     self.controller.set_node_value(
                         idx,
                         commit.sub_line,
                         &commit.text,
-                        false,
+                        ascii,
                         commit.resolved_addr,
                     );
                 }
@@ -2095,15 +2312,43 @@ impl RcxEditor {
 
     // ── Normal-mode quick keys (editor.cpp `handleNormalKey`, item 12) ──
 
-    /// The `(line, LineMeta)` of the current node — the primary-selected data row
-    /// (`currentNodeIndex`). Skips chrome rows. `None` when no node is selected.
+    /// The `(line, LineMeta)` of the current node — the row under the CARET
+    /// (`currentNodeIndex` reads `m_sci->getCursorPosition`, editor.cpp:1742), so
+    /// caret-targeted ops (P/F/S/U/1-5/Space/Left-Right type-cycle, Ctrl+Shift+Up/
+    /// Down move, F2 rename, T type-edit, Enter value-edit, F12 go-to-def) act on
+    /// the *caret* row rather than `first_selected_line` (raw gap 6 — the latter
+    /// returns the FIRST occurrence of a node_id, which is wrong once ref-expanded
+    /// children reuse the definition's node_ids). Falls back to the first selected
+    /// line when no caret is set (initial state). Skips chrome rows. `None` when no
+    /// node is current.
     fn current_node(&self) -> Option<(usize, LineMeta)> {
-        let line = self.first_selected_line()?;
+        let line = self
+            .caret_data_line()
+            .or_else(|| self.first_selected_line())?;
         let lm = self.line_meta(line)?.clone();
         if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
             return None;
         }
         Some((line, lm))
+    }
+
+    /// The caret line, validated as a real navigable data row against the current
+    /// meta (node_idx >= 0, node_id != 0, not the command row, not a continuation/
+    /// footer). `None` when the caret is unset or now points at a chrome row (a
+    /// recompose may have shifted lines under it). Used as the primary anchor for
+    /// caret-targeted ops + arrow navigation (the C++ cursor line).
+    fn caret_data_line(&self) -> Option<usize> {
+        let line = self.caret_line?;
+        let lm = self.line_meta(line)?;
+        if lm.node_idx < 0
+            || lm.node_id == 0
+            || lm.node_id == K_COMMAND_ROW_ID
+            || lm.is_continuation
+            || lm.line_kind == LineKind::Footer
+        {
+            return None;
+        }
+        Some(line)
     }
 
     /// Change the current node's kind via the controller (the `quickTypeChange`
@@ -2303,16 +2548,43 @@ impl RcxEditor {
     /// auto-appends a hex field to the last node's struct (the "+1" keyboard
     /// affordance). Selects the landed node via `handle_node_click`.
     fn navigate_node(&mut self, dir: i32, step: usize, cx: &mut Context<Self>) {
+        self.navigate_node_mode(dir, step, false, cx);
+    }
+
+    /// `navigate_node` with an explicit `page` flag. For plain arrows (`page ==
+    /// false`) `step` is a node-skip count and the scan walks `start + dir*step`
+    /// then continues in `dir` to the next navigable node — which descends INTO an
+    /// expanded nested class/struct's child rows exactly as the C++ cursor walk does
+    /// (BUG #2: the child LineMeta sit between the header and footer, so a forward
+    /// scan from the header lands on the first child). For page nav (`page ==
+    /// true`) `step` is a screenful of LINES: the C++ computes `target = clamp(line +
+    /// dir*linesOnScreen)` then linear-scans from `target` in `dir` to the nearest
+    /// navigable node (raw gap 9), so the page step lands correctly even when the
+    /// screenful spans collapsed/continuation/footer rows.
+    fn navigate_node_mode(&mut self, dir: i32, step: usize, page: bool, cx: &mut Context<Self>) {
+        // Keyboard navigation clears any open hover popup/band (item 9 / the C++
+        // dismissAllPopups on caret move).
+        self.clear_hover_state(cx);
         let result = self.controller.last_result();
         let count = result.meta.len();
         if count == 0 {
             return;
         }
+        // Anchor on the CARET line first (the C++ `getCursorPosition`), then the
+        // primary selection; this descends into ref-expanded children whose
+        // node_ids repeat the definition's (BUG #2 / raw gap 12).
         let start = self
-            .first_selected_line()
+            .caret_data_line()
+            .or_else(|| self.first_selected_line())
             .map(|l| l as i64)
             .unwrap_or(if dir > 0 { 0 } else { count as i64 });
-        let mut i = start + dir as i64 * step.max(1) as i64;
+        // Page nav: jump a screenful of LINES to a clamped target, then scan from
+        // there in `dir` for the nearest node. Plain nav: scan `start + dir*step`.
+        let mut i = if page {
+            (start + dir as i64 * step.max(1) as i64).clamp(0, count as i64 - 1)
+        } else {
+            start + dir as i64 * step.max(1) as i64
+        };
         let mut found: Option<(usize, u64)> = None;
         while i >= 0 && (i as usize) < count {
             let lm = &result.meta[i as usize];
@@ -2335,7 +2607,9 @@ impl RcxEditor {
             self.controller
                 .handle_node_click(line as i64, node_id, CtrlMods::NONE);
             self.caret_line = Some(line);
-            self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+            // Item 10: scroll MINIMALLY into view (the C++ `ensureLineVisible`) — no
+            // re-centering on every arrow key.
+            self.ensure_line_visible(line);
             self.after_mutation(cx);
             return;
         }
@@ -2398,6 +2672,62 @@ impl RcxEditor {
         self.navigate_node(1, 1, cx);
     }
 
+    fn action_nav_add_up(&mut self, _: &EditorNavAddUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_node_add(-1, cx);
+    }
+    fn action_nav_add_down(
+        &mut self,
+        _: &EditorNavAddDown,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_node_add(1, cx);
+    }
+
+    /// Item 12: Ctrl+Up/Ctrl+Down additive navigation — move the caret to the next
+    /// navigable node in `dir` and TOGGLE it into the multi-selection (the C++
+    /// `nodeClicked(.., ControlModifier)` keyboard path), rather than replacing the
+    /// selection. Does not auto-append at the end.
+    fn navigate_node_add(&mut self, dir: i32, cx: &mut Context<Self>) {
+        self.clear_hover_state(cx);
+        let count = self.controller.last_result().meta.len();
+        if count == 0 {
+            return;
+        }
+        let start = self
+            .caret_data_line()
+            .or_else(|| self.first_selected_line())
+            .map(|l| l as i64)
+            .unwrap_or(if dir > 0 { 0 } else { count as i64 });
+        let mut i = start + dir as i64;
+        let mut found: Option<(usize, u64)> = None;
+        while i >= 0 && (i as usize) < count {
+            let lm = &self.controller.last_result().meta[i as usize];
+            if lm.node_id != 0
+                && lm.node_id != K_COMMAND_ROW_ID
+                && lm.line_kind != LineKind::Footer
+                && !lm.is_continuation
+            {
+                found = Some((i as usize, lm.node_id));
+                break;
+            }
+            i += dir as i64;
+        }
+        if let Some((line, node_id)) = found {
+            self.controller.handle_node_click(
+                line as i64,
+                node_id,
+                CtrlMods {
+                    ctrl: true,
+                    shift: false,
+                },
+            );
+            self.caret_line = Some(line);
+            self.ensure_line_visible(line);
+            self.after_mutation(cx);
+        }
+    }
+
     /// Ctrl+Shift+Up — reorder the active field one slot up among its siblings.
     fn action_move_up(&mut self, _: &EditorMoveUp, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some((_l, lm)) = self.current_node() {
@@ -2414,7 +2744,9 @@ impl RcxEditor {
         }
     }
     fn action_nav_page_up(&mut self, _: &EditorNavPageUp, _w: &mut Window, cx: &mut Context<Self>) {
-        self.navigate_node(-1, self.page_step(), cx);
+        // Item 11: page nav jumps a screenful of LINES then snaps to the nearest
+        // node (page mode), not a node-skip count.
+        self.navigate_node_mode(-1, self.page_step(), true, cx);
     }
     fn action_nav_page_down(
         &mut self,
@@ -2422,7 +2754,68 @@ impl RcxEditor {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.navigate_node(1, self.page_step(), cx);
+        self.navigate_node_mode(1, self.page_step(), true, cx);
+    }
+
+    /// Item 10: scroll `line` MINIMALLY into view (the C++ `ensureLineVisible`):
+    /// only scroll when the target row is OUTSIDE the current viewport, and then
+    /// just to the nearest edge (Top when above, Bottom when below) rather than
+    /// re-centering on every keypress. When the row is already on-screen this is a
+    /// no-op so the viewport stays put.
+    fn ensure_line_visible(&self, line: usize) {
+        let (first, last) = self.visible_line_range();
+        // Before the first layout (no measured range) fall back to a top scroll so
+        // the row is at least brought on-screen.
+        if last <= first {
+            self.scroll.scroll_to_item(line, ScrollStrategy::Top);
+            return;
+        }
+        if line < first {
+            self.scroll.scroll_to_item(line, ScrollStrategy::Top);
+        } else if line > last {
+            self.scroll.scroll_to_item(line, ScrollStrategy::Bottom);
+        }
+        // Already visible → leave the viewport untouched (the C++ ensureLineVisible
+        // does nothing when the line is in range).
+    }
+
+    /// The inclusive `(first_visible, last_visible)` row range from the scroll
+    /// handle's measured viewport. `(0, 0)` before the first layout (caller treats
+    /// an empty range as "unknown → bring on-screen").
+    fn visible_line_range(&self) -> (usize, usize) {
+        let state = self.scroll.0.borrow();
+        let view_h = f32::from(state.base_handle.bounds().size.height);
+        let offset_y = f32::from(state.base_handle.offset().y);
+        if self.metrics.line_height <= 0.0 || view_h <= 0.0 {
+            return (0, 0);
+        }
+        // The list scrolls content UP by a negative offset; first visible row is
+        // floor(-offset / line_height).
+        let first = ((-offset_y).max(0.0) / self.metrics.line_height).floor() as usize;
+        let rows = (view_h / self.metrics.line_height).floor().max(1.0) as usize;
+        (first, first + rows.saturating_sub(1))
+    }
+
+    /// Item 9: clear the hover band + node id and dismiss any open hover popup
+    /// (called on keyboard nav and when the pointer leaves the viewport). The C++
+    /// caret-move / mouse-leave path runs `dismissAllPopups` + drops the hover line.
+    fn clear_hover_state(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self.hovered_line.is_some() {
+            self.hovered_line = None;
+            changed = true;
+        }
+        if self.hovered_node_id != 0 {
+            self.hovered_node_id = 0;
+            changed = true;
+        }
+        if self.hover_popup.is_some() {
+            self.hover_popup = None;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     /// One screenful of rows for PageUp/Down (the measured view height / line
@@ -2450,6 +2843,7 @@ impl RcxEditor {
     /// the anchor instead of replacing it (item 3). Mirrors editor.cpp `Key_Home`/
     /// `Key_End` (which pass `NoModifier`) plus the Shift+Home/End extension.
     fn jump_to_bound(&mut self, to_end: bool, extend: bool, cx: &mut Context<Self>) {
+        self.clear_hover_state(cx);
         let result = self.controller.last_result();
         let n = result.meta.len();
         let indices: Box<dyn Iterator<Item = usize>> = if to_end {
@@ -2475,14 +2869,8 @@ impl RcxEditor {
                 };
                 self.controller.handle_node_click(i as i64, node_id, mods);
                 self.caret_line = Some(i);
-                self.scroll.scroll_to_item(
-                    i,
-                    if to_end {
-                        ScrollStrategy::Center
-                    } else {
-                        ScrollStrategy::Top
-                    },
-                );
+                // Item 10: minimal scroll (the C++ `ensureLineVisible`).
+                self.ensure_line_visible(i);
                 self.after_mutation(cx);
                 return;
             }
@@ -2494,13 +2882,14 @@ impl RcxEditor {
     /// C++ `nodeClicked(.., ShiftModifier)` keyboard path) rather than replacing it.
     /// Does NOT auto-append a field at the end (that is the plain-Down affordance).
     fn navigate_node_extend(&mut self, dir: i32, step: usize, cx: &mut Context<Self>) {
+        self.clear_hover_state(cx);
         let count = self.controller.last_result().meta.len();
         if count == 0 {
             return;
         }
         // Start from the moving caret if we have one, else the primary selection.
         let start = self
-            .caret_line
+            .caret_data_line()
             .or_else(|| self.first_selected_line())
             .map(|l| l as i64)
             .unwrap_or(if dir > 0 { 0 } else { count as i64 });
@@ -2543,7 +2932,8 @@ impl RcxEditor {
                 },
             );
             self.caret_line = Some(line);
-            self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+            // Item 10: minimal scroll (the C++ `ensureLineVisible`).
+            self.ensure_line_visible(line);
             self.after_mutation(cx);
         }
     }
@@ -3092,9 +3482,23 @@ impl RcxEditor {
             return;
         }
         let n = &tree.nodes[idx];
-        // The referenced struct id: a typed pointer/struct carries `ref_id`.
-        let ref_id = n.ref_id;
-        if ref_id != 0 && tree.index_of_id(ref_id) >= 0 {
+        // Resolve the navigation target the way the C++ `goToDefinitionRequested`
+        // (controller.cpp:851) does, in order:
+        //   1. a typed pointer / embedded-struct-ref carries `ref_id`,
+        //   2. an Array of structs chases the array's `ref_id`,
+        //   3. (item 15) a PLAIN embedded Struct field with no ref re-roots to its
+        //      OWN id so the user views its subtree.
+        let target = if n.ref_id != 0 {
+            n.ref_id
+        } else if n.kind == NodeKind::Array && n.element_kind == NodeKind::Struct && n.ref_id != 0 {
+            n.ref_id
+        } else if n.kind == NodeKind::Struct && n.parent_id != 0 {
+            n.id
+        } else {
+            0
+        };
+        if target != 0 && tree.index_of_id(target) >= 0 {
+            let ref_id = target;
             self.controller.set_view_root_id(ref_id);
             self.controller.clear_selection();
             self.apply_document(cx);
@@ -3137,6 +3541,13 @@ impl RcxEditor {
         if targets.is_empty() {
             return;
         }
+        // Item 13: wrap the N toggles in ONE undo macro so undoing a bulk fold takes
+        // a single press (the C++ Collapse/Expand All is one undoable op), not N.
+        self.controller.begin_macro(if collapsed {
+            "Collapse all"
+        } else {
+            "Expand all"
+        });
         for idx in targets {
             // Re-check by re-reading (toggle_collapse may recompose between calls,
             // but indices are stable for collapse toggles in this controller).
@@ -3146,6 +3557,7 @@ impl RcxEditor {
                 }
             }
         }
+        self.controller.end_macro();
         self.apply_document(cx);
     }
 
@@ -3321,12 +3733,13 @@ impl RcxEditor {
     }
 
     /// `smoothScrollToNodeId(nodeId)` (editor.cpp:1792) — in presentation mode,
-    /// animate the scroll toward centering the node (with a snap-close for long
-    /// jumps, then an OutExpo glide); otherwise fall back to the instant
-    /// `scroll_to_node_id`. gpui's `UniformListScrollHandle` exposes only
-    /// `scroll_to_item`, so the "animation" lands the node centered in one step but
-    /// preserves the public entry-point + the presentation-mode branch (the snap +
-    /// easing is a visual refinement deferred to a scroll-offset animator).
+    /// animate the scroll toward centering the node with a snap-close for long jumps
+    /// then an OutExpo glide; otherwise fall back to the instant `scroll_to_node_id`.
+    /// Item 23: drives the uniform-list `base_handle` scroll OFFSET per-frame via a
+    /// ~16ms foreground timer with an OutExpo ease toward the target offset (the C++
+    /// `QVariantAnimation` + `QEasingCurve::OutExpo`, 400ms). If the target is
+    /// already on-screen it just sets the caret; if it is very far (> ~50 rows) it
+    /// snaps close first (leaving the last stretch to animate).
     pub fn smooth_scroll_to_node_id(&mut self, node_id: u64, cx: &mut Context<Self>) {
         if !self.presentation_mode {
             self.scroll_to_node_id(node_id, cx);
@@ -3335,13 +3748,102 @@ impl RcxEditor {
         let Some(line) = self.line_for_node(node_id) else {
             return;
         };
-        // Center the node (the C++ targetFirst = line - visibleLines/2). With the
-        // uniform-list handle we request a centered scroll; the snap-close + OutExpo
-        // glide is the part that needs a per-pixel scroll animator (out of scope for
-        // the uniform-list handle), so this lands centered immediately.
-        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
         self.caret_line = Some(line);
+
+        let lh = self.metrics.line_height;
+        if lh <= 0.0 {
+            // No measured metrics yet — snap.
+            self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+            cx.notify();
+            return;
+        }
+        let (view_h, current_y, max_y) = {
+            let state = self.scroll.0.borrow();
+            (
+                f32::from(state.base_handle.bounds().size.height),
+                f32::from(state.base_handle.offset().y),
+                f32::from(state.base_handle.max_offset().y),
+            )
+        };
+        if view_h <= 0.0 {
+            self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+            cx.notify();
+            return;
+        }
+        // Target offset that centers the line. The list scrolls content UP via a
+        // NEGATIVE y offset; offset = -(line*lh - (view_h - lh)/2), clamped to the
+        // valid scroll range [-max_y, 0].
+        let target_top = (line as f32) * lh - (view_h - lh) * 0.5;
+        let target_y = (-target_top).clamp(-max_y.max(0.0), 0.0);
+
+        // Already on-screen → no scroll (the C++ "already visible" branch).
+        let first = ((-current_y).max(0.0) / lh).floor() as usize;
+        let rows = (view_h / lh).floor().max(1.0) as usize;
+        if line >= first && line < first + rows {
+            cx.notify();
+            return;
+        }
+
+        // Long jump: snap close (within ~30 rows of the target) then glide the rest.
+        let mut start_y = current_y;
+        let distance_rows = ((target_y - current_y).abs() / lh) as i64;
+        if distance_rows > 50 {
+            let snap = if target_y < current_y {
+                target_y + 30.0 * lh
+            } else {
+                target_y - 30.0 * lh
+            };
+            start_y = snap.clamp(-max_y.max(0.0), 0.0);
+            self.set_scroll_offset_y(start_y);
+        }
+
+        // Drive an OutExpo glide from start_y → target_y over ~400ms (~16ms/frame).
+        const DURATION_MS: f32 = 400.0;
+        const FRAME_MS: u64 = 16;
+        let scroll = self.scroll.clone();
+        self._scroll_anim_task = cx.spawn(async move |this, cx| {
+            let begin = std::time::Instant::now();
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(FRAME_MS))
+                    .await;
+                let elapsed = begin.elapsed().as_millis() as f32;
+                let t = (elapsed / DURATION_MS).clamp(0.0, 1.0);
+                // OutExpo: 1 - 2^(-10 t).
+                let eased = if t >= 1.0 {
+                    1.0
+                } else {
+                    1.0 - 2f32.powf(-10.0 * t)
+                };
+                let y = start_y + (target_y - start_y) * eased;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if !this.presentation_mode {
+                            return false;
+                        }
+                        this.set_scroll_offset_y_on(&scroll, y);
+                        cx.notify();
+                        t < 1.0
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        });
         cx.notify();
+    }
+
+    /// Item 23: set the uniform-list vertical scroll offset to `y` (px, ≤ 0).
+    fn set_scroll_offset_y(&self, y: f32) {
+        self.set_scroll_offset_y_on(&self.scroll, y);
+    }
+
+    /// Item 23: set a given handle's vertical scroll offset to `y` (keeps x).
+    fn set_scroll_offset_y_on(&self, handle: &UniformListScrollHandle, y: f32) {
+        let state = handle.0.borrow();
+        let x = state.base_handle.offset().x;
+        state.base_handle.set_offset(point(x, px(y)));
     }
 
     /// Resolve a node id to its first non-footer / non-continuation display line
@@ -3646,8 +4148,16 @@ impl RcxEditor {
         let lm = self.line_meta(idx).cloned().unwrap_or_default();
         let mut selected = self.is_row_selected(&lm);
         // The hover band is gated by the `hover_effects` view toggle (item 3): when
-        // off, the row still tracks the pointer but paints no hover wash.
-        let hovered = self.hover_effects && self.hovered_line == Some(idx);
+        // off, the row still tracks the pointer but paints no hover wash. Item 9:
+        // the band covers ALL display lines of the hovered NODE (multi-line
+        // headers/values) by matching `hovered_node_id`, and is SUPPRESSED when the
+        // node is already selected (the C++ `applyHoverHighlight` skips selected
+        // rows). A hovered row with no real node (node_id 0 — chrome) still lights
+        // the single row it sits on so empty rows keep a hover affordance.
+        let hovered = self.hover_effects
+            && !selected
+            && ((self.hovered_node_id != 0 && lm.node_id == self.hovered_node_id)
+                || (self.hovered_node_id == 0 && self.hovered_line == Some(idx)));
 
         let editing_here = self
             .editing
@@ -3710,10 +4220,14 @@ impl RcxEditor {
             .h(px(self.metrics.line_height))
             .flex()
             .flex_row()
-            // Hover tracking (the row background tracks the cursor; §7).
+            // Hover tracking (the row background tracks the cursor; §7). Item 9:
+            // also track the hovered NODE id so the band covers every line of a
+            // multi-line node.
             .on_mouse_move(cx.listener(move |this, _e: &MouseMoveEvent, _w, cx| {
-                if this.hovered_line != Some(idx) {
+                let node_id = this.line_meta(idx).map(|lm| lm.node_id).unwrap_or(0);
+                if this.hovered_line != Some(idx) || this.hovered_node_id != node_id {
                     this.hovered_line = Some(idx);
+                    this.hovered_node_id = node_id;
                     cx.notify();
                 }
             }));
@@ -3914,6 +4428,10 @@ impl RcxEditor {
                         .left(left)
                         .h(px(self.metrics.line_height))
                         .w(width)
+                        // Item 22: the editable base-address strip shows the text
+                        // I-beam cursor (the C++ Qt::IBeamCursor over the address) so
+                        // it reads as click-to-edit, not a button.
+                        .cursor(CursorStyle::IBeam)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, e: &MouseDownEvent, window, cx| {
@@ -4174,16 +4692,23 @@ impl RcxEditor {
         if self.editing.is_some() {
             return;
         }
-        // Item 28: drag dead-zone. Until the pointer has traveled past ~8px from
-        // the press anchor (same row), or the drag has already crossed onto another
-        // row, treat the move as a not-yet-drag and do nothing — a small jitter
-        // while clicking must not begin extending the node/byte selection. Once the
-        // threshold is crossed the `drag_started` latch stays set for the rest of
-        // the gesture so subsequent moves extend freely.
-        const DRAG_DEAD_ZONE_PX: f32 = 8.0;
+        // Item 20/28: drag dead-zone. The C++ gates on VERTICAL travel (`|dy| >= 8`)
+        // — node range-select is a vertical gesture, so a horizontal jitter on the
+        // same row must NOT start a drag. Here the vertical signal is "the pointer
+        // has crossed onto a DIFFERENT row" (each row is `line_height` ≥ 8px tall,
+        // so a row change is unambiguous vertical travel). A same-row move never
+        // starts a node drag (it would only matter for a byte-grid drag, which the
+        // armed-selection path below handles). Once crossed, `drag_started` latches
+        // for the rest of the gesture.
         if !self.drag_started {
             let crossed_row = self.drag_anchor_line.map(|a| a != line).unwrap_or(false);
-            if !crossed_row && (rel_x - self.drag_anchor_x).abs() < DRAG_DEAD_ZONE_PX {
+            // A same-row byte-grid drag still arms once the pointer leaves the press
+            // column meaningfully (the byte selection extends within the row).
+            const DRAG_DEAD_ZONE_PX: f32 = 8.0;
+            let byte_drag_armed = self.drag_on_byte_grid
+                && self.byte_sel.is_active()
+                && (rel_x - self.drag_anchor_x).abs() >= DRAG_DEAD_ZONE_PX;
+            if !crossed_row && !byte_drag_armed {
                 return;
             }
             self.drag_started = true;
@@ -4202,6 +4727,13 @@ impl RcxEditor {
             }
             return;
         }
+
+        // Item 20: a drag past the dead-zone flushes any DEFERRED click (the C++
+        // `m_pendingClickNodeId`) BEFORE extending — but as a no-op for the
+        // selection because the drag is about to repaint the range anyway. Crucially
+        // we DROP the pending click so the mouse-up does not later collapse the
+        // group the drag just (re)selected.
+        self.pending_click = None;
 
         // Mode 2 — the drag started OFF the byte grid (item 8): range-select the
         // NODES between the anchor row and the current row. Shift-clicking the
@@ -4224,17 +4756,43 @@ impl RcxEditor {
         // selection lost it), then shift-extend to the dragged row so the range
         // spans [anchor, line]. `handle_node_click` keys the range off the
         // controller's `anchor_line`, which the initial mouse-down already set, so
-        // a single shift-click here paints the full range.
+        // a single shift-extend here paints the full range. Item 20: a Ctrl+drag
+        // ADDS the range to the existing selection (ctrl from the press mods)
+        // rather than replacing it.
         let node_id = lm.node_id;
         self.controller.handle_node_click(
             line as i64,
             node_id,
             CtrlMods {
-                ctrl: false,
+                ctrl: self.drag_init_mods.control,
                 shift: true,
             },
         );
         self.caret_line = Some(line);
+        self.after_mutation(cx);
+    }
+
+    /// Item 20: flush a deferred plain click on mouse-RELEASE (the C++
+    /// `m_pendingClickNodeId` release path). When no drag started, the deferred
+    /// click fires as a plain `handle_node_click`, collapsing the multi-selection to
+    /// the clicked node. A drag already cleared the pending click, so this is a
+    /// no-op after a drag.
+    fn flush_pending_click(&mut self, cx: &mut Context<Self>) {
+        self.drag_started = false;
+        let Some((line, node_id, modifiers)) = self.pending_click.take() else {
+            return;
+        };
+        self.controller.handle_node_click(
+            line as i64,
+            node_id,
+            CtrlMods {
+                ctrl: modifiers.control,
+                shift: modifiers.shift,
+            },
+        );
+        if node_id != 0 && node_id != K_COMMAND_ROW_ID {
+            self.caret_line = Some(line);
+        }
         self.after_mutation(cx);
     }
 
@@ -4254,9 +4812,14 @@ impl RcxEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let changed_band = self.hovered_line != Some(line);
+        // Item 9: track the hovered NODE id (not just the row) so the hover band
+        // lights every line of a multi-line node. Chrome rows (node_id 0) fall back
+        // to single-row hover.
+        let node_id = self.line_meta(line).map(|lm| lm.node_id).unwrap_or(0);
+        let changed_band = self.hovered_line != Some(line) || self.hovered_node_id != node_id;
         if changed_band {
             self.hovered_line = Some(line);
+            self.hovered_node_id = node_id;
         }
         // Hover popups are gated by the hover-effects toggle. Item 68: the
         // value-history popup is NOT suppressed while editing — when an edit is
@@ -4617,9 +5180,15 @@ impl RcxEditor {
                     .flex_col()
                     .gap(px(design::tokens::space::XS))
                     .child(
+                        // Item 19: the "Previous Values" title carries an HLine
+                        // separator beneath it (the C++ popup divider, editor.cpp:222)
+                        // — a thin bottom border in the popup border hue.
                         div()
                             .text_size(px(design::tokens::font::UI_XS))
                             .text_color(palette.dim)
+                            .pb(px(design::tokens::space::XS))
+                            .border_b_1()
+                            .border_color(palette.border)
                             // The C++ title is "Previous Values" (editor.cpp:222).
                             .child("Previous Values"),
                     )
@@ -4711,19 +5280,23 @@ impl RcxEditor {
                     .trim()
                     .to_string();
                 self.open_root_convert_menu(&kw, pos, window, cx);
+            } else {
+                // Item 17: a command-row click OFF the keyword falls through to the
+                // no-node Insert menu (the C++ no-node menu: Insert 4 / Insert 8 /
+                // Append bytes…), instead of returning with no menu at all.
+                self.context_target = None;
+                self.open_empty_area_menu(pos, window, cx);
             }
             return;
         }
         // Only real node rows get the node menu (command/footer/synthetic rows
         // have their own affordances and no node ops). Item 17: an empty-area /
-        // no-node row gets the C++ no-node menu (Insert 4 / Insert 8 / Append
-        // bytes…) — the keyboard Insert actions already append at the view root
-        // when there is no current node, so the menu rows reuse them.
+        // no-node row — including FOOTER rows — gets the C++ no-node menu (Insert 4
+        // / Insert 8 / Append bytes…); the keyboard Insert actions already append at
+        // the view root when there is no current node, so the menu rows reuse them.
         if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
-            if lm.line_kind != LineKind::Footer {
-                self.context_target = None;
-                self.open_empty_area_menu(pos, window, cx);
-            }
+            self.context_target = None;
+            self.open_empty_area_menu(pos, window, cx);
             return;
         }
         let target = ContextTarget {
@@ -4731,6 +5304,7 @@ impl RcxEditor {
             node_idx: lm.node_idx as usize,
             node_id: lm.node_id,
             kind: lm.node_kind,
+            sub_line: lm.sub_line,
         };
         self.context_target = Some(target);
 
@@ -4742,13 +5316,198 @@ impl RcxEditor {
             .selected_ids()
             .iter()
             .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id);
+
+        // Item 7/22/46: when MORE THAN ONE node is selected and the right-clicked
+        // node is part of that selection, open the BATCH menu (Change to <type> for
+        // N nodes, Group into Union, Delete N nodes, …) instead of the single-node
+        // menu — and do NOT collapse the multi-selection to the clicked node.
+        let sel_count = self.controller.selected_ids().len();
+        if sel_count > 1 && already_selected {
+            self.open_batch_context_menu(sel_count, pos, window, cx);
+            return;
+        }
+
         if !already_selected {
             self.controller
                 .handle_node_click(line as i64, lm.node_id, CtrlMods::NONE);
             let _ = self.controller.take_events();
         }
 
+        // Item 6: a right-click on an enum / bitfield MEMBER row opens the
+        // member-specific menu (Add Member Above/Below + Remove Member for enum
+        // members; Toggle Bit for bitfield members) ahead of the always-available
+        // node actions. Resolve member-ness from the row's `is_member_line` +
+        // `sub_line` against the node's enum/bitfield kind.
+        if lm.is_member_line && target.sub_line >= 0 {
+            let (is_enum_member, is_bitfield_member) = {
+                let tree = self.controller.tree();
+                match tree.nodes.get(target.node_idx) {
+                    Some(n) => {
+                        let sl = target.sub_line as usize;
+                        (
+                            n.is_enum() && sl < n.enum_members.len(),
+                            n.is_bitfield() && sl < n.bitfield_members.len(),
+                        )
+                    }
+                    None => (false, false),
+                }
+            };
+            if is_enum_member || is_bitfield_member {
+                self.open_member_context_menu(
+                    target,
+                    is_enum_member,
+                    is_bitfield_member,
+                    pos,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+
         self.open_context_menu(target, pos, window, cx);
+    }
+
+    /// Item 6: the enum / bitfield MEMBER row context menu (the C++
+    /// `showContextMenu` member-line branch, controller.cpp:3315). Enum members get
+    /// Add Member Above / Add Member Below / Remove Member; bitfield members get
+    /// Toggle Bit. Both fall through to Edit Value (the always-available member
+    /// edit). Wired to the existing controller member mutators.
+    fn open_member_context_menu(
+        &mut self,
+        // The member-menu actions read `self.context_target` (set by the caller), so
+        // the menu items only need the enum/bitfield flags; the target is implicit.
+        _target: ContextTarget,
+        is_enum_member: bool,
+        is_bitfield_member: bool,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focus = self.focus_handle.clone();
+        let writable = self.provider_writable();
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, _mw, _mcx| {
+            let mut menu = menu.min_w(px(200.0)).action_context(editor_focus.clone());
+            if is_enum_member {
+                menu = menu
+                    .menu_with_icon(
+                        "Add Member Above",
+                        IconName::Plus,
+                        Box::new(EditorMemberAddAbove),
+                    )
+                    .menu_with_icon(
+                        "Add Member Below",
+                        IconName::Plus,
+                        Box::new(EditorMemberAddBelow),
+                    )
+                    .menu_with_icon(
+                        "Remove Member",
+                        IconName::Delete,
+                        Box::new(EditorMemberRemove),
+                    )
+                    .separator()
+                    // Always-available member edits: Edit Value… sets the member's
+                    // integer value (the C++ member-line Value edit).
+                    .menu_with_icon(
+                        "Edit Value\tEnter",
+                        IconName::SquareTerminal,
+                        Box::new(EditorBeginValueEdit),
+                    );
+            }
+            if is_bitfield_member {
+                menu = menu
+                    .menu_with_icon(
+                        "Toggle Bit",
+                        IconName::Check,
+                        Box::new(EditorMemberToggleBit),
+                    )
+                    .when(writable, |m| {
+                        m.menu_with_icon(
+                            "Edit Value...\tEnter",
+                            IconName::SquareTerminal,
+                            Box::new(EditorBeginValueEdit),
+                        )
+                    });
+            }
+            menu
+        });
+        self.show_context_menu_at(menu, pos, window, cx);
+    }
+
+    /// Item 7/18/22/46/48: the multi-selection BATCH context menu (the C++
+    /// `showContextMenu` `selCount > 1` branch). Offers Change to <type>… (the quick
+    /// type-cycler applied to every selected node), Group into Union (controller
+    /// `group_into_union`), Insert Above, Duplicate N, Delete N, and Copy Address.
+    /// Reuses the existing batch-aware controller mutators (`quick_change_kind`,
+    /// `action_duplicate`, `action_delete` already iterate the whole selection).
+    fn open_batch_context_menu(
+        &mut self,
+        count: usize,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focus = self.focus_handle.clone();
+        let show_comment = self.show_comments();
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
+            menu.min_w(px(220.0))
+                .action_context(editor_focus.clone())
+                // "Change type of N nodes…" → opens the Change Type picker (applies
+                // to every selected node via the batch-aware controller path).
+                .menu_with_icon(
+                    SharedString::from(format!("Change type of {count} nodes\u{2026}")),
+                    IconName::Frame,
+                    Box::new(EditorChangeType),
+                )
+                // Quick "Change to <hexN>" rows the C++ batch menu lists.
+                .submenu("Change to", mw, mcx, |sub, _w, _cx| {
+                    sub.menu_with_icon("Hex8", IconName::Frame, Box::new(EditorHex8))
+                        .menu_with_icon("Hex16", IconName::Frame, Box::new(EditorHex16))
+                        .menu_with_icon("Hex32", IconName::Frame, Box::new(EditorHex32))
+                        .menu_with_icon("Hex64", IconName::Frame, Box::new(EditorHex64))
+                        .menu_with_icon(
+                            "Pointer",
+                            IconName::ArrowRight,
+                            Box::new(EditorQuickPointer),
+                        )
+                })
+                .separator()
+                // Item 18/48: Group into Union — wraps the selected nodes into a
+                // union (controller `group_into_union`).
+                .menu_with_icon(
+                    "Group into Union",
+                    IconName::Frame,
+                    Box::new(EditorGroupIntoUnion),
+                )
+                .menu_with_icon("Insert Above", IconName::Plus, Box::new(EditorInsertAbove))
+                .separator()
+                .when(show_comment, |menu| {
+                    menu.menu_with_icon(
+                        SharedString::from(format!("Comment {count} nodes")),
+                        IconName::SquareTerminal,
+                        Box::new(EditorCommentEdit),
+                    )
+                })
+                .menu_with_icon(
+                    SharedString::from(format!("Duplicate {count} nodes\tCtrl+D")),
+                    IconName::Copy,
+                    Box::new(EditorDuplicate),
+                )
+                .menu_with_icon(
+                    SharedString::from(format!("Delete {count} nodes\tDelete")),
+                    IconName::Delete,
+                    Box::new(EditorDelete),
+                )
+                .separator()
+                .submenu("Copy", mw, mcx, |sub, _w, _cx| {
+                    sub.menu_with_icon(
+                        "Copy Address\tCtrl+C",
+                        IconName::Copy,
+                        Box::new(EditorCopyAddress),
+                    )
+                })
+        });
+        self.show_context_menu_at(menu, pos, window, cx);
     }
 
     /// Item 17: the no-node (empty area) context menu — Insert 4 / Insert 8 /
@@ -4796,6 +5555,15 @@ impl RcxEditor {
         let alt_name = crate::core::kind_to_string(alt_kind_for(target.kind));
         let cycle_label = format!("\u{2190} {cur_name}  \u{2194}  {alt_name} \u{2192}");
         let is_container = crate::core::is_container_kind(target.kind);
+        // Item 14: label the Fold entry by the container's live collapsed state —
+        // 'Expand' when collapsed, 'Collapse' when expanded (the C++ `&Expand` /
+        // `&Collapse`). State-agnostic 'Toggle Fold' before.
+        let fold_collapsed = {
+            let tree = self.controller.tree();
+            let idx = tree.index_of_id(target.node_id);
+            idx >= 0 && tree.nodes[idx as usize].collapsed
+        };
+        let fold_label = if fold_collapsed { "Expand" } else { "Collapse" };
         // Item 7/9: hex-node-only menu entries (Edit Bytes / Split to hexN) + the
         // node's live big-endian state for the checkable toggle (item 13).
         let is_hex_ctx = is_hex_preview(target.kind);
@@ -4873,6 +5641,57 @@ impl RcxEditor {
         // Gap 20: the live value-change tracking flag (drives the Tracking submenu
         // check). Read once here so the menu closure can capture it by value.
         let track_values = self.controller.track_values();
+
+        // ── Item 8: Static-submenu gates (the C++ `Static` submenu,
+        // controller.cpp:3782) ──
+        //   * Add Child (Hex64) + Add Static Field: container (Struct/Array) heads.
+        //   * Add Static Field (sibling): a non-container child of a Struct/Array.
+        //   * Edit Expression: the node is a static field.
+        //   * Dissolve Union: the node is a union, or its parent is a union.
+        let (
+            static_add_child,
+            static_add_field_self,
+            static_add_field_sibling,
+            static_edit_expr,
+            static_dissolve_union,
+        ) = {
+            let tree = self.controller.tree();
+            match tree.nodes.get(target.node_idx) {
+                Some(n) => {
+                    let is_container_node = matches!(n.kind, NodeKind::Struct | NodeKind::Array);
+                    let parent_is_container = n.parent_id != 0
+                        && tree
+                            .nodes
+                            .get(tree.index_of_id(n.parent_id).max(0) as usize)
+                            .map(|p| matches!(p.kind, NodeKind::Struct | NodeKind::Array))
+                            .unwrap_or(false);
+                    let add_field_sibling = !is_container_node && parent_is_container;
+                    let dissolve = if n.kind == NodeKind::Struct && n.is_union() {
+                        true
+                    } else if n.parent_id != 0 {
+                        tree.nodes
+                            .get(tree.index_of_id(n.parent_id).max(0) as usize)
+                            .map(|p| p.kind == NodeKind::Struct && p.is_union())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    (
+                        is_container_node,
+                        is_container_node,
+                        add_field_sibling,
+                        n.is_static,
+                        dissolve,
+                    )
+                }
+                None => (false, false, false, false, false),
+            }
+        };
+        let static_has_any = static_add_child
+            || static_add_field_self
+            || static_add_field_sibling
+            || static_edit_expr
+            || static_dissolve_union;
 
         let editor_focus = self.focus_handle.clone();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
@@ -5061,9 +5880,43 @@ impl RcxEditor {
                         Box::new(EditorEditBytesAscii),
                     )
                 })
-                .submenu("Static", mw, mcx, |sub, _w, _cx| {
-                    // Static-address submenu (graceful stub — no logic op yet).
-                    sub.label("(no static address)")
+                // Item 8: the Static submenu — real entries wired to the controller
+                // static-field / StaticExpr / dissolve-union mutators (the C++
+                // `Static` submenu, controller.cpp:3782). Shown only when at least
+                // one entry applies; a placeholder otherwise.
+                .submenu("Static", mw, mcx, move |mut sub, _w, _cx| {
+                    if !static_has_any {
+                        return sub.label("(no static address)");
+                    }
+                    if static_add_child {
+                        sub = sub.menu_with_icon(
+                            "Add Child",
+                            IconName::Plus,
+                            Box::new(EditorStaticAddChild),
+                        );
+                    }
+                    if static_add_field_self || static_add_field_sibling {
+                        sub = sub.menu_with_icon(
+                            "Add Static Field",
+                            IconName::Plus,
+                            Box::new(EditorStaticAddField),
+                        );
+                    }
+                    if static_edit_expr {
+                        sub = sub.menu_with_icon(
+                            "Edit Expression",
+                            IconName::SquareTerminal,
+                            Box::new(EditorStaticEditExpr),
+                        );
+                    }
+                    if static_dissolve_union {
+                        sub = sub.menu_with_icon(
+                            "Dissolve Union",
+                            IconName::Frame,
+                            Box::new(EditorStaticDissolveUnion),
+                        );
+                    }
+                    sub
                 })
                 .separator()
                 .menu_with_icon(
@@ -5076,8 +5929,9 @@ impl RcxEditor {
                 // Item 18: Fold submenu — Toggle Fold + Collapse All / Expand All
                 // (whole-tree), with the keyboard hints the C++ uses.
                 .submenu("Fold", mw, mcx, move |sub, _w, _cx| {
+                    // Item 14: 'Expand' / 'Collapse' per the container's state.
                     sub.menu_with_icon_and_disabled(
-                        "Toggle Fold",
+                        fold_label,
                         IconName::ChevronRight,
                         Box::new(EditorFold),
                         !is_container,
@@ -5197,11 +6051,15 @@ impl RcxEditor {
                     node_idx: idx as usize,
                     node_id: t.node_id,
                     kind: n.kind,
+                    sub_line: t.sub_line,
                 });
             }
         }
-        // Fall back to the primary-selected line's node.
-        let line = self.first_selected_line()?;
+        // Item 3: fall back to the CARET line's node (the C++ accelerators read the
+        // cursor), then the primary-selected line.
+        let line = self
+            .caret_data_line()
+            .or_else(|| self.first_selected_line())?;
         let lm = self.line_meta(line)?;
         if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
             return None;
@@ -5211,6 +6069,7 @@ impl RcxEditor {
             node_idx: lm.node_idx as usize,
             node_id: lm.node_id,
             kind: lm.node_kind,
+            sub_line: lm.sub_line,
         })
     }
 
@@ -5630,6 +6489,193 @@ impl RcxEditor {
         self.after_mutation(cx);
     }
 
+    // ── Item 6: enum / bitfield member menu actions ──
+
+    /// Add an enum member ABOVE the context-target member (the C++ "Add Member
+    /// Above": insert before `sub_line`).
+    fn action_member_add_above(
+        &mut self,
+        _: &EditorMemberAddAbove,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.context_target {
+            if t.sub_line >= 0
+                && self
+                    .controller
+                    .add_member(t.node_id, Some(t.sub_line as usize))
+            {
+                self.after_mutation(cx);
+            }
+        }
+    }
+
+    /// Add an enum member BELOW the context-target member (insert at `sub_line+1`).
+    fn action_member_add_below(
+        &mut self,
+        _: &EditorMemberAddBelow,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.context_target {
+            if t.sub_line >= 0
+                && self
+                    .controller
+                    .add_member(t.node_id, Some(t.sub_line as usize + 1))
+            {
+                self.after_mutation(cx);
+            }
+        }
+    }
+
+    /// Remove the context-target enum member (the C++ "Remove Member").
+    fn action_member_remove(
+        &mut self,
+        _: &EditorMemberRemove,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.context_target {
+            if t.sub_line >= 0
+                && self
+                    .controller
+                    .delete_member(t.node_id, t.sub_line as usize)
+            {
+                self.after_mutation(cx);
+            }
+        }
+    }
+
+    /// Toggle one bit of the context-target bitfield member (the C++ "Toggle Bit" →
+    /// `toggleBitfieldBit`).
+    fn action_member_toggle_bit(
+        &mut self,
+        _: &EditorMemberToggleBit,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.context_target {
+            if t.sub_line >= 0 {
+                self.controller
+                    .toggle_bitfield_bit(t.node_id, t.sub_line as usize);
+                self.after_mutation(cx);
+            }
+        }
+    }
+
+    /// Item 7/18/48: group the current multi-selection into a Union (the C++
+    /// `group_into_union`). No-op for a selection of fewer than 2 nodes.
+    fn action_group_into_union(
+        &mut self,
+        _: &EditorGroupIntoUnion,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let ids: std::collections::HashSet<u64> = self.selected_root_ids().into_iter().collect();
+        if ids.len() >= 2 {
+            self.controller.group_into_union(&ids);
+            self.apply_document(cx);
+        }
+    }
+
+    // ── Item 8: Static submenu actions ──
+
+    /// "Add Child" — insert a Hex64 child at the container head's offset 0 (the C++
+    /// `insertNode(nodeId, 0, Hex64, "newField")`).
+    fn action_static_add_child(
+        &mut self,
+        _: &EditorStaticAddChild,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller
+                .insert_node(t.node_id, 0, NodeKind::Hex64, "newField");
+            self.apply_document(cx);
+        }
+    }
+
+    /// "Add Static Field" — add a static field to the target container (or, for a
+    /// non-container child of a struct/array, to its parent), the C++
+    /// `insertStaticField`.
+    fn action_static_add_field(
+        &mut self,
+        _: &EditorStaticAddField,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            let parent = {
+                let tree = self.controller.tree();
+                match tree.nodes.get(t.node_idx) {
+                    Some(n) if matches!(n.kind, NodeKind::Struct | NodeKind::Array) => n.id,
+                    Some(n) => n.parent_id,
+                    None => 0,
+                }
+            };
+            if parent != 0 {
+                self.controller.insert_static_field(parent);
+                self.apply_document(cx);
+            }
+        }
+    }
+
+    /// "Edit Expression" — open the inline StaticExpr edit on the static field's
+    /// row (the C++ `beginInlineEdit(StaticExpr, line)`).
+    fn action_static_edit_expr(
+        &mut self,
+        _: &EditorStaticEditExpr,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.begin_inline_edit(t.line, EditTarget::StaticExpr, window, cx);
+        }
+    }
+
+    /// "Dissolve Union" — flatten the target union (or the target's parent union)
+    /// back into its parent scope (the C++ `dissolveUnion`).
+    fn action_static_dissolve_union(
+        &mut self,
+        _: &EditorStaticDissolveUnion,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            let union_id = {
+                let tree = self.controller.tree();
+                match tree.nodes.get(t.node_idx) {
+                    Some(n) if n.kind == NodeKind::Struct && n.is_union() => n.id,
+                    Some(n) if n.parent_id != 0 => {
+                        let pi = tree.index_of_id(n.parent_id);
+                        if pi >= 0
+                            && tree.nodes[pi as usize].kind == NodeKind::Struct
+                            && tree.nodes[pi as usize].is_union()
+                        {
+                            n.parent_id
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                }
+            };
+            if union_id != 0 {
+                self.controller.dissolve_union(union_id);
+                self.apply_document(cx);
+            }
+        }
+    }
+
     /// Item 17: Append bytes… — append a single field to the enclosing container
     /// of the current/target node, falling back to the view-root struct when no
     /// node is selected (the C++ `appendSingleFieldRequested` / the no-node
@@ -5708,8 +6754,12 @@ impl RcxEditor {
         // span resolution by opening a plain Value edit then re-seeding + switching
         // to ASCII overwrite mode.
         self.begin_inline_edit(line, EditTarget::Value, window, cx);
-        if let Some(editing) = self.editing.as_ref() {
+        if let Some(editing) = self.editing.as_mut() {
             let field = editing.field.clone();
+            // Item 5: mark this edit as an ASCII byte-overwrite so the Value commit
+            // writes per-byte ASCII (is_ascii=true) rather than parsing the text as
+            // a hex value (which silently failed before).
+            editing.ascii_overwrite = true;
             field.update(cx, |f, _cx| {
                 f.set_ascii_overwrite(&seed, byte_count);
             });
@@ -5830,7 +6880,20 @@ impl RcxEditor {
     fn action_fold(&mut self, _: &EditorFold, _w: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
         if let Some(t) = self.action_target() {
-            self.controller.toggle_collapse(t.node_idx);
+            // BUG #2: a CYCLE/self-ref head materializes its referenced struct's
+            // children inline; a plain container head toggles collapse (the C++
+            // `handleMarginClick`, controller.cpp:5893). Resolve M_CYCLE from the
+            // targeted row's LineMeta.
+            let is_cycle = self
+                .line_meta(t.line)
+                .map(|lm| (lm.marker_mask & (1u32 << crate::core::linemeta::M_CYCLE)) != 0)
+                .unwrap_or(false);
+            if is_cycle {
+                self.controller.materialize_ref_children(t.node_idx);
+            } else {
+                self.controller.toggle_collapse(t.node_idx);
+            }
+            self.caret_line = Some(t.line);
             self.after_mutation(cx);
         }
     }
@@ -5985,6 +7048,7 @@ impl RcxEditor {
             node_idx: root_idx.max(0) as usize,
             node_id: root_id,
             kind,
+            sub_line: 0,
         };
         // Root mode lists every declared composite so the user can re-root onto a
         // different struct (do NOT exclude the current root — it may be re-picked).
@@ -6830,6 +7894,18 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_zoom_in))
             .on_action(cx.listener(Self::action_zoom_out))
             .on_action(cx.listener(Self::action_zoom_reset))
+            // Item 6: enum/bitfield member menu actions.
+            .on_action(cx.listener(Self::action_member_add_above))
+            .on_action(cx.listener(Self::action_member_add_below))
+            .on_action(cx.listener(Self::action_member_remove))
+            .on_action(cx.listener(Self::action_member_toggle_bit))
+            // Item 7/18/48: group multi-selection into a union.
+            .on_action(cx.listener(Self::action_group_into_union))
+            // Item 8: Static submenu actions.
+            .on_action(cx.listener(Self::action_static_add_child))
+            .on_action(cx.listener(Self::action_static_add_field))
+            .on_action(cx.listener(Self::action_static_edit_expr))
+            .on_action(cx.listener(Self::action_static_dissolve_union))
             .on_action(cx.listener(Self::action_toggle_big_endian))
             .on_action(cx.listener(Self::action_duplicate))
             .on_action(cx.listener(Self::action_delete))
@@ -6850,6 +7926,8 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_hex128))
             .on_action(cx.listener(Self::action_nav_up))
             .on_action(cx.listener(Self::action_nav_down))
+            .on_action(cx.listener(Self::action_nav_add_up))
+            .on_action(cx.listener(Self::action_nav_add_down))
             .on_action(cx.listener(Self::action_move_up))
             .on_action(cx.listener(Self::action_move_down))
             .on_action(cx.listener(Self::action_nav_page_up))
@@ -6882,6 +7960,46 @@ impl Render for RcxEditor {
                 // Clicking outside the editor commits an active edit.
                 if this.editing.is_some() {
                     this.commit_active_edit(window, cx);
+                }
+            }))
+            // Item 20: on left mouse-up, flush any DEFERRED click (a plain click on
+            // an already-selected node within a multi-selection) — collapsing to
+            // the clicked node — unless a drag already consumed it. Also clears the
+            // drag latch so the next gesture starts fresh.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseUpEvent, _w, cx| {
+                    this.flush_pending_click(cx);
+                }),
+            )
+            // BUG #1 (item 1): Ctrl/Cmd + mouse-wheel zooms the editor font (the
+            // QScintilla-native Ctrl+wheel zoom). Wheel-up = zoom-in, ±1pt per
+            // notch, clamped 6..48 by `zoom_by`. When Ctrl/Cmd is held we consume
+            // the event (stop_propagation) so it does NOT also scroll the list;
+            // otherwise we return WITHOUT stopping so the uniform_list keeps its
+            // native vertical scroll.
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
+                if !(ev.modifiers.control || ev.modifiers.platform) {
+                    return; // plain wheel → let the list scroll natively.
+                }
+                let dy = match ev.delta {
+                    gpui::ScrollDelta::Lines(p) => p.y,
+                    gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+                };
+                if dy > 0.0 {
+                    this.zoom_by(1.0, cx);
+                } else if dy < 0.0 {
+                    this.zoom_by(-1.0, cx);
+                }
+                cx.stop_propagation();
+            }))
+            // Item 9: when the pointer leaves the editor surface, clear the hover
+            // band + node id and dismiss any hover popup (the C++ mouse-leave /
+            // `dismissAllPopups`). `on_hover` fires `false` on leave. Without this
+            // the band sticks on the last hovered row.
+            .on_hover(cx.listener(|this, inside: &bool, _w, cx| {
+                if !*inside {
+                    this.clear_hover_state(cx);
                 }
             }))
             // The find bar (Ctrl+F) floats over the top of the editor when open
@@ -7580,5 +8698,275 @@ mod tests {
         assert_eq!(RcxEditor::relative_age(now, now - 12_000), "12s ago");
         assert_eq!(RcxEditor::relative_age(now, now - 180_000), "3m ago");
         assert_eq!(RcxEditor::relative_age(now, now - 7_200_000), "2h ago");
+    }
+
+    // ── Item 4: Vec/Mat value-component narrowing (the column→component map) ──
+
+    /// The pure narrowing math `begin_inline_edit` applies for a Vec/Mat Value
+    /// click: split the comma-joined value, count commas before the clicked column,
+    /// and that index is both the seeded component and the write `sub_line` (which
+    /// `set_node_value` routes to `addr + sub_line*4` as a Float).
+    fn vec_component_for_click(raw_span: &str, span_start: i32, click_col: i32) -> (usize, String) {
+        let comps: Vec<&str> = raw_span.split(',').collect();
+        if comps.len() <= 1 {
+            return (0, raw_span.trim().to_string());
+        }
+        let rel = (click_col - span_start).max(0) as usize;
+        let span_chars: Vec<char> = raw_span.chars().collect();
+        let upto = rel.min(span_chars.len());
+        let comp = span_chars[..upto]
+            .iter()
+            .filter(|&&c| c == ',')
+            .count()
+            .min(comps.len() - 1);
+        (comp, comps[comp].trim().to_string())
+    }
+
+    #[test]
+    fn vec3_value_click_narrows_to_clicked_component() {
+        // "1.0, 2.5, 3.0" starting at column 10: clicking inside "2.5" (the second
+        // component) must yield sub_line 1 and seed "2.5", not the whole string.
+        let raw = "1.0, 2.5, 3.0";
+        // Component 0 ("1.0") spans rel cols [0,3); commas at rel 3 and 8.
+        assert_eq!(vec_component_for_click(raw, 10, 10), (0, "1.0".to_string()));
+        // Click at rel col 6 (inside "2.5", after the first comma) → component 1.
+        assert_eq!(vec_component_for_click(raw, 10, 16), (1, "2.5".to_string()));
+        // Click at rel col 11 (inside "3.0", after both commas) → component 2.
+        assert_eq!(vec_component_for_click(raw, 10, 21), (2, "3.0".to_string()));
+        // A click past the end clamps to the last component.
+        assert_eq!(vec_component_for_click(raw, 10, 99), (2, "3.0".to_string()));
+    }
+
+    #[test]
+    fn scalar_value_click_is_not_narrowed() {
+        // A single-component value (no comma) is seeded whole at sub_line 0.
+        assert_eq!(vec_component_for_click("42", 5, 6), (0, "42".to_string()));
+    }
+
+    // ── Item 5: 'Edit ASCII' writes per-byte ASCII (not parsed as hex) ──
+
+    #[test]
+    fn ascii_value_parse_is_literal_not_hex() {
+        // The is_ascii path in set_node_value parses the text via
+        // `format::parse_ascii_value` (literal bytes), NOT `parse_value` (hex
+        // number). For "ABCD" into a 4-byte field that means the bytes A,B,C,D —
+        // whereas a hex parse of "ABCD" would be the 2-byte value 0xABCD. This pins
+        // the branch the editor's 'Edit ASCII' commit selects (item 5).
+        let ascii = crate::format::parse_ascii_value("ABCD", 4).expect("ascii parse");
+        assert_eq!(ascii, vec![b'A', b'B', b'C', b'D'], "literal ASCII bytes");
+        // Sanity: the value would be different if parsed as hex (proves the branch
+        // matters). A hex parse of "ABCD" is NOT the ASCII byte string.
+        assert_ne!(ascii, vec![0xCD, 0xAB, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn ascii_value_write_through_buffer_provider() {
+        use crate::core::{Node, NodeKind};
+        use crate::provider::BufferProvider;
+        use std::sync::Arc;
+        // End-to-end: a hex node whose Value is edited as ASCII writes the literal
+        // ASCII bytes through a writable BufferProvider (base 0). set_node_value
+        // with is_ascii=true is the editor's ASCII-overwrite commit path (item 5).
+        let mut doc = RcxDocument::new();
+        let s = doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "S".into(),
+            struct_type_name: "S".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let sid = doc.tree.nodes[s].id;
+        let h = doc.tree.add_node(Node {
+            kind: NodeKind::Hex32,
+            name: String::new(),
+            parent_id: sid,
+            offset: 0,
+            ..Node::default()
+        });
+        let mut c = RcxController::new(doc);
+        c.set_view_root_id(sid);
+        // 4-byte zeroed writable buffer at base 0.
+        let prov = Arc::new(BufferProvider::new(vec![0u8; 4], "ram"));
+        c.attach_provider(prov, false);
+        c.tree_mut().base_address = 0;
+        c.refresh();
+        // ASCII-write "ABCD" into the 4-byte hex field at offset 0 (addr 0).
+        c.set_node_value(h, 0, "ABCD", /* is_ascii */ true, 0);
+        let bytes = c.document().provider.read_bytes(0, 4);
+        assert_eq!(
+            bytes,
+            vec![b'A', b'B', b'C', b'D'],
+            "ASCII bytes written verbatim, not parsed as hex"
+        );
+    }
+
+    // ── Item 13: Collapse/Expand All is a SINGLE undoable macro ──
+
+    #[test]
+    fn collapse_all_is_one_undo() {
+        use crate::core::{Node, NodeKind};
+        // Three nested expanded structs; collapsing all under one macro must undo in
+        // a SINGLE step (the C++ Collapse All begin/endMacro), restoring every
+        // container's prior collapsed state at once.
+        let mut doc = RcxDocument::new();
+        let root = doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Root".into(),
+            struct_type_name: "Root".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let root_id = doc.tree.nodes[root].id;
+        // Two child sub-structs (containers), each EXPLICITLY expanded, each with a
+        // child field so they are real expandable containers.
+        for (i, nm) in ["A", "B"].iter().enumerate() {
+            let sub = doc.tree.add_node(Node {
+                kind: NodeKind::Struct,
+                name: (*nm).into(),
+                struct_type_name: (*nm).into(),
+                parent_id: root_id,
+                offset: (i as i32) * 8,
+                collapsed: false,
+                ..Node::default()
+            });
+            let sub_id = doc.tree.nodes[sub].id;
+            doc.tree.add_node(Node {
+                kind: NodeKind::Int32,
+                name: format!("f{i}"),
+                parent_id: sub_id,
+                offset: 0,
+                ..Node::default()
+            });
+        }
+        let mut c = RcxController::new(doc);
+        c.set_view_root_id(root_id);
+        c.refresh();
+        // Collapse every EXPANDED container in ONE macro (mirrors set_all_collapsed).
+        let targets: Vec<usize> = c
+            .tree()
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| crate::core::is_container_kind(n.kind) && !n.collapsed)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            targets.len() >= 2,
+            "need ≥2 expanded containers, got {}",
+            targets.len()
+        );
+        c.begin_macro("Collapse all");
+        for idx in &targets {
+            c.toggle_collapse(*idx);
+        }
+        c.end_macro();
+        // Every targeted container is now collapsed.
+        assert!(targets.iter().all(|&i| c.tree().nodes[i].collapsed));
+        // ONE undo restores all of them (not N undos).
+        c.undo();
+        assert!(
+            targets.iter().all(|&i| !c.tree().nodes[i].collapsed),
+            "a single undo must re-expand all containers"
+        );
+    }
+
+    // ── Item 12: Ctrl-additive nav toggles a node into the selection ──
+
+    #[test]
+    fn ctrl_click_toggles_node_into_selection() {
+        // The additive-nav variant (Ctrl+Up/Down) calls handle_node_click with
+        // ctrl=true, which TOGGLES the node into the multi-selection rather than
+        // replacing it. Two ctrl-clicks on distinct rows leaves both selected.
+        let mut c = editor_with_struct();
+        let result = c.last_result().clone();
+        let fields: Vec<(usize, u64)> = result
+            .meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.line_kind == LineKind::Field && m.node_id != 0)
+            .map(|(i, m)| (i, m.node_id))
+            .collect();
+        assert!(fields.len() >= 2, "need ≥2 fields");
+        let ctrl = CtrlMods {
+            ctrl: true,
+            shift: false,
+        };
+        c.handle_node_click(fields[0].0 as i64, fields[0].1, ctrl);
+        c.handle_node_click(fields[1].0 as i64, fields[1].1, ctrl);
+        let sel = c.selected_ids();
+        assert!(sel
+            .iter()
+            .any(|&id| crate::controller::strip_sel_pub(id) == fields[0].1));
+        assert!(sel
+            .iter()
+            .any(|&id| crate::controller::strip_sel_pub(id) == fields[1].1));
+        // A third ctrl-click on the first row REMOVES it (toggle off).
+        c.handle_node_click(fields[0].0 as i64, fields[0].1, ctrl);
+        assert!(!c
+            .selected_ids()
+            .iter()
+            .any(|&id| crate::controller::strip_sel_pub(id) == fields[0].1));
+    }
+
+    // ── Item 15: F12 go-to-definition target resolution ──
+
+    /// The pure target-resolution rule `action_go_to_definition` applies (the C++
+    /// `goToDefinitionRequested` ordering): ref_id → array-of-structs ref_id → a
+    /// plain embedded Struct field's OWN id → none.
+    fn goto_def_target(n: &crate::core::Node) -> u64 {
+        use crate::core::NodeKind;
+        if n.ref_id != 0 {
+            n.ref_id
+        } else if n.kind == NodeKind::Array && n.element_kind == NodeKind::Struct && n.ref_id != 0 {
+            n.ref_id
+        } else if n.kind == NodeKind::Struct && n.parent_id != 0 {
+            n.id
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn goto_definition_plain_struct_field_reroots_to_own_id() {
+        use crate::core::{Node, NodeKind};
+        // A typed pointer / ref carries ref_id → that wins.
+        let ptr = Node {
+            kind: NodeKind::Pointer64,
+            ref_id: 42,
+            parent_id: 1,
+            id: 7,
+            ..Node::default()
+        };
+        assert_eq!(goto_def_target(&ptr), 42);
+        // Item 15: a PLAIN embedded struct field with NO ref re-roots to its OWN id
+        // (was previously a no-op when ref_id == 0).
+        let embedded = Node {
+            kind: NodeKind::Struct,
+            ref_id: 0,
+            parent_id: 1,
+            id: 99,
+            ..Node::default()
+        };
+        assert_eq!(goto_def_target(&embedded), 99);
+        // A top-level struct (parent 0) with no ref has no definition to jump to.
+        let top = Node {
+            kind: NodeKind::Struct,
+            ref_id: 0,
+            parent_id: 0,
+            id: 5,
+            ..Node::default()
+        };
+        assert_eq!(goto_def_target(&top), 0);
+        // A plain scalar with no ref → none.
+        let scalar = Node {
+            kind: NodeKind::Int32,
+            ref_id: 0,
+            parent_id: 1,
+            id: 3,
+            ..Node::default()
+        };
+        assert_eq!(goto_def_target(&scalar), 0);
     }
 }
