@@ -260,8 +260,26 @@ mod view {
             cx.notify();
         }
         fn on_close(&mut self, _: &FindClose, _: &mut Window, cx: &mut Context<Self>) {
-            self.state.clear();
+            // Item 33: the C++ `hideFindBar` PRESERVES `m_findPos` and the IND_FIND
+            // highlights — it does NOT clear the search state. Just emit Close; the
+            // host hides the bar and remembers the query so re-showing resumes.
             cx.emit(FindEvent::Close);
+        }
+
+        /// The current query text (so the host can persist it across hide/show,
+        /// item 33).
+        pub fn query(&self) -> &str {
+            self.state.query()
+        }
+
+        /// Re-seed the query (resuming a prior search on re-show) and re-run it
+        /// over the current lines. Item 33.
+        pub fn set_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+            self.input
+                .update(cx, |i, cx| i.set_value(query, window, cx));
+            let lines = self.lines.clone();
+            self.state.set_query(query, &lines);
+            cx.notify();
         }
     }
 

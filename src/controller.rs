@@ -360,11 +360,21 @@ impl RcxDocument {
                 o.insert("typeAliases".into(), Value::Object(aliases));
             }
         }
-        let text = match serde_json::to_string_pretty(&json) {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        if std::fs::write(path, text).is_err() {
+        // Byte-exact `QJsonDocument::toJson(QJsonDocument::Indented)`
+        // (`controller.cpp:201`): 4-space indent + a trailing newline. serde's
+        // `to_string_pretty` emits a 2-space indent and no trailing '\n', which
+        // would defeat byte-level round-trip checks and produce noisy diffs.
+        let mut buf = Vec::new();
+        {
+            use serde::Serialize;
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+            if json.serialize(&mut ser).is_err() {
+                return false;
+            }
+        }
+        buf.push(b'\n');
+        if std::fs::write(path, &buf).is_err() {
             return false;
         }
         self.file_path = Some(path.to_path_buf());
@@ -3200,20 +3210,20 @@ impl RcxController {
         });
     }
 
-    /// Add a member to an enum/bitfield (`Add Member`, `controller.cpp:3364` /
-    /// `3315`). For an enum: append `("NewMember", lastVal+1)`. For a bitfield:
-    /// append a 1-bit member at the next free bit. `at == None` appends; `at ==
-    /// Some(i)` inserts before index `i` (Add Member Above/Below map to `i` /
-    /// `i+1`). Returns whether a member was added.
+    /// Add a member to an enum (`Add Member`, `controller.cpp:3364` / `3315`):
+    /// append `("NewMember", lastVal+1)`. `at == None` appends; `at == Some(i)`
+    /// inserts before index `i` (Add Member Above/Below map to `i` / `i+1`).
+    /// Returns whether a member was added.
+    ///
+    /// Bitfield members have NO add operation in the C++ — the bitfield-member
+    /// context menu only offers Toggle Bit / Edit Value (`controller.cpp:3348`),
+    /// so this is a no-op (returns `false`) for bitfields.
     pub fn add_member(&mut self, node_id: u64, at: Option<usize>) -> bool {
         let ni = self.doc.tree.index_of_id(node_id);
         if ni < 0 {
             return false;
         }
-        let (is_enum, is_bitfield) = {
-            let n = &self.doc.tree.nodes[ni as usize];
-            (n.is_enum(), n.is_bitfield())
-        };
+        let is_enum = self.doc.tree.nodes[ni as usize].is_enum();
         if is_enum {
             let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
             let mut members = old_members.clone();
@@ -3236,48 +3246,20 @@ impl RcxController {
             });
             return true;
         }
-        if is_bitfield {
-            // Bitfield members are not undoable via a command in the C++ (they live
-            // on the Node, not an EnumMembers list). Mutate directly so the layout
-            // grows; the next free bit is the running max of (offset+width).
-            let next_bit = self.doc.tree.nodes[ni as usize]
-                .bitfield_members
-                .iter()
-                .map(|m| m.bit_offset as u32 + m.bit_width as u32)
-                .max()
-                .unwrap_or(0);
-            let n = &mut self.doc.tree.nodes[ni as usize];
-            let idx = at
-                .unwrap_or(n.bitfield_members.len())
-                .min(n.bitfield_members.len());
-            n.bitfield_members.insert(
-                idx,
-                crate::core::BitfieldMember {
-                    name: "NewMember".to_string(),
-                    bit_offset: next_bit.min(255) as u8,
-                    bit_width: 1,
-                },
-            );
-            self.doc.tree.touch();
-            if !self.suppress_refresh {
-                self.refresh();
-            }
-            return true;
-        }
         false
     }
 
-    /// Rename enum/bitfield member `member_idx` to `name`
-    /// (`controller.cpp:1142-1149` enum path / bitfield member rename).
+    /// Rename enum member `member_idx` to `name` (`controller.cpp:1142-1149`).
+    ///
+    /// Bitfield members have NO rename operation in the C++ (the bitfield-member
+    /// context menu only offers Toggle Bit / Edit Value, `controller.cpp:3348`),
+    /// so this is a no-op (returns `false`) for bitfields.
     pub fn rename_member(&mut self, node_id: u64, member_idx: usize, name: &str) -> bool {
         let ni = self.doc.tree.index_of_id(node_id);
         if ni < 0 {
             return false;
         }
-        let (is_enum, is_bitfield) = {
-            let n = &self.doc.tree.nodes[ni as usize];
-            (n.is_enum(), n.is_bitfield())
-        };
+        let is_enum = self.doc.tree.nodes[ni as usize].is_enum();
         if is_enum {
             let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
             if member_idx >= old_members.len() {
@@ -3290,18 +3272,6 @@ impl RcxController {
                 old_members,
                 new_members: members,
             });
-            return true;
-        }
-        if is_bitfield {
-            let n = &mut self.doc.tree.nodes[ni as usize];
-            if member_idx >= n.bitfield_members.len() {
-                return false;
-            }
-            n.bitfield_members[member_idx].name = name.to_string();
-            self.doc.tree.touch();
-            if !self.suppress_refresh {
-                self.refresh();
-            }
             return true;
         }
         false
@@ -3345,17 +3315,18 @@ impl RcxController {
         true
     }
 
-    /// Delete enum/bitfield member `member_idx` (`Remove Member`,
-    /// `controller.cpp:3337`).
+    /// Delete enum member `member_idx` (`Remove Member`, `controller.cpp:3337`),
+    /// which is only offered for enum members.
+    ///
+    /// Bitfield members have NO remove operation in the C++ (the bitfield-member
+    /// context menu only offers Toggle Bit / Edit Value, `controller.cpp:3348`),
+    /// so this is a no-op (returns `false`) for bitfields.
     pub fn delete_member(&mut self, node_id: u64, member_idx: usize) -> bool {
         let ni = self.doc.tree.index_of_id(node_id);
         if ni < 0 {
             return false;
         }
-        let (is_enum, is_bitfield) = {
-            let n = &self.doc.tree.nodes[ni as usize];
-            (n.is_enum(), n.is_bitfield())
-        };
+        let is_enum = self.doc.tree.nodes[ni as usize].is_enum();
         if is_enum {
             let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
             if member_idx >= old_members.len() {
@@ -3368,18 +3339,6 @@ impl RcxController {
                 old_members,
                 new_members: members,
             });
-            return true;
-        }
-        if is_bitfield {
-            let n = &mut self.doc.tree.nodes[ni as usize];
-            if member_idx >= n.bitfield_members.len() {
-                return false;
-            }
-            n.bitfield_members.remove(member_idx);
-            self.doc.tree.touch();
-            if !self.suppress_refresh {
-                self.refresh();
-            }
             return true;
         }
         false
@@ -3878,6 +3837,34 @@ impl RcxController {
         let (k, ok) = crate::core::kind_from_type_name(text);
         if ok && !matches!(k, NodeKind::Struct | NodeKind::Array) {
             self.change_node_kind(node_idx, k);
+        } else if node_idx < self.doc.tree.nodes.len() {
+            // `controller.cpp:1196-1217`: when the text isn't a primitive/array kind,
+            // check whether it names a defined Struct type (some node's
+            // `structTypeName`). If so, convert this node to a Struct and push a
+            // `ChangeStructTypeName` so its `structTypeName` matches `text`.
+            let is_struct_type = self
+                .doc
+                .tree
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Struct && n.struct_type_name == text);
+            if is_struct_type {
+                let node_id = self.doc.tree.nodes[node_idx].id;
+                if self.doc.tree.nodes[node_idx].kind != NodeKind::Struct {
+                    self.change_node_kind(node_idx, NodeKind::Struct);
+                }
+                let idx = self.doc.tree.index_of_id(node_id);
+                if idx >= 0 {
+                    let old_type_name = self.doc.tree.nodes[idx as usize].struct_type_name.clone();
+                    if old_type_name != text {
+                        self.push_command(Command::ChangeStructTypeName {
+                            node_id,
+                            old_name: old_type_name,
+                            new_name: text.to_string(),
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -4916,3 +4903,38 @@ impl RcxController {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod save_format_tests {
+    use super::*;
+
+    /// `RcxDocument::save` must mirror `QJsonDocument::toJson(Indented)`:
+    /// 4-space indentation and a trailing newline (`controller.cpp:201`).
+    #[test]
+    fn save_uses_four_space_indent_and_trailing_newline() {
+        let mut doc = RcxDocument::new();
+        doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Foo".into(),
+            ..Default::default()
+        });
+        let dir = std::env::temp_dir().join(format!("rcx_savefmt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fmt.rcx");
+        assert!(doc.save(&path));
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Trailing newline.
+        assert!(text.ends_with('\n'), "missing trailing newline");
+        // Top-level keys are indented by exactly 4 spaces (not serde's 2).
+        assert!(
+            text.contains("\n    \"baseAddress\""),
+            "expected 4-space indent for top-level keys, got:\n{text}"
+        );
+        // Never a 2-space-only indent for a top-level key.
+        assert!(
+            !text.contains("\n  \"baseAddress\""),
+            "found 2-space indent — should be 4"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

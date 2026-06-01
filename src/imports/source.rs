@@ -51,6 +51,14 @@ fn build_type_table(ptr_size: i32) -> HashMap<String, TypeInfo> {
     ins!("int32_t", Int32, 4);
     ins!("uint64_t", UInt64, 8);
     ins!("int64_t", Int64, 8);
+    ins!("__int8", Int8, 1);
+    ins!("__int16", Int16, 2);
+    ins!("__int32", Int32, 4);
+    ins!("__int64", Int64, 8);
+    ins!("unsigned __int8", UInt8, 1);
+    ins!("unsigned __int16", UInt16, 2);
+    ins!("unsigned __int32", UInt32, 4);
+    ins!("unsigned __int64", UInt64, 8);
 
     // Standard C
     ins!("char", Int8, 1);
@@ -110,6 +118,10 @@ fn build_type_table(ptr_size: i32) -> HashMap<String, TypeInfo> {
     ins!("LONGLONG", Int64, 8);
     ins!("LONG64", Int64, 8);
     ins!("INT64", Int64, 8);
+    ins!("_BYTE", UInt8, 1);
+    ins!("_WORD", UInt16, 2);
+    ins!("_DWORD", UInt32, 4);
+    ins!("_QWORD", UInt64, 8);
 
     // Platform pointer-size types (depend on target architecture)
     ins!("PVOID", ptr_kind, ptr_size);
@@ -1226,7 +1238,12 @@ impl<'a> Parser<'a> {
                 }
                 if self.check(TokKind::Number) {
                     let num_text = self.peek(0).text.clone();
-                    member_value = parse_i64_token(&num_text).unwrap_or(member_value);
+                    // C++ assigns `memberValue = numText.toLongLong(&ok)`
+                    // unconditionally (ignores `ok`); on a parse failure
+                    // (e.g. a suffixed literal) Qt returns 0, so we mirror
+                    // that with `unwrap_or(0)` rather than keeping the
+                    // running auto-increment value.
+                    member_value = parse_i64_token(&num_text).unwrap_or(0);
                     if negative {
                         member_value = -member_value;
                     }
@@ -1257,31 +1274,33 @@ impl<'a> Parser<'a> {
 }
 
 /// Parse a TokKind::Number text as i32 (decimal or `0x...`), mirroring the C++
-/// `numText.toInt(&ok)` / `numText.mid(2).toInt(&ok, 16)`. The token text may
-/// carry integer suffixes (u/U/l/L) which Qt's `toInt` would reject — but in
-/// the array/bitfield context those tokens are pure numbers. We strip trailing
-/// suffix chars to be safe, matching the practical inputs.
+/// `numText.toInt(&ok)` / `numText.mid(2).toInt(&ok, 16)` *exactly*.
+///
+/// The tokenizer keeps integer suffixes (u/U/l/L) in the token text (the suffix
+/// chars are consumed into the token, mirroring `import_source.cpp` lines
+/// 288-290). Qt's `QString::toInt(&ok)` rejects any non-numeric trailing
+/// characters (`ok = false`, returns 0) — so a suffixed dimension like
+/// `field[16u]` must FAIL to parse here, matching `toInt(&ok)` → the caller's
+/// `if (ok)` guard then skips the dimension. We therefore do NOT strip the
+/// suffix: any trailing non-digit (or non-hex-digit after `0x`) makes the parse
+/// fail, exactly like Qt.
 fn parse_int_token(text: &str) -> Option<i32> {
-    let cleaned = text.trim_end_matches(['u', 'U', 'l', 'L']);
-    if let Some(hex) = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-    {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         i32::from_str_radix(hex, 16).ok()
     } else {
-        cleaned.parse::<i32>().ok()
+        text.parse::<i32>().ok()
     }
 }
 
+/// Parse a TokKind::Number text as i64 (decimal or `0x...`), mirroring C++
+/// `numText.toLongLong(&ok)` / `numText.mid(2).toLongLong(&ok, 16)` exactly. As
+/// with `parse_int_token`, a trailing integer suffix (kept by the tokenizer)
+/// makes the parse fail, matching Qt's reject-on-trailing-garbage behavior.
 fn parse_i64_token(text: &str) -> Option<i64> {
-    let cleaned = text.trim_end_matches(['u', 'U', 'l', 'L']);
-    if let Some(hex) = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-    {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16).ok()
     } else {
-        cleaned.parse::<i64>().ok()
+        text.parse::<i64>().ok()
     }
 }
 
@@ -1961,4 +1980,152 @@ pub fn import_from_source(source: &str, pointer_size: i32) -> Result<NodeTree, I
     resolve_pending_refs(&mut tree, &pending, &ctx.class_ids);
 
     Ok(tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Import with 8-byte pointers and return the (single) root struct's
+    /// direct children as `(kind, offset)` pairs, sorted by tree order.
+    fn fields_of(src: &str) -> Vec<(NodeKind, i32)> {
+        let tree = import_from_source(src, 8).expect("import should succeed");
+        // The first node is the root struct.
+        let root_id = tree.nodes[0].id;
+        tree.children_of(root_id)
+            .into_iter()
+            .map(|i| (tree.nodes[i].kind, tree.nodes[i].offset))
+            .collect()
+    }
+
+    // ── Item 1: MSVC __int8/__int16/__int32/__int64 (+ unsigned) ──
+
+    #[test]
+    fn msvc_fixed_int_types_resolve() {
+        // Each MSVC fixed-width type must resolve to the matching primitive
+        // *and* advance the computed-offset cursor by its true size so the
+        // following field lands at the correct offset.
+        let src = "struct S {\n  __int8 a;\n  __int16 b;\n  __int32 c;\n  __int64 d;\n};";
+        let fields = fields_of(src);
+        assert_eq!(
+            fields,
+            vec![
+                (NodeKind::Int8, 0),
+                (NodeKind::Int16, 2), // aligned to 2
+                (NodeKind::Int32, 4), // aligned to 4
+                (NodeKind::Int64, 8), // aligned to 8
+            ],
+            "MSVC __intN types must resolve and advance the offset cursor"
+        );
+    }
+
+    #[test]
+    fn unsigned_msvc_int_matches_cpp_recovery() {
+        // The `unsigned __intN` table entries exist verbatim (parity with the
+        // C++ table, lines 37-40), but `parseTypeName` only merges further
+        // `int`/`char`/`long`/modifier words — NOT `__intN`. So `unsigned __int8`
+        // does NOT resolve to UInt8: the field parse fails on the leftover token,
+        // the struct-body loop skips one token (`unsigned`) and re-parses the
+        // bare `__intN`. The net effect (identical in C++) is that the `unsigned`
+        // is dropped and the field resolves to the SIGNED `__intN` type. This
+        // test pins that C++-faithful behavior, not an idealized one.
+        let src = "struct S {\n  unsigned __int8 a;\n  unsigned __int16 b;\n  unsigned __int32 c;\n  unsigned __int64 d;\n};";
+        let fields = fields_of(src);
+        assert_eq!(
+            fields,
+            vec![
+                (NodeKind::Int8, 0),
+                (NodeKind::Int16, 2),
+                (NodeKind::Int32, 4),
+                (NodeKind::Int64, 8),
+            ],
+            "unsigned __intN drops the modifier during recovery, matching C++"
+        );
+
+        // The merged table key itself IS present (verbatim with the C++ table),
+        // even though the parser never produces the merged string.
+        let table = build_type_table(8);
+        assert_eq!(
+            table.get("unsigned __int8").map(|t| t.kind),
+            Some(NodeKind::UInt8)
+        );
+        assert_eq!(
+            table.get("unsigned __int64").map(|t| t.kind),
+            Some(NodeKind::UInt64)
+        );
+    }
+
+    #[test]
+    fn msvc_int64_does_not_stall_following_fields() {
+        // Regression for the audited bug: __int64 used to resolve to an unknown
+        // struct-type reference (size 0), stalling the cursor so the trailing
+        // field landed at offset 0 instead of 8.
+        let src = "struct S {\n  __int64 first;\n  int second;\n};";
+        let fields = fields_of(src);
+        assert_eq!(fields[0], (NodeKind::Int64, 0));
+        assert_eq!(fields[1], (NodeKind::Int32, 8));
+    }
+
+    // ── Item 2: IDA/Hex-Rays _BYTE/_WORD/_DWORD/_QWORD ──
+
+    #[test]
+    fn ida_hexrays_types_resolve() {
+        let src = "struct S {\n  _BYTE a;\n  _WORD b;\n  _DWORD c;\n  _QWORD d;\n};";
+        let fields = fields_of(src);
+        assert_eq!(
+            fields,
+            vec![
+                (NodeKind::UInt8, 0),
+                (NodeKind::UInt16, 2),
+                (NodeKind::UInt32, 4),
+                (NodeKind::UInt64, 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn ida_dword_does_not_stall_following_fields() {
+        let src = "struct S {\n  _DWORD a;\n  int b;\n};";
+        let fields = fields_of(src);
+        assert_eq!(fields[0], (NodeKind::UInt32, 0));
+        assert_eq!(fields[1], (NodeKind::Int32, 4));
+    }
+
+    // ── Item 7: integer-suffix in array dimensions / static_assert ──
+
+    #[test]
+    fn parse_int_token_rejects_integer_suffix() {
+        // Matches Qt `toInt(&ok)` which returns ok=false on trailing garbage.
+        assert_eq!(parse_int_token("16"), Some(16));
+        assert_eq!(parse_int_token("0x10"), Some(16));
+        assert_eq!(parse_int_token("16u"), None);
+        assert_eq!(parse_int_token("16U"), None);
+        assert_eq!(parse_int_token("16ull"), None);
+        assert_eq!(parse_int_token("0x10u"), None);
+        assert_eq!(parse_i64_token("16"), Some(16));
+        assert_eq!(parse_i64_token("16u"), None);
+    }
+
+    #[test]
+    fn suffixed_array_dimension_is_skipped() {
+        // `int a[16u]` — Qt's toInt(&ok) rejects "16u" (ok=false), and the
+        // `if (ok)` guard means the dimension is NOT appended. With `arraySizes`
+        // left empty the field collapses to a plain scalar `int`, exactly as in
+        // the C++. (Previously the Rust port stripped the suffix and produced a
+        // 16-element array — the bug this pins.)
+        let suffixed = import_from_source("struct S {\n  int a[16u];\n};", 8).unwrap();
+        let kids = suffixed.children_of(suffixed.nodes[0].id);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(
+            suffixed.nodes[kids[0]].kind,
+            NodeKind::Int32,
+            "suffixed dimension 16u is rejected, so the field is a scalar int"
+        );
+
+        // A plain `int a[16]` must still produce a 16-element array.
+        let sized = import_from_source("struct S {\n  int a[16];\n};", 8).unwrap();
+        let sa = sized.children_of(sized.nodes[0].id);
+        assert_eq!(sized.nodes[sa[0]].kind, NodeKind::Array);
+        assert_eq!(sized.nodes[sa[0]].array_len, 16);
+    }
 }

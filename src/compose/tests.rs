@@ -1602,7 +1602,10 @@ fn comment_chip_fires_and_can_be_suppressed() {
         &tree, &prov, root_id, false, false, false, false, true, true, true,
     );
     let c = first_chip(&r, ChipKind::Comment).expect("comment chip should fire");
-    assert_eq!(c.text, "ref count from header");
+    // The chip text carries the literal "// " lead-in so the rendered row shows
+    // `  // ref count from header`, matching the C++ displayed string
+    // (`compose.cpp:436`: `lineText += "  // " + commentText`).
+    assert_eq!(c.text, "// ref count from header");
 
     let r2 = compose(
         &tree, &prov, root_id, false, false, false, false, false, true, true,
@@ -1631,6 +1634,197 @@ fn multiline_comment_stays_on_one_line() {
     let c = first_chip(&r, ChipKind::Comment).unwrap();
     assert!(!c.text.contains('\n'), "{}", c.text);
     assert!(c.text.contains("first line"));
+}
+
+// ── Padding-gap synthetic line (`compose.cpp:850-893`) ──
+//
+// Consecutive unnamed (padding) children accumulate their byte sizes; just
+// before the next NAMED field a non-interactive "[+0xN gap]" continuation
+// line is emitted (lowercase hex), then the accumulator resets.
+
+#[test]
+fn padding_gap_line_emitted_before_named_field() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Padded".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // named `a` (UInt32 @0), unnamed padding (UInt32 @4 = 4 bytes), named `b` @8
+    tree.add_node(child(root_id, NodeKind::UInt32, 0, "a"));
+    tree.add_node(child(root_id, NodeKind::UInt32, 4, "")); // padding
+    tree.add_node(child(root_id, NodeKind::UInt32, 8, "b"));
+    let prov = BufferProvider::new(vec![0u8; (K_STRUCT_BASE + 64) as usize], "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+    // Lowercase hex: 4 bytes → "[+0x4 gap]".
+    assert!(
+        r.text.contains("[+0x4 gap]"),
+        "expected gap marker, got:\n{}",
+        r.text
+    );
+    // The gap line sits before `b` and after `a`.
+    let ls = lines(&r);
+    let a_line = ls.iter().position(|l| l.contains("a ")).unwrap();
+    let gap_line = ls.iter().position(|l| l.contains("[+0x4 gap]")).unwrap();
+    let b_line = ls
+        .iter()
+        .position(|l| l.contains(" b ") || l.ends_with(" b"))
+        .unwrap();
+    assert!(a_line < gap_line && gap_line < b_line, "{:#?}", ls);
+}
+
+#[test]
+fn padding_gap_line_uses_lowercase_hex_for_large_gaps() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Padded".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // 16 bytes of padding split across two unnamed UInt64s, then named `b`.
+    tree.add_node(child(root_id, NodeKind::UInt32, 0, "a"));
+    tree.add_node(child(root_id, NodeKind::UInt64, 8, "")); // pad 8
+    tree.add_node(child(root_id, NodeKind::UInt64, 16, "")); // pad 8 (accumulates → 0x10)
+    tree.add_node(child(root_id, NodeKind::UInt32, 24, "b"));
+    let prov = BufferProvider::new(vec![0u8; (K_STRUCT_BASE + 64) as usize], "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+    // 0x10, lowercase, NOT "0X10".
+    assert!(
+        r.text.contains("[+0x10 gap]"),
+        "expected accumulated lowercase gap marker, got:\n{}",
+        r.text
+    );
+    // Exactly one gap marker (the two paddings collapse into one line).
+    assert_eq!(r.text.matches("gap]").count(), 1);
+}
+
+#[test]
+fn trailing_padding_emits_no_gap_line() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Padded".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // named `a`, then trailing unnamed padding with NO named field after it.
+    tree.add_node(child(root_id, NodeKind::UInt32, 0, "a"));
+    tree.add_node(child(root_id, NodeKind::UInt32, 4, "")); // trailing padding
+    let prov = BufferProvider::new(vec![0u8; (K_STRUCT_BASE + 64) as usize], "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+    assert!(
+        !r.text.contains("gap]"),
+        "trailing padding should not emit a gap line, got:\n{}",
+        r.text
+    );
+}
+
+#[test]
+fn padding_gap_line_is_non_interactive_continuation() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Padded".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::UInt32, 0, "a"));
+    tree.add_node(child(root_id, NodeKind::UInt32, 4, "")); // padding
+    tree.add_node(child(root_id, NodeKind::UInt32, 8, "b"));
+    let prov = BufferProvider::new(vec![0u8; (K_STRUCT_BASE + 64) as usize], "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+    let gap_meta = r
+        .meta
+        .iter()
+        .find(|lm| lm.line_kind == LineKind::Continuation && lm.node_idx == -1)
+        .expect("gap line should have node_idx == -1 (non-interactive)");
+    assert!(gap_meta.is_continuation);
+    assert_eq!(gap_meta.node_id, 0);
+    // Offset margin points at the gap's start address (after `a`, before `b`).
+    assert_eq!(gap_meta.offset_addr, K_STRUCT_BASE + 4);
+    // No chips, default markers (the C++ gap line sets no markerMask).
+    assert!(gap_meta.chips.is_empty());
+    assert_eq!(gap_meta.marker_mask, 0);
+}
+
+#[test]
+fn no_gap_line_for_array_elements() {
+    // Arrays render children as array elements; the gap-ruler tracking is
+    // disabled for them (`!childrenAreArrayElements` guard, compose.cpp:857).
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ai = tree.add_node(Node {
+        kind: NodeKind::Array,
+        element_kind: NodeKind::UInt32,
+        array_len: 3,
+        struct_type_name: "Arr".into(),
+        ..Node::default()
+    });
+    let arr_id = tree.nodes[ai].id;
+    // Explicit child nodes with empty names (array elements are unnamed).
+    tree.add_node(child(arr_id, NodeKind::UInt32, 0, ""));
+    tree.add_node(child(arr_id, NodeKind::UInt32, 4, ""));
+    tree.add_node(child(arr_id, NodeKind::UInt32, 8, ""));
+    let prov = BufferProvider::new(vec![0u8; (K_STRUCT_BASE + 64) as usize], "synthetic");
+
+    let r = compose(
+        &tree, &prov, arr_id, false, false, false, false, true, true, true,
+    );
+    assert!(
+        !r.text.contains("gap]"),
+        "array elements must not trigger gap markers, got:\n{}",
+        r.text
+    );
+}
+
+#[test]
+fn comment_chip_carries_slashslash_prefix() {
+    // The rendered row must literally show `  // <comment>` to match the C++
+    // displayed string (`compose.cpp:436`). The chip text is `// <comment>`
+    // and `push_chip` prepends the `"  "` separator.
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(Node {
+        comment: "IHDR width".into(),
+        ..child(root_id, NodeKind::UInt32, 0, "count")
+    });
+    let prov = BufferProvider::new(vec![0u8; (K_STRUCT_BASE + 16) as usize], "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+    let c = first_chip(&r, ChipKind::Comment).expect("comment chip should fire");
+    assert_eq!(c.text, "// IHDR width");
+    // The rendered text shows the C++ "  // " lead-in.
+    assert!(
+        r.text.contains("  // IHDR width"),
+        "row should show `  // IHDR width`, got:\n{}",
+        r.text
+    );
 }
 
 #[test]

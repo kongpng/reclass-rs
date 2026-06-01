@@ -95,6 +95,23 @@ impl StatusInfo {
         self.path.is_empty() && self.detail.is_empty() && self.info.is_empty()
     }
 
+    /// Item 30: the Code (rendered) view variant of the readout. The C++ shows
+    /// `"Rendered: {main}"` for a pane in `VM_Rendered` (main.cpp:2932), prefixing
+    /// the primary line and dropping the offset/variant tail (the rendered pane has
+    /// no per-node offset cursor). The host calls this when the active pane is in
+    /// Rendered mode. A no-selection default readout is left as-is (nothing to
+    /// render-prefix).
+    pub fn into_rendered(mut self) -> StatusInfo {
+        if self.is_default || self.path.is_empty() {
+            return self;
+        }
+        self.path = format!("Rendered: {}", self.path);
+        self.detail = String::new();
+        self.type_index = String::new();
+        self.key_hints = String::new();
+        self
+    }
+
     /// Build the readout from a live controller — resolves the type name through
     /// the document's alias table (so "FuncPtr64" etc. honour user aliases), the
     /// selection from `selected_ids`, the viewed root from `view_root_id`, and the
@@ -148,16 +165,22 @@ impl StatusInfo {
         let struct_size = struct_size_segment(tree, view_root);
 
         if count > 1 {
-            // "TypeName ×N" — the multi-select summary (no offset detail / variant
-            // hints; the C++ `selectionChanged` slot shows just "N nodes selected").
+            // Item 30: the C++ `selectionChanged` slot fires AFTER `nodeSelected`
+            // and OVERWRITES the whole status to exactly "N nodes selected"
+            // (main.cpp:2945, `setAppStatus` with no dim suffix) — no offset, no
+            // variant hints, no struct-size tail. Set `path` to that literal and
+            // clear every other segment.
+            let _ = type_name;
+            let _ = root_name;
+            let _ = struct_size;
             return StatusInfo {
-                path: format!("{type_name} \u{00D7}{count}"),
+                path: format!("{count} nodes selected"),
                 detail: String::new(),
-                info: format!("{count} nodes selected"),
+                info: String::new(),
                 is_default: false,
                 type_index: String::new(),
                 key_hints: String::new(),
-                struct_size,
+                struct_size: String::new(),
             };
         }
 
@@ -755,19 +778,32 @@ mod tests {
 
     #[test]
     fn multi_select_summarizes_type_and_count() {
+        // Item 30 (corrected): the C++ `selectionChanged` slot OVERWRITES the whole
+        // status to exactly "N nodes selected" — no "Type ×N", no offset detail, no
+        // info, no variant hints, and NO struct-size tail. (This test previously
+        // encoded the old "Type ×N" + struct-size behavior; updated to match C++.)
         let (tree, root, field) = fixture();
         let info = StatusInfo::from_tree(&tree, &sel(&[root, field]), VIEW_NONE, default_type_name);
-        // Primary is the lowest id (the root, allocated first) → its type "Struct".
-        // The summary form is "Type ×N" with no compact suffix.
-        assert!(info.path.ends_with("\u{00D7}2"));
+        assert_eq!(info.path, "2 nodes selected");
         assert_eq!(info.detail, "");
-        assert_eq!(info.info, "2 nodes selected");
+        assert_eq!(info.info, "");
         assert!(!info.is_default);
-        // No per-node variant cluster on a multi-select; the struct-size tail
-        // still describes the viewed root.
         assert_eq!(info.type_index, "");
         assert_eq!(info.key_hints, "");
-        assert_eq!(info.struct_size, "UnnamedClass0: 0x24 (36)");
+        assert_eq!(info.struct_size, "");
+    }
+
+    #[test]
+    fn rendered_view_prefixes_primary_line() {
+        // Item 30: a pane in Rendered (Code) view shows "Rendered: {main}" and drops
+        // the offset/variant tail.
+        let (tree, _root, field) = fixture();
+        let info = StatusInfo::from_tree(&tree, &sel(&[field]), VIEW_NONE, default_type_name)
+            .into_rendered();
+        assert!(info.path.starts_with("Rendered: "), "got {:?}", info.path);
+        assert_eq!(info.detail, "");
+        assert_eq!(info.type_index, "");
+        assert_eq!(info.key_hints, "");
     }
 
     #[test]
@@ -799,13 +835,17 @@ mod tests {
 
     #[test]
     fn alias_resolver_is_used_for_type_name() {
-        let (tree, root, field) = fixture();
-        // Multi-select uses the primary's type name via the resolver; supply an
-        // alias to prove the resolver is honoured.
-        let info = StatusInfo::from_tree(&tree, &sel(&[root, field]), VIEW_NONE, |_k| {
-            "Aliased".into()
-        });
-        assert_eq!(info.path, "Aliased \u{00D7}2");
+        // Item 30: multi-select no longer surfaces the type name (it shows just
+        // "N nodes selected"), so prove the resolver is honoured via the SINGLE
+        // selection's variant segment instead, which formats the resolved name.
+        let (tree, _root, field) = fixture();
+        let info = StatusInfo::from_tree(&tree, &sel(&[field]), VIEW_NONE, |_k| "Aliased".into());
+        assert!(
+            info.type_index.contains("Aliased") || info.path.contains("Aliased"),
+            "resolver not honoured: path={:?} type_index={:?}",
+            info.path,
+            info.type_index
+        );
     }
 
     /// Build a single-root tree of one leaf `kind` at offset 0 and read its

@@ -163,6 +163,9 @@ pub enum SpanRole {
     /// A formatted field value (resolved addresses / numbers) — One Dark green
     /// (the `0x…` value column reads green in the reclass screenshots).
     Value,
+    /// Item 37: a string-kind field value (`"…"` / `L"…"`) — the C++ lexer
+    /// `syntaxString` orange-tan, distinct from the green numeric value.
+    StringVal,
     /// The ASCII preview column on hex rows — soft green, dim.
     Ascii,
     /// Dimmed hex bytes / fold arrows / braces / footer (`IND_HEX_DIM`).
@@ -266,10 +269,14 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
                 compose::command_row_src_span(text),
                 SpanRole::Source,
             );
+            // Item 11: C++ explicitly applies `IND_BASE_ADDR` (= theme.text) to the
+            // command-row base address, OVERRIDING the lexer's number coloring, so
+            // it reads NEUTRAL (default foreground), not the orange number/address
+            // hue. Body / field offset numbers keep the Address (number) role.
             push(
                 &mut layers,
                 compose::command_row_addr_span(text),
-                SpanRole::Address,
+                SpanRole::Text,
             );
             push(
                 &mut layers,
@@ -337,12 +344,23 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
                 push(&mut layers, vs, SpanRole::Dim);
             } else {
                 // Clip the value at the first chip so trailing chips keep their
-                // own color (`narrowPtrValueSpan`, §8).
-                push(
-                    &mut layers,
-                    narrow_value_at_first_chip(lm, vs),
-                    SpanRole::Value,
-                );
+                // own color (`narrowPtrValueSpan`, §8). Item 37: color the value
+                // by node kind, matching the C++ per-token lexer hues:
+                //   * Bool + Pointer/FnPtr (true/false/nullptr) → keyword/blue,
+                //   * string kinds ("…"/L"…") → the string orange-tan role,
+                //   * everything else (numbers) → green.
+                use crate::core::NodeKind::*;
+                let value_role = if matches!(lm.node_kind, Bool)
+                    || is_pointer_kind(lm.node_kind)
+                    || is_fnptr_kind(lm.node_kind)
+                {
+                    SpanRole::Keyword
+                } else if crate::core::is_string_kind(lm.node_kind) {
+                    SpanRole::StringVal
+                } else {
+                    SpanRole::Value
+                };
+                push(&mut layers, narrow_value_at_first_chip(lm, vs), value_role);
             }
 
             // Crisp fold disclosure triangle (`▸`/`▾`): compose emits it as
@@ -397,7 +415,10 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
     // Chips (highest priority — they are tail annotations with explicit color).
     for chip in &lm.chips {
         let role = match chip.kind {
-            ChipKind::Enum => SpanRole::EnumChip,
+            // Item 36: the inline enum-value annotation `' (MemberName)'` is plain
+            // lexer-default text in C++ (Operator/Identifier color), NOT a colored
+            // link-blue pill. Paint it as the default foreground.
+            ChipKind::Enum => SpanRole::Text,
             ChipKind::TypeHint => SpanRole::TypeHint,
             ChipKind::Rtti => SpanRole::RttiHint,
             ChipKind::Symbol | ChipKind::Comment | ChipKind::AddComment => SpanRole::CommentGreen,
@@ -413,29 +434,15 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
         );
     }
 
-    // Per-byte change heat — recolor the changed-byte *glyphs* (the orange→red
-    // hex digits in PIC1/PIC5), on top of the dim hex run. `IND_HEAT_*` are
-    // TEXTFORE indicators (editor-surface.md §3), so this is glyph color, not a
-    // background. Hex rows recolor only `changed_byte_indices` ("XX " = 3 cols);
-    // non-hex heated rows recolor the (chip-clipped) value span.
+    // Change heat — recolor the value-span glyphs (the orange→red hex digits in
+    // PIC1/PIC5), on top of the dim hex run. `IND_HEAT_*` are TEXTFORE indicators
+    // (editor-surface.md §3), so this is glyph color, not a background. Item 12:
+    // the C++ `applyHeatmapHighlight` (editor.cpp:1969) fills the ENTIRE narrowed
+    // value span for ANY row with heat>0 — both hex and non-hex. `changedByteIndices`
+    // is used only for the dataChanged flag, NEVER for coloring; the prior per-byte
+    // hex path left the unchanged bytes dim.
     if let Some(heat_role) = heat_role_for_level(lm.heat_level) {
-        if is_hex_preview(lm.node_kind) {
-            let vs = compose::value_span_for(lm, type_w, name_w);
-            if vs.valid {
-                for &b in &lm.changed_byte_indices {
-                    let s = vs.start + b * 3;
-                    push(
-                        &mut layers,
-                        ColumnSpan {
-                            start: s,
-                            end: s + 2,
-                            valid: true,
-                        },
-                        heat_role,
-                    );
-                }
-            }
-        } else if !matches!(lm.line_kind, LineKind::CommandRow | LineKind::Footer) {
+        if !matches!(lm.line_kind, LineKind::CommandRow | LineKind::Footer) {
             let vs = narrow_value_at_first_chip(lm, compose::value_span_for(lm, type_w, name_w));
             push(&mut layers, vs, heat_role);
         }
@@ -845,6 +852,7 @@ pub fn effective_widths(lm: &LineMeta) -> (i32, i32) {
 pub fn fmt_margin_text(
     offset_addr: u64,
     base_address: u64,
+    ptr_base: u64,
     hex_digits: i32,
     is_continuation: bool,
     relative: bool,
@@ -860,7 +868,16 @@ pub fn fmt_margin_text(
         // Relative offset from the view base: "+<HEX>" (no 0x, uppercase), e.g.
         // `+0 +8 +10 +18`. The "+" eats one of the `hex_digits` slots so the
         // column still lines up with the absolute mode's width.
-        let rel = offset_addr.wrapping_sub(base_address);
+        // Item 26: pointer-expanded children compute their RVA from the pointer's
+        // target base (`lm.ptrBase`), not the struct base, so a deref'd field
+        // shows the correct offset from the pointee. The C++ `reformatMargins`
+        // uses `rvaBase = lm.ptrBase ? lm.ptrBase : base`.
+        let rva_base = if ptr_base != 0 {
+            ptr_base
+        } else {
+            base_address
+        };
+        let rel = offset_addr.wrapping_sub(rva_base);
         let body = format!("{rel:X}");
         let pad = (hex_digits as usize).saturating_sub(1 + body.len());
         format!("{}+{body}", " ".repeat(pad))
@@ -1052,15 +1069,14 @@ mod tests {
     }
 
     #[test]
-    fn heat_recolors_only_changed_hex_byte_glyphs() {
-        // A hot hex row where bytes 0 and 2 changed this tick: only those byte
-        // digit pairs get a heat role, the rest stay dim.
+    fn heat_fills_whole_hex_value_span() {
+        // Item 12 (corrected): the C++ `applyHeatmapHighlight` fills the ENTIRE
+        // narrowed value span for ANY heated hex row — `changedByteIndices` is used
+        // only for the dataChanged flag, never for coloring. (This test previously
+        // asserted per-byte heat over only changed bytes; updated to match C++.)
         let mut lm = field_line(0, NodeKind::Hex64);
         lm.heat_level = 3;
         lm.changed_byte_indices = vec![0, 2];
-        // Build a line long enough to span the real value column (which starts at
-        // fold(3)+type(14)+name(22)+2 seps = 41), so byte 2's digits (cols 47-49)
-        // are not clipped by the line length.
         let vs = compose::value_span_for(&lm, 14, 22);
         let mut text = String::new();
         text.push_str("hex64");
@@ -1073,20 +1089,16 @@ mod tests {
             .iter()
             .filter(|r| r.role == SpanRole::HeatHot)
             .collect();
-        // Exactly two heat runs (byte 0 and byte 2), each 2 columns wide.
-        assert_eq!(heat_runs.len(), 2, "runs={runs:?}");
-        for r in &heat_runs {
-            assert_eq!(
-                r.end - r.start,
-                2,
-                "heat run not 2 wide: {r:?} all={heat_runs:?}"
-            );
-        }
-        // The two heat runs sit at the right byte offsets (byte 0 and byte 2).
+        // Exactly ONE heat run, covering the whole value span (no per-byte split).
+        assert_eq!(heat_runs.len(), 1, "runs={runs:?}");
         assert_eq!(heat_runs[0].start, vs.start);
-        assert_eq!(heat_runs[1].start, vs.start + 6);
-        // The unchanged bytes keep the dim role.
-        assert!(runs.iter().any(|r| r.role == SpanRole::Dim));
+        // The whole value span (all 8 byte pairs) is heated, not just bytes 0/2 —
+        // so the run is far wider than the 2-col per-byte band.
+        assert!(
+            heat_runs[0].end - heat_runs[0].start > 6,
+            "heat run should span the full value, got {:?}",
+            heat_runs[0]
+        );
     }
 
     #[test]
@@ -1325,8 +1337,82 @@ mod tests {
         let text = "[\u{25B8}] source\u{25BE}  0x400000  class Foo {";
         let runs = style_runs(&lm, text, 14, 22);
         assert!(runs.iter().any(|r| r.role == SpanRole::Keyword));
-        assert!(runs.iter().any(|r| r.role == SpanRole::Address));
+        // Item 11: the command-row base address is painted NEUTRAL (`SpanRole::Text`,
+        // the C++ `IND_BASE_ADDR = theme.text`), OVERRIDING the orange number/address
+        // hue — so there must be NO `Address` run on the command row.
+        assert!(
+            !runs.iter().any(|r| r.role == SpanRole::Address),
+            "command-row address must be neutral Text, not Address: {runs:?}"
+        );
         assert!(runs.iter().any(|r| r.role == SpanRole::ClassName));
+    }
+
+    #[test]
+    fn value_role_splits_by_node_kind() {
+        // Item 37: the value column is colored by node kind. A numeric value is
+        // green (Value), a bool/pointer value is keyword/blue (true/false/nullptr).
+        // Build each line so the value text actually lands in the computed value
+        // span (the role only applies over `value_span_for`).
+        let line_with_value = |kind: NodeKind, type_tok: &str, name: &str, value: &str| {
+            let lm = field_line(0, kind);
+            let vs = compose::value_span_for(&lm, 14, 22);
+            let mut text = String::new();
+            text.push_str(type_tok);
+            while col_len(&text) < vs.start {
+                text.push(' ');
+            }
+            text.push_str(value);
+            (lm, text, name.to_string())
+        };
+
+        let (int_line, int_text, _) = line_with_value(NodeKind::Int32, "int32_t", "health", "42");
+        let int_runs = style_runs(&int_line, &int_text, 14, 22);
+        assert!(
+            int_runs.iter().any(|r| r.role == SpanRole::Value),
+            "int value should be Value (green): {int_runs:?}"
+        );
+        assert!(!int_runs.iter().any(|r| r.role == SpanRole::Keyword));
+
+        let (bool_line, bool_text, _) = line_with_value(NodeKind::Bool, "bool", "flag", "true");
+        let bool_runs = style_runs(&bool_line, &bool_text, 14, 22);
+        assert!(
+            bool_runs.iter().any(|r| r.role == SpanRole::Keyword),
+            "bool value should be Keyword (blue): {bool_runs:?}"
+        );
+
+        let (ptr_line, ptr_text, _) =
+            line_with_value(NodeKind::Pointer64, "ptr64", "next", "nullptr");
+        let ptr_vs = compose::value_span_for(&ptr_line, 14, 22);
+        let ptr_runs = style_runs(&ptr_line, &ptr_text, 14, 22);
+        // A Keyword run must overlap the VALUE span (nullptr), not merely the ptr
+        // type token (which is also keyword-colored).
+        assert!(
+            ptr_runs
+                .iter()
+                .any(|r| r.role == SpanRole::Keyword && r.start >= ptr_vs.start),
+            "pointer value should be Keyword (blue): vs={ptr_vs:?} runs={ptr_runs:?}"
+        );
+    }
+
+    #[test]
+    fn enum_annotation_is_plain_text_not_chip() {
+        // Item 36: the inline ' (MemberName)' enum annotation is plain default text,
+        // not a colored EnumChip pill.
+        let mut lm = field_line(0, NodeKind::Int32);
+        let text = "int32_t       state           2 (Running)";
+        // Place an Enum chip over the " (Running)" tail.
+        let chip_start = text.find("(Running)").unwrap() as i32;
+        lm.chips = vec![crate::core::linemeta::LineChip {
+            kind: ChipKind::Enum,
+            start_col: chip_start,
+            end_col: chip_start + "(Running)".len() as i32,
+            ..Default::default()
+        }];
+        let runs = style_runs(&lm, text, 14, 22);
+        assert!(
+            !runs.iter().any(|r| r.role == SpanRole::EnumChip),
+            "enum annotation must be plain Text, not EnumChip: {runs:?}"
+        );
     }
 
     #[test]
@@ -1343,9 +1429,9 @@ mod tests {
         // carries a distinct address, so the gutter must differ per row (the bug
         // was every row repeating the base address).
         let base = 0xFFFF_8000_0000_0000u64;
-        let r0 = fmt_margin_text(base, base, 8, false, true);
-        let r8 = fmt_margin_text(base + 0x8, base, 8, false, true);
-        let r10 = fmt_margin_text(base + 0x10, base, 8, false, true);
+        let r0 = fmt_margin_text(base, base, 0, 8, false, true);
+        let r8 = fmt_margin_text(base + 0x8, base, 0, 8, false, true);
+        let r10 = fmt_margin_text(base + 0x10, base, 0, 8, false, true);
         assert!(r0.trim_start().ends_with("+0"), "got {r0:?}");
         assert!(r8.trim_start().ends_with("+8"), "got {r8:?}");
         assert!(r10.trim_start().ends_with("+10"), "got {r10:?}");
@@ -1361,8 +1447,8 @@ mod tests {
     fn margin_absolute_addresses_when_source_attached() {
         // PIC1: a live source → full uppercase hex address, distinct per row.
         let base = 0x7FF6_0BF0_2B80u64;
-        let a0 = fmt_margin_text(base, base, 12, false, false);
-        let a8 = fmt_margin_text(base + 0x8, base, 12, false, false);
+        let a0 = fmt_margin_text(base, base, 0, 12, false, false);
+        let a8 = fmt_margin_text(base + 0x8, base, 0, 12, false, false);
         assert_eq!(a0, "7FF60BF02B80");
         assert_eq!(a8, "7FF60BF02B88");
         assert_ne!(a0, a8);
@@ -1370,14 +1456,30 @@ mod tests {
 
     #[test]
     fn margin_continuation_is_the_dot_marker() {
-        assert_eq!(fmt_margin_text(0x40, 0, 8, true, true), "·");
-        assert_eq!(fmt_margin_text(0x40, 0, 8, true, false), "·");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, 8, true, true), "·");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, 8, true, false), "·");
     }
 
     #[test]
     fn margin_empty_when_no_digits() {
-        assert_eq!(fmt_margin_text(0x40, 0, 0, false, true), "");
-        assert_eq!(fmt_margin_text(0x40, 0, -1, false, false), "");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, 0, false, true), "");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, -1, false, false), "");
+    }
+
+    #[test]
+    fn margin_relative_uses_ptr_base_when_set() {
+        // Item 26: a pointer-expanded child's RVA is computed from the pointer
+        // TARGET base (`ptr_base`), not the struct base, so a deref'd field shows
+        // the offset from the pointee rather than a wrong RVA off the struct base.
+        let struct_base = 0x1000u64;
+        let ptr_base = 0x9000u64;
+        let child_addr = ptr_base + 0x18;
+        // With ptr_base set, the relative offset is child - ptr_base = +18.
+        let with_ptr = fmt_margin_text(child_addr, struct_base, ptr_base, 8, false, true);
+        assert!(with_ptr.trim_start().ends_with("+18"), "got {with_ptr:?}");
+        // With ptr_base == 0, it falls back to the struct base (child - base).
+        let no_ptr = fmt_margin_text(child_addr, struct_base, 0, 8, false, true);
+        assert!(no_ptr.trim_start().ends_with("+8018"), "got {no_ptr:?}");
     }
 
     #[test]

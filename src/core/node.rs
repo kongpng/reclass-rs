@@ -321,6 +321,426 @@ impl Bookmark {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Evidence records (`core.h:398-572`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The NodeTree carries three evidence arrays (events / hypotheses / proposals)
+// that record the provenance of reverse-engineering decisions. They are
+// JSON-serialized field-for-field to match the C++ exactly, including the
+// omit-when-empty / omit-when-default rules in each `toJson()`.
+
+/// Parse the trailing decimal sequence of a prefixed id (`ev_42` → `42`).
+/// Mirrors `parsePrefixedSequence` (`core.h:391-396`): returns 0 unless the id
+/// starts with `prefix` and the remainder parses cleanly as an unsigned int.
+pub fn parse_prefixed_sequence(id: &str, prefix: &str) -> u64 {
+    match id.strip_prefix(prefix) {
+        Some(rest) => rest.parse::<u64>().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// `struct EvidenceEvent` (`core.h:398-456`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceEvent {
+    /// `ev_N`.
+    pub id: String,
+    /// msec since epoch.
+    pub timestamp: i64,
+    pub source: String,
+    pub kind: String,
+    pub summary: String,
+    pub type_name: String,
+    pub node_id: u64,
+    /// offset within type, -1 = not field-specific.
+    pub field_offset: i32,
+    pub address: String,
+    pub function_name: String,
+    pub function_address: String,
+    pub instruction: String,
+    /// -1.0 = unset.
+    pub confidence: f64,
+    pub tags: Vec<String>,
+    /// source-specific structured payload (a JSON object, or `Null` when empty).
+    pub data: Value,
+}
+
+impl Default for EvidenceEvent {
+    /// C++ aggregate defaults: `fieldOffset = -1`, `confidence = -1.0`,
+    /// everything else zero/empty.
+    fn default() -> Self {
+        EvidenceEvent {
+            id: String::new(),
+            timestamp: 0,
+            source: String::new(),
+            kind: String::new(),
+            summary: String::new(),
+            type_name: String::new(),
+            node_id: 0,
+            field_offset: -1,
+            address: String::new(),
+            function_name: String::new(),
+            function_address: String::new(),
+            instruction: String::new(),
+            confidence: -1.0,
+            tags: Vec::new(),
+            data: Value::Null,
+        }
+    }
+}
+
+impl EvidenceEvent {
+    /// `EvidenceEvent::toJson()` (`core.h:415-433`).
+    pub fn to_json(&self) -> Value {
+        let mut o = Map::new();
+        o.insert("id".into(), json!(self.id));
+        o.insert("timestamp".into(), json!(self.timestamp.to_string()));
+        if !self.source.is_empty() {
+            o.insert("source".into(), json!(self.source));
+        }
+        if !self.kind.is_empty() {
+            o.insert("kind".into(), json!(self.kind));
+        }
+        if !self.summary.is_empty() {
+            o.insert("summary".into(), json!(self.summary));
+        }
+        if !self.type_name.is_empty() {
+            o.insert("typeName".into(), json!(self.type_name));
+        }
+        if self.node_id != 0 {
+            o.insert("nodeId".into(), json!(self.node_id.to_string()));
+        }
+        if self.field_offset >= 0 {
+            o.insert("fieldOffset".into(), json!(self.field_offset));
+        }
+        if !self.address.is_empty() {
+            o.insert("address".into(), json!(self.address));
+        }
+        if !self.function_name.is_empty() {
+            o.insert("functionName".into(), json!(self.function_name));
+        }
+        if !self.function_address.is_empty() {
+            o.insert("functionAddress".into(), json!(self.function_address));
+        }
+        if !self.instruction.is_empty() {
+            o.insert("instruction".into(), json!(self.instruction));
+        }
+        if self.confidence >= 0.0 {
+            o.insert("confidence".into(), json!(self.confidence));
+        }
+        if !self.tags.is_empty() {
+            o.insert("tags".into(), json!(self.tags));
+        }
+        if json_object_non_empty(&self.data) {
+            o.insert("data".into(), self.data.clone());
+        }
+        Value::Object(o)
+    }
+
+    /// `EvidenceEvent::fromJson()` (`core.h:435-455`).
+    pub fn from_json(o: &Value) -> EvidenceEvent {
+        EvidenceEvent {
+            id: str_field(o, "id"),
+            timestamp: str_to_i64(&o.get("timestamp").cloned().unwrap_or(Value::Null), "0"),
+            source: str_field(o, "source"),
+            kind: str_field(o, "kind"),
+            summary: str_field(o, "summary"),
+            type_name: str_field(o, "typeName"),
+            node_id: str_to_u64(&o.get("nodeId").cloned().unwrap_or(Value::Null), "0"),
+            field_offset: if o.get("fieldOffset").is_some() {
+                o.get("fieldOffset").and_then(Value::as_i64).unwrap_or(-1) as i32
+            } else {
+                -1
+            },
+            address: str_field(o, "address"),
+            function_name: str_field(o, "functionName"),
+            function_address: str_field(o, "functionAddress"),
+            instruction: str_field(o, "instruction"),
+            confidence: if o.get("confidence").is_some() {
+                o.get("confidence").and_then(Value::as_f64).unwrap_or(-1.0)
+            } else {
+                -1.0
+            },
+            tags: str_array(o, "tags"),
+            data: object_or_null(o, "data"),
+        }
+    }
+}
+
+/// `struct EvidenceHypothesis` (`core.h:458-516`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceHypothesis {
+    /// `hyp_N`.
+    pub id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// open, confirmed, rejected.
+    pub status: String,
+    pub claim: String,
+    pub label: String,
+    pub type_name: String,
+    pub node_id: u64,
+    pub field_offset: i32,
+    pub confidence: f64,
+    pub supporting_evidence_ids: Vec<String>,
+    pub contradicting_evidence_ids: Vec<String>,
+    pub recommended_validation: Vec<String>,
+    pub notes: String,
+    pub data: Value,
+}
+
+impl Default for EvidenceHypothesis {
+    fn default() -> Self {
+        EvidenceHypothesis {
+            id: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            status: "open".to_string(),
+            claim: String::new(),
+            label: String::new(),
+            type_name: String::new(),
+            node_id: 0,
+            field_offset: -1,
+            confidence: 0.0,
+            supporting_evidence_ids: Vec::new(),
+            contradicting_evidence_ids: Vec::new(),
+            recommended_validation: Vec::new(),
+            notes: String::new(),
+            data: Value::Null,
+        }
+    }
+}
+
+impl EvidenceHypothesis {
+    /// `EvidenceHypothesis::toJson()` (`core.h:474-496`).
+    pub fn to_json(&self) -> Value {
+        let mut o = Map::new();
+        o.insert("id".into(), json!(self.id));
+        o.insert("createdAt".into(), json!(self.created_at.to_string()));
+        o.insert("updatedAt".into(), json!(self.updated_at.to_string()));
+        o.insert("status".into(), json!(self.status));
+        if !self.claim.is_empty() {
+            o.insert("claim".into(), json!(self.claim));
+        }
+        if !self.label.is_empty() {
+            o.insert("label".into(), json!(self.label));
+        }
+        if !self.type_name.is_empty() {
+            o.insert("typeName".into(), json!(self.type_name));
+        }
+        if self.node_id != 0 {
+            o.insert("nodeId".into(), json!(self.node_id.to_string()));
+        }
+        if self.field_offset >= 0 {
+            o.insert("fieldOffset".into(), json!(self.field_offset));
+        }
+        o.insert("confidence".into(), json!(self.confidence));
+        if !self.supporting_evidence_ids.is_empty() {
+            o.insert(
+                "supportingEvidenceIds".into(),
+                json!(self.supporting_evidence_ids),
+            );
+        }
+        if !self.contradicting_evidence_ids.is_empty() {
+            o.insert(
+                "contradictingEvidenceIds".into(),
+                json!(self.contradicting_evidence_ids),
+            );
+        }
+        if !self.recommended_validation.is_empty() {
+            o.insert(
+                "recommendedValidation".into(),
+                json!(self.recommended_validation),
+            );
+        }
+        if !self.notes.is_empty() {
+            o.insert("notes".into(), json!(self.notes));
+        }
+        if json_object_non_empty(&self.data) {
+            o.insert("data".into(), self.data.clone());
+        }
+        Value::Object(o)
+    }
+
+    /// `EvidenceHypothesis::fromJson()` (`core.h:497-515`).
+    pub fn from_json(o: &Value) -> EvidenceHypothesis {
+        EvidenceHypothesis {
+            id: str_field(o, "id"),
+            created_at: str_to_i64(&o.get("createdAt").cloned().unwrap_or(Value::Null), "0"),
+            updated_at: str_to_i64(&o.get("updatedAt").cloned().unwrap_or(Value::Null), "0"),
+            status: str_field_default(o, "status", "open"),
+            claim: str_field(o, "claim"),
+            label: str_field(o, "label"),
+            type_name: str_field(o, "typeName"),
+            node_id: str_to_u64(&o.get("nodeId").cloned().unwrap_or(Value::Null), "0"),
+            field_offset: if o.get("fieldOffset").is_some() {
+                o.get("fieldOffset").and_then(Value::as_i64).unwrap_or(-1) as i32
+            } else {
+                -1
+            },
+            confidence: o.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
+            supporting_evidence_ids: str_array(o, "supportingEvidenceIds"),
+            contradicting_evidence_ids: str_array(o, "contradictingEvidenceIds"),
+            recommended_validation: str_array(o, "recommendedValidation"),
+            notes: str_field(o, "notes"),
+            data: object_or_null(o, "data"),
+        }
+    }
+}
+
+/// `struct EvidenceProposal` (`core.h:518-572`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceProposal {
+    /// `prop_N`.
+    pub id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// pending, accepted, rejected, applied.
+    pub status: String,
+    pub title: String,
+    pub action: String,
+    pub type_name: String,
+    pub node_id: u64,
+    pub field_offset: i32,
+    pub confidence: f64,
+    pub evidence_ids: Vec<String>,
+    /// usually tree.apply operations (a JSON array, or `Null` when empty).
+    pub operations: Value,
+    pub data: Value,
+}
+
+impl Default for EvidenceProposal {
+    fn default() -> Self {
+        EvidenceProposal {
+            id: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            status: "pending".to_string(),
+            title: String::new(),
+            action: String::new(),
+            type_name: String::new(),
+            node_id: 0,
+            field_offset: -1,
+            confidence: 0.0,
+            evidence_ids: Vec::new(),
+            operations: Value::Null,
+            data: Value::Null,
+        }
+    }
+}
+
+impl EvidenceProposal {
+    /// `EvidenceProposal::toJson()` (`core.h:536-553`).
+    pub fn to_json(&self) -> Value {
+        let mut o = Map::new();
+        o.insert("id".into(), json!(self.id));
+        o.insert("createdAt".into(), json!(self.created_at.to_string()));
+        o.insert("updatedAt".into(), json!(self.updated_at.to_string()));
+        o.insert("status".into(), json!(self.status));
+        if !self.title.is_empty() {
+            o.insert("title".into(), json!(self.title));
+        }
+        if !self.action.is_empty() {
+            o.insert("action".into(), json!(self.action));
+        }
+        if !self.type_name.is_empty() {
+            o.insert("typeName".into(), json!(self.type_name));
+        }
+        if self.node_id != 0 {
+            o.insert("nodeId".into(), json!(self.node_id.to_string()));
+        }
+        if self.field_offset >= 0 {
+            o.insert("fieldOffset".into(), json!(self.field_offset));
+        }
+        o.insert("confidence".into(), json!(self.confidence));
+        if !self.evidence_ids.is_empty() {
+            o.insert("evidenceIds".into(), json!(self.evidence_ids));
+        }
+        if json_array_non_empty(&self.operations) {
+            o.insert("operations".into(), self.operations.clone());
+        }
+        if json_object_non_empty(&self.data) {
+            o.insert("data".into(), self.data.clone());
+        }
+        Value::Object(o)
+    }
+
+    /// `EvidenceProposal::fromJson()` (`core.h:554-571`).
+    pub fn from_json(o: &Value) -> EvidenceProposal {
+        EvidenceProposal {
+            id: str_field(o, "id"),
+            created_at: str_to_i64(&o.get("createdAt").cloned().unwrap_or(Value::Null), "0"),
+            updated_at: str_to_i64(&o.get("updatedAt").cloned().unwrap_or(Value::Null), "0"),
+            status: str_field_default(o, "status", "pending"),
+            title: str_field(o, "title"),
+            action: str_field(o, "action"),
+            type_name: str_field(o, "typeName"),
+            node_id: str_to_u64(&o.get("nodeId").cloned().unwrap_or(Value::Null), "0"),
+            field_offset: if o.get("fieldOffset").is_some() {
+                o.get("fieldOffset").and_then(Value::as_i64).unwrap_or(-1) as i32
+            } else {
+                -1
+            },
+            confidence: o.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
+            evidence_ids: str_array(o, "evidenceIds"),
+            operations: array_or_null(o, "operations"),
+            data: object_or_null(o, "data"),
+        }
+    }
+}
+
+/// `o[key].toString()` — empty string on miss / non-string.
+fn str_field(o: &Value, key: &str) -> String {
+    o.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// `o[key].toString(default)` — the default on miss / non-string.
+fn str_field_default(o: &Value, key: &str, default: &str) -> String {
+    o.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_string()
+}
+
+/// `for (v : o[key].toArray()) out.append(v.toString())`.
+fn str_array(o: &Value, key: &str) -> Vec<String> {
+    match o.get(key).and_then(Value::as_array) {
+        Some(arr) => arr
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// `o[key].toObject()` → preserved verbatim, or `Null` when absent/empty.
+/// Matches Qt's `QJsonValue::toObject()` (an empty object when absent) but we
+/// store `Null` for "no payload" so `toJson` re-omits it exactly like C++.
+fn object_or_null(o: &Value, key: &str) -> Value {
+    match o.get(key) {
+        Some(v) if v.is_object() => v.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// `o[key].toArray()` → preserved verbatim, or `Null` when absent/empty.
+fn array_or_null(o: &Value, key: &str) -> Value {
+    match o.get(key) {
+        Some(v) if v.is_array() => v.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// `!obj.isEmpty()` for a stored `data` payload.
+fn json_object_non_empty(v: &Value) -> bool {
+    matches!(v, Value::Object(m) if !m.is_empty())
+}
+
+/// `!arr.isEmpty()` for a stored `operations` payload.
+fn json_array_non_empty(v: &Value) -> bool {
+    matches!(v, Value::Array(a) if !a.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +802,134 @@ mod tests {
     fn is_helper_legacy_key() {
         let v = json!({ "id": "1", "kind": "Hex8", "isHelper": true });
         assert!(Node::from_json(&v).is_static);
+    }
+
+    // ── Evidence records ──
+
+    #[test]
+    fn parse_prefixed_sequence_matches_cpp() {
+        assert_eq!(parse_prefixed_sequence("ev_42", "ev_"), 42);
+        assert_eq!(parse_prefixed_sequence("hyp_7", "hyp_"), 7);
+        assert_eq!(parse_prefixed_sequence("ev_42", "hyp_"), 0); // wrong prefix
+        assert_eq!(parse_prefixed_sequence("ev_x", "ev_"), 0); // non-numeric
+        assert_eq!(parse_prefixed_sequence("", "ev_"), 0);
+    }
+
+    #[test]
+    fn evidence_event_defaults_omit_optional_keys() {
+        // A default-constructed event: id="", timestamp=0, fieldOffset=-1,
+        // confidence=-1.0, everything else empty. Only id+timestamp emit.
+        let e = EvidenceEvent::default();
+        assert_eq!(e.field_offset, -1);
+        assert_eq!(e.confidence, -1.0);
+        let j = e.to_json();
+        let o = j.as_object().unwrap();
+        assert_eq!(o.len(), 2, "only id+timestamp should be present: {o:?}");
+        assert!(o.contains_key("id"));
+        assert_eq!(o["timestamp"], json!("0"));
+        // Negative fieldOffset/confidence are omitted (matches C++).
+        assert!(!o.contains_key("fieldOffset"));
+        assert!(!o.contains_key("confidence"));
+        assert!(!o.contains_key("nodeId"));
+    }
+
+    #[test]
+    fn evidence_event_round_trip_all_fields() {
+        let e = EvidenceEvent {
+            id: "ev_5".into(),
+            timestamp: 1_700_000_000_000,
+            source: "ida".into(),
+            kind: "field_access".into(),
+            summary: "read at Player+0x10".into(),
+            type_name: "Player".into(),
+            node_id: 99,
+            field_offset: 16,
+            address: "<game.exe>+0x10".into(),
+            function_name: "tick".into(),
+            function_address: "0x401000".into(),
+            instruction: "mov eax,[rcx+0x10]".into(),
+            confidence: 0.75,
+            tags: vec!["auto".into(), "ida".into()],
+            data: json!({ "k": "v" }),
+        };
+        let back = EvidenceEvent::from_json(&e.to_json());
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn evidence_event_fieldoffset_zero_is_preserved() {
+        // fieldOffset==0 must serialize (>=0) and survive the round-trip.
+        let e = EvidenceEvent {
+            id: "ev_1".into(),
+            field_offset: 0,
+            ..EvidenceEvent::default()
+        };
+        let j = e.to_json();
+        assert_eq!(j["fieldOffset"], json!(0));
+        assert_eq!(EvidenceEvent::from_json(&j).field_offset, 0);
+    }
+
+    #[test]
+    fn evidence_hypothesis_defaults_and_round_trip() {
+        let h = EvidenceHypothesis::default();
+        assert_eq!(h.status, "open");
+        assert_eq!(h.field_offset, -1);
+        let j = h.to_json();
+        let o = j.as_object().unwrap();
+        // id, createdAt, updatedAt, status, confidence always present.
+        assert!(o.contains_key("id"));
+        assert!(o.contains_key("createdAt"));
+        assert!(o.contains_key("updatedAt"));
+        assert_eq!(o["status"], json!("open"));
+        assert_eq!(o["confidence"], json!(0.0));
+        assert!(!o.contains_key("fieldOffset"));
+
+        let full = EvidenceHypothesis {
+            id: "hyp_3".into(),
+            created_at: 100,
+            updated_at: 200,
+            status: "confirmed".into(),
+            claim: "health".into(),
+            label: "hp".into(),
+            type_name: "Player".into(),
+            node_id: 7,
+            field_offset: 0x230,
+            confidence: 0.9,
+            supporting_evidence_ids: vec!["ev_1".into(), "ev_2".into()],
+            contradicting_evidence_ids: vec!["ev_9".into()],
+            recommended_validation: vec!["watch".into()],
+            notes: "n".into(),
+            data: json!({ "x": 1 }),
+        };
+        assert_eq!(EvidenceHypothesis::from_json(&full.to_json()), full);
+    }
+
+    #[test]
+    fn evidence_proposal_defaults_and_round_trip() {
+        let p = EvidenceProposal::default();
+        assert_eq!(p.status, "pending");
+        let j = p.to_json();
+        let o = j.as_object().unwrap();
+        assert_eq!(o["status"], json!("pending"));
+        assert_eq!(o["confidence"], json!(0.0));
+        assert!(!o.contains_key("operations"));
+        assert!(!o.contains_key("data"));
+
+        let full = EvidenceProposal {
+            id: "prop_2".into(),
+            created_at: 1,
+            updated_at: 2,
+            status: "applied".into(),
+            title: "rename".into(),
+            action: "rename_field".into(),
+            type_name: "Player".into(),
+            node_id: 12,
+            field_offset: 4,
+            confidence: 0.5,
+            evidence_ids: vec!["ev_1".into()],
+            operations: json!([{ "op": "rename", "to": "hp" }]),
+            data: json!({ "src": "llm" }),
+        };
+        assert_eq!(EvidenceProposal::from_json(&full.to_json()), full);
     }
 }

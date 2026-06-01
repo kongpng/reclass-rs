@@ -1376,18 +1376,21 @@ fn compose_leaf(
                     }
                 }
                 if !comment_text.is_empty() {
-                    // Raw comment text — no glyph prefix, matching
-                    // `compose.cpp:586` (`pushChip(ChipKind::Comment, commentText)`).
-                    // The green pill already marks it as a user comment; a "// " /
-                    // "/ " prefix doubled the signal (C++ comment at 581-585) and
-                    // `test_chips.cpp:284` asserts the chip text is the raw comment.
-                    // `push_chip` calls `sanitize_chip` internally (collapses
-                    // embedded \r\n\t so the chip stays on one row).
+                    // Prefix the chip text with the literal "// " lead-in to
+                    // match the authoritative C++ displayed string: `compose.cpp:436`
+                    // appends `"  // " + commentText` to the line text, so the
+                    // row literally shows `  // IHDR …`. `push_chip` prepends the
+                    // `"  "` separator (after trimming value-column padding), so a
+                    // chip text of `"// IHDR"` reproduces `"  // IHDR"` byte-for-byte.
+                    // The `// ` is added here (not via a fill closure) so the
+                    // start_col/end_col span and `sanitize_chip` (collapses embedded
+                    // \r\n\t to keep the chip on one row) cover the prefixed string.
+                    let chip_text = format!("// {comment_text}");
                     push_chip(
                         &mut line_text,
                         &mut lm,
                         ChipKind::Comment,
-                        &comment_text,
+                        &chip_text,
                         |_| {},
                     );
                 }
@@ -1898,9 +1901,48 @@ fn compose_parent(
         // Regular children.
         let children_are_array_elements = node.kind == NodeKind::Array;
         let mut element_idx = 0;
+        // Gap-ruler tracking (`compose.cpp:850-893`): accumulate consecutive
+        // unnamed (padding) children's byte sizes; just before the next NAMED
+        // child, emit a non-interactive "[+0xN gap]" continuation line, then
+        // reset. Structs/arrays contribute their struct_span, leaves their
+        // byteSize. Hex is lowercase to match Qt `.arg(gapBytes, 0, 16)`.
+        let mut gap_bytes: i32 = 0;
         let n_reg = regular.len();
         for ri in 0..n_reg {
             let child_idx = regular[ri];
+            let child = &tree.nodes[child_idx as usize];
+
+            // Emit gap-ruler line just before a named field that follows padding.
+            if !children_are_array_elements && !child.name.is_empty() && gap_bytes > 0 {
+                let gap_start_addr = abs_addr
+                    .wrapping_add(child.offset as u64)
+                    .wrapping_sub(gap_bytes as u64);
+                let mut gm = LineMeta {
+                    node_idx: -1, // non-interactive
+                    node_id: 0,
+                    depth: child_depth,
+                    line_kind: LineKind::Continuation,
+                    is_continuation: true,
+                    parent_addr: abs_addr,
+                    fold_level: compute_fold_level(child_depth, false),
+                    offset_text: render::fmt_offset_margin(
+                        gap_start_addr,
+                        false,
+                        state.offset_hex_digits,
+                    ),
+                    offset_addr: gap_start_addr,
+                    ..Default::default()
+                };
+                let mut body = U16Str::from_str(&render::indent(child_depth));
+                body.push_str(&format!("[+0x{gap_bytes:x} gap]"));
+                state.emit_line(&body, &mut gm);
+            }
+
+            let child_name_empty = child.name.is_empty();
+            let child_kind = child.kind;
+            let child_id = child.id;
+            let child_byte_size = child.byte_size();
+
             let has_more = (ri < n_reg - 1) || (!static_idxs.is_empty() && !node.collapsed);
             state.set_tree_sibling(child_depth, has_more);
             let (elem_idx_arg, container_addr_arg) = if children_are_array_elements {
@@ -1923,6 +1965,20 @@ fn compose_parent(
                 elem_idx_arg,
                 container_addr_arg,
             );
+
+            // Update gap accumulation: empty-name children contribute, named ones reset.
+            if !children_are_array_elements {
+                if child_name_empty {
+                    let sz = if child_kind == NodeKind::Struct || child_kind == NodeKind::Array {
+                        tree.struct_span(child_id)
+                    } else {
+                        child_byte_size
+                    };
+                    gap_bytes += sz;
+                } else {
+                    gap_bytes = 0;
+                }
+            }
         }
 
         // ── Static fields ──
@@ -2398,14 +2454,18 @@ fn compose_node(
                 }
             }
 
-            // Comment chip on typed-pointer header.
+            // Comment chip on typed-pointer header. Prefixed with the literal
+            // "// " lead-in to match the C++ displayed-string convention
+            // (`compose.cpp:436`: `"  // " + commentText`) so the row shows
+            // `  // comment`, consistent with the leaf-field comment chip.
+            // (`sanitize_chip` is applied inside `push_chip`.)
             if state.show_comments && !node.comment.is_empty() {
-                let sanitized = sanitize_chip(&node.comment);
+                let chip_text = format!("// {}", node.comment);
                 push_chip(
                     &mut ptr_text,
                     &mut lm,
                     ChipKind::Comment,
-                    &sanitized,
+                    &chip_text,
                     |_| {},
                 );
             }

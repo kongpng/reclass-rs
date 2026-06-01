@@ -14,8 +14,8 @@
 //!   keywords (for search), and the controls each hosts.
 //! - [`filter_visible`] — the recursive tree search filter (`filterTree`),
 //!   unit-tested against the C++ rule (name OR page-keywords OR any child).
-//! - [`FONT_CHOICES`] — the three font combo items (source-faithful, not the
-//!   stale 2-item test; widgets-dialogs §5 / §24 Q1).
+//! - [`FONT_CHOICES`] — the two font combo items in C++ order
+//!   (`optionsdialog.cpp:111-112`): JetBrains Mono, then Consolas.
 //! - [`parse_refresh_ms`] / [`font_choice_index`] — the General-page control
 //!   value reducers (the refresh spinbox parse+clamp and the font-combo index),
 //!   unit-tested headlessly.
@@ -75,8 +75,18 @@ impl OptionsResult {
 /// The refresh-spin range (`m_refreshSpin`, `optionsdialog.cpp`: range 1..60000).
 pub const REFRESH_MIN: i32 = 1;
 pub const REFRESH_MAX: i32 = 60000;
-/// The default refresh description value (660 ms).
+/// The value cited in the refresh-spin **description** text (660 ms). This is the
+/// `OptionsResult::refreshMs` struct-member default (`optionsdialog.h:19`), but it
+/// is **not** the live fresh-install seed — see [`REFRESH_FALLBACK`]. Kept only so
+/// the description string and the struct default stay in sync.
 pub const REFRESH_DEFAULT: i32 = 660;
+/// The fresh-install fallback when the `refreshMs` QSettings key is **unset**
+/// (`kDefaultRefreshMs = 200`, `core.h:1224`). Both `main.cpp:5024` (the Options
+/// dialog seed) and `controller.cpp:5511` (the live refresh timer) read
+/// `value("refreshMs", kDefaultRefreshMs)`, so with no persisted key Options shows
+/// 200 and the controllers tick at 200. The 660 above is a dead struct-field
+/// default that the live code path never uses as the unset-key seed.
+pub const REFRESH_FALLBACK: i32 = 200;
 
 /// The C++ refresh-spin description (`optionsdialog.cpp:87-89`), shown under the
 /// "Interval:" spinbox on the General page.
@@ -84,9 +94,13 @@ pub const REFRESH_DESC: &str =
     "How often live memory is re-read and the view is updated, in milliseconds. \
      Lower values give faster updates but use more CPU. Default: 660 ms.";
 
-/// The font combo items (`optionsdialog.cpp:111-113`) — three, per the **source**
-/// (the lagging test asserts two; widgets-dialogs §24 Q1 resolves to the source).
-pub const FONT_CHOICES: [&str; 3] = ["IBM Plex Mono", "JetBrains Mono", "Consolas"];
+/// The font combo items (`optionsdialog.cpp:111-112`) — exactly two, in source
+/// order: the C++ ctor calls `m_fontCombo->addItem("JetBrains Mono")` then
+/// `addItem("Consolas")` and nothing else. (An earlier port added a third
+/// "IBM Plex Mono" row, but that font cannot be represented in the View ▸ Font
+/// submenu — which lists only Consolas / JetBrains Mono — so picking it left the
+/// menu ✓ inconsistent. We match the C++ two-item list.)
+pub const FONT_CHOICES: [&str; 2] = ["JetBrains Mono", "Consolas"];
 
 /// Parse a refresh-rate edit string into a clamped ms value
 /// (`m_refreshSpin`): keep the leading run of ASCII digits (the C++ spinbox only
@@ -839,7 +853,7 @@ mod view {
 mod tests {
     use super::{
         filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
-        OptionsResult, FONT_CHOICES, REFRESH_MAX, REFRESH_MIN,
+        OptionsResult, FONT_CHOICES, REFRESH_DEFAULT, REFRESH_FALLBACK, REFRESH_MAX, REFRESH_MIN,
     };
 
     #[test]
@@ -849,18 +863,35 @@ mod tests {
         assert!(r.menu_bar_title_case);
         assert!(!r.show_icon);
         assert!(r.auto_start_mcp);
+        // The OptionsResult struct-member default (optionsdialog.h:19) is 660.
+        assert_eq!(r.refresh_ms, REFRESH_DEFAULT);
         assert_eq!(r.refresh_ms, 660);
         assert!(!r.generator_asserts);
         assert!(!r.brace_wrap);
     }
 
     #[test]
-    fn three_font_choices_per_source() {
-        // The source adds 3 fonts (the stale test asserts 2; §24 Q1).
-        assert_eq!(FONT_CHOICES.len(), 3);
-        assert_eq!(FONT_CHOICES[0], "IBM Plex Mono");
-        assert_eq!(FONT_CHOICES[1], "JetBrains Mono");
-        assert_eq!(FONT_CHOICES[2], "Consolas");
+    fn fresh_install_refresh_fallback_is_kdefaultrefreshms_200() {
+        // The unset-`refreshMs`-key fallback must be kDefaultRefreshMs = 200
+        // (core.h:1224), the value both main.cpp:5024 (Options seed) and
+        // controller.cpp:5511 (refresh timer) read. The 660 struct-member default
+        // is NOT the live fresh-install seed.
+        assert_eq!(REFRESH_FALLBACK, 200);
+        assert_ne!(REFRESH_FALLBACK, REFRESH_DEFAULT);
+    }
+
+    #[test]
+    fn two_font_choices_in_cpp_order() {
+        // The C++ ctor adds exactly two fonts, in this order
+        // (optionsdialog.cpp:111-112): JetBrains Mono, then Consolas. A prior
+        // port added a third ("IBM Plex Mono") that the View ▸ Font submenu
+        // (Consolas / JetBrains Mono only) could not represent; this pins the
+        // corrected, source-faithful two-item list.
+        assert_eq!(FONT_CHOICES.len(), 2);
+        assert_eq!(FONT_CHOICES[0], "JetBrains Mono");
+        assert_eq!(FONT_CHOICES[1], "Consolas");
+        // The dropped font is no longer selectable.
+        assert!(!FONT_CHOICES.contains(&"IBM Plex Mono"));
     }
 
     #[test]
@@ -978,13 +1009,16 @@ mod tests {
 
     #[test]
     fn font_choice_index_resolves_or_falls_back() {
-        assert_eq!(font_choice_index("IBM Plex Mono"), 0);
-        assert_eq!(font_choice_index("JetBrains Mono"), 1);
-        assert_eq!(font_choice_index("Consolas"), 2);
+        // Two-item list, C++ order: JetBrains Mono (0), Consolas (1).
+        assert_eq!(font_choice_index("JetBrains Mono"), 0);
+        assert_eq!(font_choice_index("Consolas"), 1);
         // Case-insensitive (the combo stores the display text).
-        assert_eq!(font_choice_index("consolas"), 2);
-        // Empty / unknown → first item (the C++ combo default).
+        assert_eq!(font_choice_index("consolas"), 1);
+        assert_eq!(font_choice_index("jetbrains mono"), 0);
+        // Empty / unknown → first item (the C++ combo default, JetBrains Mono).
         assert_eq!(font_choice_index(""), 0);
         assert_eq!(font_choice_index("Comic Sans"), 0);
+        // The previously-listed IBM Plex Mono is no longer a valid choice → first.
+        assert_eq!(font_choice_index("IBM Plex Mono"), 0);
     }
 }

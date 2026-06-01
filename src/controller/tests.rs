@@ -492,6 +492,51 @@ fn inline_edit_primitive_array() {
     assert_eq!(c.tree().nodes[new_idx as usize].kind, NodeKind::UInt32);
 }
 
+#[test]
+fn inline_edit_type_existing_struct_type_name() {
+    // `controller.cpp:1196-1217`: committing the Type field with text that names
+    // an existing Struct's `structTypeName` (the root here is "TestStruct")
+    // converts the node to a Struct and pushes a `ChangeStructTypeName` so its
+    // `structTypeName` matches the text — undoable.
+    let mut c = make_ctrl();
+    let idx = find_idx(&c, "field_u32");
+    assert_eq!(c.tree().nodes[idx].kind, NodeKind::UInt32);
+    let node_id = c.tree().nodes[idx].id;
+
+    c.apply_type_text(idx, "TestStruct");
+    let new_idx = c.tree().index_of_id(node_id);
+    assert!(new_idx >= 0);
+    let n = &c.tree().nodes[new_idx as usize];
+    assert_eq!(n.kind, NodeKind::Struct);
+    assert_eq!(n.struct_type_name, "TestStruct");
+
+    // C++ pushes ChangeKind then ChangeStructTypeName as two separate entries
+    // (no macro, `controller.cpp:1196-1217`). First undo reverts the type name
+    // only — the node is still a Struct with empty `structTypeName`.
+    c.undo();
+    let ui = c.tree().index_of_id(node_id);
+    assert_eq!(c.tree().nodes[ui as usize].kind, NodeKind::Struct);
+    assert_eq!(c.tree().nodes[ui as usize].struct_type_name, "");
+    // Second undo reverts the kind back to the original primitive.
+    c.undo();
+    let ui = c.tree().index_of_id(node_id);
+    assert_eq!(c.tree().nodes[ui as usize].kind, NodeKind::UInt32);
+}
+
+#[test]
+fn inline_edit_type_unknown_struct_name_is_noop() {
+    // Text that is neither a primitive/array kind nor an existing struct type
+    // name leaves the node untouched (`controller.cpp:1196` else-branch only
+    // acts when `isStructType`).
+    let mut c = make_ctrl();
+    let idx = find_idx(&c, "field_u32");
+    let node_id = c.tree().nodes[idx].id;
+    c.apply_type_text(idx, "NoSuchType");
+    let ni = c.tree().index_of_id(node_id);
+    assert_eq!(c.tree().nodes[ni as usize].kind, NodeKind::UInt32);
+    assert_eq!(c.tree().nodes[ni as usize].struct_type_name, "");
+}
+
 // ── Static-field arms ──
 
 fn push_static_field(c: &mut RcxController, name: &str, expr: &str) -> u64 {
@@ -3017,27 +3062,27 @@ fn enum_member_add_rename_value_delete() {
 }
 
 #[test]
-fn bitfield_member_add_rename_delete() {
+fn bitfield_member_add_rename_delete_are_noops() {
+    // The C++ bitfield-member context menu (`controller.cpp:3348`) only offers
+    // Toggle Bit / Edit Value — there is NO add/rename/remove of bitfield
+    // members. So add_member/rename_member/delete_member must be no-ops for a
+    // bitfield (return `false`, leave the member list untouched).
     let (mut c, bf_id) = make_bitfield_ctrl();
-    assert!(c.add_member(bf_id, None));
-    let n = c.tree().nodes[c.tree().index_of_id(bf_id) as usize].clone();
-    assert_eq!(n.bitfield_members.len(), 3);
-    // Next free bit = max(0+1, 1+3) = 4.
-    assert_eq!(n.bitfield_members[2].bit_offset, 4);
-    assert_eq!(n.bitfield_members[2].bit_width, 1);
+    let before = c.tree().nodes[c.tree().index_of_id(bf_id) as usize]
+        .bitfield_members
+        .clone();
+    assert_eq!(before.len(), 2);
 
-    assert!(c.rename_member(bf_id, 2, "c"));
-    assert_eq!(
-        c.tree().nodes[c.tree().index_of_id(bf_id) as usize].bitfield_members[2].name,
-        "c"
-    );
-    assert!(c.delete_member(bf_id, 2));
-    assert_eq!(
-        c.tree().nodes[c.tree().index_of_id(bf_id) as usize]
-            .bitfield_members
-            .len(),
-        2
-    );
+    assert!(!c.add_member(bf_id, None));
+    assert!(!c.add_member(bf_id, Some(0)));
+    assert!(!c.rename_member(bf_id, 0, "c"));
+    assert!(!c.delete_member(bf_id, 0));
+
+    // Member list is byte-for-byte unchanged.
+    let after = c.tree().nodes[c.tree().index_of_id(bf_id) as usize]
+        .bitfield_members
+        .clone();
+    assert_eq!(after, before);
 }
 
 #[test]

@@ -275,13 +275,19 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
             .map(|(i, e)| N::item(&recent_menu_label(i, &e.label), "", &e.command))
             .collect()
     };
-    // Data Source children — the registered built-in providers, then any saved
-    // sources (active one rendered checked via the host's checked-set), then
-    // Clear All (the C++ `populateSourceMenu` layout; main.cpp:8802).
+    // Data Source children — the File source, then the registered built-in
+    // providers, then any saved sources (active one rendered checked via the
+    // host's checked-set), then Clear All (the C++ `populateSourceMenu` layout;
+    // main.cpp:8802 → `ProviderRegistry::populateSourceMenu`,
+    // providerregistry.cpp:63). The C++ provider set is exactly File + the
+    // registered providers (processmemory / remoteprocessmemory / windbgmemory /
+    // reclass.netcompatlayer — see `s_providerIcons`, providerregistry.cpp:66).
+    // There is NO "Kernel Memory" data-source row: `kernelmemory` is only a
+    // provider-tab id reached from the right-click Browse-Page-Tables path
+    // (controller.cpp:4029/4066), never emitted into the Data Source menu.
     let mut source_children = vec![
         N::item("File", "", "source.file"),
         N::item("Process Memory", "", "source.process"),
-        N::item("Kernel Memory", "", "source.kernel"),
         N::item("Remote Process Memory", "", "source.remote"),
         N::item("WinDbg Memory", "", "source.windbg"),
         N::item("ReClass.NET Compat", "", "source.rcnet"),
@@ -1156,6 +1162,59 @@ mod tests {
         ] {
             assert!(!cmds.contains(&gone), "{gone} should be removed");
         }
+    }
+
+    #[test]
+    fn tools_menu_advertises_rtti_and_profiler_shortcuts() {
+        // The C++ Tools menu binds QKeySequence(Ctrl|Shift|R) for the RTTI Browser
+        // (main.cpp:1524) and QKeySequence(Ctrl|Shift|F) for the Performance
+        // Profiler (main.cpp:1565). The menu label advertises those accelerators;
+        // the window registers the matching global key bindings (so the shortcuts
+        // are no longer dead). This pins the advertised label ⇄ command contract
+        // the bindings route through.
+        let entries = flatten_menu_bar(&default_menu_tree());
+        let rtti = entries
+            .iter()
+            .find(|e| e.command == "tools.rtti")
+            .expect("RTTI Browser entry present");
+        assert_eq!(rtti.shortcut, "Ctrl+Shift+R");
+        let profiler = entries
+            .iter()
+            .find(|e| e.command == "tools.profiler")
+            .expect("Performance Profiler entry present");
+        assert_eq!(profiler.shortcut, "Ctrl+Shift+F");
+    }
+
+    #[test]
+    fn data_source_menu_matches_cpp_provider_set() {
+        // The C++ `ProviderRegistry::populateSourceMenu` (providerregistry.cpp:63)
+        // emits File + the registered providers + saved sources + Clear All — the
+        // registered provider set being exactly processmemory / remoteprocessmemory
+        // / windbgmemory / reclass.netcompatlayer (`s_providerIcons`). There is NO
+        // "Kernel Memory" data-source row: `kernelmemory` is only a provider-tab id
+        // used by the right-click Browse-Page-Tables path, never a Data-Source entry.
+        let entries = flatten_menu_bar(&default_menu_tree());
+        let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        // File + the four registered providers are present.
+        for c in [
+            "source.file",
+            "source.process",
+            "source.remote",
+            "source.windbg",
+            "source.rcnet",
+            "source.clear",
+        ] {
+            assert!(cmds.contains(&c), "Data Source menu missing {c}");
+        }
+        // The invented Kernel Memory row (no C++ counterpart) is gone.
+        assert!(
+            !cmds.contains(&"source.kernel"),
+            "source.kernel should be removed — kernelmemory is never a Data Source row"
+        );
+        assert!(
+            !entries.iter().any(|e| e.path.ends_with("Kernel Memory")),
+            "no 'Kernel Memory' Data Source label should remain"
+        );
     }
 
     #[test]

@@ -28,6 +28,9 @@ pub struct EditorPalette {
     pub fnptr_fg: Hsla,
     pub name_fg: Hsla,
     pub value_fg: Hsla,
+    /// Item 37: a string-kind field value — the C++ `syntaxString` orange-tan
+    /// (≈ #ce9178), distinct from the green numeric value color.
+    pub string_val: Hsla,
     pub dim: Hsla,
     /// `struct`/`class`/`enum`/`void*` keyword — One Dark magenta/purple.
     pub keyword: Hsla,
@@ -107,10 +110,18 @@ impl EditorPalette {
             // (the lexer `Number` hue), not orange. Use the green-leaning syntax
             // number color so resolved values read green/tan like C++.
             value_fg: t.green,
+            // Item 37: string values render in the `syntaxString` orange-tan
+            // (≈ #ce9178); the theme orange (`warning`) is the closest theme-driven
+            // hue, so retint it toward the softer tan.
+            string_val: rgb_u8(0xce, 0x91, 0x78),
             // Item 29: the dim role (hex byte run + ASCII preview + braces/footer)
             // uses the deeper C++ `textFaint`, not the brighter muted foreground.
             dim: text_faint(t.muted_foreground),
-            keyword: t.magenta,
+            // Item 39: the C++ colors `struct`/`class`/`enum`/`union`/pointer C++
+            // keyword tokens with `syntaxKeyword` (≈ #569cd6 blue), NOT magenta —
+            // magenta is `syntaxPreproc`, used only for `#define` lines. Tie the
+            // keyword role to the blue lexer-keyword hue.
+            keyword: t.blue,
             // Item 23: the root class NAME on the command row is the C++
             // `IND_CLASS_NAME = syntaxType` (teal) — identical to the named-type
             // column color — not link-blue. Tie it to the teal type/struct color.
@@ -124,7 +135,11 @@ impl EditorPalette {
             // the muted foreground toward the paper.
             ascii: with_alpha(text_faint(t.muted_foreground), 0.9),
             comment_green: t.green_light,
-            type_hint: t.muted_foreground,
+            // Item 38: `IND_TYPE_HINT` is set to `theme.indHintGreen` (≈ #5a8248,
+            // the muted comment-green family), NOT a dim gray. Tie the type-hint
+            // role to the same green the comment annotations use so inference hints
+            // read green.
+            type_hint: t.green_light,
             rtti_hint: t.yellow,
             enum_chip: t.link,
             tree_conn: t.muted_foreground,
@@ -146,21 +161,15 @@ impl EditorPalette {
             // border, dim pill fill. The 1px border + MD rounding are dropped at
             // the render site; the fill stays a faint translucent foreground wash.
             pill_bg: with_alpha(t.foreground, 0.06),
-            // Item 22: change-heat byte coloring is an amber→orange→red ramp (warm
-            // throughout), NOT blue→yellow→red. Cold is a dim warm amber/tan (lerp
-            // from the muted foreground toward a warm tan ≈ #d2aa6e), warm is a
-            // brighter orange, hot reaches red.
-            heat_cold: lerp(
-                t.muted_foreground,
-                Hsla {
-                    h: 38.0 / 360.0,
-                    s: 0.55,
-                    l: 0.62,
-                    a: 1.0,
-                },
-                0.6,
-            ),
-            heat_warm: t.warning,
+            // Item 40: the restrained C++ change-heat ramp (theme.cpp:69-74). The
+            // defaults lerp in RGB space from `textDim` (≈ muted foreground):
+            //   cold = lerp(textDim → gold  rgb(210,170,100) at 0.30)  (subtle)
+            //   warm = lerp(textDim → orange rgb(235,145,50) at 0.60)
+            //   hot  = markerPtr (the theme danger/pink ≈ t.red)
+            // The prior Rust ramp lerped in HSL much hotter (cold at 0.6, warm =
+            // full warning, hot = full red), reading noticeably brighter.
+            heat_cold: lerp_rgb(t.muted_foreground, rgb_u8(210, 170, 100), 0.30),
+            heat_warm: lerp_rgb(t.muted_foreground, rgb_u8(235, 145, 50), 0.60),
             heat_hot: t.red,
             byte_sel: t.link,
             border: t.border,
@@ -200,6 +209,7 @@ impl EditorPalette {
             SpanRole::Source => self.dim,
             SpanRole::Name => self.name_fg,
             SpanRole::Value => self.value_fg,
+            SpanRole::StringVal => self.string_val,
             SpanRole::Ascii => self.ascii,
             SpanRole::Dim => self.dim,
             SpanRole::ClassName => self.class_name,
@@ -264,9 +274,38 @@ fn text_faint(muted: Hsla) -> Hsla {
     }
 }
 
+/// An opaque `Hsla` from 8-bit RGB components (item 40 heat targets).
+fn rgb_u8(r: u8, g: u8, b: u8) -> Hsla {
+    gpui::Rgba {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: 1.0,
+    }
+    .into()
+}
+
+/// Linear interpolation in **RGB** space (item 40): byte-faithful to the C++
+/// `lerpRgb` (theme.cpp:63) used to derive the heat ramp from `textDim`. `t` is
+/// clamped to `[0,1]`. Converts each endpoint to `Rgba`, lerps per channel, and
+/// returns an opaque `Hsla`.
+fn lerp_rgb(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let t = t.clamp(0.0, 1.0);
+    let a = a.to_rgb();
+    let b = b.to_rgb();
+    gpui::Rgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    }
+    .into()
+}
+
 /// Linear interpolation between two `Hsla` colors in HSL space (item 22 heat
 /// ramp). `t` is clamped to `[0,1]`; `0` → `a`, `1` → `b`. Hue is lerped on the
 /// shorter arc so an amber/tan target does not wrap the wheel.
+#[allow(dead_code)]
 fn lerp(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let t = t.clamp(0.0, 1.0);
     let mut dh = b.h - a.h;

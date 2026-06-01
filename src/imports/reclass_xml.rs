@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufRead, BufWriter, Read};
 use std::path::Path;
 
 use quick_xml::events::{BytesDecl, BytesText, Event};
@@ -179,9 +179,25 @@ fn attr_int(e: &quick_xml::events::BytesStart, name: &str) -> i32 {
 
 // ── Import (cpp:142-390) ──
 
+/// Convert a 0-based byte offset into `content` to a 1-based line number,
+/// mirroring `QXmlStreamReader::lineNumber()` (the user-facing "XML parse error
+/// at line N"). Counts the newlines that precede `pos`. quick-xml's
+/// `buffer_position()` is a raw byte offset, so we map it back to a line here.
+fn byte_pos_to_line(content: &[u8], pos: u64) -> u64 {
+    let end = (pos as usize).min(content.len());
+    1 + content[..end].iter().filter(|&&b| b == b'\n').count() as u64
+}
+
 pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, ImportError> {
-    let file = File::open(path).map_err(|_| ImportError::CannotOpen(path.display().to_string()))?;
-    let mut reader = Reader::from_reader(BufReader::new(file));
+    let mut file =
+        File::open(path).map_err(|_| ImportError::CannotOpen(path.display().to_string()))?;
+    // Read the whole document into memory so byte positions reported by
+    // quick-xml can be mapped back to 1-based line numbers (matching the C++
+    // `xml.lineNumber()` in the parse-error message).
+    let mut content: Vec<u8> = Vec::new();
+    file.read_to_end(&mut content)
+        .map_err(|_| ImportError::CannotOpen(path.display().to_string()))?;
+    let mut reader = Reader::from_reader(content.as_slice());
     reader.config_mut().trim_text(false);
 
     let mut version = XmlVersion::V2016; // default to 2016 (most common)
@@ -209,7 +225,7 @@ pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, Im
                 // PrematureEndOfDocumentError; quick-xml returns Ok(Eof) on a
                 // clean end, so any Err here is a real parse error.)
                 return Err(ImportError::XmlParse {
-                    line: reader.buffer_position(),
+                    line: byte_pos_to_line(&content, reader.buffer_position()),
                     msg: e.to_string(),
                 });
             }
@@ -234,7 +250,19 @@ pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, Im
                     version_detected = true;
                 }
             }
-            Event::Start(e) | Event::Empty(e) => {
+            ev @ (Event::Start(_) | Event::Empty(_)) => {
+                // `is_empty` distinguishes a self-closing `<Class …/>` (delivered
+                // by quick-xml as `Event::Empty`, with no matching `Event::End`)
+                // from an opening `<Class …>`. QXmlStreamReader reports a
+                // self-closing element as a StartElement immediately followed by
+                // an EndElement, so a childless `<Class …/>` must NOT leave
+                // `in_class` set — otherwise every later `<Class>` is dropped.
+                let is_empty = matches!(ev, Event::Empty(_));
+                let e = match ev {
+                    Event::Start(e) => e,
+                    Event::Empty(e) => e,
+                    _ => unreachable!(),
+                };
                 let name = e.name();
                 let local = name.as_ref();
                 if !in_class {
@@ -254,7 +282,9 @@ pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, Im
                         struct_id = tree.nodes[idx].id;
                         class_ids.insert(class_name, struct_id);
                         child_offset = 0;
-                        in_class = true;
+                        // A self-closing/childless `<Class …/>` is immediately
+                        // closed; only an opening `<Class …>` keeps us in-class.
+                        in_class = !is_empty;
                     }
                     // else: ignore (ReClass / decl etc.)
                 } else if local == b"Node" {
@@ -271,6 +301,7 @@ pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, Im
                     };
                     handle_node(
                         &mut reader,
+                        &content,
                         attrs,
                         version,
                         pointer_size,
@@ -311,8 +342,9 @@ struct NodeAttrs {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_node(
-    reader: &mut Reader<BufReader<File>>,
+fn handle_node<B: BufRead>(
+    reader: &mut Reader<B>,
+    content: &[u8],
     attrs: NodeAttrs,
     version: XmlVersion,
     pointer_size: i32,
@@ -383,7 +415,7 @@ fn handle_node(
                 Ok(ev) => ev,
                 Err(err) => {
                     return Err(ImportError::XmlParse {
-                        line: reader.buffer_position(),
+                        line: byte_pos_to_line(content, reader.buffer_position()),
                         msg: err.to_string(),
                     })
                 }
@@ -575,12 +607,11 @@ pub fn export_reclass_xml(tree: &NodeTree, path: &Path) -> Result<(), ImportErro
     }
 
     let mut writer = Writer::new_with_indent(BufWriter::new(file), b' ', 4);
+    // C++ `QXmlStreamWriter::writeStartDocument()` emits
+    // `<?xml version="1.0" encoding="UTF-8"?>` with NO standalone attribute.
+    // Passing `None` for the standalone argument matches byte-for-byte.
     writer
-        .write_event(Event::Decl(BytesDecl::new(
-            "1.0",
-            Some("UTF-8"),
-            Some("yes"),
-        )))
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
         .map_err(|e| ImportError::Io(e.to_string()))?;
 
     // <ReClass>
@@ -758,27 +789,40 @@ pub fn export_reclass_xml(tree: &NodeTree, path: &Path) -> Result<(), ImportErro
                 array_elem_name = Some(elem_name);
             }
 
-            let start = quick_xml::events::BytesStart::new("Node")
+            let node_start = quick_xml::events::BytesStart::new("Node")
                 .with_attributes(attrs.iter().map(|(k, v)| (*k, v.as_str())));
-            writer
-                .write_event(Event::Start(start))
-                .map_err(|e| ImportError::Io(e.to_string()))?;
+            match array_elem_name {
+                // Array node: has a child <Array> element, so the <Node> stays
+                // open (Start + child + End), matching QXmlStreamWriter.
+                Some(elem_name) => {
+                    writer
+                        .write_event(Event::Start(node_start))
+                        .map_err(|e| ImportError::Io(e.to_string()))?;
 
-            if let Some(elem_name) = array_elem_name {
-                let total_str = child.array_len.to_string();
-                let arr_attrs: [(&str, &str); 2] =
-                    [("Name", elem_name.as_str()), ("Total", total_str.as_str())];
-                writer
-                    .write_event(Event::Empty(
-                        quick_xml::events::BytesStart::new("Array")
-                            .with_attributes(arr_attrs.iter().copied()),
-                    ))
-                    .map_err(|e| ImportError::Io(e.to_string()))?;
+                    let total_str = child.array_len.to_string();
+                    let arr_attrs: [(&str, &str); 2] =
+                        [("Name", elem_name.as_str()), ("Total", total_str.as_str())];
+                    writer
+                        .write_event(Event::Empty(
+                            quick_xml::events::BytesStart::new("Array")
+                                .with_attributes(arr_attrs.iter().copied()),
+                        ))
+                        .map_err(|e| ImportError::Io(e.to_string()))?;
+
+                    writer
+                        .write_event(Event::End(quick_xml::events::BytesEnd::new("Node")))
+                        .map_err(|e| ImportError::Io(e.to_string()))?;
+                }
+                // Childless generic node (pointer / primitive / struct instance):
+                // QXmlStreamWriter with auto-formatting collapses an element with
+                // no children to a self-closing `<Node …/>`. Emit a single
+                // Event::Empty to match byte-for-byte.
+                None => {
+                    writer
+                        .write_event(Event::Empty(node_start))
+                        .map_err(|e| ImportError::Io(e.to_string()))?;
+                }
             }
-
-            writer
-                .write_event(Event::End(quick_xml::events::BytesEnd::new("Node")))
-                .map_err(|e| ImportError::Io(e.to_string()))?;
 
             i += 1;
         }
@@ -804,4 +848,200 @@ pub fn export_reclass_xml(tree: &NodeTree, path: &Path) -> Result<(), ImportErro
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("rcx_xml_unit_{}_{}.reclass", tag, nanos));
+        p
+    }
+
+    fn import_str(xml: &str) -> Result<NodeTree, ImportError> {
+        let path = tmp("import");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(xml.as_bytes())
+            .unwrap();
+        let r = import_reclass_xml(&path, 8);
+        let _ = std::fs::remove_file(&path);
+        r
+    }
+
+    fn export_str(tree: &NodeTree) -> String {
+        let path = tmp("export");
+        export_reclass_xml(tree, &path).expect("export should succeed");
+        let s = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        s
+    }
+
+    // ── Item 6: byte position → 1-based line ──
+
+    #[test]
+    fn byte_pos_to_line_counts_newlines() {
+        //               0123 4 567890 1 2345 6
+        //               <a>\n  <b/>\n </a>\n
+        let content = b"<a>\n  <b/>\n</a>\n";
+        assert_eq!(byte_pos_to_line(content, 0), 1);
+        assert_eq!(byte_pos_to_line(content, 3), 1); // at the first '\n' (not yet counted)
+        assert_eq!(byte_pos_to_line(content, 4), 2); // just after first '\n'
+        assert_eq!(byte_pos_to_line(content, 11), 3); // after the 2nd '\n'
+                                                      // The content ends with a trailing '\n' (3 newlines total), so any
+                                                      // position at/after it is line 4; out-of-range clamps to len.
+        assert_eq!(byte_pos_to_line(content, 9999), 4);
+    }
+
+    #[test]
+    fn xml_parse_error_reports_line_not_byte_offset() {
+        // Malformed close tag on line 3 — the error must carry a small 1-based
+        // line number, not the (much larger) raw byte offset.
+        let xml = "<ReClass>\n  <Class Name=\"A\">\n    <Node Type=\"10\" Size=\"4\"</Class>\n</ReClass>\n";
+        match import_str(xml) {
+            Err(ImportError::XmlParse { line, .. }) => {
+                assert!(
+                    line <= 4,
+                    "expected a 1-based line number (<=4), got {line}"
+                );
+            }
+            other => panic!("expected XmlParse error, got {other:?}"),
+        }
+    }
+
+    // ── Item 3: self-closing empty <Class/> must not stall the parser ──
+
+    #[test]
+    fn empty_self_closing_class_does_not_drop_later_classes() {
+        let xml = "\
+<ReClass>
+  <Class Name=\"Empty\"/>
+  <Class Name=\"After\">
+    <Node Type=\"10\" Name=\"x\" Size=\"4\"/>
+  </Class>
+</ReClass>
+";
+        let tree = import_str(xml).expect("import should succeed");
+        let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"Empty"),
+            "empty class must still be imported, got {names:?}"
+        );
+        assert!(
+            names.contains(&"After"),
+            "class following an empty self-closing <Class/> must NOT be dropped, got {names:?}"
+        );
+        // The "After" class must have its child node attached.
+        let after_idx = tree.nodes.iter().position(|n| n.name == "After").unwrap();
+        let after_id = tree.nodes[after_idx].id;
+        assert_eq!(tree.children_of(after_id).len(), 1);
+    }
+
+    #[test]
+    fn empty_class_with_explicit_close_still_works() {
+        // Sanity: the non-self-closing empty form continues to behave.
+        let xml = "\
+<ReClass>
+  <Class Name=\"Empty\"></Class>
+  <Class Name=\"After\">
+    <Node Type=\"10\" Name=\"x\" Size=\"4\"/>
+  </Class>
+</ReClass>
+";
+        let tree = import_str(xml).expect("import");
+        let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"Empty") && names.contains(&"After"));
+    }
+
+    // ── Item 4: XML declaration has no standalone attribute ──
+
+    #[test]
+    fn export_declaration_has_no_standalone() {
+        let mut tree = NodeTree::default();
+        tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "S".to_string(),
+            struct_type_name: "S".to_string(),
+            ..Node::default()
+        });
+        let s = export_str(&tree);
+        let first_line = s.lines().next().unwrap_or("");
+        assert_eq!(
+            first_line.trim(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "declaration must match QXmlStreamWriter (no standalone)"
+        );
+        assert!(!s.contains("standalone"));
+    }
+
+    // ── Item 5: childless generic <Node> is self-closing ──
+
+    #[test]
+    fn export_generic_node_is_self_closing() {
+        let mut tree = NodeTree::default();
+        let root = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "S".to_string(),
+            struct_type_name: "S".to_string(),
+            ..Node::default()
+        });
+        let root_id = tree.nodes[root].id;
+        // A primitive (UInt32) child — no inner <Array> element.
+        tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: "field".to_string(),
+            parent_id: root_id,
+            offset: 0,
+            ..Node::default()
+        });
+        let s = export_str(&tree);
+        // The Node must self-close, never as <Node ...></Node>.
+        assert!(
+            s.contains("<Node ") && s.contains("/>"),
+            "generic node should be present and self-closing:\n{s}"
+        );
+        assert!(
+            !s.contains("</Node>"),
+            "childless generic node must self-close, not Start+End:\n{s}"
+        );
+    }
+
+    #[test]
+    fn export_array_node_stays_open_with_array_child() {
+        // An Array node DOES have a child <Array> element, so it must remain
+        // Start + child + End (matching QXmlStreamWriter).
+        let mut tree = NodeTree::default();
+        let root = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "S".to_string(),
+            struct_type_name: "S".to_string(),
+            ..Node::default()
+        });
+        let root_id = tree.nodes[root].id;
+        tree.add_node(Node {
+            kind: NodeKind::Array,
+            name: "arr".to_string(),
+            parent_id: root_id,
+            offset: 0,
+            array_len: 4,
+            element_kind: NodeKind::Int32,
+            ..Node::default()
+        });
+        let s = export_str(&tree);
+        assert!(
+            s.contains("</Node>"),
+            "array node keeps an explicit close:\n{s}"
+        );
+        assert!(
+            s.contains("<Array "),
+            "array node emits a child <Array>:\n{s}"
+        );
+    }
 }

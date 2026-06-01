@@ -13,7 +13,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Map, Value};
 
 use super::kind::{is_container_kind, NodeKind};
-use super::node::{Bookmark, Node, K_MAX_ARRAY_LEN};
+use super::node::{
+    parse_prefixed_sequence, Bookmark, EvidenceEvent, EvidenceHypothesis, EvidenceProposal, Node,
+    K_MAX_ARRAY_LEN,
+};
 
 /// `struct OverlapPair` (`core.h:530-534`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -55,7 +58,15 @@ pub struct NodeTree {
     pub pointer_size: i32,
     pub initial_class: String,
     pub bookmarks: Vec<Bookmark>,
+    /// Evidence arrays (`core.h:589-591`) — provenance of RE decisions.
+    pub evidence_events: Vec<EvidenceEvent>,
+    pub evidence_hypotheses: Vec<EvidenceHypothesis>,
+    pub evidence_proposals: Vec<EvidenceProposal>,
     next_id: u64,
+    /// `m_nextEvidenceEventId` etc. (`core.h:593-595`) — monotonic id counters.
+    next_evidence_event_id: u64,
+    next_evidence_hypothesis_id: u64,
+    next_evidence_proposal_id: u64,
     id_cache: RefCell<HashMap<u64, i32>>,
     child_cache: RefCell<HashMap<u64, Vec<usize>>>,
     generation: u64,
@@ -70,7 +81,13 @@ impl Default for NodeTree {
             pointer_size: 8,
             initial_class: String::new(),
             bookmarks: Vec::new(),
+            evidence_events: Vec::new(),
+            evidence_hypotheses: Vec::new(),
+            evidence_proposals: Vec::new(),
             next_id: 1,
+            next_evidence_event_id: 1,
+            next_evidence_hypothesis_id: 1,
+            next_evidence_proposal_id: 1,
             id_cache: RefCell::new(HashMap::new()),
             child_cache: RefCell::new(HashMap::new()),
             generation: 1,
@@ -87,7 +104,13 @@ impl Clone for NodeTree {
             pointer_size: self.pointer_size,
             initial_class: self.initial_class.clone(),
             bookmarks: self.bookmarks.clone(),
+            evidence_events: self.evidence_events.clone(),
+            evidence_hypotheses: self.evidence_hypotheses.clone(),
+            evidence_proposals: self.evidence_proposals.clone(),
             next_id: self.next_id,
+            next_evidence_event_id: self.next_evidence_event_id,
+            next_evidence_hypothesis_id: self.next_evidence_hypothesis_id,
+            next_evidence_proposal_id: self.next_evidence_proposal_id,
             // caches are an optimization, not semantics — clone empty.
             id_cache: RefCell::new(HashMap::new()),
             child_cache: RefCell::new(HashMap::new()),
@@ -149,6 +172,109 @@ impl NodeTree {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// `m_nextEvidenceEventId` etc. read accessors (mirror the `quint64`
+    /// counters at `core.h:593-595`).
+    pub fn next_evidence_event_id(&self) -> u64 {
+        self.next_evidence_event_id
+    }
+    pub fn next_evidence_hypothesis_id(&self) -> u64 {
+        self.next_evidence_hypothesis_id
+    }
+    pub fn next_evidence_proposal_id(&self) -> u64 {
+        self.next_evidence_proposal_id
+    }
+
+    /// `reserveEvidenceEventId()` (`core.h:628-630`) — `ev_N`, monotonic.
+    pub fn reserve_evidence_event_id(&mut self) -> String {
+        let s = format!("ev_{}", self.next_evidence_event_id);
+        self.next_evidence_event_id += 1;
+        s
+    }
+    /// `reserveEvidenceHypothesisId()` (`core.h:631-633`) — `hyp_N`.
+    pub fn reserve_evidence_hypothesis_id(&mut self) -> String {
+        let s = format!("hyp_{}", self.next_evidence_hypothesis_id);
+        self.next_evidence_hypothesis_id += 1;
+        s
+    }
+    /// `reserveEvidenceProposalId()` (`core.h:634-636`) — `prop_N`.
+    pub fn reserve_evidence_proposal_id(&mut self) -> String {
+        let s = format!("prop_{}", self.next_evidence_proposal_id);
+        self.next_evidence_proposal_id += 1;
+        s
+    }
+
+    /// `appendEvidenceEvent(event)` (`core.h:638-650`). Assigns an `ev_N` id
+    /// when empty (else bumps the counter past an explicit id) and stamps the
+    /// timestamp when unset. `now_ms` is the current epoch-msec the caller
+    /// supplies (the C++ uses `QDateTime::currentMSecsSinceEpoch()`).
+    pub fn append_evidence_event(
+        &mut self,
+        mut event: EvidenceEvent,
+        now_ms: i64,
+    ) -> EvidenceEvent {
+        if event.id.is_empty() {
+            event.id = self.reserve_evidence_event_id();
+        } else {
+            let seq = parse_prefixed_sequence(&event.id, "ev_");
+            if seq >= self.next_evidence_event_id {
+                self.next_evidence_event_id = seq + 1;
+            }
+        }
+        if event.timestamp <= 0 {
+            event.timestamp = now_ms;
+        }
+        self.evidence_events.push(event.clone());
+        event
+    }
+
+    /// `appendEvidenceHypothesis(hyp)` (`core.h:652-664`).
+    pub fn append_evidence_hypothesis(
+        &mut self,
+        mut hyp: EvidenceHypothesis,
+        now_ms: i64,
+    ) -> EvidenceHypothesis {
+        if hyp.id.is_empty() {
+            hyp.id = self.reserve_evidence_hypothesis_id();
+        } else {
+            let seq = parse_prefixed_sequence(&hyp.id, "hyp_");
+            if seq >= self.next_evidence_hypothesis_id {
+                self.next_evidence_hypothesis_id = seq + 1;
+            }
+        }
+        if hyp.created_at <= 0 {
+            hyp.created_at = now_ms;
+        }
+        if hyp.updated_at <= 0 {
+            hyp.updated_at = now_ms;
+        }
+        self.evidence_hypotheses.push(hyp.clone());
+        hyp
+    }
+
+    /// `appendEvidenceProposal(proposal)` (`core.h:666-678`).
+    pub fn append_evidence_proposal(
+        &mut self,
+        mut proposal: EvidenceProposal,
+        now_ms: i64,
+    ) -> EvidenceProposal {
+        if proposal.id.is_empty() {
+            proposal.id = self.reserve_evidence_proposal_id();
+        } else {
+            let seq = parse_prefixed_sequence(&proposal.id, "prop_");
+            if seq >= self.next_evidence_proposal_id {
+                self.next_evidence_proposal_id = seq + 1;
+            }
+        }
+        if proposal.created_at <= 0 {
+            proposal.created_at = now_ms;
+        }
+        if proposal.updated_at <= 0 {
+            proposal.updated_at = now_ms;
+        }
+        self.evidence_proposals.push(proposal.clone());
+        proposal
     }
 
     /// `invalidateIdCache()` (`core.h:448`) — clears BOTH caches.
@@ -604,6 +730,57 @@ impl NodeTree {
                 Value::Array(self.bookmarks.iter().map(Bookmark::to_json).collect()),
             );
         }
+        if !self.evidence_events.is_empty() {
+            o.insert(
+                "evidenceEvents".into(),
+                Value::Array(
+                    self.evidence_events
+                        .iter()
+                        .map(EvidenceEvent::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !self.evidence_hypotheses.is_empty() {
+            o.insert(
+                "evidenceHypotheses".into(),
+                Value::Array(
+                    self.evidence_hypotheses
+                        .iter()
+                        .map(EvidenceHypothesis::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !self.evidence_proposals.is_empty() {
+            o.insert(
+                "evidenceProposals".into(),
+                Value::Array(
+                    self.evidence_proposals
+                        .iter()
+                        .map(EvidenceProposal::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if self.next_evidence_event_id != 1 {
+            o.insert(
+                "nextEvidenceEventId".into(),
+                json!(self.next_evidence_event_id.to_string()),
+            );
+        }
+        if self.next_evidence_hypothesis_id != 1 {
+            o.insert(
+                "nextEvidenceHypothesisId".into(),
+                json!(self.next_evidence_hypothesis_id.to_string()),
+            );
+        }
+        if self.next_evidence_proposal_id != 1 {
+            o.insert(
+                "nextEvidenceProposalId".into(),
+                json!(self.next_evidence_proposal_id.to_string()),
+            );
+        }
         Value::Object(o)
     }
 
@@ -646,6 +823,62 @@ impl NodeTree {
         if let Some(arr) = o.get("bookmarks").and_then(Value::as_array) {
             for v in arr {
                 t.bookmarks.push(Bookmark::from_json(v));
+            }
+        }
+        // Evidence counters (default "1"), then arrays — bumping each counter
+        // past any explicit prefixed id (`core.h:942-967`).
+        t.next_evidence_event_id = o
+            .get("nextEvidenceEventId")
+            .and_then(Value::as_str)
+            .unwrap_or("1")
+            .trim()
+            .parse()
+            .unwrap_or(1);
+        t.next_evidence_hypothesis_id = o
+            .get("nextEvidenceHypothesisId")
+            .and_then(Value::as_str)
+            .unwrap_or("1")
+            .trim()
+            .parse()
+            .unwrap_or(1);
+        t.next_evidence_proposal_id = o
+            .get("nextEvidenceProposalId")
+            .and_then(Value::as_str)
+            .unwrap_or("1")
+            .trim()
+            .parse()
+            .unwrap_or(1);
+        if let Some(arr) = o.get("evidenceEvents").and_then(Value::as_array) {
+            t.evidence_events.reserve(arr.len());
+            for v in arr {
+                let event = EvidenceEvent::from_json(v);
+                let seq = parse_prefixed_sequence(&event.id, "ev_");
+                if seq >= t.next_evidence_event_id {
+                    t.next_evidence_event_id = seq + 1;
+                }
+                t.evidence_events.push(event);
+            }
+        }
+        if let Some(arr) = o.get("evidenceHypotheses").and_then(Value::as_array) {
+            t.evidence_hypotheses.reserve(arr.len());
+            for v in arr {
+                let hyp = EvidenceHypothesis::from_json(v);
+                let seq = parse_prefixed_sequence(&hyp.id, "hyp_");
+                if seq >= t.next_evidence_hypothesis_id {
+                    t.next_evidence_hypothesis_id = seq + 1;
+                }
+                t.evidence_hypotheses.push(hyp);
+            }
+        }
+        if let Some(arr) = o.get("evidenceProposals").and_then(Value::as_array) {
+            t.evidence_proposals.reserve(arr.len());
+            for v in arr {
+                let prop = EvidenceProposal::from_json(v);
+                let seq = parse_prefixed_sequence(&prop.id, "prop_");
+                if seq >= t.next_evidence_proposal_id {
+                    t.next_evidence_proposal_id = seq + 1;
+                }
+                t.evidence_proposals.push(prop);
             }
         }
         t
@@ -796,5 +1029,93 @@ mod tests {
             t.normalize_prefer_descendants(&sel2),
             [lid].into_iter().collect()
         );
+    }
+
+    // ── Evidence arrays ──
+
+    #[test]
+    fn evidence_arrays_round_trip_and_counters_omit_default() {
+        let mut t = NodeTree::new();
+        // Default counters (== 1) must NOT appear in the JSON.
+        let empty = t.to_json();
+        let eo = empty.as_object().unwrap();
+        assert!(!eo.contains_key("evidenceEvents"));
+        assert!(!eo.contains_key("nextEvidenceEventId"));
+        assert!(!eo.contains_key("nextEvidenceHypothesisId"));
+        assert!(!eo.contains_key("nextEvidenceProposalId"));
+
+        // Append one of each; the append helpers stamp ids + timestamps.
+        let now = 1_700_000_000_000;
+        t.append_evidence_event(
+            EvidenceEvent {
+                summary: "marker".into(),
+                ..EvidenceEvent::default()
+            },
+            now,
+        );
+        t.append_evidence_hypothesis(EvidenceHypothesis::default(), now);
+        t.append_evidence_proposal(EvidenceProposal::default(), now);
+
+        assert_eq!(t.evidence_events[0].id, "ev_1");
+        assert_eq!(t.evidence_events[0].timestamp, now);
+        assert_eq!(t.evidence_hypotheses[0].id, "hyp_1");
+        assert_eq!(t.evidence_hypotheses[0].created_at, now);
+        assert_eq!(t.evidence_proposals[0].id, "prop_1");
+        assert_eq!(t.next_evidence_event_id(), 2);
+        assert_eq!(t.next_evidence_hypothesis_id(), 2);
+        assert_eq!(t.next_evidence_proposal_id(), 2);
+
+        // Now the JSON carries the arrays + (bumped) counters.
+        let j = t.to_json();
+        let o = j.as_object().unwrap();
+        assert!(o.contains_key("evidenceEvents"));
+        assert_eq!(o["nextEvidenceEventId"], json!("2"));
+        assert_eq!(o["nextEvidenceHypothesisId"], json!("2"));
+        assert_eq!(o["nextEvidenceProposalId"], json!("2"));
+
+        // Full round-trip preserves arrays + counters.
+        let back = NodeTree::from_json(&j);
+        assert_eq!(back.evidence_events, t.evidence_events);
+        assert_eq!(back.evidence_hypotheses, t.evidence_hypotheses);
+        assert_eq!(back.evidence_proposals, t.evidence_proposals);
+        assert_eq!(back.next_evidence_event_id(), 2);
+        assert_eq!(back.next_evidence_hypothesis_id(), 2);
+        assert_eq!(back.next_evidence_proposal_id(), 2);
+    }
+
+    #[test]
+    fn evidence_counter_bumps_past_explicit_ids_on_load() {
+        // A C++-authored file with high explicit ids but no nextEvidence*Id key
+        // (older save) must still bump the counter past the seen ids.
+        let j = json!({
+            "baseAddress": "400000",
+            "nextId": "1",
+            "nodes": [],
+            "evidenceEvents": [ { "id": "ev_10", "timestamp": "5" } ],
+            "evidenceHypotheses": [ { "id": "hyp_4", "createdAt": "1", "updatedAt": "1", "status": "open", "confidence": 0.0 } ],
+            "evidenceProposals": [ { "id": "prop_7", "createdAt": "1", "updatedAt": "1", "status": "pending", "confidence": 0.0 } ],
+        });
+        let t = NodeTree::from_json(&j);
+        assert_eq!(t.evidence_events.len(), 1);
+        assert_eq!(t.next_evidence_event_id(), 11);
+        assert_eq!(t.next_evidence_hypothesis_id(), 5);
+        assert_eq!(t.next_evidence_proposal_id(), 8);
+    }
+
+    #[test]
+    fn append_evidence_with_explicit_id_bumps_counter() {
+        let mut t = NodeTree::new();
+        t.append_evidence_event(
+            EvidenceEvent {
+                id: "ev_50".into(),
+                timestamp: 1,
+                ..EvidenceEvent::default()
+            },
+            0,
+        );
+        // Counter advanced past the explicit id; next auto-id is ev_51.
+        assert_eq!(t.next_evidence_event_id(), 51);
+        let auto = t.reserve_evidence_event_id();
+        assert_eq!(auto, "ev_51");
     }
 }

@@ -245,7 +245,13 @@ actions!(
         RedoAction,
         AddBookmarkAction,
         QuickBookmarkAction,
-        ShortcutsAction
+        ShortcutsAction,
+        // Tools accelerators advertised in the menu but previously unbound — the
+        // C++ binds QKeySequence(Ctrl|Shift|R) for the RTTI Browser (main.cpp:1524)
+        // and QKeySequence(Ctrl|Shift|F) for the Performance Profiler
+        // (main.cpp:1565). Each routes back through `run_menu_command`.
+        RttiAction,
+        ProfilerAction
     ]
 );
 
@@ -1168,6 +1174,17 @@ impl MainWindow {
     fn on_shortcuts(&mut self, _: &ShortcutsAction, window: &mut Window, cx: &mut Context<Self>) {
         self.run_menu_command(&"help.shortcuts".to_string(), window, cx);
     }
+    // The Tools accelerator handlers — the RTTI Browser (Ctrl+Shift+R;
+    // main.cpp:1524) and Performance Profiler (Ctrl+Shift+F; main.cpp:1565) were
+    // advertised in the Tools menu but had no global key binding, so both
+    // shortcuts were dead. Each routes its bound key to the same MENU CONTRACT
+    // command `run_menu_command` already dispatches.
+    fn on_rtti(&mut self, _: &RttiAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"tools.rtti".to_string(), window, cx);
+    }
+    fn on_profiler(&mut self, _: &ProfilerAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"tools.profiler".to_string(), window, cx);
+    }
 
     /// Dispatch a chosen command (from the menu bar, the command palette, or a
     /// global key binding). Maps a
@@ -1226,7 +1243,10 @@ impl MainWindow {
             "source.clear" => self.clear_active_source(window, cx),
             "source.file" => self.prompt_data_file(window, cx),
             "source.process" => self.open_process_picker(window, cx),
-            "source.kernel" | "source.remote" | "source.windbg" | "source.rcnet" => {
+            // The C++ Data Source set is File + the registered providers only — no
+            // Kernel Memory row (kernelmemory is a Browse-Page-Tables provider id,
+            // never a Data Source entry; see commandpalette.rs `menu_tree_with`).
+            "source.remote" | "source.windbg" | "source.rcnet" => {
                 self.report_unavailable_source(cmd.as_str(), window, cx)
             }
 
@@ -1450,10 +1470,11 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// File ▸ Data Source ▸ {Kernel / Remote / WinDbg / ReClass.NET} — these live
-    /// providers have no factory on this platform. The C++ shows a blocking
-    /// warning when a source can't attach; mirror that with the themed modal
-    /// message box (not a transient toast).
+    /// File ▸ Data Source ▸ {Remote / WinDbg / ReClass.NET} — these live providers
+    /// have no factory on this platform. The C++ shows a blocking warning when a
+    /// source can't attach; mirror that with the themed modal message box (not a
+    /// transient toast). (No Kernel Memory case: the C++ Data Source menu has no
+    /// such row — see `report_unavailable_source`'s callers / `menu_tree_with`.)
     fn report_unavailable_source(
         &mut self,
         cmd: &str,
@@ -1461,7 +1482,6 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         let label = match cmd {
-            "source.kernel" => "Kernel Memory",
             "source.remote" => "Remote Process Memory",
             "source.windbg" => "WinDbg Memory",
             "source.rcnet" => "ReClass.NET Compat",
@@ -5067,6 +5087,10 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_add_bookmark))
             .on_action(cx.listener(Self::on_quick_bookmark))
             .on_action(cx.listener(Self::on_shortcuts))
+            // Tools accelerators (RTTI Browser / Performance Profiler) — advertised
+            // in the menu but previously unbound.
+            .on_action(cx.listener(Self::on_rtti))
+            .on_action(cx.listener(Self::on_profiler))
             // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
             // Dimmed in Presentation Mode (chrome fade).
             .child(div().opacity(chrome_opacity).child(titlebar))
@@ -5404,6 +5428,33 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     bindings.push(KeyBinding::new(
         "cmd-alt-b",
         QuickBookmarkAction,
+        Some("RcxWindow"),
+    ));
+
+    // ── Tools accelerators advertised in the Tools menu but previously unbound:
+    // RTTI Browser (the C++ QKeySequence(Ctrl|Shift|R); main.cpp:1524) and
+    // Performance Profiler (the C++ QKeySequence(Ctrl|Shift|F); main.cpp:1565).
+    // Both shortcuts were dead labels until now. Each routes to its MENU CONTRACT
+    // command via the action handler, so keyboard + menu + palette stay in
+    // lockstep. The Ctrl (Win/Linux) and Cmd (mac) forms are both bound. ──
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-r",
+        RttiAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-r",
+        RttiAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-f",
+        ProfilerAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-f",
+        ProfilerAction,
         Some("RcxWindow"),
     ));
 
