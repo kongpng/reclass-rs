@@ -902,7 +902,7 @@ mod view {
                 // a faint color so the significant address digits read first.
                 let (dim, bright) = split_address_dim(&row.address_text);
                 div()
-                    .font_family(tokens::font::MONO_FAMILY)
+                    .font_family(tokens::font::mono_family())
                     .text_size(px(tokens::font::EDITOR_SIZE))
                     .child(
                         div()
@@ -937,7 +937,7 @@ mod view {
                     .w_full()
                     .flex()
                     .justify_end()
-                    .font_family(tokens::font::MONO_FAMILY)
+                    .font_family(tokens::font::mono_family())
                     .text_size(px(tokens::font::EDITOR_SIZE))
                     .when_some(tint, |dv, c| dv.text_color(c))
                     .when(tint.is_none() && muted, |dv| {

@@ -394,7 +394,7 @@ mod view {
                         .child(
                             div()
                                 .flex_none()
-                                .font_family(tokens::font::MONO_FAMILY)
+                                .font_family(tokens::font::mono_family())
                                 .text_size(px(tokens::font::EDITOR_SIZE))
                                 .text_color(muted)
                                 .child(format!("0x{:x}", r.member.value)),

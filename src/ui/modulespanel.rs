@@ -589,7 +589,7 @@ mod view {
                 r.child(
                     div()
                         .flex_none()
-                        .font_family(tokens::font::MONO_FAMILY)
+                        .font_family(tokens::font::mono_family())
                         .text_size(px(tokens::font::UI_XS))
                         .text_color(color::text_muted(cx))
                         .child(SharedString::from(row.size_text)),
@@ -598,7 +598,7 @@ mod view {
             .child(
                 div()
                     .flex_none()
-                    .font_family(tokens::font::MONO_FAMILY)
+                    .font_family(tokens::font::mono_family())
                     .text_size(px(tokens::font::UI_XS))
                     .text_color(color::syntax_address(cx))
                     .child(SharedString::from(row.base_text)),
@@ -635,7 +635,7 @@ mod view {
                     .child(
                         div()
                             .flex_none()
-                            .font_family(tokens::font::MONO_FAMILY)
+                            .font_family(tokens::font::mono_family())
                             .text_size(px(tokens::font::UI_XS))
                             .text_color(color::syntax_address(cx))
                             .child(SharedString::from(row.offset_text)),
@@ -681,7 +681,7 @@ mod view {
                         r.child(
                             div()
                                 .flex_none()
-                                .font_family(tokens::font::MONO_FAMILY)
+                                .font_family(tokens::font::mono_family())
                                 .text_size(px(tokens::font::UI_XS))
                                 .text_color(color::text_muted(cx))
                                 .child(SharedString::from(row.size_text)),

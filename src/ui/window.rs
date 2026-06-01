@@ -2672,6 +2672,14 @@ pub fn open_main_window(cx: &mut App) {
 /// loaded project (the C++ `QMetaObject::invokeMethod(... project_open ...)`
 /// after `window.show()`; main.cpp:8774).
 pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
+    // Resolve the editor monospace family from the platform's installed fonts
+    // BEFORE any view shapes text. gpui's `font_family` takes a single family (not a
+    // CSS fallback list), so we must pick one real installed mono — otherwise the
+    // editor falls back to a proportional font and its fixed-cell column grid
+    // (offsets/types/names/values, the inline-edit overlay, and mouse hit-testing)
+    // drifts off the painted glyphs.
+    super::design::tokens::font::resolve_mono_family(&cx.text_system().all_font_names());
+
     let theme_manager = ThemeRegistryGlobal::get(cx);
 
     // Register the editor-surface + inline-field + start-page key bindings, plus

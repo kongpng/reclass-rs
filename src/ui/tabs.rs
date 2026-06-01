@@ -876,7 +876,7 @@ impl DocumentArea {
                 .justify_center()
                 .bg(color::content_bg(cx))
                 .text_color(color::text_muted(cx))
-                .font_family(tokens::font::MONO_FAMILY)
+                .font_family(tokens::font::mono_family())
                 .text_size(px(tokens::font::EDITOR_SIZE))
                 .child("// nothing to render — open or build a struct")
                 .into_any_element();
@@ -902,7 +902,7 @@ impl DocumentArea {
             .size_full()
             .bg(color::content_bg(cx))
             .overflow_scroll()
-            .font_family(tokens::font::MONO_FAMILY)
+            .font_family(tokens::font::mono_family())
             .text_size(px(tokens::font::EDITOR_SIZE))
             .py(px(tokens::space::SM))
             .children(rows)

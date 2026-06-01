@@ -343,7 +343,7 @@ mod view {
         /// accepted address-expression forms (example → mode) plus the operator
         /// hint, styled like a Zed popover section.
         fn render_help(&self, cx: &Context<Self>) -> impl IntoElement {
-            let mono = SharedString::from(tokens::font::MONO_FAMILY);
+            let mono = SharedString::from(tokens::font::mono_family());
             let rows = ADDRESS_FORMS.into_iter().map(|(example, meaning)| {
                 gpui_component::h_flex()
                     .w_full()
@@ -408,7 +408,7 @@ mod view {
             // narrow window (QA #1; the dialog layer centers with no edge clamp).
             let card_w = modal::clamp_width(460., window);
             let card_max_h = modal::clamp_height(560., 120., window);
-            let mono = SharedString::from(tokens::font::MONO_FAMILY);
+            let mono = SharedString::from(tokens::font::mono_family());
             let (status_text, status_color) = match self.state.status() {
                 GotoStatus::Idle => (" ".to_string(), color::text_muted(cx)),
                 GotoStatus::Resolved(v) => (format!("\u{2192} 0x{v:x}"), cx.theme().success),

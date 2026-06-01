@@ -335,7 +335,7 @@ mod view {
             div()
                 .text_color(fg)
                 .text_size(px(tokens::font::UI_SM))
-                .when(mono, |d| d.font_family(tokens::font::MONO_FAMILY))
+                .when(mono, |d| d.font_family(tokens::font::mono_family()))
                 .child(text)
         }
 

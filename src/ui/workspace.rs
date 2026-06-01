@@ -1266,7 +1266,7 @@ fn field_offset_chip(offset: i32, cx: &App) -> impl IntoElement {
         .items_center()
         .justify_end()
         .text_size(px(tokens::font::UI_XS))
-        .font_family(tokens::font::MONO_FAMILY)
+        .font_family(tokens::font::mono_family())
         .text_color(color::syntax_address(cx))
         .child(SharedString::from(format_field_offset(offset)))
 }

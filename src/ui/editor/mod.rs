@@ -228,7 +228,8 @@ pub struct RcxEditor {
     /// minimap / the C++ purple overview block, data_options.png). Purely-visual
     /// editor state, defaults off; the View menu's "Minimap" item flips it.
     minimap: bool,
-    /// Measured monospace cell metrics (updated each frame from the font).
+    /// Measured monospace cell metrics (re-measured each frame in `render` from
+    /// the real shaped glyph advance so column math matches the painted grid).
     metrics: CellMetrics,
     /// The node-row context menu (`editor.cpp` `customContextMenuRequested`,
     /// reclass_right_click_on_address.png). When `Some`, a built [`PopupMenu`] is
@@ -3359,29 +3360,38 @@ impl Focusable for RcxEditor {
 
 impl Render for RcxEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Measure the monospace cell once per frame from the active font so
-        // hit-testing math matches the painted glyph advance.
-        let line_height = f32::from(window.line_height());
-        // The advance of '0' in the editor font (monospace ⇒ uniform).
+        // Measure the monospace cell once per frame so hit-test/overlay column math
+        // matches the painted glyph grid EXACTLY. Two things were wrong before and
+        // each shifted the inline-edit box / mouse hit-test right of the painted
+        // token (worse on the name/value columns since the error accumulates):
+        //   1) the font: the rows below are painted with the editor MONO font at
+        //      `EDITOR_SIZE` (see `.font_family(MONO_FAMILY).text_size(..)`), but the
+        //      metric was measured against `window.text_style()` — the ambient UI
+        //      font at a larger size — so every cell was ~0.6px too wide.
+        //   2) the sample: a lone `shape_line("0")` reports the glyph's full width
+        //      incl. side-bearing, not the run advance the painter uses; measure a
+        //      RUN of 10 and divide.
+        // Measure with the SAME explicit font + size the rows use, and take the line
+        // height from the editor's own value (not the ambient `window.line_height`).
+        const PROBE: &str = "0000000000";
+        let editor_font_size = px(design::tokens::font::EDITOR_SIZE);
+        let line_height = design::tokens::font::EDITOR_SIZE * EDITOR_LINE_HEIGHT;
         let cell_width = {
-            let style = window.text_style();
-            let font = style.font();
-            let font_size = style.font_size.to_pixels(window.rem_size());
             let run = TextRun {
-                len: 1,
-                font,
+                len: PROBE.len(),
+                font: gpui::font(design::tokens::font::mono_family()),
                 color: cx.theme().foreground,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
             let shaped = window.text_system().shape_line(
-                "0".into(),
-                font_size,
+                PROBE.into(),
+                editor_font_size,
                 std::slice::from_ref(&run),
                 None,
             );
-            let w = f32::from(shaped.width());
+            let w = f32::from(shaped.width()) / PROBE.len() as f32;
             if w > 0.0 {
                 w
             } else {
@@ -3404,7 +3414,7 @@ impl Render for RcxEditor {
             // A real monospace at the comfortable Zed editor size + generous
             // leading (the prior build was cramped). The measured `line_height`
             // above derives from exactly these so hit-testing stays aligned.
-            .font_family(design::tokens::font::MONO_FAMILY)
+            .font_family(design::tokens::font::mono_family())
             .text_size(px(design::tokens::font::EDITOR_SIZE))
             .line_height(px(design::tokens::font::EDITOR_SIZE * EDITOR_LINE_HEIGHT))
             .on_action(cx.listener(Self::action_tab))
@@ -3580,7 +3590,7 @@ impl Render for AddressFormatTooltip {
                     .justify_between()
                     .child(
                         div()
-                            .font_family(tokens::font::MONO_FAMILY)
+                            .font_family(tokens::font::mono_family())
                             .text_color(number)
                             .child(SharedString::from(example)),
                     )

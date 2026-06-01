@@ -126,11 +126,66 @@ pub mod tokens {
         pub const UI_FAMILY: &str =
             "Inter, \"SF Pro Text\", \"Segoe UI\", Cantarell, \"Noto Sans\", \"DejaVu Sans\", sans-serif";
 
-        /// Monospace (editor) font family. A real monospace with strong Linux
-        /// fallbacks (JetBrains Mono / Fira Code / Cascadia / DejaVu Sans Mono),
-        /// then the platform monospace, then generic.
-        pub const MONO_FAMILY: &str =
-            "\"JetBrains Mono\", \"Fira Code\", \"Cascadia Code\", \"Source Code Pro\", \"DejaVu Sans Mono\", Menlo, Consolas, monospace";
+        /// Candidate monospace families for the editor, best-first. gpui's
+        /// `font_family` takes a SINGLE family name — it does NOT parse a CSS-style
+        /// comma fallback list, so passing one silently falls back to the default
+        /// PROPORTIONAL font, where the space glyph is narrower than a digit and the
+        /// editor's fixed-cell column grid (offsets/types/names/values + the
+        /// inline-edit overlay + mouse hit-test, all `col * cell_width`) drifts off
+        /// the painted glyphs. We therefore resolve ONE real, installed monospace at
+        /// startup ([`resolve_mono_family`]) and use it everywhere ([`mono_family`]).
+        pub const MONO_CANDIDATES: &[&str] = &[
+            "JetBrains Mono",
+            "JetBrainsMono Nerd Font",
+            "Fira Code",
+            "FiraCode Nerd Font",
+            "Cascadia Code",
+            "Cascadia Mono",
+            "Source Code Pro",
+            "DejaVu Sans Mono",
+            "Liberation Mono",
+            "Roboto Mono",
+            "Noto Sans Mono",
+            "Ubuntu Mono",
+            "Menlo",
+            "SF Mono",
+            "Consolas",
+            "Courier New",
+            "monospace",
+        ];
+
+        static RESOLVED_MONO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+        /// Resolve the editor monospace family from the platform's installed fonts
+        /// (call ONCE at startup with `cx.text_system().all_font_names()`). Picks the
+        /// first [`MONO_CANDIDATES`] entry that is actually installed; failing that,
+        /// the first family whose name signals monospace; else the generic
+        /// `"monospace"`. Idempotent.
+        pub fn resolve_mono_family(available: &[String]) {
+            let _ = RESOLVED_MONO.get_or_init(|| {
+                for cand in MONO_CANDIDATES {
+                    if available.iter().any(|f| f == cand) {
+                        return (*cand).to_string();
+                    }
+                }
+                if let Some(m) = available.iter().find(|f| {
+                    let l = f.to_lowercase();
+                    l.contains("mono") || l.contains("code") || l.contains("consol")
+                }) {
+                    return m.clone();
+                }
+                "monospace".to_string()
+            });
+        }
+
+        /// The resolved editor monospace family — a SINGLE real family gpui can load.
+        /// Before [`resolve_mono_family`] runs it returns the first candidate.
+        pub fn mono_family() -> &'static str {
+            RESOLVED_MONO
+                .get()
+                .map(String::as_str)
+                .unwrap_or(MONO_CANDIDATES[0])
+        }
     }
 }
 
@@ -558,9 +613,13 @@ mod tests {
         assert!(font::UI_MD < font::UI_LG);
         // The default UI size is the ~14px Zed body size.
         assert_eq!(font::UI_MD, 14.0);
-        // The editor uses a real monospace family (contains a known mono).
-        assert!(font::MONO_FAMILY.contains("Mono") || font::MONO_FAMILY.contains("Code"));
-        assert!(font::MONO_FAMILY.contains("monospace"));
+        // The editor resolves to a single real monospace family (a CSS-style comma
+        // list silently falls back to a proportional font in gpui). The candidate
+        // list is best-first and ends in the generic fallback.
+        assert!(font::MONO_CANDIDATES.len() > 3);
+        assert_eq!(*font::MONO_CANDIDATES.last().unwrap(), "monospace");
+        // Before resolution, `mono_family()` returns the first candidate.
+        assert_eq!(font::mono_family(), font::MONO_CANDIDATES[0]);
     }
 
     #[test]

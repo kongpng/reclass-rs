@@ -1172,7 +1172,7 @@ mod view {
                                     .flex_1()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .font_family(tokens::font::MONO_FAMILY)
+                                    .font_family(tokens::font::mono_family())
                                     .text_size(px(tokens::font::EDITOR_SIZE))
                                     .children(name_spans),
                             )
@@ -1588,7 +1588,7 @@ mod view {
                         .w_full()
                         .px(px(tokens::space::MD))
                         .pt(px(tokens::space::SM))
-                        .font_family(tokens::font::MONO_FAMILY)
+                        .font_family(tokens::font::mono_family())
                         .text_size(px(tokens::font::UI_XS))
                         .text_color(muted)
                         .child(summary),

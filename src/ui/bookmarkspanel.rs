@@ -391,7 +391,7 @@ mod view {
                     .child(
                         div()
                             .truncate()
-                            .font_family(tokens::font::MONO_FAMILY)
+                            .font_family(tokens::font::mono_family())
                             .text_size(px(tokens::font::UI_XS))
                             .text_color(color::text_muted(cx))
                             .child(SharedString::from(row.formula)),

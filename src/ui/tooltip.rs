@@ -386,7 +386,7 @@ mod view {
                             div()
                                 .flex_none()
                                 .min_w(px(150.))
-                                .font_family(tokens::font::MONO_FAMILY)
+                                .font_family(tokens::font::mono_family())
                                 .text_size(px(tokens::font::EDITOR_SIZE))
                                 .text_color(color::text(cx))
                                 .child(example.clone()),
@@ -410,7 +410,7 @@ mod view {
                         .justify_between()
                         .child(
                             div()
-                                .font_family(tokens::font::MONO_FAMILY)
+                                .font_family(tokens::font::mono_family())
                                 .text_size(px(tokens::font::EDITOR_SIZE))
                                 .text_color(color::text(cx))
                                 .child(value.clone()),

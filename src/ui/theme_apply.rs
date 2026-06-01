@@ -647,7 +647,7 @@ pub fn apply_theme(theme: &Theme, window: &mut gpui::Window, cx: &mut gpui::App)
     use super::design::tokens;
     gtheme.font_family = tokens::font::UI_FAMILY.into();
     gtheme.font_size = gpui::px(tokens::font::UI_MD);
-    gtheme.mono_font_family = tokens::font::MONO_FAMILY.into();
+    gtheme.mono_font_family = tokens::font::mono_family().into();
     gtheme.mono_font_size = gpui::px(tokens::font::EDITOR_SIZE);
     gtheme.radius = gpui::px(tokens::radius::MD);
     gtheme.radius_lg = gpui::px(tokens::radius::LG);

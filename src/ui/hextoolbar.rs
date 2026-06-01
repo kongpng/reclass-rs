@@ -518,7 +518,7 @@ mod view {
                         .bg(cx.theme().background)
                         .border_1()
                         .border_color(border)
-                        .font_family(tokens::font::MONO_FAMILY)
+                        .font_family(tokens::font::mono_family())
                         .text_size(px(tokens::font::EDITOR_SIZE))
                         .text_color(fg)
                         .whitespace_nowrap()
