@@ -240,26 +240,6 @@ impl FieldInput {
         )
     }
 
-    /// Overwrite the single char at byte offset `at` with `ch` (no length change).
-    /// Returns the new caret offset (advanced one position, space-skipping).
-    fn overwrite_at(&mut self, at: usize, ch: char, cx: &mut Context<Self>) {
-        if at >= self.content.len() {
-            return;
-        }
-        let mut s: Vec<char> = self.content.chars().collect();
-        // The content is ASCII (hex digits/spaces or printable ASCII), so char and
-        // byte indices coincide; guard anyway.
-        if at < s.len() {
-            s[at] = ch;
-            self.content = s.into_iter().collect::<String>().into();
-        }
-        let next = self.ow_next(at);
-        self.selected_range = next..next;
-        self.selection_reversed = false;
-        self.restart_blink(cx);
-        cx.notify();
-    }
-
     /// Whether the caret quad should be painted this frame (BUG 2). Solid while
     /// typing/moving; toggles on the idle blink timer.
     pub fn caret_visible(&self) -> bool {
@@ -467,8 +447,18 @@ impl FieldInput {
     }
     fn paste(&mut self, _: &FieldPaste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            // Inline fields are single-line: strip newlines (begin-edit §11 paste).
-            self.replace_text_in_range(None, &text.replace(['\n', '\r'], ""), window, cx);
+            // Sanitized paste (item 83, editor.cpp `handleEditKey` Ctrl+V,
+            // editor.cpp:3301): inline fields are single-line, so strip newlines /
+            // carriage returns; for a base-address edit also strip backticks (the
+            // address-formula syntax the expr-evaluator already removes, so a paste
+            // of `app.exe + 0x10` does not introduce stray backticks).
+            let sanitized = sanitize_inline_paste(&text, self.target == EditTarget::BaseAddress);
+            // Hex/ASCII overwrite paste respects the field WIDTH: the overwrite path
+            // in `replace_text_in_range` writes one accepted char per position and
+            // never extends the fixed-length string, so a too-long paste is clamped
+            // to the field (editor.cpp:3440 `writeCol < spanEnd`). Spaces in the
+            // pasted hex are dropped there too (the separator is skipped).
+            self.replace_text_in_range(None, &sanitized, window, cx);
         }
     }
     fn copy(&mut self, _: &FieldCopy, _: &mut Window, cx: &mut Context<Self>) {
@@ -652,30 +642,19 @@ impl EntityInputHandler for FieldInput {
         // it overwrites one position in place (fixed length) and advances. Filter
         // accepted characters (hex digits / printable ASCII), upper-casing hex.
         if let Some(mode) = self.hex_overwrite {
-            for ch in new_text.chars() {
-                let at = self
-                    .cursor_offset()
-                    .min(self.content.len().saturating_sub(1));
-                // Skip a space separator under the caret (hex mode) before writing.
-                let at = if mode.is_hex() && self.content.as_bytes().get(at) == Some(&b' ') {
-                    (at + 1).min(self.content.len().saturating_sub(1))
-                } else {
-                    at
-                };
-                let accepted = match mode {
-                    HexOverwrite::Hex { .. } => {
-                        ch.is_ascii_hexdigit().then(|| ch.to_ascii_uppercase())
-                    }
-                    HexOverwrite::Ascii { .. } => {
-                        let c = ch as u32;
-                        (0x20..=0x7E).contains(&c).then_some(ch)
-                    }
-                };
-                if let Some(c) = accepted {
-                    self.overwrite_at(at, c, cx);
-                }
-            }
+            // Item 7 / 83: fixed-length per-byte overwrite (single keystroke OR a
+            // multi-char paste). Delegates to the pure `overwrite_paste_into`, which
+            // respects the field WIDTH (stops at the end rather than re-overwriting
+            // the last cell), drops/skips hex separators, filters accepted chars,
+            // and advances the caret past a trailing separator.
+            let (content, caret) =
+                overwrite_paste_into(&self.content, self.cursor_offset(), mode.is_hex(), new_text);
+            self.content = content.into();
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
             self.marked_range.take();
+            self.restart_blink(cx);
+            cx.notify();
             return;
         }
         let range = range_utf16
@@ -777,6 +756,72 @@ pub fn splice_text(content: &str, range: Range<usize>, new_text: &str) -> (Strin
     out.push_str(&content[end..]);
     let cursor = start + new_text.len();
     (out, cursor)
+}
+
+/// Item 83 (pure): sanitize text about to be spliced into a single-line inline
+/// field. Always strips newlines/CR (the field is one line); for a base-address
+/// edit also strips backticks (the address-formula syntax the expr-evaluator
+/// removes). Mirrors the C++ `handleEditKey` Ctrl+V sanitize (editor.cpp:3301).
+pub fn sanitize_inline_paste(text: &str, is_base_address: bool) -> String {
+    text.chars()
+        .filter(|&c| c != '\n' && c != '\r' && !(is_base_address && c == '`'))
+        .collect()
+}
+
+/// Item 83 (pure): overwrite `text` into the fixed-length `content` buffer
+/// starting at byte offset `start`, respecting the field WIDTH. Returns the new
+/// `(content, caret)`. The buffer length never changes (overwrite, not splice);
+/// once the write cursor reaches the end it stops rather than re-overwriting the
+/// last cell (the C++ `writeCol < spanEnd` guard, editor.cpp:3440). In hex mode,
+/// space separators in the target are skipped and literal spaces in the pasted
+/// text are dropped; only `[0-9A-Fa-f]` are accepted (upper-cased) and the final
+/// caret advances past a trailing separator. In ASCII mode only `0x20..=0x7E`.
+pub fn overwrite_paste_into(
+    content: &str,
+    start: usize,
+    is_hex: bool,
+    text: &str,
+) -> (String, usize) {
+    let span_end = content.len();
+    let mut buf: Vec<u8> = content.as_bytes().to_vec();
+    let mut write = start.min(span_end);
+    for ch in text.chars() {
+        if write >= span_end {
+            break;
+        }
+        if is_hex && buf.get(write) == Some(&b' ') {
+            write += 1;
+            if write >= span_end {
+                break;
+            }
+        }
+        if is_hex && ch == ' ' {
+            continue;
+        }
+        let accepted = if is_hex {
+            ch.is_ascii_hexdigit().then(|| ch.to_ascii_uppercase())
+        } else {
+            let c = ch as u32;
+            (0x20..=0x7E).contains(&c).then_some(ch)
+        };
+        if let Some(c) = accepted {
+            // ASCII content: one byte per char (the buffer is hex digits/spaces or
+            // printable ASCII), so byte/char indices coincide.
+            if write < buf.len() {
+                buf[write] = c as u8;
+                write += 1;
+            }
+        }
+    }
+    let mut caret = write;
+    if is_hex && buf.get(caret) == Some(&b' ') {
+        caret += 1;
+    }
+    let caret = caret.min(span_end.saturating_sub(1));
+    (
+        String::from_utf8(buf).unwrap_or_else(|_| content.to_string()),
+        caret,
+    )
 }
 
 /// Item 7 (pure): the caret offset one position to the RIGHT in a fixed-length
@@ -1062,8 +1107,59 @@ mod tests {
     // Import only the items under test — NOT `super::*`, which would pull the
     // module's `gpui::*` glob into the `#[test]` hygiene expansion and explode
     // the type-recursion budget on this nightly+gpui combination.
-    use super::{ow_next_in, ow_prev_in, splice_text, EditCommit};
+    use super::{
+        overwrite_paste_into, ow_next_in, ow_prev_in, sanitize_inline_paste, splice_text,
+        EditCommit,
+    };
     use crate::compose::EditTarget;
+
+    #[test]
+    fn paste_sanitize_strips_newlines_and_base_addr_backticks() {
+        // Item 83: a single-line field strips newlines/CR always.
+        assert_eq!(sanitize_inline_paste("ab\ncd\r\nef", false), "abcdef");
+        // A base-address edit additionally strips backticks (the formula syntax).
+        assert_eq!(
+            sanitize_inline_paste("`app.exe` + 0x10", true),
+            "app.exe + 0x10"
+        );
+        // A non-base-address field keeps backticks (only newlines stripped).
+        assert_eq!(sanitize_inline_paste("a`b\nc", false), "a`bc");
+    }
+
+    #[test]
+    fn overwrite_paste_respects_hex_field_width() {
+        // Item 83: an 8-byte hex field "00 00 00 00 00 00 00 00" (len 23). Pasting
+        // a longer hex string clamps to the field width — never grows the buffer.
+        let field = "00 00 00 00 00 00 00 00";
+        let (out, _caret) =
+            overwrite_paste_into(field, 0, true, "DEADBEEFCAFEBABE1122334455667788FF");
+        assert_eq!(out.len(), field.len(), "fixed length preserved");
+        assert_eq!(out, "DE AD BE EF CA FE BA BE", "width-clamped overwrite");
+    }
+
+    #[test]
+    fn overwrite_paste_hex_skips_separators_and_drops_spaces() {
+        // Pasting space-separated hex into a hex field: spaces in the paste are
+        // dropped, and the target's own separators are skipped.
+        let field = "00 00 00 00";
+        let (out, _c) = overwrite_paste_into(field, 0, true, "AA BB");
+        assert_eq!(out, "AA BB 00 00");
+        // Non-hex chars are filtered out (only hex nibbles land).
+        let (out2, _c2) = overwrite_paste_into(field, 0, true, "A!B?C");
+        assert_eq!(out2, "AB C0 00 00");
+    }
+
+    #[test]
+    fn overwrite_paste_ascii_respects_width_and_printable() {
+        // ASCII overwrite field of 4 bytes "....": only printable ASCII is taken,
+        // clamped to width; non-printable (newline already stripped by sanitize,
+        // but a raw control char here) is filtered.
+        let field = "....";
+        let (out, _c) = overwrite_paste_into(field, 0, false, "Hello");
+        assert_eq!(out, "Hell", "width-clamped to 4 bytes");
+        let (out2, _c2) = overwrite_paste_into(field, 0, false, "a\u{0007}bc");
+        assert_eq!(out2, "abc.", "control char filtered, printables land");
+    }
 
     #[test]
     fn edit_commit_carries_identity_and_trimmed_text() {

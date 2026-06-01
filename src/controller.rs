@@ -26,9 +26,10 @@ use crate::core::linemeta::{
     K_ARRAY_ELEM_MASK, K_COMMAND_ROW_ID, K_FOOTER_ID_BIT, K_MEMBER_BIT, K_MEMBER_SUB_MASK,
 };
 use crate::core::{
-    alignment_for, is_container_kind, is_func_ptr, is_hex_node, kind_from_string, kind_meta,
-    kind_to_string, size_for_kind, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree,
-    OffsetAdj, ValueHistory,
+    alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node,
+    is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string, size_for_kind,
+    Command, ComposeResult, LineKind, Node, NodeKind, NodeTree, OffsetAdj, ValueHistory,
+    K_COMMON_TYPES,
 };
 use crate::format;
 use crate::provider::{
@@ -131,6 +132,135 @@ pub struct SavedSourceEntry {
     pub provider_target: String,
     pub base_address: u64,
     pub base_address_formula: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Type-selector popup application (`controller.cpp:4826` applyTypePopupResult)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `enum class TypePopupMode` (`typeselectorpopup.h:26`) — what the popup is
+/// picking. Re-declared here (headless) so the controller's
+/// [`apply_type_popup_result`](RcxController::apply_type_popup_result) does not
+/// depend on the GPUI `ui` layer; the editor maps its own `TypePopupMode` onto
+/// this 1:1 before calling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TypePopupMode {
+    /// Picking a top-level type at the root (sets the view-root id).
+    #[default]
+    Root,
+    /// Picking a field type (modifiers `*`/`**`/`[]` allowed).
+    FieldType,
+    /// Picking an array element type (modifiers allowed).
+    ArrayElement,
+    /// Picking a pointer target (no modifiers).
+    PointerTarget,
+}
+
+/// The kind of a [`TypePopupChoice`] (`TypeEntry::EntryKind`,
+/// `typeselectorpopup.h:30`). Section headers are never delivered as a choice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeEntryKind {
+    /// A built-in primitive kind.
+    Primitive,
+    /// A user struct/class/enum, or a built-in/cross-document composite.
+    Composite,
+}
+
+/// The chosen entry from the type-selector popup (`struct TypeEntry`, condensed
+/// to the fields `applyTypePopupResult` reads, plus the resolved modifier text).
+///
+/// `struct_id == 0` on a [`TypeEntryKind::Composite`] means the type comes from
+/// the built-in [`K_COMMON_TYPES`] library or another document — it is imported
+/// on demand via [`find_or_create_struct_by_name`](RcxController::find_or_create_struct_by_name).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypePopupChoice {
+    pub entry_kind: TypeEntryKind,
+    /// For [`TypeEntryKind::Primitive`]: the kind it represents.
+    pub primitive_kind: NodeKind,
+    /// For [`TypeEntryKind::Composite`]: the struct/enum id (0 ⇒ import by name).
+    pub struct_id: u64,
+    /// The display name (e.g. "int32_t", "Player", "UNICODE_STRING").
+    pub display_name: String,
+    /// The full type text including any modifier suffix (`Ball*`, `int32_t[10]`).
+    /// Empty ⇒ derived from `display_name` (no modifier).
+    pub full_text: String,
+    /// "+ New" marker (popup item 15): materialize a fresh named composite rather
+    /// than the existing generic `Struct` primitive.
+    pub create_new: bool,
+}
+
+impl TypePopupChoice {
+    /// A plain primitive choice with no modifier.
+    pub fn primitive(kind: NodeKind, display_name: impl Into<String>) -> Self {
+        TypePopupChoice {
+            entry_kind: TypeEntryKind::Primitive,
+            primitive_kind: kind,
+            struct_id: 0,
+            display_name: display_name.into(),
+            full_text: String::new(),
+            create_new: false,
+        }
+    }
+    /// A composite choice referencing an existing struct id.
+    pub fn composite(struct_id: u64, display_name: impl Into<String>) -> Self {
+        TypePopupChoice {
+            entry_kind: TypeEntryKind::Composite,
+            primitive_kind: NodeKind::Struct,
+            struct_id,
+            display_name: display_name.into(),
+            full_text: String::new(),
+            create_new: false,
+        }
+    }
+}
+
+/// `struct TypeSpec` (`typeselectorpopup.h:59`) — a parsed type text.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TypeSpec {
+    pub base_name: String,
+    pub is_pointer: bool,
+    /// 1 for `*`, 2 for `**`, 0 if not a pointer.
+    pub ptr_depth: i32,
+    /// Array element count (0 = not an array).
+    pub array_count: i32,
+}
+
+/// `parseTypeSpec(text)` (`typeselectorpopup.cpp:113-142`) — split a type text
+/// into its base name + optional `*`/`**`/`[N]` modifier.
+pub fn parse_type_spec(text: &str) -> TypeSpec {
+    let mut spec = TypeSpec::default();
+    let s = text.trim();
+    if s.is_empty() {
+        return spec;
+    }
+    // Pointer suffix: "Ball*" / "Ball**".
+    if let Some(stripped) = s.strip_suffix('*') {
+        spec.is_pointer = true;
+        spec.ptr_depth = 1;
+        let stripped = if let Some(s2) = stripped.strip_suffix('*') {
+            spec.ptr_depth = 2;
+            s2
+        } else {
+            stripped
+        };
+        spec.base_name = stripped.trim().to_string();
+        return spec;
+    }
+    // Array suffix: "int32_t[10]".
+    if let Some(bracket) = s.find('[') {
+        if bracket > 0 && s.ends_with(']') {
+            spec.base_name = s[..bracket].trim().to_string();
+            let count_str = &s[bracket + 1..s.len() - 1];
+            if let Ok(count) = count_str.trim().parse::<i32>() {
+                if count > 0 {
+                    spec.array_count = count;
+                }
+            }
+            return spec;
+        }
+    }
+    spec.base_name = s.to_string();
+    spec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2209,6 +2339,1180 @@ impl RcxController {
         self.refresh();
     }
 
+    /// `applyTypePopupResult(mode, nodeIdx, entry, fullText)`
+    /// (`controller.cpp:4826`).
+    ///
+    /// Single entry point the editor calls once the type-selector popup resolves.
+    /// It branches on the popup `mode` (root / field / array-element / pointer
+    /// target) and the chosen entry kind (primitive vs composite), parsing the
+    /// `full_text` for a `*`/`**`/`[N]` modifier, and emits all mutations inside
+    /// one undo macro so a single undo reverts the whole type change.
+    ///
+    /// `struct_id == 0` on a composite means an external/built-in type — it is
+    /// imported via [`find_or_create_struct_by_name`](Self::find_or_create_struct_by_name)
+    /// before any field mutation (so compose can expand the referenced layout).
+    pub fn apply_type_popup_result(
+        &mut self,
+        mode: TypePopupMode,
+        node_id: u64,
+        choice: TypePopupChoice,
+    ) {
+        // Whole popup-apply is one undo macro (`fix #1`): create-new / import /
+        // kind-change / refId / sibling-shift all collapse into a single entry.
+        // Inner `begin/end_macro` calls fold into this parent buffer.
+        let was = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Change type");
+        self.apply_type_popup_inner(mode, node_id, choice);
+        self.end_macro();
+        self.suppress_refresh = was;
+        if !self.suppress_refresh {
+            self.refresh();
+        }
+    }
+
+    fn apply_type_popup_inner(
+        &mut self,
+        mode: TypePopupMode,
+        node_id: u64,
+        mut choice: TypePopupChoice,
+    ) {
+        // "+ New" (popup item 15): materialize a brand-new `NewClass[_N]` struct
+        // (8×Hex64) and use it as the composite target, rather than importing by
+        // name or reusing the generic `Struct` primitive (`controller.cpp:4520`).
+        if choice.create_new {
+            let (id, name) = self.create_new_class_struct();
+            choice.entry_kind = TypeEntryKind::Composite;
+            choice.struct_id = id;
+            if choice.display_name.is_empty() {
+                choice.display_name = name;
+            }
+        }
+
+        // Resolve external / built-in composites: structId==0 → import by name.
+        if choice.entry_kind == TypeEntryKind::Composite
+            && choice.struct_id == 0
+            && !choice.display_name.is_empty()
+        {
+            choice.struct_id = self.find_or_create_struct_by_name(&choice.display_name, 0);
+        }
+
+        if mode == TypePopupMode::Root {
+            if choice.entry_kind == TypeEntryKind::Composite && choice.struct_id != 0 {
+                self.set_view_root_id(choice.struct_id);
+            }
+            return;
+        }
+
+        let node_idx = self.doc.tree.index_of_id(node_id);
+        if node_idx < 0 {
+            return;
+        }
+        let node_idx = node_idx as usize;
+
+        // Snapshot fields before any mutation (changeNodeKind may reallocate).
+        let node_kind = self.doc.tree.nodes[node_idx].kind;
+        let elem_kind = self.doc.tree.nodes[node_idx].element_kind;
+        let node_ref_id = self.doc.tree.nodes[node_idx].ref_id;
+        let arr_len = self.doc.tree.nodes[node_idx].array_len;
+
+        let full = if choice.full_text.is_empty() {
+            choice.display_name.clone()
+        } else {
+            choice.full_text.clone()
+        };
+        let spec = parse_type_spec(&full);
+
+        match mode {
+            TypePopupMode::FieldType => {
+                self.apply_field_type(node_id, node_idx, &choice, &spec, node_kind);
+            }
+            TypePopupMode::ArrayElement => {
+                if choice.entry_kind == TypeEntryKind::Primitive {
+                    if choice.primitive_kind != elem_kind {
+                        self.push_command(Command::ChangeArrayMeta {
+                            node_id,
+                            old_element_kind: elem_kind,
+                            new_element_kind: choice.primitive_kind,
+                            old_array_len: arr_len,
+                            new_array_len: arr_len,
+                        });
+                    }
+                } else if elem_kind != NodeKind::Struct || node_ref_id != choice.struct_id {
+                    self.push_command(Command::ChangeArrayMeta {
+                        node_id,
+                        old_element_kind: elem_kind,
+                        new_element_kind: NodeKind::Struct,
+                        old_array_len: arr_len,
+                        new_array_len: arr_len,
+                    });
+                    if node_ref_id != choice.struct_id {
+                        self.push_command(Command::ChangePointerRef {
+                            node_id,
+                            old_ref_id: node_ref_id,
+                            new_ref_id: choice.struct_id,
+                        });
+                    }
+                }
+            }
+            TypePopupMode::PointerTarget => {
+                // "void" / primitive entry → refId 0; composite → real structId.
+                let real_ref = if choice.entry_kind == TypeEntryKind::Composite {
+                    choice.struct_id
+                } else {
+                    0
+                };
+                if real_ref != node_ref_id {
+                    self.push_command(Command::ChangePointerRef {
+                        node_id,
+                        old_ref_id: node_ref_id,
+                        new_ref_id: real_ref,
+                    });
+                }
+            }
+            TypePopupMode::Root => unreachable!(),
+        }
+    }
+
+    /// The `mode == FieldType` body of [`apply_type_popup_result`], factored out
+    /// to keep the match arms readable. Mirrors `controller.cpp:4859-5043`,
+    /// including the post-mutation sibling-offset adjustment for Struct/Array
+    /// targets (`changeNodeKind` forces newSize=0 for those, so this block owns
+    /// the shift).
+    fn apply_field_type(
+        &mut self,
+        node_id: u64,
+        node_idx: usize,
+        choice: &TypePopupChoice,
+        spec: &TypeSpec,
+        node_kind: NodeKind,
+    ) {
+        // Old effective size for the post-mutation sibling adjustment.
+        let parent_id = self.doc.tree.nodes[node_idx].parent_id;
+        let node_offset = self.doc.tree.nodes[node_idx].offset;
+        let mut old_effective = self.doc.tree.nodes[node_idx].byte_size();
+        if old_effective == 0 && matches!(node_kind, NodeKind::Struct | NodeKind::Array) {
+            old_effective = self.doc.tree.struct_span(node_id);
+        }
+
+        if choice.entry_kind == TypeEntryKind::Primitive {
+            let pk = choice.primitive_kind;
+            if spec.array_count > 0 {
+                // Primitive array, e.g. "int32_t[10]".
+                let was = self.suppress_refresh;
+                self.suppress_refresh = true;
+                self.begin_macro("Change to primitive array");
+                if node_kind != NodeKind::Array {
+                    self.change_node_kind(node_idx, NodeKind::Array);
+                }
+                let idx = self.doc.tree.index_of_id(node_id);
+                if idx >= 0 {
+                    let n = &self.doc.tree.nodes[idx as usize];
+                    if n.element_kind != pk || n.array_len != spec.array_count {
+                        let (oek, oal) = (n.element_kind, n.array_len);
+                        self.push_command(Command::ChangeArrayMeta {
+                            node_id,
+                            old_element_kind: oek,
+                            new_element_kind: pk,
+                            old_array_len: oal,
+                            new_array_len: spec.array_count,
+                        });
+                    }
+                }
+                self.end_macro();
+                self.suppress_refresh = was;
+                if !self.suppress_refresh {
+                    self.refresh();
+                }
+            } else if spec.is_pointer {
+                if !is_valid_primitive_ptr_target(pk) {
+                    // Hex / pointer / fnptr with `*` → a plain void pointer.
+                    if node_kind != NodeKind::Pointer64 {
+                        self.change_node_kind(node_idx, NodeKind::Pointer64);
+                    }
+                    let idx = self.doc.tree.index_of_id(node_id);
+                    if idx >= 0 {
+                        let old_ref = {
+                            let n = &mut self.doc.tree.nodes[idx as usize];
+                            n.ptr_depth = 0;
+                            n.ref_id
+                        };
+                        if old_ref != 0 {
+                            self.push_command(Command::ChangePointerRef {
+                                node_id,
+                                old_ref_id: old_ref,
+                                new_ref_id: 0,
+                            });
+                        }
+                    }
+                } else {
+                    // Primitive pointer, e.g. "int32*" / "f64**".
+                    let was = self.suppress_refresh;
+                    self.suppress_refresh = true;
+                    self.begin_macro("Change to primitive pointer");
+                    if node_kind != NodeKind::Pointer64 {
+                        self.change_node_kind(node_idx, NodeKind::Pointer64);
+                    }
+                    let idx = self.doc.tree.index_of_id(node_id);
+                    if idx >= 0 {
+                        let old_ref = {
+                            let n = &mut self.doc.tree.nodes[idx as usize];
+                            if n.element_kind != pk || n.ptr_depth != spec.ptr_depth {
+                                n.element_kind = pk;
+                                n.ptr_depth = spec.ptr_depth;
+                            }
+                            n.ref_id
+                        };
+                        if old_ref != 0 {
+                            self.push_command(Command::ChangePointerRef {
+                                node_id,
+                                old_ref_id: old_ref,
+                                new_ref_id: 0,
+                            });
+                        }
+                    }
+                    self.end_macro();
+                    self.suppress_refresh = was;
+                    if !self.suppress_refresh {
+                        self.refresh();
+                    }
+                }
+            } else if pk != node_kind {
+                self.change_node_kind(node_idx, pk);
+            }
+        } else {
+            // Composite target.
+            let struct_id = choice.struct_id;
+            let was = self.suppress_refresh;
+            self.suppress_refresh = true;
+            self.begin_macro("Change to composite type");
+
+            if spec.is_pointer {
+                // Pointer modifier → Pointer64 + refId + ptrDepth.
+                if node_kind != NodeKind::Pointer64 {
+                    self.change_node_kind(node_idx, NodeKind::Pointer64);
+                }
+                let idx = self.doc.tree.index_of_id(node_id);
+                if idx >= 0 {
+                    let new_depth = (spec.ptr_depth - 1).max(0);
+                    let old_ref = {
+                        let n = &mut self.doc.tree.nodes[idx as usize];
+                        if n.ptr_depth != new_depth {
+                            n.ptr_depth = new_depth;
+                        }
+                        n.ref_id
+                    };
+                    if old_ref != struct_id {
+                        self.push_command(Command::ChangePointerRef {
+                            node_id,
+                            old_ref_id: old_ref,
+                            new_ref_id: struct_id,
+                        });
+                    }
+                }
+            } else if spec.array_count > 0 {
+                // Array modifier → Array + Struct element.
+                if node_kind != NodeKind::Array {
+                    self.change_node_kind(node_idx, NodeKind::Array);
+                }
+                let idx = self.doc.tree.index_of_id(node_id);
+                if idx >= 0 {
+                    let n = &self.doc.tree.nodes[idx as usize];
+                    let (oek, oal, oref) = (n.element_kind, n.array_len, n.ref_id);
+                    if oek != NodeKind::Struct || oal != spec.array_count {
+                        self.push_command(Command::ChangeArrayMeta {
+                            node_id,
+                            old_element_kind: oek,
+                            new_element_kind: NodeKind::Struct,
+                            old_array_len: oal,
+                            new_array_len: spec.array_count,
+                        });
+                    }
+                    if oref != struct_id {
+                        self.push_command(Command::ChangePointerRef {
+                            node_id,
+                            old_ref_id: oref,
+                            new_ref_id: struct_id,
+                        });
+                    }
+                }
+            } else {
+                // Plain struct → Struct + structTypeName + refId.
+                if node_kind != NodeKind::Struct {
+                    self.change_node_kind(node_idx, NodeKind::Struct);
+                }
+                let idx = self.doc.tree.index_of_id(node_id);
+                if idx >= 0 {
+                    // Derive the type name from the referenced root struct.
+                    let target_name = {
+                        let ri = self.doc.tree.index_of_id(struct_id);
+                        if ri >= 0 {
+                            let r = &self.doc.tree.nodes[ri as usize];
+                            if r.struct_type_name.is_empty() {
+                                r.name.clone()
+                            } else {
+                                r.struct_type_name.clone()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    };
+                    let (old_type_name, old_ref) = {
+                        let n = &self.doc.tree.nodes[idx as usize];
+                        (n.struct_type_name.clone(), n.ref_id)
+                    };
+                    if old_type_name != target_name {
+                        self.push_command(Command::ChangeStructTypeName {
+                            node_id,
+                            old_name: old_type_name,
+                            new_name: target_name,
+                        });
+                    }
+                    if old_ref != struct_id {
+                        self.push_command(Command::ChangePointerRef {
+                            node_id,
+                            old_ref_id: old_ref,
+                            new_ref_id: struct_id,
+                        });
+                    }
+                }
+            }
+
+            self.end_macro();
+            self.suppress_refresh = was;
+            if !self.suppress_refresh {
+                self.refresh();
+            }
+        }
+
+        // ── Post-mutation sibling offset adjustment (Struct/Array only) ──
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni >= 0 {
+            let kind = self.doc.tree.nodes[ni as usize].kind;
+            if matches!(kind, NodeKind::Struct | NodeKind::Array) {
+                let mut new_effective = self.doc.tree.nodes[ni as usize].byte_size();
+                if new_effective == 0 && kind == NodeKind::Struct {
+                    new_effective = self.doc.tree.struct_span(node_id);
+                }
+                if new_effective == 0 && kind == NodeKind::Array {
+                    let (ek, rid, al) = {
+                        let n = &self.doc.tree.nodes[ni as usize];
+                        (n.element_kind, n.ref_id, n.array_len)
+                    };
+                    if ek == NodeKind::Struct && rid != 0 {
+                        let elem_span = self.doc.tree.struct_span(rid) as i64;
+                        new_effective = (elem_span * al as i64).min(i32::MAX as i64) as i32;
+                    } else if ek != NodeKind::Struct {
+                        let p = size_for_kind(ek) as i64 * al as i64;
+                        new_effective = p.min(i32::MAX as i64) as i32;
+                    }
+                }
+                let size_delta = new_effective - old_effective;
+                if size_delta != 0 && old_effective > 0 {
+                    let old_end = node_offset + old_effective;
+                    let siblings = self.doc.tree.children_of(parent_id);
+                    let was = self.suppress_refresh;
+                    self.suppress_refresh = true;
+                    self.begin_macro("Adjust sibling offsets");
+                    for si in siblings {
+                        let (sib_id, sib_off, sib_static) = {
+                            let s = &self.doc.tree.nodes[si];
+                            (s.id, s.offset, s.is_static)
+                        };
+                        if sib_id == node_id || sib_static {
+                            continue;
+                        }
+                        if sib_off >= old_end {
+                            self.push_command(Command::ChangeOffset {
+                                node_id: sib_id,
+                                old_offset: sib_off,
+                                new_offset: sib_off + size_delta,
+                            });
+                        }
+                    }
+                    self.end_macro();
+                    self.suppress_refresh = was;
+                    if !self.suppress_refresh {
+                        self.refresh();
+                    }
+                }
+            }
+        }
+    }
+
+    /// `findOrCreateStructByName(typeName, depth)` (`controller.cpp:5074`).
+    ///
+    /// Resolve a type by name to a root-struct id: reuse an existing local root
+    /// struct, else materialize a built-in [`K_COMMON_TYPES`] layout (recursively
+    /// wiring pointer targets), else a default 8×Hex64 struct. All inserts are
+    /// wrapped in one "Import type" macro. Returns the resolved root id (0 only on
+    /// recursion-depth overflow).
+    pub fn find_or_create_struct_by_name(&mut self, type_name: &str, depth: i32) -> u64 {
+        if depth > 8 {
+            return 0; // guard against cyclic type graphs.
+        }
+        // Already present locally?
+        for n in &self.doc.tree.nodes {
+            if n.parent_id == 0
+                && n.kind == NodeKind::Struct
+                && (n.struct_type_name == type_name
+                    || (n.struct_type_name.is_empty() && n.name == type_name))
+            {
+                return n.id;
+            }
+        }
+
+        let was = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Import type");
+
+        let mut root = Node {
+            kind: NodeKind::Struct,
+            struct_type_name: type_name.to_string(),
+            name: "instance".to_string(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        };
+        root.id = self.doc.tree.reserve_id();
+        let root_id = root.id;
+
+        if let Some(ct) = find_common_type(type_name) {
+            root.class_keyword = ct.class_keyword.to_string();
+            self.push_command(Command::Insert {
+                node: root,
+                off_adjs: Vec::new(),
+            });
+            for f in ct.fields {
+                let mut child = Node {
+                    kind: f.kind,
+                    name: f.name.to_string(),
+                    parent_id: root_id,
+                    offset: f.offset,
+                    ..Node::default()
+                };
+                child.id = self.doc.tree.reserve_id();
+                let child_id = child.id;
+                if !f.ptr_target.is_empty()
+                    && matches!(f.kind, NodeKind::Pointer64 | NodeKind::Pointer32)
+                    && f.ptr_target != type_name
+                {
+                    self.push_command(Command::Insert {
+                        node: child,
+                        off_adjs: Vec::new(),
+                    });
+                    let target_id = self.find_or_create_struct_by_name(f.ptr_target, depth + 1);
+                    if target_id != 0 {
+                        self.push_command(Command::ChangePointerRef {
+                            node_id: child_id,
+                            old_ref_id: 0,
+                            new_ref_id: target_id,
+                        });
+                    }
+                } else {
+                    self.push_command(Command::Insert {
+                        node: child,
+                        off_adjs: Vec::new(),
+                    });
+                }
+            }
+        } else {
+            // Unknown type → default 8×Hex64.
+            self.push_command(Command::Insert {
+                node: root,
+                off_adjs: Vec::new(),
+            });
+            for i in 0..8 {
+                let mut child = Node {
+                    kind: NodeKind::Hex64,
+                    name: format!("field_{:02x}", i * 8),
+                    parent_id: root_id,
+                    offset: i * 8,
+                    ..Node::default()
+                };
+                child.id = self.doc.tree.reserve_id();
+                self.push_command(Command::Insert {
+                    node: child,
+                    off_adjs: Vec::new(),
+                });
+            }
+        }
+
+        self.end_macro();
+        self.suppress_refresh = was;
+        root_id
+    }
+
+    /// `createNewTypeRequested` handler (`controller.cpp:4520`): materialize a
+    /// fresh `NewClass`/`NewClassN` root struct with 8×Hex64 fields in one
+    /// "Create new type" macro. Returns `(root_id, type_name)`.
+    pub fn create_new_class_struct(&mut self) -> (u64, String) {
+        let base = "NewClass";
+        let mut type_name = base.to_string();
+        let mut counter = 1;
+        let existing: std::collections::HashSet<String> = self
+            .doc
+            .tree
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Struct && !n.struct_type_name.is_empty())
+            .map(|n| n.struct_type_name.clone())
+            .collect();
+        while existing.contains(&type_name) {
+            type_name = format!("{base}{counter}");
+            counter += 1;
+        }
+
+        let was = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Create new type");
+
+        let mut root = Node {
+            kind: NodeKind::Struct,
+            struct_type_name: type_name.clone(),
+            name: "instance".to_string(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        };
+        root.id = self.doc.tree.reserve_id();
+        let root_id = root.id;
+        self.push_command(Command::Insert {
+            node: root,
+            off_adjs: Vec::new(),
+        });
+        for i in 0..8 {
+            let mut child = Node {
+                kind: NodeKind::Hex64,
+                name: format!("field_{:02x}", i * 8),
+                parent_id: root_id,
+                offset: i * 8,
+                ..Node::default()
+            };
+            child.id = self.doc.tree.reserve_id();
+            self.push_command(Command::Insert {
+                node: child,
+                off_adjs: Vec::new(),
+            });
+        }
+
+        self.end_macro();
+        self.suppress_refresh = was;
+        (root_id, type_name)
+    }
+
+    /// The composite [`TypePopupChoice`] entries surfaced by the type popup beyond
+    /// the local named structs: every built-in [`K_COMMON_TYPES`] entry, as an
+    /// importable composite (`struct_id == 0` ⇒ imported on choose). Mirrors the
+    /// C++ `fullTypeEntries` appending `kCommonTypes` after the local structs
+    /// (`controller.cpp`, raw gaps 13/14). The editor concatenates these after its
+    /// local-struct entries.
+    pub fn common_type_entries(&self) -> Vec<TypePopupChoice> {
+        K_COMMON_TYPES
+            .iter()
+            .map(|ct| TypePopupChoice {
+                entry_kind: TypeEntryKind::Composite,
+                primitive_kind: NodeKind::Struct,
+                struct_id: 0,
+                display_name: ct.name.to_string(),
+                full_text: String::new(),
+                create_new: false,
+            })
+            .collect()
+    }
+
+    /// `dissolveUnion(unionId)` (`controller.cpp:1959`).
+    ///
+    /// Flatten a union back into its parent scope: each member (and its subtree)
+    /// is re-parented under the union's parent at `unionOffset + memberOffset`,
+    /// then the union node itself is removed — all in one "Dissolve union" macro.
+    pub fn dissolve_union(&mut self, union_id: u64) {
+        let ui = self.doc.tree.index_of_id(union_id);
+        if ui < 0 {
+            return;
+        }
+        let (kind, is_union, parent_id, union_offset) = {
+            let u = &self.doc.tree.nodes[ui as usize];
+            (u.kind, u.is_union(), u.parent_id, u.offset)
+        };
+        if kind != NodeKind::Struct || !is_union {
+            return;
+        }
+
+        // Snapshot each direct member + its (non-self) subtree, by value.
+        struct SavedMember {
+            node: Node,
+            subtree: Vec<Node>,
+        }
+        let mut saved: Vec<SavedMember> = Vec::new();
+        for ci in self.doc.tree.children_of(union_id) {
+            let member = self.doc.tree.nodes[ci].clone();
+            let mut subtree: Vec<Node> = Vec::new();
+            for si in self.doc.tree.subtree_indices(member.id) {
+                if self.doc.tree.nodes[si].id != member.id {
+                    subtree.push(self.doc.tree.nodes[si].clone());
+                }
+            }
+            saved.push(SavedMember {
+                node: member,
+                subtree,
+            });
+        }
+
+        let was = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Dissolve union");
+
+        // Remove the union (and all its children).
+        {
+            let subtree: Vec<Node> = self
+                .doc
+                .tree
+                .subtree_indices(union_id)
+                .into_iter()
+                .map(|si| self.doc.tree.nodes[si].clone())
+                .collect();
+            self.push_command(Command::Remove {
+                node_id: union_id,
+                subtree,
+                off_adjs: Vec::new(),
+            });
+        }
+
+        // Re-insert each member under the union's parent at the union's offset.
+        for sm in &saved {
+            let mut copy = sm.node.clone();
+            copy.parent_id = parent_id;
+            copy.offset = union_offset + sm.node.offset;
+            copy.id = self.doc.tree.reserve_id();
+            let new_id = copy.id;
+            let old_id = sm.node.id;
+            self.push_command(Command::Insert {
+                node: copy,
+                off_adjs: Vec::new(),
+            });
+            for child in &sm.subtree {
+                let mut cc = child.clone();
+                if cc.parent_id == old_id {
+                    cc.parent_id = new_id;
+                }
+                cc.id = self.doc.tree.reserve_id();
+                self.push_command(Command::Insert {
+                    node: cc,
+                    off_adjs: Vec::new(),
+                });
+            }
+        }
+
+        self.end_macro();
+        self.suppress_refresh = was;
+        if !self.suppress_refresh {
+            self.refresh();
+        }
+    }
+
+    /// The current value of a bitfield member + its max, for seeding the
+    /// "Edit Bitfield Value" prompt (`controller.cpp:2871-2873`). Returns
+    /// `(value, max_val)`, or `None` if the node is not a valid bitfield member.
+    /// Reads through [`format::extract_bits`] (the same path the formatter uses).
+    pub fn bitfield_member_value(&self, node_id: u64, member_idx: usize) -> Option<(u64, u64)> {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return None;
+        }
+        let (member, element_kind) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
+                return None;
+            }
+            (n.bitfield_members[member_idx].clone(), n.element_kind)
+        };
+        let signed_off = self.doc.tree.compute_offset(ni);
+        if signed_off < 0 {
+            return None;
+        }
+        let addr = self.doc.tree.base_address + signed_off as u64;
+        let val = format::extract_bits(
+            &*self.doc.provider,
+            addr,
+            element_kind,
+            member.bit_offset,
+            member.bit_width,
+        );
+        let max_val = if member.bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << member.bit_width) - 1
+        };
+        Some((val, max_val))
+    }
+
+    /// `toggleBitfieldBit(nodeId, memberIdx)` (`controller.cpp:2825`).
+    ///
+    /// XOR-flip one bit of a bitfield member through an undoable `WriteBytes`.
+    /// No-op unless the node is a bitfield, the member index is in range, and the
+    /// provider is writable.
+    pub fn toggle_bitfield_bit(&mut self, node_id: u64, member_idx: usize) {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return;
+        }
+        let (is_bitfield, member, container_size) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
+                return;
+            }
+            let cs = {
+                let s = size_for_kind(n.element_kind);
+                if s <= 0 {
+                    4
+                } else {
+                    s
+                }
+            };
+            (true, n.bitfield_members[member_idx].clone(), cs)
+        };
+        if !is_bitfield || !self.doc.provider.is_writable() {
+            return;
+        }
+        let signed_off = self.doc.tree.compute_offset(ni);
+        if signed_off < 0 {
+            return;
+        }
+        let addr = self.doc.tree.base_address + signed_off as u64;
+
+        let mut old_bytes = vec![0u8; container_size as usize];
+        self.doc.provider.read(addr, &mut old_bytes);
+        let mut new_bytes = old_bytes.clone();
+        let byte_idx = (member.bit_offset / 8) as usize;
+        let bit_in_byte = member.bit_offset % 8;
+        if byte_idx < new_bytes.len() {
+            new_bytes[byte_idx] ^= 1u8 << bit_in_byte;
+        }
+        self.push_command(Command::WriteBytes {
+            addr,
+            old_bytes,
+            new_bytes,
+        });
+    }
+
+    /// `editBitfieldValue(nodeId, memberIdx, newValueText)` (`controller.cpp:2855`).
+    ///
+    /// Read-modify-write the member's bit span to `new_value_text` (decimal, or
+    /// `0x`-prefixed hex), clamped to `(1<<width)-1`. The UI supplies the typed
+    /// string (the C++ prompts a dialog); returns whether a write was queued.
+    pub fn edit_bitfield_value(
+        &mut self,
+        node_id: u64,
+        member_idx: usize,
+        new_value_text: &str,
+    ) -> bool {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return false;
+        }
+        let (member, container_size) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
+                return false;
+            }
+            let cs = {
+                let s = size_for_kind(n.element_kind);
+                if s <= 0 {
+                    4
+                } else {
+                    s
+                }
+            };
+            (n.bitfield_members[member_idx].clone(), cs)
+        };
+        if !self.doc.provider.is_writable() {
+            return false;
+        }
+        let signed_off = self.doc.tree.compute_offset(ni);
+        if signed_off < 0 {
+            return false;
+        }
+        let addr = self.doc.tree.base_address + signed_off as u64;
+
+        let max_val: u64 = if member.bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << member.bit_width) - 1
+        };
+
+        // Parse the typed value (hex with 0x prefix, else decimal).
+        let s = new_value_text.trim();
+        if s.is_empty() {
+            return false;
+        }
+        let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+        } else {
+            s.parse::<u64>()
+        };
+        let Ok(mut new_val) = parsed else {
+            return false;
+        };
+        new_val &= max_val;
+
+        let mut old_bytes = vec![0u8; container_size as usize];
+        self.doc.provider.read(addr, &mut old_bytes);
+        let mut new_bytes = old_bytes.clone();
+        // Read-modify-write the container's masked bit span.
+        let mut container: u64 = 0;
+        let n = (container_size as usize).min(8);
+        for (i, b) in old_bytes.iter().take(n).enumerate() {
+            container |= (*b as u64) << (8 * i);
+        }
+        let mask = max_val << member.bit_offset;
+        container = (container & !mask) | ((new_val & max_val) << member.bit_offset);
+        for (i, b) in new_bytes.iter_mut().take(n).enumerate() {
+            *b = (container >> (8 * i)) as u8;
+        }
+
+        self.push_command(Command::WriteBytes {
+            addr,
+            old_bytes,
+            new_bytes,
+        });
+        true
+    }
+
+    /// `insertStaticField(parentId)` (`controller.cpp:2909`).
+    ///
+    /// Add a static/global field (`isStatic`, `offsetExpr = "base"`, Hex64) as a
+    /// child of `parent_id`, undoable.
+    pub fn insert_static_field(&mut self, parent_id: u64) {
+        let mut sf = Node {
+            kind: NodeKind::Hex64,
+            name: "static_field".to_string(),
+            parent_id,
+            offset: 0,
+            is_static: true,
+            offset_expr: "base".to_string(),
+            ..Node::default()
+        };
+        sf.id = self.doc.tree.reserve_id();
+        self.push_command(Command::Insert {
+            node: sf,
+            off_adjs: Vec::new(),
+        });
+    }
+
+    /// Add a member to an enum/bitfield (`Add Member`, `controller.cpp:3364` /
+    /// `3315`). For an enum: append `("NewMember", lastVal+1)`. For a bitfield:
+    /// append a 1-bit member at the next free bit. `at == None` appends; `at ==
+    /// Some(i)` inserts before index `i` (Add Member Above/Below map to `i` /
+    /// `i+1`). Returns whether a member was added.
+    pub fn add_member(&mut self, node_id: u64, at: Option<usize>) -> bool {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return false;
+        }
+        let (is_enum, is_bitfield) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            (n.is_enum(), n.is_bitfield())
+        };
+        if is_enum {
+            let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
+            let mut members = old_members.clone();
+            let pos = at.unwrap_or(members.len()).min(members.len());
+            // Value policy (`controller.cpp:3321`/`3368`): a strict append uses
+            // `last + 1`; an insert before `pos` uses `predecessor + 1` (or 0 at
+            // the head).
+            let val = if at.is_none() {
+                members.last().map(|(_, v)| v + 1).unwrap_or(0)
+            } else if pos > 0 {
+                members[pos - 1].1 + 1
+            } else {
+                0
+            };
+            members.insert(pos, ("NewMember".to_string(), val));
+            self.push_command(Command::ChangeEnumMembers {
+                node_id,
+                old_members,
+                new_members: members,
+            });
+            return true;
+        }
+        if is_bitfield {
+            // Bitfield members are not undoable via a command in the C++ (they live
+            // on the Node, not an EnumMembers list). Mutate directly so the layout
+            // grows; the next free bit is the running max of (offset+width).
+            let next_bit = self.doc.tree.nodes[ni as usize]
+                .bitfield_members
+                .iter()
+                .map(|m| m.bit_offset as u32 + m.bit_width as u32)
+                .max()
+                .unwrap_or(0);
+            let n = &mut self.doc.tree.nodes[ni as usize];
+            let idx = at
+                .unwrap_or(n.bitfield_members.len())
+                .min(n.bitfield_members.len());
+            n.bitfield_members.insert(
+                idx,
+                crate::core::BitfieldMember {
+                    name: "NewMember".to_string(),
+                    bit_offset: next_bit.min(255) as u8,
+                    bit_width: 1,
+                },
+            );
+            self.doc.tree.touch();
+            if !self.suppress_refresh {
+                self.refresh();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Rename enum/bitfield member `member_idx` to `name`
+    /// (`controller.cpp:1142-1149` enum path / bitfield member rename).
+    pub fn rename_member(&mut self, node_id: u64, member_idx: usize, name: &str) -> bool {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return false;
+        }
+        let (is_enum, is_bitfield) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            (n.is_enum(), n.is_bitfield())
+        };
+        if is_enum {
+            let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
+            if member_idx >= old_members.len() {
+                return false;
+            }
+            let mut members = old_members.clone();
+            members[member_idx].0 = name.to_string();
+            self.push_command(Command::ChangeEnumMembers {
+                node_id,
+                old_members,
+                new_members: members,
+            });
+            return true;
+        }
+        if is_bitfield {
+            let n = &mut self.doc.tree.nodes[ni as usize];
+            if member_idx >= n.bitfield_members.len() {
+                return false;
+            }
+            n.bitfield_members[member_idx].name = name.to_string();
+            self.doc.tree.touch();
+            if !self.suppress_refresh {
+                self.refresh();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Set enum member `member_idx`'s value (`controller.cpp:1222-1239`). Accepts
+    /// decimal or `0x`-prefixed hex; no-op on parse failure.
+    pub fn set_member_value(&mut self, node_id: u64, member_idx: usize, value_text: &str) -> bool {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return false;
+        }
+        if !self.doc.tree.nodes[ni as usize].is_enum() {
+            return false;
+        }
+        let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
+        if member_idx >= old_members.len() {
+            return false;
+        }
+        let s = value_text.trim();
+        // toLongLong(10) then toLongLong(16) fallback, mirroring the C++.
+        let parsed = s
+            .parse::<i64>()
+            .ok()
+            .or_else(|| {
+                s.strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .and_then(|h| i64::from_str_radix(h, 16).ok())
+            })
+            .or_else(|| i64::from_str_radix(s, 16).ok());
+        let Some(val) = parsed else {
+            return false;
+        };
+        let mut members = old_members.clone();
+        members[member_idx].1 = val;
+        self.push_command(Command::ChangeEnumMembers {
+            node_id,
+            old_members,
+            new_members: members,
+        });
+        true
+    }
+
+    /// Delete enum/bitfield member `member_idx` (`Remove Member`,
+    /// `controller.cpp:3337`).
+    pub fn delete_member(&mut self, node_id: u64, member_idx: usize) -> bool {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return false;
+        }
+        let (is_enum, is_bitfield) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            (n.is_enum(), n.is_bitfield())
+        };
+        if is_enum {
+            let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
+            if member_idx >= old_members.len() {
+                return false;
+            }
+            let mut members = old_members.clone();
+            members.remove(member_idx);
+            self.push_command(Command::ChangeEnumMembers {
+                node_id,
+                old_members,
+                new_members: members,
+            });
+            return true;
+        }
+        if is_bitfield {
+            let n = &mut self.doc.tree.nodes[ni as usize];
+            if member_idx >= n.bitfield_members.len() {
+                return false;
+            }
+            n.bitfield_members.remove(member_idx);
+            self.doc.tree.touch();
+            if !self.suppress_refresh {
+                self.refresh();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Resolve an address expression through [`AddressParser`] against the active
+    /// provider, wiring `resolveModule` / `readPointer` / `resolveIdentifier`
+    /// (via [`SymbolStore`]) and — when the provider reports kernel paging —
+    /// `vtop` / `cr3` / `physRead`. Mirrors the callback bag built in
+    /// `controller.cpp:1107` / `1249` / `5168`. Returns `(value, ok)`.
+    ///
+    /// This is the single resolution path used by base-address inline edits,
+    /// provider attach / source switch re-evaluation, and goto/scanner address
+    /// resolution (raw gaps 63/64/65/66).
+    pub fn resolve_address_expr(&self, expr: &str) -> (u64, bool) {
+        use crate::addr::{AddressParser, AddressParserCallbacks};
+        #[cfg(feature = "symbols")]
+        use crate::rtti::symbol_store::SymbolStore;
+
+        let cleaned: String = expr.chars().filter(|&c| c != '`' && c != '\'').collect();
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            return (0, false);
+        }
+
+        let prov = &*self.doc.provider;
+        let ptr_sz = self.doc.tree.pointer_size;
+        let mut cbs = AddressParserCallbacks {
+            resolve_module: Some(Box::new(move |name: &str| {
+                let base = prov.symbol_to_address(name);
+                (base, base != 0)
+            })),
+            read_pointer: Some(Box::new(move |addr: u64| {
+                let mut buf = [0u8; 8];
+                let n = ptr_sz.clamp(1, 8) as usize;
+                let ok = prov.read(addr, &mut buf[..n]);
+                let mut val = 0u64;
+                for (i, b) in buf[..n].iter().enumerate() {
+                    val |= (*b as u64) << (8 * i);
+                }
+                (val, ok)
+            })),
+            ..Default::default()
+        };
+
+        // `resolveIdentifier` is backed by the global `SymbolStore`, which lives
+        // in the `symbols`-gated `rtti` module. Without that feature there are no
+        // user-imported symbols to resolve, so the callback is simply absent
+        // (the parser then fails identifier lookups, matching the headless build).
+        #[cfg(feature = "symbols")]
+        {
+            cbs.resolve_identifier = Some(Box::new(move |name: &str| {
+                match SymbolStore::global().lock() {
+                    Ok(store) => store.resolve(name, Some(prov)),
+                    Err(_) => (0, false),
+                }
+            }));
+        }
+
+        if prov.has_kernel_paging() {
+            cbs.vtop = Some(Box::new(move |_pid: u32, va: u64| {
+                let r = prov.translate_address(va);
+                (r.physical, r.valid)
+            }));
+            cbs.cr3 = Some(Box::new(move |_pid: u32| {
+                let cr3 = prov.get_cr3();
+                (cr3, cr3 != 0)
+            }));
+            cbs.phys_read = Some(Box::new(move |phys_addr: u64| {
+                let entries = prov.read_page_table(phys_addr, 0, 1);
+                (entries.first().copied().unwrap_or(0), !entries.is_empty())
+            }));
+        }
+
+        let result = AddressParser::evaluate(cleaned, ptr_sz, Some(&cbs));
+        (result.value, result.ok)
+    }
+
+    /// Commit a base-address inline edit (`EditTarget::BaseAddress`,
+    /// `controller.cpp:1243-1302`): evaluate the typed expression through the
+    /// live provider callbacks ([`resolve_address_expr`](Self::resolve_address_expr)),
+    /// and on success push a [`Command::ChangeBase`] preserving the user-typed
+    /// expression as the formula — unless it is a bare hex/decimal literal that
+    /// round-trips through the canonical `0xHEX` display.
+    pub fn commit_base_address(&mut self, text: &str) {
+        let mut s = text.trim().to_string();
+        s.retain(|c| c != '`' && c != '\n' && c != '\r');
+        let (value, ok) = self.resolve_address_expr(&s);
+        if !ok {
+            return;
+        }
+        // A bare literal (0xHEX or decimal) round-trips through the display, so
+        // store an empty formula; anything richer is kept verbatim.
+        let trimmed = s.trim();
+        let is_literal = !trimmed.is_empty()
+            && (trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+                .map(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+                .unwrap_or(false)
+                || trimmed.chars().all(|c| c.is_ascii_digit()));
+        let new_formula = if is_literal {
+            String::new()
+        } else {
+            trimmed.to_string()
+        };
+        let old_base = self.doc.tree.base_address;
+        let old_formula = self.doc.tree.base_address_formula.clone();
+        if value != old_base || new_formula != old_formula {
+            self.push_command(Command::ChangeBase {
+                old_base,
+                new_base: value,
+                old_formula,
+                new_formula,
+            });
+        }
+    }
+
+    /// Re-evaluate the stored `base_address_formula` against the current provider
+    /// and update `tree.base_address` in place (no undo entry — relocation, not a
+    /// user edit). No-op when the formula is empty. Mirrors the post-attach /
+    /// post-source-switch re-evaluation block (`controller.cpp:5167-5208`).
+    pub fn reevaluate_base_address_formula(&mut self) {
+        if self.doc.tree.base_address_formula.is_empty() {
+            return;
+        }
+        let formula = self.doc.tree.base_address_formula.clone();
+        let (value, ok) = self.resolve_address_expr(&formula);
+        if ok {
+            self.doc.tree.base_address = value;
+        }
+    }
+
     /// `splitHexNode(nodeId)` (`controller.cpp:3332`).
     pub fn split_hex_node(&mut self, node_id: u64) {
         let ni = self.doc.tree.index_of_id(node_id);
@@ -3525,6 +4829,9 @@ impl RcxController {
                 self.doc.load_data_file(&entry.file_path);
                 self.doc.tree.base_address = entry.base_address;
                 self.doc.tree.base_address_formula = entry.base_address_formula.clone();
+                // Re-resolve a stored formula against the freshly-loaded source so
+                // a module-relative base relocates on switch (`controller.cpp:5231`).
+                self.reevaluate_base_address_formula();
                 self.reset_snapshot();
                 self.refresh();
             }
@@ -3572,6 +4879,10 @@ impl RcxController {
                 self.doc.tree.base_address = new_base;
             }
         }
+        // Re-evaluate a stored module-relative / `[ptr]` formula against the new
+        // provider so a project saved with a module-relative base relocates to the
+        // new module load address (`controller.cpp:5167-5208`).
+        self.reevaluate_base_address_formula();
         self.reset_snapshot();
         if register_as_saved {
             // Dedup on (kind, providerTarget) — here providerTarget is empty.

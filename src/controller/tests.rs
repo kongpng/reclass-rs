@@ -2454,3 +2454,668 @@ fn materialize_ref_children_noop_without_ref() {
     c.materialize_ref_children(0);
     assert_eq!(c.tree().nodes.len(), before);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// New-feature ports: type popup, find/create struct, dissolve union, bitfield
+// interaction, enum/bitfield members, static field, address resolution.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A two-root document: a `Player` root struct and a sibling leaf field on a
+/// second root — covers the FieldType / PointerTarget / ArrayElement flows.
+fn make_two_root_ctrl() -> RcxController {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    // Root A: a named struct "Player" with 2 fields (used as a composite target).
+    let a = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Player".into(),
+        name: "player".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let a_id = doc.tree.nodes[a].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::Float,
+        name: "x".into(),
+        parent_id: a_id,
+        offset: 0,
+        ..Node::default()
+    });
+    doc.tree.add_node(Node {
+        kind: NodeKind::Float,
+        name: "y".into(),
+        parent_id: a_id,
+        offset: 4,
+        ..Node::default()
+    });
+    // Root B: a host struct with a single Hex64 field we mutate.
+    let b = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Host".into(),
+        name: "host".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let b_id = doc.tree.nodes[b].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "slot".into(),
+        parent_id: b_id,
+        offset: 0,
+        ..Node::default()
+    });
+    doc.tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "after".into(),
+        parent_id: b_id,
+        offset: 8,
+        ..Node::default()
+    });
+    doc.provider = Arc::new(BufferProvider::new(vec![0u8; 256], "x.bin"));
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+    c
+}
+
+fn player_and_slot(c: &RcxController) -> (u64, u64) {
+    let player = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| n.struct_type_name == "Player")
+        .unwrap()
+        .id;
+    let slot = c.tree().nodes.iter().find(|n| n.name == "slot").unwrap().id;
+    (player, slot)
+}
+
+#[test]
+fn parse_type_spec_modifiers() {
+    let s = parse_type_spec("Ball*");
+    assert!(s.is_pointer && s.ptr_depth == 1 && s.base_name == "Ball");
+    let s = parse_type_spec("Ball**");
+    assert!(s.is_pointer && s.ptr_depth == 2 && s.base_name == "Ball");
+    let s = parse_type_spec("int32_t[10]");
+    assert_eq!(s.array_count, 10);
+    assert_eq!(s.base_name, "int32_t");
+    let s = parse_type_spec("int32_t[0]");
+    assert_eq!(s.array_count, 0); // [0] is rejected.
+    let s = parse_type_spec("uint64_t");
+    assert!(!s.is_pointer && s.array_count == 0 && s.base_name == "uint64_t");
+}
+
+#[test]
+fn type_popup_field_primitive() {
+    let mut c = make_two_root_ctrl();
+    let (_player, slot) = player_and_slot(&c);
+    c.apply_type_popup_result(
+        TypePopupMode::FieldType,
+        slot,
+        TypePopupChoice::primitive(NodeKind::UInt32, "uint32_t"),
+    );
+    let n = &c.tree().nodes[c.tree().index_of_id(slot) as usize];
+    assert_eq!(n.kind, NodeKind::UInt32);
+}
+
+#[test]
+fn type_popup_field_composite_sets_ref_and_typename() {
+    let mut c = make_two_root_ctrl();
+    let (player, slot) = player_and_slot(&c);
+    c.apply_type_popup_result(
+        TypePopupMode::FieldType,
+        slot,
+        TypePopupChoice::composite(player, "Player"),
+    );
+    let n = c.tree().nodes[c.tree().index_of_id(slot) as usize].clone();
+    assert_eq!(n.kind, NodeKind::Struct);
+    assert_eq!(n.ref_id, player);
+    assert_eq!(n.struct_type_name, "Player");
+    // One undo reverts the whole composite change.
+    c.undo();
+    let n = &c.tree().nodes[c.tree().index_of_id(slot) as usize];
+    assert_eq!(n.kind, NodeKind::Hex64);
+    assert_eq!(n.ref_id, 0);
+}
+
+#[test]
+fn type_popup_field_composite_pointer_and_array() {
+    let mut c = make_two_root_ctrl();
+    let (player, slot) = player_and_slot(&c);
+    // "Player*" → Pointer64 + refId, ptrDepth 0.
+    let mut choice = TypePopupChoice::composite(player, "Player");
+    choice.full_text = "Player*".into();
+    c.apply_type_popup_result(TypePopupMode::FieldType, slot, choice);
+    let n = c.tree().nodes[c.tree().index_of_id(slot) as usize].clone();
+    assert_eq!(n.kind, NodeKind::Pointer64);
+    assert_eq!(n.ref_id, player);
+    assert_eq!(n.ptr_depth, 0);
+
+    // "Player[4]" → Array of Struct element, refId, len 4.
+    let mut choice = TypePopupChoice::composite(player, "Player");
+    choice.full_text = "Player[4]".into();
+    c.apply_type_popup_result(TypePopupMode::FieldType, slot, choice);
+    let n = c.tree().nodes[c.tree().index_of_id(slot) as usize].clone();
+    assert_eq!(n.kind, NodeKind::Array);
+    assert_eq!(n.element_kind, NodeKind::Struct);
+    assert_eq!(n.array_len, 4);
+    assert_eq!(n.ref_id, player);
+}
+
+#[test]
+fn type_popup_pointer_target_and_array_element() {
+    let mut c = make_two_root_ctrl();
+    let (player, slot) = player_and_slot(&c);
+    // Make slot a pointer first, then set its target via PointerTarget mode.
+    c.change_node_kind(c.tree().index_of_id(slot) as usize, NodeKind::Pointer64);
+    c.apply_type_popup_result(
+        TypePopupMode::PointerTarget,
+        slot,
+        TypePopupChoice::composite(player, "Player"),
+    );
+    assert_eq!(
+        c.tree().nodes[c.tree().index_of_id(slot) as usize].ref_id,
+        player
+    );
+    // Picking "void" (primitive) clears the refId.
+    c.apply_type_popup_result(
+        TypePopupMode::PointerTarget,
+        slot,
+        TypePopupChoice::primitive(NodeKind::Hex64, "void"),
+    );
+    assert_eq!(
+        c.tree().nodes[c.tree().index_of_id(slot) as usize].ref_id,
+        0
+    );
+
+    // ArrayElement: make slot an array, then set its element to a composite.
+    c.change_node_kind(c.tree().index_of_id(slot) as usize, NodeKind::Array);
+    c.apply_type_popup_result(
+        TypePopupMode::ArrayElement,
+        slot,
+        TypePopupChoice::composite(player, "Player"),
+    );
+    let n = c.tree().nodes[c.tree().index_of_id(slot) as usize].clone();
+    assert_eq!(n.element_kind, NodeKind::Struct);
+    assert_eq!(n.ref_id, player);
+}
+
+#[test]
+fn type_popup_imports_common_type_by_name() {
+    let mut c = make_two_root_ctrl();
+    let (_player, slot) = player_and_slot(&c);
+    // struct_id 0 + a built-in name → find_or_create_struct_by_name imports it.
+    c.apply_type_popup_result(
+        TypePopupMode::FieldType,
+        slot,
+        TypePopupChoice::composite(0, "UNICODE_STRING"),
+    );
+    let n = c.tree().nodes[c.tree().index_of_id(slot) as usize].clone();
+    assert_eq!(n.kind, NodeKind::Struct);
+    assert_ne!(n.ref_id, 0);
+    // The imported root has UNICODE_STRING's 4 fields, and its Buffer pointer
+    // recursively imported a UTF16... no — UTF16 is a primitive target name; the
+    // ptr_target "UTF16" is not a common type so it falls back to default 8xHex64.
+    let imported = c.tree().nodes[c.tree().index_of_id(n.ref_id) as usize].clone();
+    assert_eq!(imported.struct_type_name, "UNICODE_STRING");
+    assert_eq!(c.tree().children_of(imported.id).len(), 4);
+}
+
+#[test]
+fn type_popup_create_new_materializes_fresh_composite() {
+    let mut c = make_two_root_ctrl();
+    let (_player, slot) = player_and_slot(&c);
+    let roots_before = c.tree().nodes.iter().filter(|n| n.parent_id == 0).count();
+    let mut choice = TypePopupChoice::composite(0, "");
+    choice.create_new = true;
+    c.apply_type_popup_result(TypePopupMode::FieldType, slot, choice);
+    // A fresh NewClass root was created and the slot points at it.
+    let n = c.tree().nodes[c.tree().index_of_id(slot) as usize].clone();
+    assert_eq!(n.kind, NodeKind::Struct);
+    assert_ne!(n.ref_id, 0);
+    let new_root = c.tree().nodes[c.tree().index_of_id(n.ref_id) as usize].clone();
+    assert_eq!(new_root.struct_type_name, "NewClass");
+    assert_eq!(c.tree().children_of(new_root.id).len(), 8);
+    let roots_after = c.tree().nodes.iter().filter(|n| n.parent_id == 0).count();
+    assert_eq!(roots_after, roots_before + 1);
+    // Whole apply is ONE undo: create + import + kind-change all revert together.
+    c.undo();
+    assert!(c.tree().index_of_id(new_root.id) < 0);
+    let n = &c.tree().nodes[c.tree().index_of_id(slot) as usize];
+    assert_eq!(n.kind, NodeKind::Hex64);
+    assert_eq!(n.ref_id, 0);
+}
+
+#[test]
+fn type_popup_composite_single_undo() {
+    let mut c = make_two_root_ctrl();
+    let (_player, slot) = player_and_slot(&c);
+    // Import UNICODE_STRING (creates a root + 4 fields) AND change the slot — all
+    // in one undo macro.
+    c.apply_type_popup_result(
+        TypePopupMode::FieldType,
+        slot,
+        TypePopupChoice::composite(0, "UNICODE_STRING"),
+    );
+    assert!(c
+        .tree()
+        .nodes
+        .iter()
+        .any(|n| n.struct_type_name == "UNICODE_STRING"));
+    c.undo();
+    assert!(!c
+        .tree()
+        .nodes
+        .iter()
+        .any(|n| n.struct_type_name == "UNICODE_STRING"));
+    assert_eq!(
+        c.tree().nodes[c.tree().index_of_id(slot) as usize].kind,
+        NodeKind::Hex64
+    );
+}
+
+#[test]
+fn find_or_create_struct_reuses_existing() {
+    let mut c = make_two_root_ctrl();
+    let (player, _slot) = player_and_slot(&c);
+    let id = c.find_or_create_struct_by_name("Player", 0);
+    assert_eq!(id, player); // reused, not re-created.
+    let n_before = c.tree().nodes.len();
+    let id2 = c.find_or_create_struct_by_name("Player", 0);
+    assert_eq!(id2, player);
+    assert_eq!(c.tree().nodes.len(), n_before);
+}
+
+#[test]
+fn find_or_create_struct_unknown_defaults_to_hex64() {
+    let mut c = make_two_root_ctrl();
+    let id = c.find_or_create_struct_by_name("TotallyUnknownType", 0);
+    assert_ne!(id, 0);
+    let kids = c.tree().children_of(id);
+    assert_eq!(kids.len(), 8);
+    for &k in &kids {
+        assert_eq!(c.tree().nodes[k].kind, NodeKind::Hex64);
+    }
+}
+
+#[test]
+fn common_type_entries_lists_builtins() {
+    let c = make_two_root_ctrl();
+    let entries = c.common_type_entries();
+    assert!(entries.iter().any(|e| e.display_name == "UNICODE_STRING"));
+    assert!(entries.iter().all(|e| e.struct_id == 0));
+    assert_eq!(entries.len(), crate::core::K_COMMON_TYPES.len());
+}
+
+#[test]
+fn dissolve_union_reparents_members() {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let root = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[root].id;
+    // Union at offset 0x10 with 2 members.
+    let u = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        class_keyword: "union".into(),
+        name: "u".into(),
+        parent_id: root_id,
+        offset: 0x10,
+        ..Node::default()
+    });
+    let u_id = doc.tree.nodes[u].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "asInt".into(),
+        parent_id: u_id,
+        offset: 0,
+        ..Node::default()
+    });
+    doc.tree.add_node(Node {
+        kind: NodeKind::Float,
+        name: "asFloat".into(),
+        parent_id: u_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+
+    c.dissolve_union(u_id);
+    // Union gone; both members re-parented under root at unionOffset + memberOffset.
+    assert!(c.tree().index_of_id(u_id) < 0);
+    let kids = c.tree().children_of(root_id);
+    let names: Vec<_> = kids
+        .iter()
+        .map(|&i| (c.tree().nodes[i].name.clone(), c.tree().nodes[i].offset))
+        .collect();
+    assert!(names.contains(&("asInt".to_string(), 0x10)));
+    assert!(names.contains(&("asFloat".to_string(), 0x10)));
+
+    // One undo restores the union.
+    c.undo();
+    assert!(c.tree().index_of_id(u_id) >= 0);
+    assert_eq!(c.tree().children_of(u_id).len(), 2);
+}
+
+#[test]
+fn dissolve_union_carries_subtree() {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let root = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[root].id;
+    let u = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        class_keyword: "union".into(),
+        name: "u".into(),
+        parent_id: root_id,
+        offset: 0x20,
+        ..Node::default()
+    });
+    let u_id = doc.tree.nodes[u].id;
+    // Member is a nested struct with a child.
+    let m = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "inner".into(),
+        parent_id: u_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let m_id = doc.tree.nodes[m].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::UInt8,
+        name: "leaf".into(),
+        parent_id: m_id,
+        offset: 4,
+        ..Node::default()
+    });
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+    c.dissolve_union(u_id);
+    // inner re-parented under root at 0x20; its leaf re-parented under the new inner.
+    let new_inner = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| n.name == "inner" && n.parent_id == root_id)
+        .unwrap()
+        .clone();
+    assert_eq!(new_inner.offset, 0x20);
+    let leaf = c.tree().children_of(new_inner.id);
+    assert_eq!(leaf.len(), 1);
+    assert_eq!(c.tree().nodes[leaf[0]].name, "leaf");
+}
+
+/// Build a controller whose root holds one bitfield node over a writable buffer.
+fn make_bitfield_ctrl() -> (RcxController, u64) {
+    use crate::core::BitfieldMember;
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let root = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[root].id;
+    let bf = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        class_keyword: "bitfield".into(),
+        name: "flags".into(),
+        parent_id: root_id,
+        offset: 0,
+        element_kind: NodeKind::Hex32, // 4-byte container.
+        bitfield_members: vec![
+            BitfieldMember {
+                name: "a".into(),
+                bit_offset: 0,
+                bit_width: 1,
+            },
+            BitfieldMember {
+                name: "b".into(),
+                bit_offset: 1,
+                bit_width: 3,
+            },
+        ],
+        ..Node::default()
+    });
+    let bf_id = doc.tree.nodes[bf].id;
+    doc.provider = Arc::new(BufferProvider::new(vec![0u8; 64], "x.bin"));
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+    (c, bf_id)
+}
+
+#[test]
+fn toggle_bitfield_bit_xor_flips() {
+    let (mut c, bf_id) = make_bitfield_ctrl();
+    // Toggle bit "a" (bit 0) on, then off.
+    c.toggle_bitfield_bit(bf_id, 0);
+    let mut buf = [0u8; 4];
+    c.document().provider.read(0, &mut buf);
+    assert_eq!(buf[0] & 1, 1);
+    c.toggle_bitfield_bit(bf_id, 0);
+    c.document().provider.read(0, &mut buf);
+    assert_eq!(buf[0] & 1, 0);
+    // Undo of the last toggle re-sets the bit.
+    c.undo();
+    c.document().provider.read(0, &mut buf);
+    assert_eq!(buf[0] & 1, 1);
+}
+
+#[test]
+fn edit_bitfield_value_rmw_with_clamp() {
+    let (mut c, bf_id) = make_bitfield_ctrl();
+    // Member "b": offset 1, width 3 (max 7). Write 5 → bits[1..4] = 101.
+    assert!(c.edit_bitfield_value(bf_id, 1, "5"));
+    let mut buf = [0u8; 4];
+    c.document().provider.read(0, &mut buf);
+    assert_eq!((buf[0] >> 1) & 0b111, 5);
+    // Over-max value (9) clamps to 9 & 7 == 1.
+    assert!(c.edit_bitfield_value(bf_id, 1, "9"));
+    c.document().provider.read(0, &mut buf);
+    assert_eq!((buf[0] >> 1) & 0b111, 1);
+    // Hex parse.
+    assert!(c.edit_bitfield_value(bf_id, 1, "0x6"));
+    c.document().provider.read(0, &mut buf);
+    assert_eq!((buf[0] >> 1) & 0b111, 6);
+    // Non-numeric → no-op.
+    assert!(!c.edit_bitfield_value(bf_id, 1, "xyz"));
+}
+
+#[test]
+fn bitfield_member_value_reads_current() {
+    let (mut c, bf_id) = make_bitfield_ctrl();
+    // Write 5 into member "b" (offset 1, width 3, max 7).
+    assert!(c.edit_bitfield_value(bf_id, 1, "5"));
+    let (val, max) = c.bitfield_member_value(bf_id, 1).unwrap();
+    assert_eq!(val, 5);
+    assert_eq!(max, 7);
+    // member "a" (1 bit, max 1) is still 0.
+    let (val, max) = c.bitfield_member_value(bf_id, 0).unwrap();
+    assert_eq!(val, 0);
+    assert_eq!(max, 1);
+    // Out-of-range / non-bitfield → None.
+    assert!(c.bitfield_member_value(bf_id, 9).is_none());
+}
+
+#[test]
+fn bitfield_ops_guard_non_writable_and_non_bitfield() {
+    let mut c = make_ctrl(); // BufferProvider is writable, but root is a Struct.
+    let root_id = c.tree().nodes[0].id;
+    c.toggle_bitfield_bit(root_id, 0); // not a bitfield → no-op (no panic).
+    assert!(!c.edit_bitfield_value(root_id, 0, "1"));
+}
+
+#[test]
+fn enum_member_add_rename_value_delete() {
+    let mut doc = RcxDocument::new();
+    let root = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        class_keyword: "enum".into(),
+        name: "E".into(),
+        parent_id: 0,
+        offset: 0,
+        enum_members: vec![("Zero".into(), 0), ("One".into(), 1)],
+        ..Node::default()
+    });
+    let e_id = doc.tree.nodes[root].id;
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+
+    // Append a member → ("NewMember", 2).
+    assert!(c.add_member(e_id, None));
+    let m = &c.tree().nodes[c.tree().index_of_id(e_id) as usize].enum_members;
+    assert_eq!(m.last().unwrap(), &("NewMember".to_string(), 2));
+
+    // Rename it.
+    assert!(c.rename_member(e_id, 2, "Two"));
+    // Set its value (hex).
+    assert!(c.set_member_value(e_id, 2, "0x10"));
+    let m = c.tree().nodes[c.tree().index_of_id(e_id) as usize]
+        .enum_members
+        .clone();
+    assert_eq!(m[2], ("Two".to_string(), 16));
+
+    // Insert-above index 1.
+    assert!(c.add_member(e_id, Some(1)));
+    let m = c.tree().nodes[c.tree().index_of_id(e_id) as usize]
+        .enum_members
+        .clone();
+    assert_eq!(m[1].0, "NewMember");
+
+    // Delete index 0.
+    assert!(c.delete_member(e_id, 0));
+    let m = c.tree().nodes[c.tree().index_of_id(e_id) as usize]
+        .enum_members
+        .clone();
+    assert!(!m.iter().any(|(n, _)| n == "Zero"));
+
+    // Undo unwinds the last delete.
+    c.undo();
+    let m = c.tree().nodes[c.tree().index_of_id(e_id) as usize]
+        .enum_members
+        .clone();
+    assert!(m.iter().any(|(n, _)| n == "Zero"));
+}
+
+#[test]
+fn bitfield_member_add_rename_delete() {
+    let (mut c, bf_id) = make_bitfield_ctrl();
+    assert!(c.add_member(bf_id, None));
+    let n = c.tree().nodes[c.tree().index_of_id(bf_id) as usize].clone();
+    assert_eq!(n.bitfield_members.len(), 3);
+    // Next free bit = max(0+1, 1+3) = 4.
+    assert_eq!(n.bitfield_members[2].bit_offset, 4);
+    assert_eq!(n.bitfield_members[2].bit_width, 1);
+
+    assert!(c.rename_member(bf_id, 2, "c"));
+    assert_eq!(
+        c.tree().nodes[c.tree().index_of_id(bf_id) as usize].bitfield_members[2].name,
+        "c"
+    );
+    assert!(c.delete_member(bf_id, 2));
+    assert_eq!(
+        c.tree().nodes[c.tree().index_of_id(bf_id) as usize]
+            .bitfield_members
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn insert_static_field_defaults() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let before = c.tree().children_of(root_id).len();
+    c.insert_static_field(root_id);
+    let kids = c.tree().children_of(root_id);
+    assert_eq!(kids.len(), before + 1);
+    let sf = kids
+        .iter()
+        .map(|&i| c.tree().nodes[i].clone())
+        .find(|n| n.is_static)
+        .unwrap();
+    assert_eq!(sf.kind, NodeKind::Hex64);
+    assert_eq!(sf.offset_expr, "base");
+    assert_eq!(sf.name, "static_field");
+    // Undoable.
+    c.undo();
+    assert_eq!(c.tree().children_of(root_id).len(), before);
+}
+
+#[test]
+fn commit_base_address_literal_vs_formula() {
+    let mut c = make_ctrl();
+    // Bare hex literal → base set, formula cleared.
+    c.commit_base_address("0x1000");
+    assert_eq!(c.tree().base_address, 0x1000);
+    assert!(c.document().tree.base_address_formula.is_empty());
+    // A bare number is a hex literal in the AddressParser (ReClass convention):
+    // "4096" → 0x4096. It is still a literal (round-trips), so formula clears.
+    c.commit_base_address("4096");
+    assert_eq!(c.tree().base_address, 0x4096);
+    assert!(c.document().tree.base_address_formula.is_empty());
+    // An arithmetic expression is kept verbatim as the formula.
+    c.commit_base_address("0x1000 + 0x20");
+    assert_eq!(c.tree().base_address, 0x1020);
+    assert_eq!(c.document().tree.base_address_formula, "0x1000 + 0x20");
+    // Single undo reverts to the previous literal base (0x4096).
+    c.undo();
+    assert_eq!(c.tree().base_address, 0x4096);
+}
+
+#[test]
+fn resolve_address_expr_reads_pointer_through_provider() {
+    // Buffer with a pointer value 0xABCD stored at offset 0x10.
+    let mut data = vec![0u8; 256];
+    data[0x10..0x18].copy_from_slice(&0xABCDu64.to_le_bytes());
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    doc.provider = Arc::new(BufferProvider::new(data, "x.bin"));
+    let c = RcxController::new(doc);
+    // [0x10] dereferences the pointer-sized value at 0x10.
+    let (val, ok) = c.resolve_address_expr("[0x10]");
+    assert!(ok);
+    assert_eq!(val, 0xABCD);
+    // A plain literal resolves to itself.
+    let (val, ok) = c.resolve_address_expr("0x40");
+    assert!(ok && val == 0x40);
+    // Empty → not ok.
+    assert!(!c.resolve_address_expr("   ").1);
+}
+
+#[test]
+fn reevaluate_base_address_formula_relocates() {
+    let mut data = vec![0u8; 256];
+    data[0x10..0x18].copy_from_slice(&0x5000u64.to_le_bytes());
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    doc.tree.base_address_formula = "[0x10] + 4".into();
+    doc.provider = Arc::new(BufferProvider::new(data, "x.bin"));
+    let mut c = RcxController::new(doc);
+    c.reevaluate_base_address_formula();
+    assert_eq!(c.tree().base_address, 0x5004);
+    // Empty formula → no-op.
+    c.document_mut().tree.base_address_formula.clear();
+    c.document_mut().tree.base_address = 7;
+    c.reevaluate_base_address_formula();
+    assert_eq!(c.tree().base_address, 7);
+}

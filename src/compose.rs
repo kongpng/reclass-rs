@@ -24,7 +24,21 @@ use crate::core::{
     size_for_kind, ComposeResult, LayoutInfo, LineChip, LineKind, LineMeta, Node, NodeKind,
     NodeTree,
 };
-use crate::provider::{NullProvider, Provider};
+use crate::provider::{ModuleEntry, NullProvider, Provider};
+#[cfg(feature = "symbols")]
+use crate::rtti::walk::{walk_rtti, walk_rtti_itanium, RttiInfo};
+
+// When the `symbols` feature is disabled the RTTI walker (`crate::rtti`) is not
+// compiled. The composition engine is always-on (it does not depend on heavy
+// deps), so we supply a feature-stubbed `RttiInfo` whose `ok` is permanently
+// `false`. Every RTTI auto-detect call site stays identical; without `symbols`
+// the hint simply never fires, which is the correct headless behavior.
+#[cfg(not(feature = "symbols"))]
+#[derive(Clone, Default)]
+struct RttiInfo {
+    ok: bool,
+    demangled_name: String,
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Column layout constants (`core.h:1129-1148`). Re-declared here because the
@@ -237,6 +251,9 @@ pub fn compose_with_symbols(
         abs_offsets: Vec::new(),
         scope_type_w: HashMap::new(),
         scope_name_w: HashMap::new(),
+        rtti_modules_cached: false,
+        rtti_modules: Vec::new(),
+        rtti_cache: HashMap::new(),
     };
 
     // Precompute parent→children map (`compose.cpp:1527-1528`).
@@ -718,6 +735,15 @@ struct ComposeState<'a> {
     abs_offsets: Vec<i64>,
     scope_type_w: HashMap<u64, i32>,
     scope_name_w: HashMap<u64, i32>,
+
+    // ── RTTI auto-detect cache (per compose pass) ──
+    // Module list is fetched lazily on the first vtable candidate. `walk_rtti`
+    // results are memoized — both successes (avoid re-walk) and failures
+    // (avoid re-trying every refresh on the same arbitrary 8-byte word).
+    // (`compose.cpp:85-91`.)
+    rtti_modules_cached: bool,
+    rtti_modules: Vec<ModuleEntry>,
+    rtti_cache: HashMap<u64, RttiInfo>,
 }
 
 impl ComposeState<'_> {
@@ -923,6 +949,58 @@ fn resolve_addr(
     state.abs_offsets[node_idx as usize] as u64
 }
 
+/// Resolve RTTI for a candidate vtable address, cached per compose pass
+/// (`compose.cpp:250-286`).
+///
+/// Module enumeration runs at most once per pass; values that don't land inside
+/// any known module short-circuit before [`walk_rtti`] is even called. Negative
+/// results (`ok=false`) are cached too — this prevents the parser from being
+/// re-run on the same arbitrary qword every refresh tick.
+///
+/// `max_vtable_slots=0` is honored by the walker's slot loop (`rtti.cpp:236`) —
+/// it yields the demangled class name without enumerating method addresses,
+/// which is all the inline hint needs.
+///
+/// Returns a clone of the cached [`RttiInfo`] (cheap; the hint only reads `ok` +
+/// `demangled_name`). The C++ returns a `const &` into the cache, but Rust's
+/// borrow rules make a clone the simplest faithful equivalent.
+fn rtti_for_vtable(state: &mut ComposeState, prov: &dyn Provider, candidate_addr: u64) -> RttiInfo {
+    if let Some(info) = state.rtti_cache.get(&candidate_addr) {
+        return info.clone();
+    }
+
+    if !state.rtti_modules_cached {
+        state.rtti_modules = prov.enumerate_modules();
+        state.rtti_modules_cached = true;
+    }
+
+    // ok=false default — caches negative results. (`mut` is only exercised when
+    // the `symbols` feature is on and the RTTI walker can overwrite `info`.)
+    #[cfg_attr(not(feature = "symbols"), allow(unused_mut))]
+    let mut info = RttiInfo::default();
+    let mut in_module = false;
+    for m in &state.rtti_modules {
+        if candidate_addr >= m.base && candidate_addr < m.base.wrapping_add(m.size) {
+            in_module = true;
+            break;
+        }
+    }
+    #[cfg(feature = "symbols")]
+    if in_module {
+        // Try MSVC RTTI first (signature-validated, lower false-positive risk).
+        // Fall back to Itanium ABI for GCC/Clang/MinGW binaries.
+        info = walk_rtti(prov, candidate_addr, 8, 0);
+        if !info.ok {
+            info = walk_rtti_itanium(prov, candidate_addr, 8, 0);
+        }
+    }
+    // `symbols` off: `in_module` is computed but the walker is unavailable, so
+    // `info` stays at its `ok=false` default (no RTTI hint emitted).
+    let _ = in_module;
+    state.rtti_cache.insert(candidate_addr, info.clone());
+    info
+}
+
 /// `node`-display type string (the `nodeTypeName` lambda, `compose.cpp:1602-1613`).
 fn node_type_name(tree: &NodeTree, n: &Node) -> String {
     match n.kind {
@@ -945,14 +1023,12 @@ fn node_type_name(tree: &NodeTree, n: &Node) -> String {
 // ───────────────────────────────────────────────────────────────────────────
 // Value preview for type hints (`compose.cpp:18-56` — the file-local
 // `formatPreview`). Formats raw bytes as the suggested type using the `fmt::`
-// formatters. Faithful port, but — exactly like the C++ — it has no live
-// caller: `formatPreview` is dead code in `compose.cpp` (only self-recursion at
-// :61), and the TypeHint chip text is the bare `formatHint` type name
-// (`compose.cpp:547`; `test_chips.cpp:209` asserts no '[' in the chip text).
-// Kept (and unit-tested) for parity; `#[allow(dead_code)]` mirrors that status.
+// formatters. Drives the TypeHint chip's value-first text
+// (`preview + " [" + typeName + "]"`, `compose.cpp:450-458`). Recursive: a
+// multi-lane suggestion splits the bytes into `kinds.len()` equal slices and
+// joins each lane's preview with ", ".
 // ───────────────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 fn format_preview(data: &[u8], len: i32, kinds: &[NodeKind]) -> String {
     use crate::format as fmt;
 
@@ -1205,49 +1281,24 @@ fn compose_leaf(
                 }
             }
 
-            // 3. RTTI / Symbol — null-pointer CTA + symbol fallback. (Resolved
-            //    RTTI requires the `symbols` walker + a discovery hook, both
-            //    absent in headless builds, so only the null-pointer CTA and
-            //    PDB-symbol fallback can fire here.)
+            // 3. RTTI auto-detect — Hex64/Pointer64 whose value lands inside a
+            //    known module is a vtable candidate. The module-range scan
+            //    rejects ~99% of values cheaply; surviving candidates run
+            //    `walk_rtti` once and the result is cached for the rest of this
+            //    compose pass (`rtti_for_vtable`). Independent of `type_hints`
+            //    and `show_comments` — RTTI is "real signal" worth showing on
+            //    its own (`compose.cpp:462-484`, `test_rtti_hint.cpp:312`).
+            //    The null-pointer CTA chip (port-specific) is gated on
+            //    `show_rtti`; the PDB symbol annotation now rides in the value
+            //    text via `read_value` (`format.cpp:425`), so no Symbol chip.
+            if (node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64)
+                && prov.is_readable(abs_addr, 8)
             {
-                let mut is_null_pointer = false;
-                if state.show_rtti
-                    && (node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64)
-                    && prov.is_readable(abs_addr, 8)
+                let candidate = prov.read_u64(abs_addr);
+                if candidate == 0
+                    && state.show_rtti
+                    && (node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32)
                 {
-                    let candidate = prov.read_u64(abs_addr);
-                    if candidate == 0
-                        && (node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32)
-                    {
-                        is_null_pointer = true;
-                    } else if candidate != 0 && candidate != u64::MAX {
-                        // Resolved-RTTI path: requires module enumeration + the
-                        // discovery hook. Built-in providers return no modules,
-                        // so this never fires here (parity with headless C++).
-                    }
-                }
-
-                let mut ptr_sym = String::new();
-                if matches!(
-                    node.kind,
-                    NodeKind::Pointer32
-                        | NodeKind::Pointer64
-                        | NodeKind::FuncPtr32
-                        | NodeKind::FuncPtr64
-                ) && prov.is_readable(abs_addr, node.byte_size())
-                {
-                    let pv = if node.kind == NodeKind::Pointer64 || node.kind == NodeKind::FuncPtr64
-                    {
-                        prov.read_u64(abs_addr)
-                    } else {
-                        prov.read_u32(abs_addr) as u64
-                    };
-                    if pv != 0 {
-                        ptr_sym = prov.get_symbol(pv);
-                    }
-                }
-
-                if is_null_pointer {
                     push_chip(
                         &mut line_text,
                         &mut lm,
@@ -1257,13 +1308,21 @@ fn compose_leaf(
                             c.rtti_vtable_addr = 0;
                         },
                     );
-                } else if !ptr_sym.is_empty() {
-                    push_chip(&mut line_text, &mut lm, ChipKind::Symbol, &ptr_sym, |_| {});
+                } else if candidate != 0 && candidate != u64::MAX {
+                    let info = rtti_for_vtable(state, prov, candidate);
+                    if info.ok && !info.demangled_name.is_empty() {
+                        let hint = format!("{{RTTI: {}}}", info.demangled_name);
+                        push_chip(&mut line_text, &mut lm, ChipKind::Rtti, &hint, |c| {
+                            c.rtti_vtable_addr = candidate;
+                        });
+                    }
                 }
             }
 
             // 3b. TypeHint — type-inference annotation on hex preview nodes.
-            if is_hex_node(node.kind) {
+            // Gated on `state.type_hints` (`compose.cpp:441`); with the flag off
+            // the green chip is suppressed (`test_rtti_hint.cpp:313`).
+            if state.type_hints && is_hex_node(node.kind) {
                 let sz = size_for_kind(node.kind);
                 let b = if prov.is_readable(abs_addr, sz) {
                     prov.read_bytes(abs_addr, sz)
@@ -1278,18 +1337,28 @@ fn compose_leaf(
                     let suggestions = crate::core::infer_types(&b, &Default::default(), 3);
                     if let Some(first) = suggestions.first() {
                         if first.strength >= 3 {
-                            // Plain type name only, matching `compose.cpp:547`
-                            // (`QString hint = formatHint(suggestions[0])`).
-                            // The chip pill carries the "suggested type" signal —
-                            // no value-preview, no brackets. (`test_chips.cpp:209`
-                            // asserts the chip text contains no '['.) `formatPreview`
-                            // is dead code in the C++ too: kept here for parity but
-                            // never reaches a live chip.
-                            let hint = crate::core::format_hint(first);
+                            // Value-preview + bracketed type label, mirroring
+                            // `lm.typeHint` (`compose.cpp:450-458`):
+                            //   "0x7ff718570000 [ptr64]"  /  "-99999+f, -0.0000f [Float×2]"
+                            // When the preview is empty fall back to "[type]"
+                            // (`compose.cpp:457`).
+                            let type_name = crate::core::format_hint(first);
+                            let preview = format_preview(&b, sz, &first.kinds);
+                            let chip_text = if preview.is_empty() {
+                                format!("[{type_name}]")
+                            } else {
+                                format!("{preview} [{type_name}]")
+                            };
                             let kinds = first.kinds.clone();
-                            push_chip(&mut line_text, &mut lm, ChipKind::TypeHint, &hint, |c| {
-                                c.type_hint_kinds = kinds;
-                            });
+                            push_chip(
+                                &mut line_text,
+                                &mut lm,
+                                ChipKind::TypeHint,
+                                &chip_text,
+                                |c| {
+                                    c.type_hint_kinds = kinds;
+                                },
+                            );
                         }
                     }
                 }
@@ -2297,33 +2366,36 @@ fn compose_node(
                 state.compact_columns,
             );
 
-            // RTTI / Symbol chips on the typed-pointer header. Resolved RTTI is
-            // out of scope in headless builds (no walker, no module hook), so
-            // only the null-pointer CTA and PDB symbol fallback can fire.
-            let mut is_null_pointer = false;
-            let mut ptr_sym = String::new();
+            // RTTI hint on typed-pointer headers: the pointer's value is *the
+            // vtable address itself*. `compose_leaf`'s RTTI block doesn't see
+            // this case (typed pointers route through `compose_node`), so we
+            // duplicate the detect-and-attach here — same per-pass cache, same
+            // `{RTTI: …}` text (`compose.cpp:1217-1241`). The PDB symbol rides
+            // in the pointer-header value text via `read_value`
+            // (`format.cpp:457`), so no separate Symbol chip.
             if prov.is_readable(abs_addr, 8) {
                 let candidate = prov.read_u64(abs_addr);
                 if candidate == 0 {
                     if state.show_rtti {
-                        is_null_pointer = true;
+                        push_chip(
+                            &mut ptr_text,
+                            &mut lm,
+                            ChipKind::Rtti,
+                            "(Name class\u{2026})",
+                            |c| {
+                                c.rtti_vtable_addr = 0;
+                            },
+                        );
                     }
                 } else if candidate != u64::MAX {
-                    ptr_sym = prov.get_symbol(candidate);
+                    let info = rtti_for_vtable(state, prov, candidate);
+                    if info.ok && !info.demangled_name.is_empty() {
+                        let hint = format!("{{RTTI: {}}}", info.demangled_name);
+                        push_chip(&mut ptr_text, &mut lm, ChipKind::Rtti, &hint, |c| {
+                            c.rtti_vtable_addr = candidate;
+                        });
+                    }
                 }
-            }
-            if is_null_pointer {
-                push_chip(
-                    &mut ptr_text,
-                    &mut lm,
-                    ChipKind::Rtti,
-                    "(Name class\u{2026})",
-                    |c| {
-                        c.rtti_vtable_addr = 0;
-                    },
-                );
-            } else if !ptr_sym.is_empty() {
-                push_chip(&mut ptr_text, &mut lm, ChipKind::Symbol, &ptr_sym, |_| {});
             }
 
             // Comment chip on typed-pointer header.

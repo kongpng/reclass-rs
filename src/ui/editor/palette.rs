@@ -79,6 +79,16 @@ pub struct EditorPalette {
     /// primary/cursor row (Zed's active-line background), softer than the
     /// accent-tinted selection fill so a selected row still reads as selected.
     pub active_line_bg: Hsla,
+    /// Item 71: the `M_ERR` row band — a translucent red wash painted behind a row
+    /// whose live inline edit is INVALID (the C++ `theme.markerError`). Reads as a
+    /// clear error surface while leaving the row text legible.
+    pub error_bg: Hsla,
+    /// Item 71: the bright error foreground for the '! <error>' hint comment (the
+    /// C++ `theme.markerError` text).
+    pub error_fg: Hsla,
+    /// Item 74: the presentation-mode focus-glow base color (the C++
+    /// `theme.focusGlow`). The pulsing band lerps its alpha from this each tick.
+    pub focus_glow: Hsla,
 }
 
 impl EditorPalette {
@@ -168,6 +178,14 @@ impl EditorPalette {
             // Active-line band: a barely-there foreground wash (Zed's active-line
             // bg), softer than the accent selection fill so the two are distinct.
             active_line_bg: with_alpha(t.foreground, 0.03),
+            // Item 71: the M_ERR red error band (translucent red wash) + bright red
+            // hint text (the C++ `theme.markerError`). The wash is light enough to
+            // keep the row text legible while flagging the invalid edit.
+            error_bg: with_alpha(t.red, 0.22),
+            error_fg: t.red,
+            // Item 74: the presentation focus-glow base (the C++ `theme.focusGlow`);
+            // tie it to the link/accent hue so the pulse reads as an AI/MCP marker.
+            focus_glow: t.link,
         }
     }
 

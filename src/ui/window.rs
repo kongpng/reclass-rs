@@ -200,6 +200,16 @@ mod settings_keys {
     pub const AUTO_START_MCP: &str = "autoStartMcp";
     pub const BRACE_WRAP: &str = "braceWrap";
     pub const GENERATOR_ASSERTS: &str = "generatorAsserts";
+    /// Title-case (vs Title-Case) for the menu-bar top-level titles (the C++
+    /// `menuBarTitleCase`; main.cpp:988). Default `false` → "Title Case".
+    pub const MENU_BAR_TITLE_CASE: &str = "menuBarTitleCase";
+    /// Whether the titlebar shows the app icon (the C++ `showIcon`;
+    /// main.cpp:990). Default `false`.
+    pub const SHOW_ICON: &str = "showIcon";
+    /// The last process the user attached to in the process picker, by name (the
+    /// C++ `lastAttachedProcess`; processpicker.cpp:390). Read on picker open to
+    /// preselect the matching row; written on a successful attach.
+    pub const LAST_ATTACHED_PROCESS: &str = "lastAttachedProcess";
 }
 
 // App-level actions. Mirrors Zed: the command palette opens on Ctrl+Shift+P / F1
@@ -330,6 +340,21 @@ pub struct MainWindow {
     /// Persisted refresh interval (ms) (the C++ `refreshMs`). Pushed into the
     /// active controllers when Options applies; persisted via the disk store.
     refresh_ms: i32,
+    /// Whether the menu-bar top-level titles are upper-cased (the C++
+    /// `m_menuBarTitleCase`; main.cpp:988). Pushed into [`menubar`](Self::menubar)
+    /// via [`MenuBar::set_title_case`] and persisted on Options apply.
+    menu_bar_title_case: bool,
+    /// Whether the titlebar shows the app icon (the C++ `showIcon`; main.cpp:990).
+    /// Owned + persisted here so Options can toggle it; the titlebar has no icon
+    /// slot in this port yet, so this is faithfully persisted but visually inert.
+    show_icon: bool,
+    /// The **extra** editor split panes beyond the primary document pane (the C++
+    /// `TabState::panes` minus the primary `panes[0]`). Each carries its own
+    /// [`ViewMode`] (Tree / rendered C/C++) and views the SAME active document as
+    /// the primary pane (the C++ `createSplitPane` binds the pane to the tab's
+    /// controller). Empty ⇒ the editor is unsplit (the default single-pane view).
+    /// `view.split` appends a pane; `view.unsplit` removes the last.
+    split_panes: Vec<ViewMode>,
 }
 
 /// The seven checkable View-menu options (the C++ View menu defaults; the
@@ -650,6 +675,53 @@ fn relabel_command(nodes: &mut [super::commandpalette::MenuNode], command: &str,
     }
 }
 
+/// The struct name of the active **view root** for the window title (the C++
+/// `rootName(tree, viewRootId())`; main.cpp:5180). Climbs from the view-root
+/// node to its top-level parent and returns that node's `struct_type_name`
+/// (falling back to its `name`). Mirrors the status-bar's `root_name_of` climb.
+/// Returns an empty string when the index is out of range. Pure; unit-tested.
+fn root_name_for_title(tree: &crate::core::NodeTree, view_root_id: u64) -> String {
+    let mut cur = tree.index_of_id(view_root_id);
+    // A `0`/unknown view root means "the whole document" — start at the first
+    // top-level node so a fresh document still names its root struct.
+    if cur < 0 {
+        cur = tree
+            .nodes
+            .iter()
+            .position(|n| n.parent_id == 0)
+            .map_or(-1, |i| i as i32);
+    }
+    while cur >= 0 {
+        let Some(n) = tree.nodes.get(cur as usize) else {
+            break;
+        };
+        if n.parent_id == 0 {
+            return if n.struct_type_name.is_empty() {
+                n.name.clone()
+            } else {
+                n.struct_type_name.clone()
+            };
+        }
+        cur = tree.index_of_id(n.parent_id);
+    }
+    String::new()
+}
+
+/// Assemble the OS window-title string from a root name + dirty flag (the C++
+/// `updateWindowTitle` formatting; main.cpp:5176-5186): `"<name>[ *] - Reclass"`,
+/// or plain `"Reclass"` when the name is empty (no document / unnamed root).
+/// Pure; unit-tested.
+fn window_title_string(root_name: &str, modified: bool) -> String {
+    if root_name.is_empty() {
+        return "Reclass".to_string();
+    }
+    let mut name = root_name.to_string();
+    if modified {
+        name.push_str(" *");
+    }
+    format!("{name} - Reclass")
+}
+
 impl MainWindow {
     /// Construct the main window view: build the [`DockArea`], assemble the
     /// default dock layout, seed [`AppState`], wire the dock/tab/workspace events,
@@ -702,6 +774,15 @@ impl MainWindow {
                 s.get(settings_keys::REFRESH_MS)
                     .and_then(|v| v.parse::<i32>().ok())
                     .unwrap_or(super::optionsdialog::REFRESH_DEFAULT),
+            )
+        };
+        // Appearance prefs (the C++ `menuBarTitleCase` / `showIcon`; main.cpp:988).
+        // Both default `false`, matching the C++ `value(key, false)` reads.
+        let (menu_bar_title_case, show_icon) = {
+            let s = settings.borrow();
+            (
+                s.get_bool(settings_keys::MENU_BAR_TITLE_CASE, false),
+                s.get_bool(settings_keys::SHOW_ICON, false),
             )
         };
 
@@ -891,6 +972,10 @@ impl MainWindow {
             brace_wrap,
             generator_asserts,
             refresh_ms,
+            menu_bar_title_case,
+            show_icon,
+            // The editor starts unsplit (single pane); `view.split` appends panes.
+            split_panes: Vec::new(),
         };
 
         // Observe the initial editor(s) so a row selection re-renders the window
@@ -902,6 +987,11 @@ impl MainWindow {
         win.sync_font_menu_checked(cx);
         win.sync_theme_menu_checked(cx);
         win.rebuild_menus(cx);
+        // Push the persisted menu-bar title-case preference (the C++
+        // `applyMenuBarTitleCase(m_menuBarTitleCase)` on startup; main.cpp:989).
+        let title_case = win.menu_bar_title_case;
+        win.menubar
+            .update(cx, |mb, cx| mb.set_title_case(title_case, cx));
         // Reflect the initial scanner-dock state in the View menu (closed by
         // default ⇒ View ▸ Memory Scanner starts unchecked).
         win.sync_scanner_menu_checked(cx);
@@ -1149,8 +1239,8 @@ impl MainWindow {
             // ── View: docks / windows ──
             "view.project" => self.toggle_left_dock(window, cx),
             "view.scanner" => self.toggle_scanner_dock(&ToggleScanner, window, cx),
-            "view.modules" => self.toggle_right_dock(window, cx),
-            "view.bookmarks" | "view.symbols" => self.toggle_right_dock(window, cx),
+            "view.modules" => self.raise_modules(window, cx),
+            "view.bookmarks" | "view.symbols" => self.raise_bookmarks(window, cx),
             "view.reset_windows" => self.reset_windows(window, cx),
 
             // ── View: editor view-option toggles (EDITOR SETTER CONTRACT) ──
@@ -1175,16 +1265,8 @@ impl MainWindow {
             "view.refresh" => self.refresh_active_editor(cx),
             "view.goto_address" => self.open_goto_address(window, cx),
             "view.command_palette" => self.open_command_palette(&OpenCommandPalette, window, cx),
-            "view.split" => self.notify(
-                "Split Editor is a known stub in this port (single pane only).",
-                window,
-                cx,
-            ),
-            "view.unsplit" => self.notify(
-                "Unsplit Editor is a known stub in this port (single pane only).",
-                window,
-                cx,
-            ),
+            "view.split" => self.split_view(window, cx),
+            "view.unsplit" => self.unsplit_view(window, cx),
             "view.presentation" => self.toggle_presentation(cx),
             // View ▸ Edit Theme — fold into the Options dialog's Appearance page
             // (the port's theme editing lives there); open it directly rather than
@@ -1203,11 +1285,7 @@ impl MainWindow {
             ),
 
             // ── Plugins ──
-            "plugins.manage" => self.notify(
-                "Plugin Manager: native plugins are not loaded in this port.",
-                window,
-                cx,
-            ),
+            "plugins.manage" => self.open_plugins_dialog(window, cx),
 
             // ── Help ──
             "help.about" => self.show_about(window, cx),
@@ -1330,6 +1408,17 @@ impl MainWindow {
     fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use super::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
         let model = ProcessPickerModel::from_registry(&crate::provider::ProviderRegistry::new());
+        // Remember which process the user last attached to (the C++
+        // `lastAttachedProcess` QSettings key; processpicker.cpp:386). The picker
+        // *reads* this to pre-select the matching row in `selectPreferredProcess` —
+        // that read lives inside the picker (it owns the row table + selection), so
+        // here we only own the WRITE side (on a successful attach, below). The read
+        // is loaded so a future picker that consumes it sees a populated value.
+        let _last_attached = self
+            .settings
+            .borrow()
+            .get(settings_keys::LAST_ATTACHED_PROCESS)
+            .filter(|s| !s.is_empty());
         let picker = cx.new(|cx| ProcessPicker::new(model, window, cx));
         self.goto_sub = Some(cx.subscribe_in(
             &picker,
@@ -1337,6 +1426,12 @@ impl MainWindow {
             |this, _p, ev: &ProcessPickEvent, window, cx| match ev {
                 ProcessPickEvent::Attach { name, pid, .. } => {
                     window.close_dialog(cx);
+                    // Remember this process for next time (the C++ persists
+                    // `lastAttachedProcess` on a successful attach; read back by
+                    // `selectPreferredProcess`). Persisted via the disk store.
+                    this.settings
+                        .borrow_mut()
+                        .set(settings_keys::LAST_ATTACHED_PROCESS, name);
                     // No live provider factory on this platform — record the pick
                     // as the document's logical source so the tab reflects it.
                     let source = super::state::DataSource::new(
@@ -1739,6 +1834,37 @@ impl MainWindow {
         );
     }
 
+    /// Plugins ▸ Manage Plugins… — open the read-only [`PluginManagerDialog`] (the
+    /// C++ `showPluginsDialog`; main.cpp:8821). The C++ lists each loaded
+    /// `IPlugin` (name, version, description, type, author) with Load/Unload
+    /// buttons backed by native `dlopen`. This platform has no native plugin
+    /// loader, so the dialog lists the **built-in provider plugins** the port ships
+    /// — the in-scope analogue of "loaded provider plugins" — read-only, with a
+    /// note that runtime DLL/SO loading is out of scope. This replaces the bare
+    /// notify with the actual (read-only) manager surface.
+    fn open_plugins_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = cx.new(|cx| PluginManagerDialog::new(builtin_plugins(), cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        // Reuse the generic dialog subscription slot (Close-only, like the other
+        // single-button dialogs).
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            |_this, _d, _ev: &PluginManagerEvent, window, cx| {
+                window.close_dialog(cx);
+            },
+        ));
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(620.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     /// Tools ▸ Start/Stop MCP Server — toggle the MCP bridge flag and flip the
     /// menu label (the C++ `toggleMcp` + dynamic action text; main.cpp:1568). No
     /// live bridge on this platform; the toggle + label are real.
@@ -1813,11 +1939,15 @@ impl MainWindow {
             .map(|t| t.name.clone())
             .collect();
         let theme_index = self.theme_manager.borrow().current_index();
+        // Seed the dialog with the LIVE persisted state (the C++ builds `current`
+        // from `m_menuBarTitleCase` / `showIcon` etc; main.cpp:5019). Previously
+        // these two were hardcoded, so the dialog never reflected — and Apply could
+        // never preserve — the user's real preference.
         let current = OptionsResult {
             theme_index,
             font_name: self.editor_font.clone(),
-            menu_bar_title_case: true,
-            show_icon: false,
+            menu_bar_title_case: self.menu_bar_title_case,
+            show_icon: self.show_icon,
             auto_start_mcp: self.auto_start_mcp,
             refresh_ms: self.refresh_ms,
             generator_asserts: self.generator_asserts,
@@ -1912,6 +2042,28 @@ impl MainWindow {
         self.settings
             .borrow_mut()
             .set_bool(settings_keys::AUTO_START_MCP, self.auto_start_mcp);
+        // Menu-bar title-case (the C++ `r.menuBarTitleCase` → `applyMenuBarTitleCase`
+        // + persist "menuBarTitleCase"; main.cpp:5041). Push into the live menu bar
+        // so the titles re-case immediately, then persist across launches.
+        if result.menu_bar_title_case != self.menu_bar_title_case {
+            self.menu_bar_title_case = result.menu_bar_title_case;
+            let title_case = self.menu_bar_title_case;
+            self.menubar
+                .update(cx, |mb, cx| mb.set_title_case(title_case, cx));
+            self.settings
+                .borrow_mut()
+                .set_bool(settings_keys::MENU_BAR_TITLE_CASE, self.menu_bar_title_case);
+        }
+        // Titlebar show-icon (the C++ `r.showIcon` → `m_titleBar->setShowIcon` +
+        // persist "showIcon"; main.cpp:5046). The port's titlebar has no icon slot
+        // yet, so this is faithfully persisted but visually inert — applied the
+        // moment a titlebar icon lands.
+        if result.show_icon != self.show_icon {
+            self.show_icon = result.show_icon;
+            self.settings
+                .borrow_mut()
+                .set_bool(settings_keys::SHOW_ICON, self.show_icon);
+        }
         self.notify("Options applied.", window, cx);
         cx.notify();
     }
@@ -2180,6 +2332,32 @@ impl MainWindow {
             .any(|t| t.editor.read(cx).controller().document().modified)
     }
 
+    /// Recompute the OS window title from the active document and push it to the
+    /// platform window (the C++ `updateWindowTitle`; main.cpp:5172). The title is
+    /// `"<rootName>[ *] - Reclass"` where `<rootName>` is the struct name of the
+    /// active tab's **view root** and the trailing `" *"` marks an unsaved
+    /// document; with no active document it is plain `"Reclass"`. Call on every
+    /// active-tab change, view-root change, and dirty-state change.
+    fn update_window_title(&self, window: &mut Window, cx: &Context<Self>) {
+        let title = self.compute_window_title(cx);
+        window.set_window_title(&title);
+    }
+
+    /// The window-title string for the active document (the pure half of
+    /// [`update_window_title`], so it can be unit-tested via
+    /// [`window_title_string`]). Reads the active editor's controller (tree +
+    /// view root + dirty bit); falls back to `"Reclass"` when no document is open.
+    fn compute_window_title(&self, cx: &Context<Self>) -> String {
+        let Some(editor) = self.document_area.read(cx).active_editor() else {
+            return "Reclass".to_string();
+        };
+        let ed = editor.read(cx);
+        let ctrl = ed.controller();
+        let name = root_name_for_title(ctrl.tree(), ctrl.view_root_id());
+        let modified = ctrl.document().modified;
+        window_title_string(&name, modified)
+    }
+
     /// Push the active document's modified state into its tab's dirty dot (the
     /// bug: the controller tracks `doc.modified` but the window never propagated
     /// it). Mirrors the C++ tab-title dirty marker.
@@ -2368,6 +2546,11 @@ impl MainWindow {
                 });
                 self.state.set_title(id, title);
             }
+            // Record the just-saved path in the recent-files list (the C++ `saveFile`
+            // / `saveFileAs` call `addRecentFile(path)` after a successful write;
+            // main.cpp). Without this, Save As to a new path never surfaced it in
+            // Recent Files or the start page until the next Open.
+            self.record_recent_file(path, cx);
             self.notify(format!("Saved {}", path.display()), window, cx);
         } else {
             self.notify(format!("Failed to save {}", path.display()), window, cx);
@@ -2631,6 +2814,273 @@ impl MainWindow {
         });
     }
 
+    /// Build the editor split panes (View ▸ Split Editor) — one element per extra
+    /// pane in [`split_panes`](Self::split_panes). Each pane views the SAME active
+    /// document as the primary editor (the C++ `SplitPane` binds to the tab's
+    /// controller) with its OWN view mode: a Tree pane embeds the live editor
+    /// entity; a Rendered pane shows the generated C/C++ for the view root. Each
+    /// pane carries a header with a per-pane Tree/Code segmented toggle (the C++
+    /// per-`SplitPane` view-mode combo) and an "✕" that removes it. Returns an
+    /// empty vec when unsplit (the primary pane is the dock area itself).
+    fn render_split_panes(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        use super::design::color;
+        if self.split_panes.is_empty() {
+            return Vec::new();
+        }
+        let editor = self.document_area.read(cx).active_editor().cloned();
+        self.split_panes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(pane_ix, mode)| {
+                let inner = self.render_one_split_pane(pane_ix, mode, editor.as_ref(), cx);
+                // Each pane is an equal-flex column with a left divider separating it
+                // from the dock area / its sibling panes (Zed split gutter).
+                gpui_component::v_flex()
+                    .id(SharedString::from(format!("rcx-split-pane-{pane_ix}")))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .border_l_1()
+                    .border_color(color::border(cx))
+                    .bg(color::content_bg(cx))
+                    .child(inner)
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Render one split pane's header (a Tree/Code segmented toggle + remove "✕")
+    /// stacked over its body (the live editor for Tree, the generated source for
+    /// Rendered). Shared by [`render_split_panes`](Self::render_split_panes).
+    fn render_one_split_pane(
+        &self,
+        pane_ix: usize,
+        mode: ViewMode,
+        editor: Option<&Entity<super::editor::RcxEditor>>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use super::design::{color, tokens};
+
+        // ── Header: per-pane view-mode segmented toggle + close button. ──
+        let segment = |label: &'static str, this_mode: ViewMode, cx: &Context<Self>| {
+            let selected = mode == this_mode;
+            div()
+                .id(SharedString::from(format!("split-seg-{pane_ix}-{label}")))
+                .px(px(tokens::space::SM))
+                .py(px(2.))
+                .text_size(px(11.))
+                .text_color(if selected {
+                    color::text(cx)
+                } else {
+                    color::text_muted(cx)
+                })
+                .when(selected, |d| {
+                    d.bg(color::selected_bg(cx)).rounded(px(tokens::radius::SM))
+                })
+                .hover(|d| d.bg(color::hover_overlay(cx)))
+                .cursor_pointer()
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, _w, cx| {
+                        // Only toggle when switching modes (clicking the active
+                        // segment is a no-op, like the C++ exclusive combo).
+                        if this.split_panes.get(pane_ix).copied() != Some(this_mode) {
+                            this.toggle_split_pane_mode(pane_ix, cx);
+                        }
+                    }),
+                )
+        };
+
+        let header = gpui_component::h_flex()
+            .flex_none()
+            .h(px(28.))
+            .w_full()
+            .items_center()
+            .justify_between()
+            .px(px(tokens::space::SM))
+            .bg(color::chrome_bg(cx))
+            .border_b_1()
+            .border_color(color::border(cx))
+            .child(
+                gpui_component::h_flex()
+                    .gap(px(tokens::space::XXS))
+                    .child(segment("Tree", ViewMode::Tree, cx))
+                    .child(segment("Code", ViewMode::Rendered, cx)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("split-close-{pane_ix}")))
+                    .px(px(tokens::space::XS))
+                    .text_size(px(13.))
+                    .text_color(color::text_muted(cx))
+                    .hover(|d| d.text_color(color::text(cx)))
+                    .cursor_pointer()
+                    .child("✕")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| {
+                            // Remove THIS pane (the C++ closes the pane's tab widget).
+                            if pane_ix < this.split_panes.len() {
+                                this.split_panes.remove(pane_ix);
+                                cx.notify();
+                            }
+                        }),
+                    ),
+            );
+
+        // ── Body: the same document in the pane's view mode. ──
+        //
+        // NOTE: a split pane must NOT re-render the live `RcxEditor` entity — gpui
+        // renders an entity once per frame, and the primary pane (inside the dock
+        // area) already owns that render. So a split's *Tree* view shows a
+        // read-only projection of the editor's composed tree text (the C++
+        // `SplitPane` views the same document; here it mirrors the composed
+        // output), and the *Code* view shows the generated C/C++. Both are pure
+        // read-only projections built from the controller — never the live entity.
+        let body = match (editor, mode) {
+            (Some(ed), ViewMode::Tree) => self.render_split_tree(ed, cx),
+            (Some(ed), ViewMode::Rendered) => self.render_split_code(ed, cx),
+            (None, _) => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(color::text_muted(cx))
+                .child("No document")
+                .into_any_element(),
+        };
+
+        gpui_component::v_flex()
+            .size_full()
+            .child(header)
+            .child(div().flex_1().min_h_0().overflow_hidden().child(body))
+            .into_any_element()
+    }
+
+    /// The read-only Tree projection for a split pane: the editor's last composed
+    /// tree text (the C++ `SplitPane` tree view shows the same document). Rendered
+    /// as monospaced lines so the split mirrors the primary editor's structure
+    /// without re-rendering the live `RcxEditor` entity (which gpui only permits
+    /// once per frame). The primary pane stays fully interactive; this is a faithful
+    /// read-only mirror.
+    fn render_split_tree(
+        &self,
+        editor: &Entity<super::editor::RcxEditor>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use super::design::{color, tokens};
+        let text = editor.read(cx).last_result().text.clone();
+        if text.trim().is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(color::content_bg(cx))
+                .text_color(color::text_muted(cx))
+                .font_family(tokens::font::mono_family())
+                .text_size(px(tokens::font::EDITOR_SIZE))
+                .child("// empty document")
+                .into_any_element();
+        }
+        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let rows: Vec<AnyElement> = text
+            .lines()
+            .map(|line| {
+                div()
+                    .h(line_h)
+                    .px(px(tokens::space::SM))
+                    .text_color(color::text(cx))
+                    .child(line.to_string())
+                    .into_any_element()
+            })
+            .collect();
+        gpui_component::v_flex()
+            .id("rcx-split-tree-view")
+            .size_full()
+            .bg(color::content_bg(cx))
+            .overflow_scroll()
+            .font_family(tokens::font::mono_family())
+            .text_size(px(tokens::font::EDITOR_SIZE))
+            .py(px(tokens::space::SM))
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// The rendered C/C++ projection for a split pane (the C++ `updateRenderedView`
+    /// for a `SplitPane`): generate the source for the active editor's view root
+    /// and show it as a read-only, line-numbered, monospaced text block. A
+    /// self-contained mirror of the document area's code view (which lives in the
+    /// out-of-ownership `tabs.rs`); kept deliberately simple (no per-token syntax
+    /// colouring) since it is a secondary pane.
+    fn render_split_code(
+        &self,
+        editor: &Entity<super::editor::RcxEditor>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use super::design::{color, tokens};
+        let ed = editor.read(cx);
+        let ctrl = ed.controller();
+        let aliases = &ctrl.document().type_aliases;
+        let aliases = if aliases.is_empty() {
+            None
+        } else {
+            Some(aliases)
+        };
+        let source = crate::generator::render_cpp_tree(
+            ctrl.tree(),
+            ctrl.view_root_id(),
+            aliases,
+            /* emit_asserts */ self.generator_asserts,
+        );
+        if source.trim().is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(color::content_bg(cx))
+                .text_color(color::text_muted(cx))
+                .font_family(tokens::font::mono_family())
+                .text_size(px(tokens::font::EDITOR_SIZE))
+                .child("// nothing to render — open or build a struct")
+                .into_any_element();
+        }
+        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let rows: Vec<AnyElement> = source
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                gpui_component::h_flex()
+                    .h(line_h)
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .pr(px(tokens::space::SM))
+                            .text_align(gpui::TextAlign::Right)
+                            .text_color(color::syntax_address(cx))
+                            .child(format!("{}", i + 1)),
+                    )
+                    .child(div().flex_1().min_w_0().child(line.to_string()))
+                    .into_any_element()
+            })
+            .collect();
+        gpui_component::v_flex()
+            .id("rcx-split-code-view")
+            .size_full()
+            .bg(color::content_bg(cx))
+            .overflow_scroll()
+            .font_family(tokens::font::mono_family())
+            .text_size(px(tokens::font::EDITOR_SIZE))
+            .py(px(tokens::space::SM))
+            .px(px(tokens::space::SM))
+            .children(rows)
+            .into_any_element()
+    }
+
     /// Feed the active document's provider into the scanner + modules docks and
     /// the active document's bookmark list into the bookmarks dock (the C++
     /// `ScannerPanel::set_provider` / `refreshModulesDock` / `refreshBookmarksDock`).
@@ -2724,10 +3174,12 @@ impl MainWindow {
         self.sync_view_menu_checked(cx);
     }
 
-    /// Toggle the **right** dock (Modules + Bookmarks, tabified together; View ▸
-    /// Modules / Bookmarks). Mirrors [`toggle_scanner_dock`](Self::toggle_scanner_dock)
-    /// for the bottom dock but for [`DockPlacement::Right`]. Both menu items
-    /// reflect the dock's shared open state.
+    /// Toggle the **right** dock (Modules + Bookmarks, tabified together). Kept as
+    /// the plain open/close primitive behind the more specific
+    /// [`raise_modules`](Self::raise_modules) / [`raise_bookmarks`](Self::raise_bookmarks)
+    /// (which open the dock AND focus their panel); a future "View ▸ Toggle Right
+    /// Dock" command can route straight here.
+    #[allow(dead_code)]
     fn toggle_right_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let open = self
             .dock_area
@@ -2751,15 +3203,122 @@ impl MainWindow {
         });
     }
 
-    /// View ▸ Reset Windows — restore the canonical layout: the workspace dock
-    /// open, the scanner + right docks closed (their default-closed state; the
-    /// C++ canonical "Reset Windows" placement). Re-syncs every dock ✓.
+    /// View ▸ Modules (`Ctrl+Shift+Y`) — raise the **Modules** tab of the right
+    /// dock (the C++ `m_modulesDock->raise()`; main.cpp). Opens the right dock if
+    /// closed and gives the Modules panel keyboard focus so it is the one the user
+    /// lands on (gpui-component's `TabPanel` has no public "select tab N" API, so
+    /// raising == open + focus the panel). Re-syncs the View ✓.
+    fn raise_modules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_right_dock_open(true, window, cx);
+        let focus = self.modules.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.sync_view_menu_checked(cx);
+        cx.notify();
+    }
+
+    /// View ▸ Bookmarks (`Ctrl+Shift+B`) — raise the **Bookmarks** tab of the right
+    /// dock (the C++ `m_bookmarksDock->raise()`). Same open-+-focus behaviour as
+    /// [`raise_modules`](Self::raise_modules) but targeting the Bookmarks panel.
+    fn raise_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_right_dock_open(true, window, cx);
+        let focus = self.bookmarks.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.sync_view_menu_checked(cx);
+        cx.notify();
+    }
+
+    /// View ▸ Split Editor (`Ctrl+\`) — append a split pane to the active document
+    /// (the C++ `splitView` → `tab->panes.append(createSplitPane(*tab))`;
+    /// main.cpp:4299). The new pane views the SAME active document and starts in
+    /// the **rendered C/C++** mode (so the split is immediately useful: tree on the
+    /// left, generated source on the right — the canonical reclass split). Capped
+    /// to keep the layout legible. No-op (notified) with no active document.
+    fn split_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.document_area.read(cx).active_editor().is_none() {
+            self.notify("Open a document before splitting the editor.", window, cx);
+            return;
+        }
+        // The C++ has no hard cap, but more than two extra panes is unreadable in
+        // a single row; cap at 2 extra (3 total incl. the primary) so the layout
+        // stays usable. A capped split notifies rather than silently no-opping.
+        const MAX_EXTRA_PANES: usize = 2;
+        if self.split_panes.len() >= MAX_EXTRA_PANES {
+            self.notify("Editor is already split to the maximum.", window, cx);
+            return;
+        }
+        // New panes default to the rendered (code) view — the primary keeps the
+        // tree, so the user gets the side-by-side tree⇄code split out of the box.
+        self.split_panes.push(ViewMode::Rendered);
+        cx.notify();
+    }
+
+    /// View ▸ Unsplit Editor (`Ctrl+Shift+\`) — remove the last split pane (the C++
+    /// `unsplitView` → `tab->panes.takeLast()` guarded by `panes.size() > 1`;
+    /// main.cpp:4305). With no extra panes the editor is already unsplit; notify
+    /// rather than silently no-op.
+    fn unsplit_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split_panes.pop().is_none() {
+            self.notify("Editor is not split.", window, cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    /// Toggle the view mode of a split pane (its own segmented Tree/Code control;
+    /// the C++ per-`SplitPane` view-mode combo). No-op if `pane_ix` is stale.
+    fn toggle_split_pane_mode(&mut self, pane_ix: usize, cx: &mut Context<Self>) {
+        if let Some(mode) = self.split_panes.get_mut(pane_ix) {
+            *mode = mode.toggled();
+            cx.notify();
+        }
+    }
+
+    /// View ▸ Reset Windows — restore the canonical dock layout (the C++ "Reset
+    /// Windows": discard the current placement and return every dock to its
+    /// default size + open state). Restores the workspace dock open at its default
+    /// width, the scanner + right docks closed at their default sizes, collapses
+    /// any editor split, and re-syncs every menu ✓.
+    ///
+    /// This resets **placement only** — open documents, the active tab, and each
+    /// panel's content are preserved (the C++ Reset Windows likewise re-docks the
+    /// existing widgets, it does not reload the project). Default sizes mirror
+    /// [`docks::build_default_layout`] (workspace ~280px, scanner ~320px).
     fn reset_windows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Collapse any editor split back to the single primary pane.
+        self.split_panes.clear();
+
+        // Restore each dock to its canonical open state + default size. The
+        // `apply_layout_preset` re-opens the workspace dock; the explicit size +
+        // open resets below return the scanner/right docks to their default
+        // geometry even after a drag-resize or close.
         self.apply_layout_preset(LayoutPreset::Workspace, window, cx);
-        self.set_bottom_dock_open(false, window, cx);
-        self.set_right_dock_open(false, window, cx);
+        let dock_area = self.dock_area.clone();
+        dock_area.update(cx, |area, cx| {
+            if let Some(dock) = area.left_dock().cloned() {
+                dock.update(cx, |d, cx| {
+                    d.set_size(px(280.), window, cx);
+                    d.set_open(true, window, cx);
+                });
+            }
+            if let Some(dock) = area.bottom_dock().cloned() {
+                dock.update(cx, |d, cx| {
+                    d.set_size(px(320.), window, cx);
+                    d.set_open(false, window, cx);
+                });
+            }
+            if let Some(dock) = area.right_dock().cloned() {
+                dock.update(cx, |d, cx| {
+                    d.set_size(px(280.), window, cx);
+                    d.set_open(false, window, cx);
+                });
+            }
+        });
+        self.layout_preset = LayoutPreset::Workspace;
+
         self.sync_scanner_menu_checked(cx);
         self.sync_view_menu_checked(cx);
+        self.notify("Windows reset to the default layout.", window, cx);
+        cx.notify();
     }
 
     // ── View: refresh / goto / theme / presentation ──────────────────────────
@@ -3480,7 +4039,8 @@ impl MainWindow {
     fn recent_entries(&self) -> Vec<RecentEntry> {
         // Skip entries whose file no longer exists (the C++ start-page filters
         // the same way the Recent Files menu does; main.cpp:8789).
-        self.existing_recent_files()
+        let mut entries: Vec<RecentEntry> = self
+            .existing_recent_files()
             .into_iter()
             .map(|(_, p)| RecentEntry {
                 path: p.to_string_lossy().into_owned(),
@@ -3496,7 +4056,15 @@ impl MainWindow {
                 age_days: 0,
                 is_example: false,
             })
-            .collect()
+            .collect();
+        // Append the bundled examples (the C++ `loadEntries` always lists the
+        // examples regardless of the recent list; startpage.h). These give the
+        // start page a one-click "Continue" demo to open even on a fresh install
+        // with no recent files — the audited "start-page Continue demo absent"
+        // gap. Each example's `path` is its `file.example.<name>` key, routed
+        // through `open_example` (not `open_project`) by `on_start_page_event`.
+        entries.extend(super::startpage::example_entries());
+        entries
     }
 
     fn on_start_page_event(
@@ -3532,11 +4100,17 @@ impl MainWindow {
                 StartCard::ImportPdb => self.prompt_import(ImportKind::Pdb, window, cx),
             },
             StartPageEvent::FileSelected(path) => {
-                // The C++ start-page recent-file click → `project_open(path)`
-                // (app-shell §13). Dismiss the splash + load the `.rcx` into the
-                // active document via the controller/imports lifecycle.
+                // A bundled-example row carries a `file.example.<name>` key (not a
+                // real on-disk path); route it through `open_example`
+                // (materialize-then-open) — the C++ Examples bucket opens the
+                // example, not a non-existent path. A real recent file → the C++
+                // `project_open(path)`. Either way the splash dismisses.
                 self.dismiss_start_page(cx);
-                self.open_project(std::path::Path::new(&path), None, window, cx);
+                if let Some(name) = path.strip_prefix("file.example.") {
+                    self.open_example(name, window, cx);
+                } else {
+                    self.open_project(std::path::Path::new(&path), None, window, cx);
+                }
             }
         }
     }
@@ -4171,8 +4745,212 @@ impl Render for TypeAliasesDialog {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PluginManagerDialog — the read-only Plugins manager (the C++ showPluginsDialog)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One row in the Plugins manager (the C++ `IPlugin` descriptor; main.cpp:8845).
+/// Read-only metadata: name, version, type, author, and a one-line description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginInfo {
+    name: &'static str,
+    version: &'static str,
+    kind: &'static str,
+    author: &'static str,
+    description: &'static str,
+}
+
+/// The built-in provider "plugins" this port ships (the in-scope analogue of the
+/// C++ loaded `IPlugin`s — native DLL/SO loading is out of scope, so these are
+/// the compiled-in provider backends the registry can hand out). Pure;
+/// unit-tested via [`builtin_plugins`] in the test module.
+fn builtin_plugins() -> Vec<PluginInfo> {
+    vec![
+        PluginInfo {
+            name: "File Provider",
+            version: env!("CARGO_PKG_VERSION"),
+            kind: "Provider",
+            author: "Reclass (Rust port)",
+            description: "Reads a project's data from a binary file on disk.",
+        },
+        PluginInfo {
+            name: "Buffer Provider",
+            version: env!("CARGO_PKG_VERSION"),
+            kind: "Provider",
+            author: "Reclass (Rust port)",
+            description: "Reads from an in-memory byte buffer (imports / tests).",
+        },
+        PluginInfo {
+            name: "Snapshot Provider",
+            version: env!("CARGO_PKG_VERSION"),
+            kind: "Provider",
+            author: "Reclass (Rust port)",
+            description: "Reads from a captured memory snapshot.",
+        },
+        PluginInfo {
+            name: "Null Provider",
+            version: env!("CARGO_PKG_VERSION"),
+            kind: "Provider",
+            author: "Reclass (Rust port)",
+            description: "The detached source — every read returns zero.",
+        },
+    ]
+}
+
+/// The Plugins manager's outcome — Close (the only action in the read-only port).
+#[derive(Clone, Debug)]
+enum PluginManagerEvent {
+    Close,
+}
+
+/// The read-only Plugins manager view (the C++ `showPluginsDialog`; main.cpp:8821).
+/// Lists the built-in provider plugins with the same fields the C++ shows
+/// (name·version·type·author·description) and a single Close button. The C++
+/// Load/Unload buttons drove native `dlopen`/`dlclose`, which has no analogue on
+/// this platform, so they are replaced by a one-line "loading runtime plugins is
+/// not supported in this build" note (the honest boundary).
+struct PluginManagerDialog {
+    plugins: Vec<PluginInfo>,
+    focus_handle: FocusHandle,
+}
+
+impl PluginManagerDialog {
+    fn new(plugins: Vec<PluginInfo>, cx: &mut Context<Self>) -> Self {
+        PluginManagerDialog {
+            plugins,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn close(&mut self, cx: &mut Context<Self>) {
+        cx.emit(PluginManagerEvent::Close);
+    }
+}
+
+impl EventEmitter<PluginManagerEvent> for PluginManagerDialog {}
+
+impl Focusable for PluginManagerDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for PluginManagerDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use super::design::{color, tokens};
+        use super::dialogs::modal;
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let card_w = modal::clamp_width(620., window);
+        let card_max_h = modal::clamp_height(440., 100., window);
+
+        // One card per plugin (the C++ `QListWidgetItem` rows).
+        let rows: Vec<AnyElement> = self
+            .plugins
+            .iter()
+            .map(|p| {
+                gpui_component::v_flex()
+                    .w_full()
+                    .gap(px(2.))
+                    .p(px(tokens::space::SM))
+                    .rounded(px(tokens::radius::SM))
+                    .bg(color::panel_bg(cx))
+                    .border_1()
+                    .border_color(color::border(cx))
+                    .child(
+                        gpui_component::h_flex()
+                            .items_center()
+                            .gap(px(tokens::space::SM))
+                            .child(
+                                div()
+                                    .text_color(color::text(cx))
+                                    .text_size(px(tokens::font::UI_MD))
+                                    .child(format!("{} v{}", p.name, p.version)),
+                            )
+                            .child(
+                                div()
+                                    .px(px(tokens::space::XS))
+                                    .rounded(px(tokens::radius::SM))
+                                    .bg(color::selected_bg(cx))
+                                    .text_color(color::text_muted(cx))
+                                    .text_size(px(tokens::font::UI_SM))
+                                    .child(p.kind),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(color::text_muted(cx))
+                            .text_size(px(tokens::font::UI_SM))
+                            .child(p.description.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_color(color::text_muted(cx))
+                            .text_size(px(tokens::font::UI_SM))
+                            .child(format!("Author: {}", p.author)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let note = div()
+            .text_color(color::text_muted(cx))
+            .text_size(px(tokens::font::UI_SM))
+            .child(
+                "Loading runtime plugins (DLL/SO) is not supported in this build; \
+                 the provider plugins above are compiled in.",
+            );
+
+        let body = modal::body(cx).child(
+            gpui_component::v_flex()
+                .id("rcx-plugin-rows")
+                .w_full()
+                .max_h(px(300.))
+                .overflow_y_scroll()
+                .gap(px(tokens::space::XS))
+                .children(rows)
+                .child(note),
+        );
+
+        let footer = modal::footer(cx).child(
+            Button::new("plugins-close")
+                .primary()
+                .label("Close")
+                .on_click(cx.listener(|this, _e, _w, cx| this.close(cx))),
+        );
+
+        modal::card(cx)
+            .id("rcx-plugins")
+            .track_focus(&self.focus_handle)
+            .key_context("RcxPlugins")
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                if ev.keystroke.key.as_str() == "escape" {
+                    this.close(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .w(card_w)
+            .max_h(card_max_h)
+            .child(modal::header("Plugins", cx).child(modal::close_button(
+                "plugins-x",
+                cx.listener(|this, _e, _w, cx| this.close(cx)),
+                cx,
+            )))
+            .child(body)
+            .child(footer)
+    }
+}
+
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep the OS window title in sync with the active document (the C++
+        // `updateWindowTitle`; main.cpp:5172). Every active-tab change, view-root
+        // change, and dirty-state change forces a re-render, so recomputing the
+        // title here covers all three transitions without threading `window`
+        // through each dirty-sync path; `set_window_title` is a cheap no-op when
+        // the string is unchanged.
+        self.update_window_title(window, cx);
+
         // Root overlay layers (modals/dialogs/sheets/notifications).
         let sheet_layer = Root::render_sheet_layer(window, cx);
         let dialog_layer = Root::render_dialog_layer(window, cx);
@@ -4228,6 +5006,11 @@ impl Render for MainWindow {
         let presentation = self.presentation;
         let chrome_opacity = if presentation { 0.45 } else { 1.0 };
 
+        // Editor split panes (View ▸ Split Editor). Each extra pane views the same
+        // active document as the primary editor (the C++ `SplitPane`s bound to the
+        // tab's controller); lay them side-by-side to the right of the dock area.
+        let split_panes = self.render_split_panes(cx);
+
         div()
             .id("reclass-main-window")
             .key_context("RcxWindow")
@@ -4272,8 +5055,25 @@ impl Render for MainWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    // The docking workspace: center document tabs + side docks.
-                    .child(div().size_full().child(self.dock_area.clone()))
+                    // The docking workspace (center document tabs + side docks) and,
+                    // when the editor is split, the extra panes laid out beside it in
+                    // a horizontal row. With no split this is just the dock area at
+                    // full width (unchanged single-pane layout).
+                    .child(
+                        gpui_component::h_flex()
+                            .size_full()
+                            .items_stretch()
+                            // The dock area (incl. the primary editor pane) takes the
+                            // remaining width; each split pane shares the rest evenly.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(self.dock_area.clone()),
+                            )
+                            .children(split_panes),
+                    )
                     // The start-page overlay (over the workspace while shown).
                     .when_some(self.start_page.clone(), |this, page| this.child(page)),
             )
@@ -4626,8 +5426,8 @@ mod tests {
     // These import specific items (NOT `super::*`) so the module's `gpui::*` glob
     // is not pulled into the test-hygiene expansion (see the menubar.rs note).
     use super::{
-        seed_root_doc, settings_keys, DiskSettings, ExportKind, ImportKind, RootKind, ViewOpt,
-        ViewOptions,
+        builtin_plugins, root_name_for_title, seed_root_doc, settings_keys, window_title_string,
+        DiskSettings, ExportKind, ImportKind, RootKind, ViewOpt, ViewOptions,
     };
     use crate::theme::SettingsStore;
 
@@ -4739,6 +5539,57 @@ mod tests {
         assert_eq!(src.kind, crate::ui::state::SourceKind::File);
         assert_eq!(src.target, data.to_string_lossy());
         let _ = std::fs::remove_file(&data);
+    }
+
+    // ── Dynamic window title (the C++ updateWindowTitle) ──
+
+    #[test]
+    fn window_title_formats_name_dirty_and_empty() {
+        // `"<name> - Reclass"` when clean; a trailing `" *"` before " - Reclass"
+        // when modified; plain "Reclass" when the name is empty (no document).
+        assert_eq!(window_title_string("Player", false), "Player - Reclass");
+        assert_eq!(window_title_string("Player", true), "Player * - Reclass");
+        assert_eq!(window_title_string("", false), "Reclass");
+        assert_eq!(window_title_string("", true), "Reclass");
+    }
+
+    #[test]
+    fn root_name_for_title_uses_view_root_struct_name() {
+        // The window title names the active VIEW ROOT's top-level struct: build a
+        // class document and assert its struct_type_name is returned for the root,
+        // and that climbing from a child reaches the same root name.
+        let doc = seed_root_doc(RootKind::Class);
+        let tree = &doc.tree;
+        // The root is the first top-level node; its view-root id names the title.
+        let root_id = tree.nodes.iter().find(|n| n.parent_id == 0).unwrap().id;
+        let name = root_name_for_title(tree, root_id);
+        assert_eq!(name, RootKind::Class.type_name());
+        // A `0`/unknown view root still resolves to the first top-level struct.
+        assert_eq!(root_name_for_title(tree, 0), RootKind::Class.type_name());
+        // Climbing from a child field reaches the same root name.
+        if let Some(child) = tree.nodes.iter().find(|n| n.parent_id == root_id) {
+            assert_eq!(
+                root_name_for_title(tree, child.id),
+                RootKind::Class.type_name()
+            );
+        }
+    }
+
+    // ── Plugins manager (the read-only port of showPluginsDialog) ──
+
+    #[test]
+    fn builtin_plugins_lists_the_provider_backends() {
+        let plugins = builtin_plugins();
+        // Every shipped provider backend is listed as a read-only "Provider".
+        assert!(!plugins.is_empty());
+        assert!(plugins.iter().all(|p| p.kind == "Provider"));
+        let names: Vec<&str> = plugins.iter().map(|p| p.name).collect();
+        assert!(names.contains(&"File Provider"));
+        assert!(names.contains(&"Null Provider"));
+        // Each row carries the fields the C++ dialog shows.
+        assert!(plugins.iter().all(|p| {
+            !p.version.is_empty() && !p.author.is_empty() && !p.description.is_empty()
+        }));
     }
 
     #[test]

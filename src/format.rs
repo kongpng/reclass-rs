@@ -887,7 +887,14 @@ fn read_value_impl(
             if !display {
                 raw_hex(u64::from(val), 8)
             } else {
-                fmt_pointer32(val)
+                let mut s = fmt_pointer32(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:425-426`).
+                let sym = prov.get_symbol(u64::from(val));
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
             }
         }
         NodeKind::Pointer64 => {
@@ -912,6 +919,12 @@ fn read_value_impl(
                     };
                     let deref_val = read_value_impl(&tmp, prov, target, 0, mode);
                     if display {
+                        // Arrow to deref target value + symbol on the pointer's
+                        // own value (`format.cpp:443-449`).
+                        let sym = prov.get_symbol(val);
+                        if !sym.is_empty() {
+                            return format!("-> {deref_val}  // {sym}");
+                        }
                         return format!("-> {deref_val}");
                     }
                     return deref_val;
@@ -924,7 +937,14 @@ fn read_value_impl(
             if !display {
                 raw_hex(val, 16)
             } else {
-                fmt_pointer64(val)
+                let mut s = fmt_pointer64(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:457-458`).
+                let sym = prov.get_symbol(val);
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
             }
         }
         NodeKind::FuncPtr32 => {
@@ -932,7 +952,14 @@ fn read_value_impl(
             if !display {
                 raw_hex(u64::from(val), 8)
             } else {
-                fmt_pointer32(val)
+                let mut s = fmt_pointer32(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:465-466`).
+                let sym = prov.get_symbol(u64::from(val));
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
             }
         }
         NodeKind::FuncPtr64 => {
@@ -940,7 +967,14 @@ fn read_value_impl(
             if !display {
                 raw_hex(val, 16)
             } else {
-                fmt_pointer64(val)
+                let mut s = fmt_pointer64(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:473-474`).
+                let sym = prov.get_symbol(val);
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
             }
         }
         NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => {
@@ -2047,5 +2081,121 @@ mod tests {
         assert_eq!(type_name_raw(NodeKind::Float), "X");
         set_type_name_provider(None);
         assert_eq!(type_name_raw(NodeKind::Float), "float");
+    }
+
+    // A provider whose 8 bytes at addr 0 hold a fixed pointer value, and which
+    // resolves exactly that one value to a synthetic `module!Symbol` name.
+    struct SymProvider {
+        ptr_val: u64,
+        sym_addr: u64,
+        sym: String,
+    }
+    impl crate::provider::Provider for SymProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            if addr == 0 && buf.len() <= 8 {
+                let bytes = self.ptr_val.to_le_bytes();
+                buf.copy_from_slice(&bytes[..buf.len()]);
+                true
+            } else {
+                buf.iter_mut().for_each(|b| *b = 0);
+                true
+            }
+        }
+        fn size(&self) -> i32 {
+            4096
+        }
+        fn get_symbol(&self, a: u64) -> String {
+            if a == self.sym_addr {
+                self.sym.clone()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    // ── Symbol annotation on rendered pointer values (format.cpp:421-475) ──
+    #[test]
+    fn test_pointer_symbol_suffix() {
+        let prov = SymProvider {
+            ptr_val: 0x7FF7_1857_0000,
+            sym_addr: 0x7FF7_1857_0000,
+            sym: "ntdll!RtlUserThreadStart".to_string(),
+        };
+        let p64 = Node {
+            kind: NodeKind::Pointer64,
+            ..Node::default()
+        };
+        let disp = read_value(&p64, &prov, 0, 0);
+        assert!(
+            disp.contains("// ntdll!RtlUserThreadStart"),
+            "Pointer64 display should append `  // module!Symbol`, got: {disp}"
+        );
+        assert!(disp.contains("0x7ff718570000"));
+        // Editable mode never appends the symbol.
+        let edit = editable_value(&p64, &prov, 0, 0);
+        assert!(
+            !edit.contains("//"),
+            "editable value must not carry symbol: {edit}"
+        );
+
+        // FuncPtr64 carries the same suffix.
+        let fp64 = Node {
+            kind: NodeKind::FuncPtr64,
+            ..Node::default()
+        };
+        assert!(read_value(&fp64, &prov, 0, 0).contains("// ntdll!RtlUserThreadStart"));
+
+        // No symbol → no suffix.
+        let prov_nosym = SymProvider {
+            ptr_val: 0x1234,
+            sym_addr: 0xDEAD,
+            sym: "x".to_string(),
+        };
+        let s = read_value(&p64, &prov_nosym, 0, 0);
+        assert!(!s.contains("//"), "no matching symbol → no suffix: {s}");
+    }
+
+    // ── Symbol suffix on the primitive-deref `-> <derefVal>` branch ──
+    #[test]
+    fn test_pointer_deref_symbol_suffix() {
+        // Pointer at addr 0 → 0x100; target holds an int32 = 0x2A.
+        struct DerefProv;
+        impl crate::provider::Provider for DerefProv {
+            fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+                let v: u64 = match addr {
+                    0 => 0x100,    // the pointer
+                    0x100 => 0x2A, // the int32 target
+                    _ => 0,
+                };
+                let bytes = v.to_le_bytes();
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = bytes.get(i).copied().unwrap_or(0);
+                }
+                true
+            }
+            fn size(&self) -> i32 {
+                4096
+            }
+            fn get_symbol(&self, a: u64) -> String {
+                if a == 0x100 {
+                    "mod!gPtr".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        }
+        let prov = DerefProv;
+        let node = Node {
+            kind: NodeKind::Pointer64,
+            ptr_depth: 1,
+            element_kind: NodeKind::Int32,
+            ..Node::default()
+        };
+        let disp = read_value(&node, &prov, 0, 0);
+        assert!(disp.starts_with("-> 42"), "deref arrow + value: {disp}");
+        assert!(
+            disp.ends_with("// mod!gPtr"),
+            "deref branch should append symbol of the pointer value: {disp}"
+        );
     }
 }

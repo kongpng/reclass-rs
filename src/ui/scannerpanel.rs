@@ -30,6 +30,25 @@ use crate::scanner::{
     natural_alignment, parse_signature, serialize_value, value_size_for_type, ScanCondition,
     ScanRequest, ScanResult, ValueType,
 };
+use crate::theme::manager::SettingsStore;
+
+/// QSettings group/key names for scanner-form persistence (the C++
+/// `ScannerPanel::saveSettings`/`loadSettings`, scannerpanel.cpp:2439-2465). The
+/// C++ uses `beginGroup(key)` + relative keys; here we flatten to
+/// `"<group>/<field>"` so any flat [`SettingsStore`] (the disk INI / registry
+/// replacement) round-trips them. Kept in one place so save + load agree.
+pub mod settings_keys {
+    /// Default group the panel persists under (the C++ caller passes "scanner").
+    pub const GROUP: &str = "scanner";
+    pub const MODE: &str = "mode";
+    pub const VALUE_TYPE: &str = "valueType";
+    pub const CONDITION: &str = "condition";
+    pub const FILTER_EXEC: &str = "filterExec";
+    pub const FILTER_WRITE: &str = "filterWrite";
+    pub const PRIVATE_ONLY: &str = "privateOnly";
+    pub const SKIP_SYSTEM: &str = "skipSystem";
+    pub const USER_MODE: &str = "userMode";
+}
 
 /// The scan **mode** — the C++ `m_modeCombo` (Signature vs Value). The condition
 /// combo's "Exact Sig" sentinel flips this to [`ScanMode::Signature`]
@@ -79,7 +98,13 @@ impl CondEntry {
 }
 
 /// The value-type dropdown entries in display order (`scannerpanel.cpp:494-503`).
-/// Order matters: the UI index maps onto the [`ValueType`] discriminant.
+///
+/// The C++ combo exposes int8..double; the engine ([`serialize_value`] /
+/// [`value_size_for_type`] / [`natural_alignment`]) additionally supports the
+/// vector and string types, so the port surfaces them too (raw gap 5): Vec2/3/4
+/// for game-coordinate scans and UTF8/UTF16/HexBytes for string / raw-byte
+/// scans. The persistence layer keys on the [`ValueType`] discriminant (not the
+/// dropdown index), so appending entries does not break saved settings.
 pub fn value_type_entries() -> &'static [(ValueType, &'static str)] {
     &[
         (ValueType::Int8, "int8"),
@@ -92,6 +117,12 @@ pub fn value_type_entries() -> &'static [(ValueType, &'static str)] {
         (ValueType::UInt64, "uint64"),
         (ValueType::Float, "float"),
         (ValueType::Double, "double"),
+        (ValueType::Vec2, "vec2"),
+        (ValueType::Vec3, "vec3"),
+        (ValueType::Vec4, "vec4"),
+        (ValueType::Utf8, "utf8"),
+        (ValueType::Utf16, "utf16"),
+        (ValueType::HexBytes, "hex bytes"),
     ]
 }
 
@@ -150,6 +181,11 @@ pub struct ScannerForm {
     last_mode: ScanMode,
     last_value_type: ValueType,
     last_pattern: Vec<u8>,
+    /// The condition the last `build_request` actually emitted (the C++
+    /// `m_lastCondition`). For value-mode ExactValue scans, `finish_first_scan`
+    /// overrides each result's cached bytes with this searched `last_pattern`
+    /// (the engine caches the raw chunk, not the searched value).
+    last_condition: ScanCondition,
 }
 
 impl Default for ScannerForm {
@@ -169,6 +205,7 @@ impl Default for ScannerForm {
             last_mode: ScanMode::Value,
             last_value_type: ValueType::Int32,
             last_pattern: Vec::new(),
+            last_condition: ScanCondition::ExactValue,
         }
     }
 }
@@ -319,14 +356,61 @@ impl ScannerForm {
             }
         }
 
-        // Record the "last scan" snapshot for result-value formatting.
+        // Record the "last scan" snapshot for result-value formatting (the C++
+        // `m_lastScanMode`/`m_lastValueType`/`m_lastCondition`/`m_lastPattern`,
+        // scannerpanel.cpp:1226-1231). `m_lastCondition` is only updated in value
+        // mode, after the Changed→Unknown remap above (so ExactValue stays
+        // ExactValue while Changed/Increased/etc. became UnknownValue).
         self.last_mode = self.mode();
         if self.last_mode == ScanMode::Value {
             self.last_value_type = self.value_type;
+            self.last_condition = req.condition;
         }
         self.last_pattern = req.pattern.clone();
 
         Ok(req)
+    }
+
+    /// Overwrite the last-scan snapshot directly (used by the blocking
+    /// automation entry points, which build their own [`ScanRequest`] outside
+    /// [`build_request`](Self::build_request) and so must record the snapshot
+    /// the value-column formatter reads).
+    pub fn set_last_scan(
+        &mut self,
+        mode: ScanMode,
+        value_type: ValueType,
+        condition: ScanCondition,
+        pattern: &[u8],
+    ) {
+        self.last_mode = mode;
+        self.last_value_type = value_type;
+        self.last_condition = condition;
+        self.last_pattern = pattern.to_vec();
+    }
+
+    /// The mode the last `build_request` ran in (the C++ `m_lastScanMode`).
+    pub fn last_mode(&self) -> ScanMode {
+        self.last_mode
+    }
+
+    /// The value type the last value-mode `build_request` used (the C++
+    /// `m_lastValueType`).
+    pub fn last_value_type(&self) -> ValueType {
+        self.last_value_type
+    }
+
+    /// The condition the last value-mode `build_request` emitted (the C++
+    /// `m_lastCondition`, post Changed→Unknown remap).
+    pub fn last_condition(&self) -> ScanCondition {
+        self.last_condition
+    }
+
+    /// The serialized search bytes from the last `build_request` (the C++
+    /// `m_lastPattern`). For a value-mode ExactValue scan this is the searched
+    /// value, which `finish_first_scan` writes back over each result's cached
+    /// bytes (the engine only caches the raw chunk).
+    pub fn last_pattern(&self) -> &[u8] {
+        &self.last_pattern
     }
 
     /// `formatValue(bytes)` (`scannerpanel.cpp:2145-2178`) — render a result's
@@ -339,6 +423,128 @@ impl ScannerForm {
             bytes,
         )
     }
+
+    /// Persist the form's mode / value-type / condition / filter checkboxes to a
+    /// [`SettingsStore`] (the C++ `ScannerPanel::saveSettings`,
+    /// scannerpanel.cpp:2439-2451). Unlike the C++ — which stores fragile combo
+    /// *indices* — this persists semantic enum values (`ScanMode` 0/1, the
+    /// `ValueType` discriminant, and the `ScanCondition` discriminant or `-1` for
+    /// the Signature sentinel) so appending dropdown entries can't corrupt a
+    /// saved session. Keyed under `group/<field>`.
+    pub fn save_settings<S: SettingsStore + ?Sized>(&self, group: &str, store: &mut S) {
+        let k = |field: &str| format!("{group}/{field}");
+        let mode_i = match self.mode() {
+            ScanMode::Signature => 0,
+            ScanMode::Value => 1,
+        };
+        store.set(&k(settings_keys::MODE), &mode_i.to_string());
+        store.set(
+            &k(settings_keys::VALUE_TYPE),
+            &(self.value_type as i32).to_string(),
+        );
+        let cond_i = match self.condition {
+            CondEntry::Signature => -1,
+            CondEntry::Value(c) => c as i32,
+        };
+        store.set(&k(settings_keys::CONDITION), &cond_i.to_string());
+        store.set(
+            &k(settings_keys::FILTER_EXEC),
+            bool_str(self.filter_executable),
+        );
+        store.set(
+            &k(settings_keys::FILTER_WRITE),
+            bool_str(self.filter_writable),
+        );
+        store.set(&k(settings_keys::PRIVATE_ONLY), bool_str(self.private_only));
+        store.set(
+            &k(settings_keys::SKIP_SYSTEM),
+            bool_str(self.skip_system_modules),
+        );
+        store.set(&k(settings_keys::USER_MODE), bool_str(self.user_mode_only));
+    }
+
+    /// Restore the form from a [`SettingsStore`] previously written by
+    /// [`save_settings`](Self::save_settings) (the C++ `loadSettings`,
+    /// scannerpanel.cpp:2453-2465). Missing / unparseable keys leave the current
+    /// value untouched (the C++ `if (s.contains(...))` guard).
+    pub fn load_settings<S: SettingsStore + ?Sized>(&mut self, group: &str, store: &S) {
+        let k = |field: &str| format!("{group}/{field}");
+        if let Some(v) = store.get(&k(settings_keys::CONDITION)) {
+            if let Ok(c) = v.parse::<i32>() {
+                self.condition = cond_entry_from_i32(c);
+            }
+        }
+        // MODE is honored only when the condition didn't already pin Signature —
+        // a stored mode of 0 (Signature) re-selects the Signature sentinel.
+        if let Some(v) = store.get(&k(settings_keys::MODE)) {
+            if v.parse::<i32>() == Ok(0) {
+                self.condition = CondEntry::Signature;
+            }
+        }
+        if let Some(v) = store.get(&k(settings_keys::VALUE_TYPE)) {
+            if let Ok(d) = v.parse::<i32>() {
+                if let Some(vt) = value_type_from_i32(d) {
+                    self.value_type = vt;
+                }
+            }
+        }
+        if let Some(v) = store.get(&k(settings_keys::FILTER_EXEC)) {
+            self.filter_executable = parse_bool(&v);
+        }
+        if let Some(v) = store.get(&k(settings_keys::FILTER_WRITE)) {
+            self.filter_writable = parse_bool(&v);
+        }
+        if let Some(v) = store.get(&k(settings_keys::PRIVATE_ONLY)) {
+            self.private_only = parse_bool(&v);
+        }
+        if let Some(v) = store.get(&k(settings_keys::SKIP_SYSTEM)) {
+            self.skip_system_modules = parse_bool(&v);
+        }
+        if let Some(v) = store.get(&k(settings_keys::USER_MODE)) {
+            self.user_mode_only = parse_bool(&v);
+        }
+    }
+}
+
+/// `"true"`/`"false"` (the `DiskSettings::set_bool` spelling).
+fn bool_str(b: bool) -> &'static str {
+    if b {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Parse a persisted bool (`"true"`/`"1"` ⇒ true), mirroring
+/// `DiskSettings::get_bool`.
+fn parse_bool(s: &str) -> bool {
+    s == "true" || s == "1"
+}
+
+/// Map a `ValueType` discriminant back to the enum (the inverse of
+/// `value_type as i32`). Returns `None` for an out-of-range / unknown value so
+/// load leaves the current type untouched.
+fn value_type_from_i32(d: i32) -> Option<ValueType> {
+    value_type_entries()
+        .iter()
+        .map(|(vt, _)| *vt)
+        .find(|vt| *vt as i32 == d)
+}
+
+/// Map a persisted condition discriminant (or `-1` for Signature) to the
+/// dropdown entry it selects.
+fn cond_entry_from_i32(c: i32) -> CondEntry {
+    if c < 0 {
+        return CondEntry::Signature;
+    }
+    CondEntry::entries()
+        .iter()
+        .map(|(e, _)| *e)
+        .find(|e| match e {
+            CondEntry::Value(cond) => *cond as i32 == c,
+            CondEntry::Signature => false,
+        })
+        .unwrap_or(CondEntry::Value(ScanCondition::ExactValue))
 }
 
 /// `formatValue` (`scannerpanel.cpp:2145-2178`), as a free function over the
@@ -391,19 +597,116 @@ pub fn format_value(mode: ScanMode, vt: ValueType, last_pattern: &[u8], bytes: &
             let v = f64::from_le_bytes(bytes[..8].try_into().unwrap());
             return format_float(v, 17);
         }
+        // Vector types: render as "(x, y[, z[, w]])" with the float-9 precision
+        // each component would use as a scalar Float.
+        ValueType::Vec2 if sz >= 8 => return format_vec(bytes, 2),
+        ValueType::Vec3 if sz >= 12 => return format_vec(bytes, 3),
+        ValueType::Vec4 if sz >= 16 => return format_vec(bytes, 4),
+        // String types: render the decoded text (lossy for invalid sequences,
+        // the way a value preview tolerates partial reads).
+        ValueType::Utf8 if sz > 0 => {
+            return String::from_utf8_lossy(bytes).to_string();
+        }
+        ValueType::Utf16 if sz >= 2 => {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            return String::from_utf16_lossy(&units);
+        }
+        // Hex bytes: space-separated uppercase, same shape as signature display.
+        ValueType::HexBytes if sz > 0 => {
+            let mut s = String::new();
+            for (j, b) in bytes.iter().enumerate() {
+                if j > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&format!("{b:02X}"));
+            }
+            return s;
+        }
         _ => {}
     }
     "??".to_string()
 }
 
-/// `QString::number(double, 'g', prec)` — shortest `%g`-style rendering at the
-/// given significant-digit precision (Qt default `%g` semantics).
-fn format_float(v: f64, _prec: usize) -> String {
-    // Rust's default f64 Display already produces the shortest round-trippable
-    // form; for the scanner's display purposes this matches Qt's 'g' output for
-    // the common cases (whole numbers, simple decimals) closely enough.
-    let s = format!("{v}");
-    s
+/// Render `n` little-endian `f32` components as `"(x, y, …)"` using the same
+/// per-component precision the scalar Float column uses (`%g,9`). Used for the
+/// Vec2/Vec3/Vec4 value-column display.
+fn format_vec(bytes: &[u8], n: usize) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * 4;
+        let v = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        parts.push(format_float(v as f64, 9));
+    }
+    format!("({})", parts.join(", "))
+}
+
+/// `QString::number(double, 'g', prec)` — `%g`-style rendering honoring the
+/// significant-digit precision argument, matching C's `printf("%.*g", prec, v)`
+/// (which is what Qt's `QString::number(double, 'g', prec)` ultimately calls).
+///
+/// The scanner uses three precisions: float values render with `%g,9`, double
+/// values with `%g,17`, and float/double deltas with `%g,6` — so the precision
+/// argument is load-bearing (a too-coarse default Display diverged from the C++
+/// for e.g. `0.30000001192092896_f32` which `%g,9` prints as `0.300000012`).
+///
+/// `%g` semantics (per C99): with `P` significant digits (`P==0` treated as 1),
+/// let `X` be the decimal exponent of `v`. If `X >= -4 && X < P`, use `%f`-style
+/// with `P - 1 - X` fractional digits; otherwise use `%e`-style with `P - 1`
+/// fractional digits. Trailing zeros (and a trailing `.`) are then stripped (no
+/// `#` flag). NaN/inf degrade to Rust's Display (`NaN`/`inf`), which matches
+/// what the column shows for a non-finite value.
+fn format_float(v: f64, prec: usize) -> String {
+    if !v.is_finite() {
+        // C `%g` prints "nan"/"inf"; Qt mirrors libc. Keep Rust's spelling here
+        // (the value column never compares these as strings).
+        return format!("{v}");
+    }
+    let p = prec.max(1);
+
+    if v == 0.0 {
+        // Preserve sign of zero the way printf does (it does not print "-0").
+        return "0".to_string();
+    }
+
+    // Decimal exponent X = floor(log10(|v|)). Compute via the %e rendering so
+    // rounding at P significant digits picks the exponent libc would pick (a
+    // value like 9.9999e0 at P=1 rounds up to 1e1, bumping X).
+    let e_str = format!("{:.*e}", p - 1, v); // e.g. "1.23e2" / "9.9e0"
+    let exp: i32 = e_str
+        .rsplit_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
+
+    let pi = p as i32;
+    let body = if exp >= -4 && exp < pi {
+        // %f-style with (P - 1 - X) fractional digits.
+        let frac = (pi - 1 - exp).max(0) as usize;
+        let s = format!("{:.*}", frac, v);
+        strip_g_trailing(&s)
+    } else {
+        // %e-style with (P - 1) fractional mantissa digits; normalize the
+        // exponent to libc's `e±NN` (sign + at least two digits).
+        let (mantissa, e) = e_str.split_once('e').unwrap_or((e_str.as_str(), "0"));
+        let mantissa = strip_g_trailing(mantissa);
+        let ev: i32 = e.parse().unwrap_or(0);
+        let sign = if ev < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", ev.abs())
+    };
+    body
+}
+
+/// Strip the trailing zeros (and a now-dangling decimal point) from a fixed /
+/// mantissa rendering — the `%g` no-`#`-flag behaviour. `"1.2300" -> "1.23"`,
+/// `"5.000" -> "5"`, `"5" -> "5"`.
+fn strip_g_trailing(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let trimmed = s.trim_end_matches('0');
+    trimmed.trim_end_matches('.').to_string()
 }
 
 /// The C++ `AddressDelegate::paint` dim/bright split (`scannerpanel.cpp:204-236`):
@@ -441,6 +744,66 @@ pub fn format_scan_address(addr: u64) -> String {
     let hi = (addr >> 32) as u32;
     let lo = (addr & 0xFFFF_FFFF) as u32;
     format!("{hi:08X}`{lo:08X}")
+}
+
+/// Format a batch of addresses for the clipboard (the C++ multi-row Copy):
+/// newline-joined `0xUPPER` hex, in the order given. Used by "Copy All
+/// Addresses" and the batch context action.
+pub fn format_addresses_for_clipboard(addresses: &[u64]) -> String {
+    addresses
+        .iter()
+        .map(|a| format!("0x{a:X}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Drop the results at the given displayed-row indices, returning the surviving
+/// list (the C++ multi-row Delete). Indices are deduped + sorted descending so
+/// removal can't shift an index out from under a later removal; out-of-range
+/// indices are ignored.
+pub fn delete_rows(mut results: Vec<ScanResult>, rows: &[usize]) -> Vec<ScanResult> {
+    let mut idx: Vec<usize> = rows.to_vec();
+    idx.sort_unstable();
+    idx.dedup();
+    for &r in idx.iter().rev() {
+        if r < results.len() {
+            results.remove(r);
+        }
+    }
+    results
+}
+
+/// Parse a "Change All Values" replacement string into raw bytes, per the last
+/// scan mode + value type (the C++ batch-write parse, scannerpanel.cpp:945-978).
+///
+/// Signature mode parses space-separated hex bytes (no wildcards — each token
+/// must be a valid `00..FF` byte; a `??` is rejected, matching the C++ `toUInt`
+/// path that fails on non-hex). Value mode serializes the typed value exactly
+/// the way [`serialize_value`] does for a single cell. Returns the upstream-style
+/// error string on a parse failure.
+pub fn parse_change_all_bytes(
+    mode: ScanMode,
+    vt: ValueType,
+    text: &str,
+) -> Result<Vec<u8>, String> {
+    if mode == ScanMode::Signature {
+        // Space-separated hex bytes; reject anything that isn't 00..FF (the C++
+        // `tok.toUInt(&ok, 16)` + `val > 0xFF` guard — wildcards not allowed in a
+        // write).
+        let mut bytes = Vec::new();
+        for tok in text.split(' ').filter(|t| !t.is_empty()) {
+            match u32::from_str_radix(tok, 16) {
+                Ok(v) if v <= 0xFF => bytes.push(v as u8),
+                _ => return Err(format!("Invalid hex byte: {tok}")),
+            }
+        }
+        Ok(bytes)
+    } else {
+        // Typed value — serialize exactly like a single-cell edit.
+        serialize_value(vt, text)
+            .map(|(pat, _mask)| pat)
+            .map_err(|_| "Invalid value".to_string())
+    }
 }
 
 /// One result row's display strings — the Address column (with backtick), the
@@ -806,7 +1169,9 @@ pub fn deserialize_results_json(json: &str) -> Vec<ScanResult> {
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
-pub use view::{ScannerEdit, ScannerNav, ScannerPanel};
+pub use view::{
+    ScannerAddNodes, ScannerBatchEdit, ScannerDragAddress, ScannerEdit, ScannerNav, ScannerPanel,
+};
 
 #[cfg(feature = "ui")]
 mod view {
@@ -819,16 +1184,33 @@ mod view {
     use gpui_component::checkbox::Checkbox;
     use gpui_component::dock::{Panel, PanelEvent};
     use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::menu::PopupMenu;
     use gpui_component::popover::Popover;
     use gpui_component::table::{
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
     use gpui_component::{Disableable as _, Sizable as _};
 
+    // ── Result-row context-menu actions (the C++ `customContextMenuRequested`
+    // menu, scannerpanel.cpp:899-993). Dispatched by the `PopupMenu` the table
+    // delegate builds; the panel records the right-clicked row in
+    // `context_target` (from `TableEvent::RightClickedRow`) so each handler knows
+    // which result it targets, then runs the action against `self.results`. ──
+    gpui::actions!(
+        rcx_scanner,
+        [
+            ScCopyAddress,
+            ScCopyValue,
+            ScSetBaseAddress,
+            ScChangeAllValues
+        ]
+    );
+
     use super::{
-        compute_delta, previous_delta_text, rescan_status, serialize_results_json,
-        split_address_dim, stage_breadcrumb, truncation_banner, value_type_entries, CondEntry,
-        ScanMode, ScanRow, ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
+        compute_delta, format_addresses_for_clipboard, parse_change_all_bytes, previous_delta_text,
+        rescan_status, serialize_results_json, split_address_dim, stage_breadcrumb,
+        truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow, ScannerForm,
+        FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
     use crate::provider::Provider;
     use crate::scanner::{
@@ -861,6 +1243,31 @@ mod view {
         WriteValue { row: usize, address: u64 },
     }
 
+    /// A batch Change-All-Values write intent (the C++ "Change All Values"
+    /// context action). Raised as a SEPARATE event type from [`ScannerEdit`] so
+    /// the panel can grow this capability without forcing every existing
+    /// `match ScannerEdit` site to add an arm. The window writes `bytes` to every
+    /// `addresses` entry through its mutable provider, re-reads each, and hands
+    /// the new bytes back via [`ScannerPanel::apply_change_all`] (the panel held
+    /// provider handle is read-only, so it cannot write directly).
+    #[derive(Clone, Debug)]
+    pub struct ScannerBatchEdit {
+        /// Every current result address (the C++ `for (auto& r : m_results)`).
+        pub addresses: Vec<u64>,
+        /// The bytes to write, already parsed per the last scan mode / type.
+        pub bytes: Vec<u8>,
+    }
+
+    /// An "add these result addresses as nodes" intent (the C++ drag-row-into-
+    /// editor / add-as-nodes path). The window appends each address as a node in
+    /// the active editor. A separate event type (like [`ScannerBatchEdit`]) so it
+    /// doesn't disturb existing `ScannerEdit` match sites.
+    #[derive(Clone, Debug)]
+    pub struct ScannerAddNodes {
+        /// The addresses to add (in displayed order).
+        pub addresses: Vec<u64>,
+    }
+
     /// The result columns. The C++ scanner table is 2 columns (Address, Value);
     /// PIC6 additionally surfaces a Previous→Δ column (the pre-rescan value with
     /// its signed delta) and a Module column (when any result falls in a known
@@ -868,6 +1275,39 @@ mod view {
     const COL_ADDRESS: usize = 0;
     const COL_VALUE: usize = 1;
     const COL_PREVIOUS: usize = 2;
+
+    /// The drag payload a result row carries when dragged out of the scanner
+    /// (the C++ `setDragEnabled(true)` + the QMimeData address). An editor drop
+    /// target reads `address` to add it as a node (the C++ "drag a row into the
+    /// editor to add a node" affordance). The editor drop handler lives in the
+    /// editor surface (another module); this is the source side + the contract.
+    #[derive(Clone, Debug)]
+    pub struct ScannerDragAddress {
+        pub address: u64,
+    }
+
+    /// The drag preview shown under the cursor while dragging a result row out —
+    /// the formatted address in a small elevated pill (the visual stand-in for
+    /// the dragged node).
+    struct ScannerDragPreview {
+        address_text: SharedString,
+    }
+
+    impl Render for ScannerDragPreview {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .px(px(tokens::space::MD))
+                .py(px(tokens::space::XS))
+                .rounded(px(tokens::radius::MD))
+                .bg(color::elevated_bg(cx))
+                .border_1()
+                .border_color(color::border(cx))
+                .font_family(tokens::font::mono_family())
+                .text_size(px(tokens::font::EDITOR_SIZE))
+                .text_color(color::text(cx))
+                .child(self.address_text.clone())
+        }
+    }
 
     /// One displayed row plus its render metadata — the formatted strings, the
     /// per-row delta direction (drives green/red coloring on the Value + Previous
@@ -892,6 +1332,10 @@ mod view {
         rows: Vec<DisplayRow>,
         show_previous: bool,
         show_module: bool,
+        /// The total live result count (the C++ `m_results.size()`), shown in the
+        /// "Change All Values (N)" context-menu label. The delegate only holds
+        /// the displayed (capped/filtered) subset, so the full count is fed in.
+        result_count: usize,
     }
 
     impl ScanResultsDelegate {
@@ -900,6 +1344,7 @@ mod view {
                 rows: Vec::new(),
                 show_previous: false,
                 show_module: false,
+                result_count: 0,
             }
         }
     }
@@ -912,6 +1357,52 @@ mod view {
 
         fn rows_count(&self, _cx: &App) -> usize {
             self.rows.len()
+        }
+
+        /// The result-row right-click menu (the C++ `customContextMenuRequested`
+        /// handler, scannerpanel.cpp:904-916): Copy Address (0xUPPER), Copy Value,
+        /// Set as Base Address, a separator, then Change All Values (N). The menu
+        /// dispatches the `rcx_scanner` actions; the panel root's `.on_action`
+        /// handlers resolve them against the recorded `context_target` row.
+        fn context_menu(
+            &mut self,
+            _row_ix: usize,
+            menu: PopupMenu,
+            _window: &mut Window,
+            _cx: &mut Context<TableState<Self>>,
+        ) -> PopupMenu {
+            menu.menu("Copy Address", Box::new(ScCopyAddress))
+                .menu("Copy Value", Box::new(ScCopyValue))
+                .menu("Set as Base Address", Box::new(ScSetBaseAddress))
+                .separator()
+                .menu(
+                    format!("Change All Values ({})", self.result_count),
+                    Box::new(ScChangeAllValues),
+                )
+        }
+
+        /// The row container — carries the drag-out source (the C++
+        /// `setDragEnabled(true)`). Dragging a row hands a [`ScannerDragAddress`]
+        /// to whatever drop target accepts it (the editor adds it as a node).
+        fn render_tr(
+            &mut self,
+            row_ix: usize,
+            _window: &mut Window,
+            _cx: &mut Context<TableState<Self>>,
+        ) -> Stateful<Div> {
+            let mut row = div().id(("scanner-result-row", row_ix));
+            if let Some(d) = self.rows.get(row_ix) {
+                let address = d.row.address;
+                let address_text: SharedString = d.row.address_text.clone().into();
+                row = row.on_drag(
+                    ScannerDragAddress { address },
+                    move |_payload, _offset, _window, cx| {
+                        let address_text = address_text.clone();
+                        cx.new(|_| ScannerDragPreview { address_text })
+                    },
+                );
+            }
+            row
         }
 
         fn column(&self, col_ix: usize, _cx: &App) -> Column {
@@ -1103,12 +1594,32 @@ mod view {
         cond_open: bool,
         type_open: bool,
         align_open: bool,
+        /// The Reset two-click confirm flag (the C++ `resetArmed` dynamic
+        /// property): when a large result list (≥ [`RESET_CONFIRM_THRESHOLD`]) is
+        /// about to be discarded, the first Reset click only arms this + relabels
+        /// the button; the second click within the cooldown commits.
+        reset_armed: bool,
+        /// Monotonic generation counter for the reset-cooldown timer so a stale
+        /// 4 s disarm callback can't clobber a freshly re-armed state.
+        reset_arm_gen: u64,
+        /// The right-clicked result row recorded on `RightClickedRow` so the
+        /// context-menu actions know which result they target (the C++
+        /// `customContextMenuRequested` → `rowToResultIdx`). Indexes the
+        /// displayed (filtered/sorted) row list.
+        context_target: Option<usize>,
         focus_handle: FocusHandle,
         _subs: Vec<Subscription>,
     }
 
     /// The undo-stack cap (the C++ `kMaxUndo`).
     const MAX_UNDO: usize = 16;
+
+    /// Reset two-click confirm threshold (the C++ `kConfirmThreshold`): at or
+    /// above this result count the first Reset click only arms the confirm.
+    const RESET_CONFIRM_THRESHOLD: usize = 1000;
+
+    /// Reset confirm cooldown in milliseconds (the C++ 4 s `QTimer::singleShot`).
+    const RESET_CONFIRM_COOLDOWN_MS: u64 = 4000;
 
     impl ScannerPanel {
         /// Build an empty scanner panel.
@@ -1152,6 +1663,14 @@ mod view {
                 cx.subscribe(&table, |this, table, ev: &TableEvent, cx| match ev {
                     TableEvent::SelectRow(row_ix) => {
                         this.selected_row = Some(*row_ix);
+                        cx.notify();
+                    }
+                    // Record the right-clicked row before the context-menu action
+                    // fires so Copy/Set-base know which result they target (the
+                    // C++ `rowAt(pos.y())` → `rowToResultIdx`). `None` (empty area)
+                    // falls back to the current selection.
+                    TableEvent::RightClickedRow(row_ix) => {
+                        this.context_target = row_ix.or(this.selected_row);
                         cx.notify();
                     }
                     TableEvent::DoubleClickedRow(row_ix) => {
@@ -1213,6 +1732,9 @@ mod view {
                 cond_open: false,
                 type_open: false,
                 align_open: false,
+                reset_armed: false,
+                reset_arm_gen: 0,
+                context_target: None,
                 focus_handle: cx.focus_handle(),
                 _subs: subs,
             }
@@ -1255,6 +1777,29 @@ mod view {
         /// The form reducer (for tests / external wiring).
         pub fn form(&self) -> &ScannerForm {
             &self.form
+        }
+
+        /// Persist the scanner form (mode / value-type / condition / filters) to
+        /// the app settings store under the scanner group (the C++
+        /// `saveSettings`). The window calls this on close / settings flush.
+        pub fn save_settings<S: crate::theme::manager::SettingsStore + ?Sized>(
+            &self,
+            store: &mut S,
+        ) {
+            self.form.save_settings(super::settings_keys::GROUP, store);
+        }
+
+        /// Restore the scanner form from the app settings store (the C++
+        /// `loadSettings`). The window calls this once after constructing the
+        /// panel so the controls reflect the user's last session, then syncs the
+        /// value input + notifies.
+        pub fn load_settings<S: crate::theme::manager::SettingsStore + ?Sized>(
+            &mut self,
+            store: &S,
+            cx: &mut Context<Self>,
+        ) {
+            self.form.load_settings(super::settings_keys::GROUP, store);
+            cx.notify();
         }
 
         /// The current status line text.
@@ -1517,10 +2062,21 @@ mod view {
             form: &ScannerForm,
             cx: &mut Context<Self>,
         ) {
-            // Exact-value scans override the cached bytes with the searched
-            // pattern (the engine caches raw chunk bytes); previous is cleared.
+            // Bytes are cached by the engine during the scan. Value-mode
+            // ExactValue scans override the cached raw chunk with the exact
+            // search pattern so the Value column shows the searched value rather
+            // than the leading bytes of the chunk (the C++ onScanFinished loop,
+            // scannerpanel.cpp:1451-1455). Unknown / signature / compare modes
+            // keep the engine-captured bytes as the baseline. Previous is always
+            // cleared on a first scan.
+            let override_exact = form.last_mode() == ScanMode::Value
+                && form.last_condition() == ScanCondition::ExactValue
+                && !form.last_pattern().is_empty();
             for r in &mut results {
                 r.previous_value.clear();
+                if override_exact {
+                    r.scan_value = form.last_pattern().to_vec();
+                }
             }
             self.scanning = false;
             self.results = results;
@@ -1555,6 +2111,142 @@ mod view {
             cx.notify();
         }
 
+        /// Run a typed value scan SYNCHRONOUSLY and return its results (the C++
+        /// `ScannerPanel::runValueScanAndWait`, scannerpanel.cpp:1347-1388). Built
+        /// for MCP / automation callers that need the result list inline rather
+        /// than via the async UI path: it serializes `value` per `value_type`,
+        /// runs [`run_scan`] on the attached provider, populates the panel table
+        /// (so the UI reflects the automated scan), and hands the results back.
+        ///
+        /// Returns an empty list (and sets the status) when there is no provider,
+        /// a scan is already running, or the value fails to parse — matching the
+        /// C++ early-returns. `constrain_regions` limits the scan to those address
+        /// ranges (intersected with the provider's regions).
+        pub fn run_value_scan_and_wait(
+            &mut self,
+            value_type: ValueType,
+            value: &str,
+            filter_executable: bool,
+            filter_writable: bool,
+            constrain_regions: Vec<crate::scanner::AddressRange>,
+            cx: &mut Context<Self>,
+        ) -> Vec<ScanResult> {
+            let (pattern, mask) = match serialize_value(value_type, value) {
+                Ok(pm) => pm,
+                Err(e) => {
+                    self.status = format!("Value error: {e}");
+                    cx.notify();
+                    return Vec::new();
+                }
+            };
+            let mut req = crate::scanner::ScanRequest {
+                pattern,
+                mask,
+                alignment: crate::scanner::natural_alignment(value_type),
+                filter_executable,
+                filter_writable,
+                constrain_regions,
+                value_size: value_size_for_type(value_type),
+                value_type,
+                ..Default::default()
+            };
+            req.condition = ScanCondition::ExactValue;
+            self.run_blocking_scan(req, ScanMode::Value, value_type, cx)
+        }
+
+        /// Run a byte-pattern (signature) scan SYNCHRONOUSLY and return its
+        /// results (the C++ `ScannerPanel::runPatternScanAndWait`,
+        /// scannerpanel.cpp:1390-1437). Parses `pattern` via [`parse_signature`]
+        /// (`??` wildcards allowed), runs [`run_scan`] at byte alignment, and
+        /// populates the panel table. Same early-return contract as
+        /// [`run_value_scan_and_wait`](Self::run_value_scan_and_wait).
+        pub fn run_pattern_scan_and_wait(
+            &mut self,
+            pattern: &str,
+            filter_executable: bool,
+            filter_writable: bool,
+            constrain_regions: Vec<crate::scanner::AddressRange>,
+            cx: &mut Context<Self>,
+        ) -> Vec<ScanResult> {
+            let (pat, mask) = match crate::scanner::parse_signature(pattern) {
+                Ok(pm) => pm,
+                Err(e) => {
+                    self.status = format!("Pattern error: {e}");
+                    cx.notify();
+                    return Vec::new();
+                }
+            };
+            let req = crate::scanner::ScanRequest {
+                pattern: pat,
+                mask,
+                alignment: 1,
+                filter_executable,
+                filter_writable,
+                constrain_regions,
+                condition: ScanCondition::ExactValue,
+                ..Default::default()
+            };
+            self.run_blocking_scan(req, ScanMode::Signature, ValueType::Int32, cx)
+        }
+
+        /// The shared blocking-scan kernel for the automation entry points: guards
+        /// the provider + running state, runs [`run_scan`] inline (no worker
+        /// thread — the C++ `QEventLoop` blocked, so this blocks the caller too),
+        /// records the last-scan snapshot for value formatting, populates the
+        /// table, and returns the results.
+        fn run_blocking_scan(
+            &mut self,
+            req: crate::scanner::ScanRequest,
+            mode: ScanMode,
+            value_type: ValueType,
+            cx: &mut Context<Self>,
+        ) -> Vec<ScanResult> {
+            let Some(provider) = self.provider.clone() else {
+                self.status = "No provider (attach to a process or open a file first)".to_string();
+                cx.notify();
+                return Vec::new();
+            };
+            if self.scanning {
+                self.status = "Scan already in progress".to_string();
+                cx.notify();
+                return Vec::new();
+            }
+
+            let abort = AtomicBool::new(false);
+            let obs = NullObserver;
+            let mut results = run_scan(provider.as_ref(), &req, &abort, &obs);
+
+            // Record the last-scan snapshot so the table value column formats
+            // correctly + the ExactValue override applies (the C++ sets
+            // m_lastScanMode / m_lastValueType / m_lastPattern before the loop).
+            self.form
+                .set_last_scan(mode, value_type, ScanCondition::ExactValue, &req.pattern);
+            let override_exact = mode == ScanMode::Value && !req.pattern.is_empty();
+            for r in &mut results {
+                r.previous_value.clear();
+                if override_exact {
+                    r.scan_value = req.pattern.clone();
+                }
+            }
+
+            self.results = results.clone();
+            self.show_previous = false;
+            self.undo_stack.clear();
+            self.generation = 1;
+            self.last_result_count = 0;
+            self.selected_row = None;
+            self.scanning = false;
+            let n = results.len();
+            self.status = if n == 1 {
+                "1 result".to_string()
+            } else {
+                format!("{n} results")
+            };
+            self.refresh_table(cx);
+            cx.notify();
+            results
+        }
+
         /// Push the current result list onto the undo stack (capped).
         fn push_undo_snapshot(&mut self) {
             self.undo_stack.push(self.results.clone());
@@ -1587,7 +2279,51 @@ mod view {
         }
 
         /// Clear the result list (the C++ `onNewScanClicked` / Reset).
+        ///
+        /// Two-click guard (the C++ `kConfirmThreshold` flow,
+        /// scannerpanel.cpp:2176-2220): when the live result list is large
+        /// (≥ [`RESET_CONFIRM_THRESHOLD`]) the FIRST click only arms the confirm —
+        /// it relabels the button to "Click again to reset" and starts a 4 s
+        /// cooldown after which the arm auto-clears. A SECOND click while armed
+        /// commits the reset. Lists under the threshold reset immediately (the
+        /// CE-like pace for typical narrowing chains).
         fn reset(&mut self, cx: &mut Context<Self>) {
+            if self.results.len() >= RESET_CONFIRM_THRESHOLD && !self.reset_armed {
+                self.reset_armed = true;
+                self.reset_arm_gen = self.reset_arm_gen.wrapping_add(1);
+                let gen = self.reset_arm_gen;
+                self.status = format!(
+                    "About to discard {} results — click Reset again to confirm.",
+                    self.results.len()
+                );
+                cx.notify();
+                // Disarm after the cooldown unless the button was clicked again
+                // (a fresh arm bumps `reset_arm_gen`, so a stale callback no-ops).
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(RESET_CONFIRM_COOLDOWN_MS))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if this.reset_armed && this.reset_arm_gen == gen {
+                            this.reset_armed = false;
+                            // Restore the prior result-count status (the confirm
+                            // prompt above overwrote it).
+                            let n = this.results.len();
+                            this.status = if n == 1 {
+                                "1 result".to_string()
+                            } else {
+                                format!("{n} results")
+                            };
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+
+            self.reset_armed = false;
             self.results.clear();
             self.undo_stack.clear();
             self.show_previous = false;
@@ -1595,6 +2331,7 @@ mod view {
             self.last_result_count = 0;
             self.status.clear();
             self.selected_row = None;
+            self.context_target = None;
             self.refresh_table(cx);
             cx.notify();
         }
@@ -1627,6 +2364,202 @@ mod view {
                 self.status = format!("Copied 0x{address:X}");
                 cx.notify();
             }
+        }
+
+        /// The displayed-row payload (address + formatted value) the context-menu
+        /// actions target — resolved through the table delegate so it honors the
+        /// current sort/filter (the C++ `rowToResultIdx`). Falls back to the
+        /// selected row when no explicit right-click target was recorded.
+        fn context_row(&self, cx: &App) -> Option<(u64, String)> {
+            let ix = self.context_target.or(self.selected_row)?;
+            self.table
+                .read(cx)
+                .delegate()
+                .rows
+                .get(ix)
+                .map(|r| (r.row.address, r.row.value_text.clone()))
+        }
+
+        /// Context menu ▸ Copy Address — copy the right-clicked row's address as
+        /// `0xUPPER` (the C++ `copyAddr` action, scannerpanel.cpp:917-921).
+        fn ctx_copy_address(&mut self, _: &ScCopyAddress, _w: &mut Window, cx: &mut Context<Self>) {
+            if let Some((address, _)) = self.context_row(cx) {
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{address:X}")));
+                self.status = format!("Copied: 0x{address:X}");
+                cx.notify();
+            }
+        }
+
+        /// Context menu ▸ Copy Value — copy the right-clicked row's formatted
+        /// value (the C++ `copyVal` action, scannerpanel.cpp:922-924).
+        fn ctx_copy_value(&mut self, _: &ScCopyValue, _w: &mut Window, cx: &mut Context<Self>) {
+            if let Some((_, value)) = self.context_row(cx) {
+                cx.write_to_clipboard(ClipboardItem::new_string(value));
+                self.status = "Copied value".to_string();
+                cx.notify();
+            }
+        }
+
+        /// Context menu ▸ Set as Base Address — rebase the active editor tab onto
+        /// the right-clicked row's address (the C++ `goTo` action emitting
+        /// `goToAddress`, scannerpanel.cpp:925-926). Raises [`ScannerNav`].
+        fn ctx_set_base_address(
+            &mut self,
+            _: &ScSetBaseAddress,
+            _w: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if let Some((address, _)) = self.context_row(cx) {
+                cx.emit(ScannerNav { address });
+            }
+        }
+
+        /// Context menu ▸ Change All Values (N) — prompt for a value, parse it per
+        /// the last scan mode / value type, and emit a [`ScannerEdit::ChangeAll`]
+        /// intent the window resolves against its mutable source (the
+        /// read-only-surface pattern the inline value-edit already uses). The C++
+        /// (scannerpanel.cpp:927-992) parses + writes to every `m_results` address
+        /// inline through the panel's writable provider; here the provider handle
+        /// is read-only (`Arc`), so the bytes + addresses are handed to the window
+        /// which owns the mutable controller + the re-read / "Wrote to X/Y" report.
+        fn ctx_change_all_values(
+            &mut self,
+            _: &ScChangeAllValues,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if self.results.is_empty() {
+                return;
+            }
+            let last_mode = self.form.last_mode();
+            let last_vt = self.form.last_value_type();
+            let prompt = if last_mode == ScanMode::Signature {
+                "Change All Values — new hex bytes (e.g. 90 90 90):"
+            } else {
+                "Change All Values — new value (e.g. 999):"
+            };
+            // Prompt for the new value. gpui's `prompt` is a simple message box
+            // (no text entry), so route the value through the panel's own Value
+            // input: the user types the replacement there, then picks the action.
+            let text = self.value_input.read(cx).value().to_string();
+            if text.trim().is_empty() {
+                self.status = format!(
+                    "{prompt}  Type the value in the Value field above, then re-run Change All Values."
+                );
+                cx.notify();
+                let _ = window;
+                return;
+            }
+            // Parse the typed value into raw bytes the way a single-cell edit
+            // would (the C++ per-mode parse, scannerpanel.cpp:945-978).
+            let bytes = match parse_change_all_bytes(last_mode, last_vt, &text) {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => return,
+                Err(e) => {
+                    self.status = e;
+                    cx.notify();
+                    return;
+                }
+            };
+            let addresses: Vec<u64> = self.results.iter().map(|r| r.address).collect();
+            self.status = format!(
+                "Writing {} bytes to {} addresses…",
+                bytes.len(),
+                addresses.len()
+            );
+            cx.emit(ScannerBatchEdit { addresses, bytes });
+            cx.notify();
+        }
+
+        /// Apply the result of a batch Change-All write resolved by the window
+        /// (the C++ re-read + "Wrote to X/Y" tail, scannerpanel.cpp:981-991). The
+        /// window writes the bytes to every address through its mutable provider,
+        /// re-reads each, and hands back the new bytes (or `None` where the write
+        /// failed); the panel updates `scan_value`, refreshes, and reports the
+        /// success count.
+        pub fn apply_change_all(
+            &mut self,
+            results: Vec<(u64, Option<Vec<u8>>)>,
+            cx: &mut Context<Self>,
+        ) {
+            let total = results.len();
+            let mut wrote = 0usize;
+            for (addr, new_bytes) in results {
+                if let Some(nb) = new_bytes {
+                    if let Some(r) = self.results.iter_mut().find(|r| r.address == addr) {
+                        r.previous_value = r.scan_value.clone();
+                        r.scan_value = nb;
+                    }
+                    wrote += 1;
+                }
+            }
+            self.status = format!("Wrote to {wrote}/{total} addresses");
+            self.refresh_table(cx);
+            cx.notify();
+        }
+
+        /// "Copy All" footer button — copy every displayed result address to the
+        /// clipboard, newline-joined (the C++ multi-row Copy). Honors the current
+        /// sort/filter (it reads the displayed-row list).
+        fn copy_all_addresses(&mut self, cx: &mut Context<Self>) {
+            let addrs: Vec<u64> = self
+                .table
+                .read(cx)
+                .delegate()
+                .rows
+                .iter()
+                .map(|r| r.row.address)
+                .collect();
+            if addrs.is_empty() {
+                return;
+            }
+            let n = addrs.len();
+            cx.write_to_clipboard(ClipboardItem::new_string(format_addresses_for_clipboard(
+                &addrs,
+            )));
+            self.status = format!("Copied {n} addresses");
+            cx.notify();
+        }
+
+        /// "Delete" footer button — drop the selected result row from the list
+        /// (the C++ multi-row Delete; the single-select DataTable limits this to
+        /// the one selected row, so it removes that). Resolves the displayed-row
+        /// index to its address, removes the matching result, and refreshes.
+        fn delete_selected(&mut self, cx: &mut Context<Self>) {
+            let Some((address, _)) = self.context_row(cx) else {
+                return;
+            };
+            let before = self.results.len();
+            self.results.retain(|r| r.address != address);
+            if self.results.len() != before {
+                self.status = format!("Deleted 0x{address:X}");
+            }
+            self.selected_row = None;
+            self.context_target = None;
+            self.refresh_table(cx);
+            cx.notify();
+        }
+
+        /// "Add as Nodes" footer button — hand every displayed result address to
+        /// the window so it appends each as a node in the active editor (the C++
+        /// drag-into-editor / add-as-nodes path). Raised as a [`ScannerAddNodes`]
+        /// event the window resolves against its editor controller.
+        fn add_all_as_nodes(&mut self, cx: &mut Context<Self>) {
+            let addresses: Vec<u64> = self
+                .table
+                .read(cx)
+                .delegate()
+                .rows
+                .iter()
+                .map(|r| r.row.address)
+                .collect();
+            if addresses.is_empty() {
+                return;
+            }
+            let n = addresses.len();
+            cx.emit(ScannerAddNodes { addresses });
+            self.status = format!("Adding {n} addresses as nodes…");
+            cx.notify();
         }
 
         /// The current post-scan filter text.
@@ -1687,11 +2620,13 @@ mod view {
                     .collect()
             };
 
+            let result_count = self.results.len();
             self.table.update(cx, |state, cx| {
                 let del = state.delegate_mut();
                 del.rows = rows;
                 del.show_previous = show_previous;
                 del.show_module = show_module;
+                del.result_count = result_count;
                 cx.notify();
             });
         }
@@ -1928,6 +2863,8 @@ mod view {
     impl EventEmitter<PanelEvent> for ScannerPanel {}
     impl EventEmitter<ScannerNav> for ScannerPanel {}
     impl EventEmitter<ScannerEdit> for ScannerPanel {}
+    impl EventEmitter<ScannerBatchEdit> for ScannerPanel {}
+    impl EventEmitter<ScannerAddNodes> for ScannerPanel {}
 
     impl Focusable for ScannerPanel {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1961,6 +2898,7 @@ mod view {
             let has_results = !self.results.is_empty();
             let has_selection = self.selected_row.is_some();
             let has_undo = !self.undo_stack.is_empty();
+            let reset_armed = self.reset_armed;
             let scanning = self.scanning;
             let progress = self.progress;
             let breadcrumb =
@@ -2141,6 +3079,14 @@ mod view {
                         this.cancel_scan(cx);
                     }
                 }))
+                // Result-row context-menu actions (the C++ row right-click menu).
+                // The table delegate's `context_menu` dispatches these; they
+                // bubble to these root handlers and resolve against the recorded
+                // right-clicked row.
+                .on_action(cx.listener(Self::ctx_copy_address))
+                .on_action(cx.listener(Self::ctx_copy_value))
+                .on_action(cx.listener(Self::ctx_set_base_address))
+                .on_action(cx.listener(Self::ctx_change_all_values))
                 // ── Panel header (uppercase muted title strip) ──
                 .child(crate::ui::design::panel_header("Scanner", cx))
                 .child(
@@ -2221,7 +3167,11 @@ mod view {
                                                 Button::new("scanner-reset")
                                                     .ghost()
                                                     .small()
-                                                    .label("Reset")
+                                                    .label(if reset_armed {
+                                                        "Click again to reset"
+                                                    } else {
+                                                        "Reset"
+                                                    })
                                                     .disabled(!has_results)
                                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                                         this.reset(cx)
@@ -2463,6 +3413,40 @@ mod view {
                                         .on_click(
                                             cx.listener(|this, _e, _w, cx| this.copy_selected(cx)),
                                         ),
+                                )
+                                // Batch actions over the result set (the C++
+                                // multi-row Copy / Delete / add-as-nodes). The
+                                // single-select DataTable limits Delete to the
+                                // selected row; Copy All / Add as Nodes operate on
+                                // every displayed row.
+                                .child(
+                                    Button::new("scanner-delete")
+                                        .small()
+                                        .label("Delete")
+                                        .disabled(!has_selection)
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| {
+                                                this.delete_selected(cx)
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("scanner-copy-all")
+                                        .small()
+                                        .label("Copy All")
+                                        .disabled(!has_results)
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.copy_all_addresses(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("scanner-add-nodes")
+                                        .small()
+                                        .label("Add as Nodes")
+                                        .disabled(!has_results)
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.add_all_as_nodes(cx)
+                                        })),
                                 ),
                         ),
                 )
@@ -2473,12 +3457,14 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_delta, deserialize_results_json, filter_rows, format_value, previous_delta_text,
-        rescan_status, serialize_results_json, split_address_dim, stage_breadcrumb,
-        truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow, ScannerForm,
-        FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
+        compute_delta, delete_rows, deserialize_results_json, filter_rows,
+        format_addresses_for_clipboard, format_float, format_value, parse_change_all_bytes,
+        previous_delta_text, rescan_status, serialize_results_json, split_address_dim,
+        stage_breadcrumb, truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow,
+        ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
     use crate::scanner::{ScanCondition, ScanResult, ValueType};
+    use crate::theme::manager::MemSettings;
 
     // ── Delta / narrowed-count / breadcrumb / truncation / JSON helpers ──
 
@@ -2889,7 +3875,12 @@ mod tests {
         assert_eq!(entries[0].0, ValueType::Int8);
         assert_eq!(entries[0].1, "int8");
         assert_eq!(entries[2].0, ValueType::Int32);
-        assert_eq!(entries.last().unwrap().0, ValueType::Double);
+        assert_eq!(entries[9].0, ValueType::Double);
+        // The port additionally surfaces the engine's vector + string types
+        // (raw gap 5): Vec2/3/4 then UTF8/UTF16/HexBytes.
+        assert_eq!(entries[10].0, ValueType::Vec2);
+        assert_eq!(entries.last().unwrap().0, ValueType::HexBytes);
+        assert_eq!(entries.last().unwrap().1, "hex bytes");
     }
 
     #[test]
@@ -2903,5 +3894,193 @@ mod tests {
     #[test]
     fn fast_scan_alignments_are_powers_of_two() {
         assert_eq!(FAST_SCAN_ALIGNMENTS, &[1, 4, 8, 16, 32, 64]);
+    }
+
+    // ── format_float honors the %g precision argument (raw gap 8) ──
+
+    #[test]
+    fn format_float_matches_libc_g_precision() {
+        // float column uses %g,9 — the canonical 0.3f rounding case.
+        assert_eq!(format_float(0.3f32 as f64, 9), "0.300000012");
+        // whole numbers strip the trailing ".0".
+        assert_eq!(format_float(1.0, 9), "1");
+        // double column uses %g,17 — full round-trip precision.
+        assert_eq!(format_float(0.1, 17), "0.10000000000000001");
+        assert_eq!(format_float(1.5, 17), "1.5");
+        // delta uses %g,6.
+        assert_eq!(format_float(0.5, 6), "0.5");
+        assert_eq!(format_float(-0.5, 6), "-0.5");
+        // scientific-notation crossover (X >= P) → %e with libc exponent shape.
+        assert_eq!(format_float(1_000_000.0, 6), "1e+06");
+        assert_eq!(format_float(1234567.0, 6), "1.23457e+06");
+        assert_eq!(format_float(123456789.0, 6), "1.23457e+08");
+        // small magnitude stays %f down to X == -4.
+        assert_eq!(format_float(0.0001234567, 6), "0.000123457");
+        // zero is a bare "0".
+        assert_eq!(format_float(0.0, 9), "0");
+    }
+
+    #[test]
+    fn format_float_differs_from_default_display_for_float() {
+        // The whole point of honoring the precision arg: default Display would
+        // round-trip 0.3f as "0.3", but %g,9 surfaces the float's true value.
+        let v = 0.3f32 as f64;
+        assert_ne!(format_float(v, 9), format!("{v}"));
+        assert_eq!(format_float(v, 9), "0.300000012");
+    }
+
+    // ── format_value for the newly-surfaced engine value types (raw gap 5) ──
+
+    #[test]
+    fn format_value_vector_and_string_types() {
+        // vec2: two LE floats rendered "(x, y)".
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&1.0f32.to_le_bytes());
+        v2.extend_from_slice(&2.5f32.to_le_bytes());
+        assert_eq!(
+            format_value(ScanMode::Value, ValueType::Vec2, &[], &v2),
+            "(1, 2.5)"
+        );
+        // utf8 decodes the bytes as text.
+        assert_eq!(
+            format_value(ScanMode::Value, ValueType::Utf8, &[], b"Hi"),
+            "Hi"
+        );
+        // utf16-LE.
+        let u16b: Vec<u8> = "Hi".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert_eq!(
+            format_value(ScanMode::Value, ValueType::Utf16, &[], &u16b),
+            "Hi"
+        );
+        // hex bytes: uppercase space-separated.
+        assert_eq!(
+            format_value(ScanMode::Value, ValueType::HexBytes, &[], &[0x90, 0xAB]),
+            "90 AB"
+        );
+    }
+
+    // ── Change All Values batch-write parse (feature 2) ──
+
+    #[test]
+    fn parse_change_all_value_mode_int32() {
+        let b = parse_change_all_bytes(ScanMode::Value, ValueType::Int32, "999").unwrap();
+        assert_eq!(b, 999i32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn parse_change_all_signature_mode_hex_bytes() {
+        let b = parse_change_all_bytes(ScanMode::Signature, ValueType::Int32, "90 90 90").unwrap();
+        assert_eq!(b, vec![0x90, 0x90, 0x90]);
+        // A non-hex / over-255 token is rejected (no wildcards in a write).
+        assert!(parse_change_all_bytes(ScanMode::Signature, ValueType::Int32, "??").is_err());
+        assert!(parse_change_all_bytes(ScanMode::Signature, ValueType::Int32, "1FF").is_err());
+    }
+
+    #[test]
+    fn parse_change_all_value_mode_invalid() {
+        assert_eq!(
+            parse_change_all_bytes(ScanMode::Value, ValueType::Int32, "notanumber"),
+            Err("Invalid value".to_string())
+        );
+    }
+
+    // ── Batch multi-row helpers (feature 5) ──
+
+    #[test]
+    fn format_addresses_for_clipboard_newline_joined_upper() {
+        let s = format_addresses_for_clipboard(&[0x1000, 0xDEAD_BEEF, 0xab]);
+        assert_eq!(s, "0x1000\n0xDEADBEEF\n0xAB");
+    }
+
+    #[test]
+    fn delete_rows_removes_by_index_descending() {
+        let mk = |a: u64| ScanResult {
+            address: a,
+            ..ScanResult::default()
+        };
+        let results = vec![mk(1), mk(2), mk(3), mk(4)];
+        // Remove rows 1 and 3 (addresses 2 and 4); 0 and 2 survive.
+        let kept = delete_rows(results, &[3, 1, 3]); // dup + out-of-order tolerated
+        let addrs: Vec<u64> = kept.iter().map(|r| r.address).collect();
+        assert_eq!(addrs, vec![1, 3]);
+    }
+
+    // ── First-scan ExactValue override (raw gap 7) ──
+    //
+    // build_request records last_condition; for value-mode ExactValue the
+    // finish-first-scan loop should replace each result's cached chunk with the
+    // searched pattern. Exercised here at the snapshot level: a value-mode
+    // ExactValue build records ExactValue + the searched bytes as last_pattern.
+
+    #[test]
+    fn build_request_records_exact_value_snapshot() {
+        let mut f = ScannerForm::new();
+        f.condition = CondEntry::Value(ScanCondition::ExactValue);
+        f.value_type = ValueType::Int32;
+        f.value_text = "1337".to_string();
+        let _ = f.build_request(8, None).unwrap();
+        assert_eq!(f.last_mode(), ScanMode::Value);
+        assert_eq!(f.last_condition(), ScanCondition::ExactValue);
+        assert_eq!(f.last_pattern(), 1337i32.to_le_bytes());
+    }
+
+    #[test]
+    fn build_request_changed_records_unknown_condition() {
+        // Changed/Increased/etc. remap to UnknownValue, so last_condition is NOT
+        // ExactValue and the override must not fire.
+        let mut f = ScannerForm::new();
+        f.condition = CondEntry::Value(ScanCondition::Changed);
+        f.value_type = ValueType::Int32;
+        let _ = f.build_request(8, None).unwrap();
+        assert_eq!(f.last_condition(), ScanCondition::UnknownValue);
+    }
+
+    // ── QSettings-equivalent form persistence (raw gap 6) ──
+
+    #[test]
+    fn settings_round_trip_preserves_form() {
+        let mut f = ScannerForm::new();
+        f.condition = CondEntry::Value(ScanCondition::BiggerThan);
+        f.value_type = ValueType::Float;
+        f.filter_executable = true;
+        f.filter_writable = false;
+        f.private_only = true;
+        f.skip_system_modules = true;
+        f.user_mode_only = true;
+
+        let mut store = MemSettings::new();
+        f.save_settings("scanner", &mut store);
+
+        let mut g = ScannerForm::new();
+        g.load_settings("scanner", &store);
+        assert_eq!(g.condition, CondEntry::Value(ScanCondition::BiggerThan));
+        assert_eq!(g.value_type, ValueType::Float);
+        assert!(g.filter_executable);
+        assert!(!g.filter_writable);
+        assert!(g.private_only);
+        assert!(g.skip_system_modules);
+        assert!(g.user_mode_only);
+    }
+
+    #[test]
+    fn settings_round_trip_signature_mode() {
+        let mut f = ScannerForm::new();
+        f.condition = CondEntry::Signature;
+        let mut store = MemSettings::new();
+        f.save_settings("scanner", &mut store);
+
+        let mut g = ScannerForm::new();
+        g.load_settings("scanner", &store);
+        assert_eq!(g.mode(), ScanMode::Signature);
+        assert_eq!(g.condition, CondEntry::Signature);
+    }
+
+    #[test]
+    fn settings_load_missing_keys_leaves_defaults() {
+        let store = MemSettings::new();
+        let mut g = ScannerForm::new();
+        let before = (g.condition, g.value_type, g.filter_writable);
+        g.load_settings("scanner", &store);
+        assert_eq!((g.condition, g.value_type, g.filter_writable), before);
     }
 }

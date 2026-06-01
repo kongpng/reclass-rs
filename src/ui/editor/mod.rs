@@ -168,6 +168,10 @@ actions!(
         EditorCopyOffset,
         EditorCopyLine,
         EditorCopyAllText,
+        // Gap 20: the Tracking submenu — toggle live value-change tracking, and
+        // clear all recorded change history.
+        EditorTrackToggle,
+        EditorTrackClear,
     ]
 );
 
@@ -378,8 +382,56 @@ pub struct RcxEditor {
     /// The open EnumPicker / HexToolbar popup subscriptions (items 8/9).
     _enum_picker_sub: Option<Subscription>,
     _hex_toolbar_sub: Option<Subscription>,
+    /// Item 71/72: the live inline-edit validation state, recomputed on every
+    /// field change. `Some` while editing; carries the error (empty = valid) so the
+    /// row paints the red `M_ERR` band + a hint comment ('Enter=Save Esc=Cancel' on
+    /// valid, '! <error>' on error), and suppresses the selection marker on error.
+    edit_validation: Option<EditValidation>,
+    /// Item 68/73: the floating expression-result popup shown while editing a
+    /// BaseAddress / Value whose text contains an arithmetic operator. `Some` holds
+    /// the evaluated `→ 0xHEX` / `Result: <value>` string + the line to anchor near.
+    expr_result: Option<ExprResult>,
+    /// Item 81/74: presentation mode (smooth animated scroll + a pulsing focus
+    /// glow). Off by default; the window's "Presentation Mode" toggle flips it.
+    presentation_mode: bool,
+    /// Item 81/74: the AI/MCP focus node — its row(s) pulse with the `M_FOCUS` glow
+    /// while set. 0 = no focus. Driven by `set_focus_node` / `clear_focus_node`.
+    focus_node_id: u64,
+    /// Item 74: the focus-glow pulse phase (bumped ~every 30ms by the glow timer);
+    /// `0.5 + 0.5*sin(phase*PI/12)` modulates the glow alpha (the C++ `m_glowPhase`).
+    focus_glow_phase: u32,
+    /// The focus-glow pulse timer task (a ~30ms foreground loop). Held so it is
+    /// cancelled when the view drops / focus clears.
+    _focus_glow_task: Task<()>,
+    /// Item 75: the third per-pane surface (`VM_Debug`). When on, the editor renders
+    /// the DEBUG dump (each composed line's margin + annotated text + per-line
+    /// LineMeta) instead of the structured grid. Off by default; toggled by the
+    /// view-mode cycle (window) via `set_debug_view` / `cycle_view_mode`.
+    debug_view: bool,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+}
+
+/// Item 71/72: the live inline-edit validation snapshot. Recomputed on each field
+/// change (the C++ `validateEditLive`, editor.cpp:4891). `error` empty ⇒ valid.
+#[derive(Clone, Debug, Default)]
+struct EditValidation {
+    /// The display line the edit overlays (the row that gets the `M_ERR` band).
+    line: usize,
+    /// The validator error message, or empty when the current text is valid.
+    error: String,
+}
+
+/// Item 68/73: the floating expression-result popup state (the C++
+/// `m_exprResultLabel` / `updateExprResultPopup`, editor.cpp:4923).
+#[derive(Clone, Debug)]
+struct ExprResult {
+    /// The display line the edit is on (anchors the popup above the edit span).
+    line: usize,
+    /// The char-column the edit span starts at (horizontal anchor).
+    col: i32,
+    /// The rendered result text (`→ 0x1A2B` for an address / `Result: 42`).
+    text: String,
 }
 
 /// The node a context-menu / accelerator action targets — captured on
@@ -404,7 +456,18 @@ struct ContextTarget {
 #[derive(Clone, Debug)]
 enum HoverPopupKind {
     /// A changed-value history list (newest → oldest), the heat graph analogue.
-    ValueHistory { lines: Vec<String> },
+    /// Each entry carries the value text + a relative-age label ('now'/'12s ago'/
+    /// '3m ago'/'1h ago'). `node_idx`/`sub_line`/`resolved_addr` + `set_buttons`
+    /// drive the edit-time 'Set' buttons (item 68): when `set_buttons` is true the
+    /// popup is shown during an active edit and each row gets a Set button that
+    /// writes the value back into the node.
+    ValueHistory {
+        entries: Vec<(String, String)>,
+        node_idx: i32,
+        sub_line: i32,
+        resolved_addr: u64,
+        set_buttons: bool,
+    },
     /// Disassembly of the code at a function pointer's target (title "Disassembly")
     /// or a hex dump at a void pointer's target (title "Hex Dump").
     TitleBody { title: String, body: String },
@@ -470,6 +533,13 @@ impl RcxEditor {
             _find_bar_sub: None,
             _enum_picker_sub: None,
             _hex_toolbar_sub: None,
+            edit_validation: None,
+            expr_result: None,
+            presentation_mode: false,
+            focus_node_id: 0,
+            focus_glow_phase: 0,
+            _focus_glow_task: Task::ready(()),
+            debug_view: false,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
@@ -991,6 +1061,7 @@ impl RcxEditor {
                     "+1000h" => Some("+1000h"),
                     "Trim" => Some("Trim"),
                     "+10" => Some("+10"),
+                    "+1" => Some("+1"),
                     _ => None,
                 };
                 break;
@@ -1014,10 +1085,132 @@ impl RcxEditor {
                 self.append_bytes_to_struct(lm.node_id, bytes, cx);
                 true
             }
-            // Trim trailing hex / +10 enum members need controller ops not exposed
-            // here; consume the click without mutating (the pill still highlights).
+            // `+1` single-add pill (the C++ `appendSingleFieldRequested`,
+            // controller.cpp:962): append one Hex64 field at the container tail
+            // (with the embedded-struct refId redirect), OR one auto-numbered enum
+            // member when the footer's container is an enum. `append_single_field`
+            // walks up to the enclosing Struct/Array/Enum and does exactly this.
+            "+1" => {
+                if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID {
+                    self.controller.append_single_field(lm.node_id);
+                    self.apply_document(cx);
+                }
+                true
+            }
+            // `+10` enum pill (the C++ `appendEnumMembersRequested`,
+            // controller.cpp:1088): bulk-append 10 auto-numbered members.
+            "+10" => {
+                self.append_enum_members(lm.node_id, 10, cx);
+                true
+            }
+            // `Trim` pill (the C++ `trimHexRequested`, controller.cpp:1047):
+            // drop trailing hex padding fields from the struct.
+            "Trim" => {
+                self.trim_trailing_padding(lm.node_id, cx);
+                true
+            }
             _ => true,
         }
+    }
+
+    /// Bulk-append `count` auto-numbered enum members to the enum identified by
+    /// `enum_id` (the footer `+10` pill — the C++ `appendEnumMembersRequested`,
+    /// controller.cpp:1088). One undoable `ChangeEnumMembers` command swaps the old
+    /// member list for the extended one; new members continue the value sequence
+    /// from `last().value + 1` (or 0 for an empty enum), named `MemberN`.
+    fn append_enum_members(&mut self, enum_id: u64, count: i32, cx: &mut Context<Self>) {
+        if enum_id == 0 || enum_id == K_COMMAND_ROW_ID || count <= 0 {
+            return;
+        }
+        let (node_id, old_members, new_members) = {
+            let tree = self.controller.tree();
+            let ni = tree.index_of_id(enum_id);
+            if ni < 0 {
+                return;
+            }
+            let node = &tree.nodes[ni as usize];
+            if !node.is_enum() {
+                return;
+            }
+            let old_members = node.enum_members.clone();
+            let next_val = old_members.last().map(|(_, v)| v + 1).unwrap_or(0);
+            let mut new_members = old_members.clone();
+            for i in 0..count as i64 {
+                let v = next_val + i;
+                new_members.push((format!("Member{v}"), v));
+            }
+            (node.id, old_members, new_members)
+        };
+        self.controller
+            .push_command(crate::core::Command::ChangeEnumMembers {
+                node_id,
+                old_members,
+                new_members,
+            });
+        self.apply_document(cx);
+    }
+
+    /// Trim trailing hex padding fields from the struct `struct_id` (the footer
+    /// `Trim` pill — the C++ `trimHexRequested`, controller.cpp:1047). Faithful
+    /// port:
+    /// - **Union**: a no-op — union members all overlap at offset 0, so there is
+    ///   no "trailing" padding to remove.
+    /// - **Embedded-struct refId redirect**: an embedded placeholder with no
+    ///   children but a `ref_id` operates on the referenced root class instead.
+    /// - Sort the target's children by offset **descending**, then collect the
+    ///   leading run of `Hex8/16/32/64`/`Hex128` nodes (the trailing padding) and
+    ///   remove them inside one undo macro.
+    fn trim_trailing_padding(&mut self, struct_id: u64, cx: &mut Context<Self>) {
+        if struct_id == 0 || struct_id == K_COMMAND_ROW_ID {
+            return;
+        }
+        // Resolve the target container + the ids of trailing hex nodes to remove.
+        let to_remove: Vec<u64> = {
+            let tree = self.controller.tree();
+            let si = tree.index_of_id(struct_id);
+            if si < 0 {
+                return;
+            }
+            // Unions have no trailing padding (all members overlap at offset 0).
+            if tree.nodes[si as usize].is_union() {
+                return;
+            }
+            // Embedded struct with a refId (virtual children) → operate on the
+            // referenced root class definition instead.
+            let mut children = tree.children_of(struct_id);
+            if children.is_empty() && tree.nodes[si as usize].ref_id != 0 {
+                let target_id = tree.nodes[si as usize].ref_id;
+                children = tree.children_of(target_id);
+            }
+            if children.is_empty() {
+                return;
+            }
+            // Sort children by offset DESCENDING to find the trailing run.
+            children.sort_by(|&a, &b| tree.nodes[b].offset.cmp(&tree.nodes[a].offset));
+            let mut ids = Vec::new();
+            for ci in children {
+                let n = &tree.nodes[ci];
+                if !crate::core::is_hex_node(n.kind) {
+                    break;
+                }
+                ids.push(n.id);
+            }
+            ids
+        };
+        if to_remove.is_empty() {
+            return;
+        }
+        // One undo macro for the whole trim (the C++ beginMacro/endMacro group).
+        self.controller
+            .begin_macro(format!("Trim {} trailing hex nodes", to_remove.len()));
+        for nid in to_remove {
+            let idx = self.controller.tree().index_of_id(nid);
+            if idx >= 0 {
+                self.controller.remove_node(idx as usize);
+            }
+        }
+        self.controller.end_macro();
+        self.apply_document(cx);
     }
 
     /// Append `bytes` worth of `Hex64` fields to the struct identified by the
@@ -1166,6 +1359,10 @@ impl RcxEditor {
             let outcome = field.update(cx, |f, _| f.take_outcome());
             if let Some(outcome) = outcome {
                 this.resolve_edit_outcome(outcome, cx);
+            } else {
+                // Item 71/72/68/73: while still editing, re-validate the live text
+                // and refresh the expression-result popup on every change.
+                this.update_edit_validation(cx);
             }
             cx.notify();
         });
@@ -1194,7 +1391,79 @@ impl RcxEditor {
         if let Some(mode) = hex_overwrite_mode {
             field.update(cx, |f, _cx| f.set_hex_overwrite(mode));
         }
+        // Item 71/72: seed the validation/hint state for the freshly-opened edit so
+        // the green 'Enter=Save Esc=Cancel' hint shows immediately (and any seeded
+        // error paints right away).
+        self.update_edit_validation(cx);
         cx.notify();
+    }
+
+    /// Item 71/72/68/73: recompute the live inline-edit validation + expression-
+    /// result popup from the active field's current text (the C++ `validateEditLive`
+    /// + `updateExprResultPopup`, editor.cpp:4891/4923). No-op when not editing.
+    ///
+    /// - Validation: `validate_base_address` for a BaseAddress edit, else
+    ///   `validate_value(kind, text)` for a Value edit (other targets — name /
+    ///   comment / type — are never invalid here, so they validate clean).
+    /// - Expression result: when editing a BaseAddress, or a Value whose text
+    ///   contains an arithmetic operator (`+ - * / << >> & | ^ ~`), evaluate the
+    ///   text via `parse_base_address` and float a `→ 0xHEX` / `Result: N` popup.
+    fn update_edit_validation(&mut self, _cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.as_ref() else {
+            self.edit_validation = None;
+            self.expr_result = None;
+            return;
+        };
+        let line = editing.line;
+        let col = editing.col_start;
+        let target = editing.field.read(_cx).target();
+        let text = editing.field.read(_cx).content().trim().to_string();
+        let is_overwrite = editing.field.read(_cx).is_hex_overwrite();
+
+        // The kind the value is validated against (the edited node's kind).
+        let kind = self
+            .line_meta(line)
+            .map(|lm| lm.node_kind)
+            .unwrap_or(NodeKind::Hex64);
+
+        // ── Validation (editor.cpp:4891) ──
+        let error = match target {
+            EditTarget::BaseAddress => crate::format::validate_base_address(&text),
+            EditTarget::Value if !is_overwrite => crate::format::validate_value(kind, &text),
+            // Hex/ASCII overwrite, names, comments, types, etc. are not range-
+            // validated inline (they are always structurally valid here).
+            _ => String::new(),
+        };
+        self.edit_validation = Some(EditValidation { line, error });
+
+        // ── Expression-result popup (editor.cpp:4923) ──
+        let is_addr = target == EditTarget::BaseAddress;
+        let is_val = target == EditTarget::Value && !is_overwrite;
+        let has_operator = text
+            .chars()
+            .any(|c| matches!(c, '+' | '-' | '*' | '/' | '<' | '>' | '&' | '|' | '^' | '~'));
+        // Address edits always show the resolved value; value edits only when the
+        // text reads as an expression (otherwise it is a plain literal).
+        if (is_addr || (is_val && has_operator)) && !text.is_empty() {
+            let base = self.controller.tree().base_address;
+            let (value, formula) = parse_base_address(&text, base);
+            // A pure formula we cannot resolve numerically (no provider) keeps the
+            // fallback base; only float a result when the text actually evaluated to
+            // a number (formula empty) OR resolved to a non-fallback value.
+            let resolved = formula.is_empty() || value != base;
+            if resolved {
+                let label = if is_addr { "→" } else { "Result:" };
+                self.expr_result = Some(ExprResult {
+                    line,
+                    col,
+                    text: format!("{label} 0x{value:X}"),
+                });
+            } else {
+                self.expr_result = None;
+            }
+        } else {
+            self.expr_result = None;
+        }
     }
 
     /// Apply a committed/cancelled inline edit (the `inlineEditCommitted`/
@@ -1203,10 +1472,14 @@ impl RcxEditor {
         match outcome {
             EditOutcome::Commit(commit) => {
                 self.editing = None;
+                self.edit_validation = None;
+                self.expr_result = None;
                 self.apply_commit(&commit, cx);
             }
             EditOutcome::Cancel => {
                 self.editing = None;
+                self.edit_validation = None;
+                self.expr_result = None;
                 cx.notify();
             }
             EditOutcome::Continue => {}
@@ -1218,6 +1491,8 @@ impl RcxEditor {
         let Some(editing) = self.editing.take() else {
             return;
         };
+        self.edit_validation = None;
+        self.expr_result = None;
         let commit = editing.field.read(cx).to_commit();
         self.apply_commit(&commit, cx);
     }
@@ -1417,9 +1692,45 @@ impl RcxEditor {
                 // recomposed command row reflects the new name.
                 self.controller.rename_root_class(commit.text.trim());
             }
+            // Gap 21: inline-edit the root class KEYWORD (`struct`/`class`/`union`/
+            // `enum`). The C++ `EditTarget::RootClassType` commit routes to
+            // `selectKeyword`/keyword conversion; `set_root_class_keyword` parses the
+            // typed keyword and pushes a `ChangeClassKeyword` command (no-op for an
+            // unrecognized word).
+            EditTarget::RootClassType => {
+                self.controller.set_root_class_keyword(commit.text.trim());
+            }
+            // Gap 22: the Source-dropdown inline commit. The C++ `EditTarget::Source`
+            // commit selects a saved source by display-name (`selectSource`). Resolve
+            // the typed name to a saved-source index and switch to it.
+            EditTarget::Source => {
+                self.select_source(commit.text.trim());
+            }
             _ => {}
         }
         let _ = cx;
+    }
+
+    /// Select a saved data source by its display name (gap 22, the C++
+    /// `selectSource` / `EditTarget::Source` commit). Resolves `name` to a
+    /// saved-source slot index (case-insensitive on the display name) and switches
+    /// the controller to it via `switch_to_saved_source`. No-op for an unknown name
+    /// or when it is already active. The actual byte-provider attach is the
+    /// controller's job; this only drives the source selection.
+    fn select_source(&mut self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let idx = self
+            .controller
+            .saved_sources()
+            .iter()
+            .position(|s| s.display_name.eq_ignore_ascii_case(name));
+        if let Some(idx) = idx {
+            if idx as i32 != self.controller.active_source_index() {
+                self.controller.switch_to_saved_source(idx as i32);
+            }
+        }
     }
 
     /// Tab to the next editable field in the current row (or first field if not
@@ -2131,42 +2442,51 @@ impl RcxEditor {
         out
     }
 
-    /// Serialize the selected nodes into a portable `rcx-clipboard/v1` blob. Each
-    /// node is flattened via [`Node::to_json`] (the same per-node schema the `.rcx`
-    /// saver uses), wrapped in a versioned envelope. Returns `None` when nothing
-    /// node-like is selected. Pure helper (unit-tested).
-    fn serialize_selected_nodes(&self) -> Option<String> {
-        let idxs = self.selected_node_indices_ordered();
-        if idxs.is_empty() {
-            return None;
+    /// The selected node IDS, in display order, with selection bits stripped — the
+    /// C++ `selectedRootIds` lambda (controller.cpp:511). Each is a real tree id
+    /// (de-duplicated, skips the command row / array-elem / member synthetics).
+    fn selected_root_ids(&self) -> Vec<u64> {
+        let result = self.controller.last_result();
+        let sel = self.controller.selected_ids();
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for lm in result.meta.iter() {
+            if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+                continue;
+            }
+            if !seen.insert(lm.node_id) {
+                continue;
+            }
+            if sel
+                .iter()
+                .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
+            {
+                out.push(lm.node_id);
+            }
         }
-        let tree = self.controller.tree();
-        let nodes: Vec<serde_json::Value> = idxs
-            .iter()
-            .filter_map(|&i| tree.nodes.get(i))
-            .map(|n| n.to_json())
-            .collect();
-        if nodes.is_empty() {
-            return None;
-        }
-        let envelope = serde_json::json!({
-            "format": "rcx-clipboard/v1",
-            "nodes": nodes,
-        });
-        serde_json::to_string(&envelope).ok()
+        out
     }
 
-    /// Parse an `rcx-clipboard/v1` blob into the list of [`Node`]s it carries.
-    /// Returns `None` for any non-clipboard / malformed text (so a plain text
-    /// clipboard does not spuriously paste nodes). Pure helper (unit-tested).
-    fn parse_clipboard_nodes(blob: &str) -> Option<Vec<crate::core::Node>> {
-        let v: serde_json::Value = serde_json::from_str(blob).ok()?;
-        if v.get("format").and_then(|f| f.as_str()) != Some("rcx-clipboard/v1") {
+    /// Serialize the selected nodes (PLUS their whole subtrees) into the portable
+    /// `application/x-reclass-nodes-v1` blob via the faithful core codec
+    /// ([`core::clipboard::serialize`], the C++ `ClipboardCodec::serialize`,
+    /// clipboard.h:58). Unlike the old per-node flatten, this collects every
+    /// descendant of each selected root (so struct/array/pointer subtrees keep
+    /// their contents) and clears the parent link only on the selected roots
+    /// (`clear_parent_for`) so they re-anchor cleanly under the paste target.
+    /// Returns `None` when nothing node-like is selected.
+    fn serialize_selected_nodes(&self) -> Option<String> {
+        let roots = self.selected_root_ids();
+        if roots.is_empty() {
             return None;
         }
-        let arr = v.get("nodes")?.as_array()?;
-        let nodes: Vec<crate::core::Node> = arr.iter().map(crate::core::Node::from_json).collect();
-        (!nodes.is_empty()).then_some(nodes)
+        let clear_parent_for: std::collections::HashSet<u64> = roots.iter().copied().collect();
+        let (bytes, _plain) =
+            crate::core::clipboard::serialize(self.controller.tree(), &roots, &clear_parent_for);
+        if bytes.is_empty() {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
     }
 
     fn action_copy_nodes(&mut self, _: &EditorCopyNodes, _w: &mut Window, cx: &mut Context<Self>) {
@@ -2209,52 +2529,127 @@ impl RcxEditor {
         let Some(blob) = blob else {
             return;
         };
-        let Some(nodes) = Self::parse_clipboard_nodes(&blob) else {
+        // Faithful core decode (the C++ `ClipboardCodec::deserialize`,
+        // clipboard.h:97): parse the `application/x-reclass-nodes-v1` blob, remap
+        // every id/parent/ref across the WHOLE captured subtree to fresh
+        // non-colliding ids, and return the new root ids. This is what makes a
+        // pasted struct/array/pointer keep its children (the old flat path dropped
+        // them, set `collapsed=true`, and never re-wired the subtree).
+        let paste =
+            crate::core::clipboard::deserialize(self.controller.tree_mut(), blob.as_bytes());
+        if paste.nodes.is_empty() {
             return;
-        };
-        // Insert under the current node's PARENT at its tail (so paste lands next
-        // to the cursor), falling back to the view-root struct.
-        let (parent_id, base_off) = match self.current_node() {
-            Some((_l, lm)) => {
-                let tree = self.controller.tree();
-                let idx = tree.index_of_id(lm.node_id);
-                if idx >= 0 {
-                    let n = &tree.nodes[idx as usize];
-                    let sz = crate::core::size_for_kind(n.kind).max(0);
-                    (n.parent_id, n.offset + sz)
-                } else {
-                    (self.controller.view_root_id(), -1)
+        }
+        let root_set: std::collections::HashSet<u64> = paste.root_ids.iter().copied().collect();
+
+        // Paste-below-selection (controller.cpp:558): drop the pasted roots right
+        // after the selected node with the greatest end offset, pushing later
+        // siblings down. With nothing selected, fall back to append-at-end.
+        let mut target_parent = self.controller.view_root_id();
+        let mut anchor_end: i32 = -1;
+        for nid in self.selected_root_ids() {
+            let tree = self.controller.tree();
+            let ai = tree.index_of_id(nid);
+            if ai < 0 {
+                continue;
+            }
+            let a = &tree.nodes[ai as usize];
+            let asz = if crate::core::is_container_kind(a.kind) {
+                tree.struct_span(a.id)
+            } else {
+                crate::core::size_for_kind(a.kind).max(0)
+            };
+            let end = a.offset + asz;
+            if end > anchor_end {
+                anchor_end = end;
+                target_parent = a.parent_id;
+            }
+        }
+        if target_parent == 0 {
+            return;
+        }
+
+        // Total span the pasted roots will occupy (with inter-root alignment), so
+        // we know how far to shift existing siblings (controller.cpp:601).
+        let mut paste_total = 0i32;
+        for &r in &paste.root_ids {
+            if let Some(n) = paste.nodes.iter().find(|n| n.id == r) {
+                let align = crate::core::alignment_for(n.kind);
+                paste_total =
+                    (paste_total + align - 1) / align * align + Self::pasted_span(&paste.nodes, r);
+            }
+        }
+
+        // Shift existing siblings at/after the anchor down by `paste_total`, on the
+        // FIRST root's Insert command (so one undo reverses the whole paste).
+        let mut shift: Vec<crate::core::OffsetAdj> = Vec::new();
+        if anchor_end >= 0 && paste_total > 0 {
+            let tree = self.controller.tree();
+            for si in tree.children_of(target_parent) {
+                let s = &tree.nodes[si];
+                if s.offset >= anchor_end {
+                    shift.push(crate::core::OffsetAdj {
+                        node_id: s.id,
+                        old_offset: s.offset,
+                        new_offset: s.offset + paste_total,
+                    });
                 }
             }
-            None => (self.controller.view_root_id(), -1),
-        };
-        if parent_id == 0 {
-            return;
         }
-        // Lay the pasted nodes out contiguously from `base_off` (or the parent's
-        // tail when base_off < 0), reparented under `parent_id` with fresh ids.
-        let mut cursor = if base_off >= 0 {
-            base_off
-        } else {
-            self.container_tail(parent_id)
-        };
-        for src in &nodes {
-            let mut n = src.clone();
-            n.id = self.controller.tree_mut().reserve_id();
-            n.parent_id = parent_id;
-            n.offset = cursor;
-            // Children are not carried by the flat v1 blob; drop any dangling
-            // ref/children state so the pasted node is self-contained.
-            n.ref_id = 0;
-            n.collapsed = true;
-            let sz = crate::core::size_for_kind(n.kind).max(0);
-            cursor += sz.max(1);
-            self.controller.push_command(crate::core::Command::Insert {
-                node: n,
-                off_adjs: Vec::new(),
-            });
+
+        // One undo macro for the whole paste (the C++ beginMacro/endMacro group).
+        self.controller.begin_macro("Paste nodes");
+        let mut placed_base = anchor_end; // -1 ⇒ append-at-end fallback
+        let mut first_root = true;
+        // `paste.nodes` carries the whole subtree; placing only re-anchors the
+        // ROOTS (their captured children keep their relative offsets + remapped
+        // parent links, so the subtree re-wires itself on insert).
+        for n in &paste.nodes {
+            let mut node = n.clone();
+            if root_set.contains(&node.id) {
+                node.parent_id = target_parent;
+                let align = crate::core::alignment_for(node.kind);
+                if placed_base >= 0 {
+                    node.offset = (placed_base + align - 1) / align * align;
+                    placed_base = node.offset + Self::pasted_span(&paste.nodes, n.id);
+                } else {
+                    // Append path: after all current siblings of the target parent.
+                    let max_end = self.container_tail(target_parent);
+                    node.offset = (max_end + align - 1) / align * align;
+                }
+            }
+            let off_adjs = if first_root && root_set.contains(&n.id) {
+                first_root = false;
+                std::mem::take(&mut shift)
+            } else {
+                Vec::new()
+            };
+            self.controller
+                .push_command(crate::core::Command::Insert { node, off_adjs });
         }
+        self.controller.end_macro();
         self.apply_document(cx);
+    }
+
+    /// The byte span a to-be-pasted node will occupy, computed from the deserialized
+    /// `nodes` list (NOT yet in the tree) — the C++ `pastedSpan` lambda
+    /// (controller.cpp:582). Struct/array roots recurse over their captured
+    /// children (max child end); leaves use their kind size.
+    fn pasted_span(nodes: &[crate::core::Node], id: u64) -> i32 {
+        let Some(n) = nodes.iter().find(|n| n.id == id) else {
+            return 0;
+        };
+        if !crate::core::is_container_kind(n.kind) {
+            return crate::core::size_for_kind(n.kind).max(0);
+        }
+        let mut max_end = 0i32;
+        for c in nodes.iter().filter(|c| c.parent_id == id) {
+            let cend = c.offset + Self::pasted_span(nodes, c.id);
+            if cend > max_end {
+                max_end = cend;
+            }
+        }
+        max_end
     }
 
     /// The aligned tail offset of a container (max child end). Used as the paste
@@ -2459,6 +2854,244 @@ impl RcxEditor {
         self.after_mutation(cx);
     }
 
+    // ── Presentation mode + focus glow + scroll-to-node (items 74/81) ──
+    //
+    // The public navigation/focus API the controller (and the AI/MCP layer) drives
+    // for "show me node N" interactions, plus the presentation-mode chrome (smooth
+    // animated scroll + a pulsing focus glow). Faithful port of the C++
+    // `RcxEditor` methods (editor.cpp:1780-1913).
+
+    /// `setPresentationMode(on)` (editor.h:41) — enable smooth animated scroll +
+    /// the focus-glow pulse. When off, `smooth_scroll_to_node_id` snaps instantly
+    /// and the glow is not painted (the focus node is still tracked, but inert).
+    pub fn set_presentation_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.presentation_mode == on {
+            return;
+        }
+        self.presentation_mode = on;
+        if !on {
+            // Leaving presentation mode stops the glow pulse (the glow band is gated
+            // on `presentation_mode` in render_row, but stop the timer too).
+            self._focus_glow_task = Task::ready(());
+        } else if self.focus_node_id != 0 {
+            // Re-arm the pulse if a focus node is already set.
+            self.arm_focus_glow(cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether presentation mode is active.
+    pub fn presentation_mode(&self) -> bool {
+        self.presentation_mode
+    }
+
+    /// `setFocusNode(nodeId)` (editor.cpp:1863) — mark `node_id` as the AI/MCP focus
+    /// node. Its row(s) pulse with the `M_FOCUS` glow (in presentation mode) via a
+    /// ~30ms timer. `node_id == 0` clears the focus (same as `clear_focus_node`).
+    pub fn set_focus_node(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        if node_id == self.focus_node_id && node_id != 0 {
+            return;
+        }
+        self.focus_node_id = node_id;
+        self.focus_glow_phase = 0;
+        if node_id == 0 {
+            self._focus_glow_task = Task::ready(());
+        } else {
+            self.arm_focus_glow(cx);
+        }
+        cx.notify();
+    }
+
+    /// `clearFocusNode()` (editor.cpp:1908) — stop the glow pulse + drop the focus.
+    pub fn clear_focus_node(&mut self, cx: &mut Context<Self>) {
+        self._focus_glow_task = Task::ready(());
+        self.focus_node_id = 0;
+        self.focus_glow_phase = 0;
+        cx.notify();
+    }
+
+    /// `isFocusGlowActive()` (editor.h:40) — a focus node is set.
+    pub fn is_focus_glow_active(&self) -> bool {
+        self.focus_node_id != 0
+    }
+
+    /// Arm the ~30ms focus-glow pulse timer (the C++ `m_focusGlowTimer`,
+    /// editor.cpp:1892). Each tick bumps `focus_glow_phase` and repaints so the
+    /// glow band's alpha advances along the `0.5 + 0.5*sin(phase*PI/12)` curve.
+    /// Self-reschedules until the focus is cleared / the entity drops.
+    fn arm_focus_glow(&mut self, cx: &mut Context<Self>) {
+        const GLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
+        self._focus_glow_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(GLOW_INTERVAL).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if this.focus_node_id == 0 || !this.presentation_mode {
+                            return false; // focus cleared / left presentation — stop.
+                        }
+                        this.focus_glow_phase = this.focus_glow_phase.wrapping_add(1);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// `scrollToNodeId(nodeId)` (editor.cpp:1780) — resolve the node's first
+    /// non-footer display line and snap it into view (instant). The public
+    /// non-animated navigation the controller drives. Also selects the row so the
+    /// landed node is the active selection (the C++ `setCursorPosition`).
+    pub fn scroll_to_node_id(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        let Some(line) = self.line_for_node(node_id) else {
+            return;
+        };
+        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+        self.caret_line = Some(line);
+        cx.notify();
+    }
+
+    /// `smoothScrollToNodeId(nodeId)` (editor.cpp:1792) — in presentation mode,
+    /// animate the scroll toward centering the node (with a snap-close for long
+    /// jumps, then an OutExpo glide); otherwise fall back to the instant
+    /// `scroll_to_node_id`. gpui's `UniformListScrollHandle` exposes only
+    /// `scroll_to_item`, so the "animation" lands the node centered in one step but
+    /// preserves the public entry-point + the presentation-mode branch (the snap +
+    /// easing is a visual refinement deferred to a scroll-offset animator).
+    pub fn smooth_scroll_to_node_id(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        if !self.presentation_mode {
+            self.scroll_to_node_id(node_id, cx);
+            return;
+        }
+        let Some(line) = self.line_for_node(node_id) else {
+            return;
+        };
+        // Center the node (the C++ targetFirst = line - visibleLines/2). With the
+        // uniform-list handle we request a centered scroll; the snap-close + OutExpo
+        // glide is the part that needs a per-pixel scroll animator (out of scope for
+        // the uniform-list handle), so this lands centered immediately.
+        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+        self.caret_line = Some(line);
+        cx.notify();
+    }
+
+    /// Resolve a node id to its first non-footer / non-continuation display line
+    /// (the C++ `m_nodeLineIndex` first entry, used by scroll-to-node). `None` when
+    /// the node is not currently composed (collapsed away / filtered).
+    fn line_for_node(&self, node_id: u64) -> Option<usize> {
+        if node_id == 0 {
+            return None;
+        }
+        self.controller.last_result().meta.iter().position(|lm| {
+            lm.node_id == node_id && lm.line_kind != LineKind::Footer && !lm.is_continuation
+        })
+    }
+
+    // ── Debug view (item 75, `VM_Debug`) ──
+
+    /// Whether the editor is showing the DEBUG surface (each line's margin +
+    /// annotated text + LineMeta) instead of the structured grid.
+    pub fn debug_view(&self) -> bool {
+        self.debug_view
+    }
+
+    /// Turn the DEBUG surface on/off (`VM_Debug`). The window's view-mode toggle
+    /// drives this; the structured grid is restored when off.
+    pub fn set_debug_view(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.debug_view != on {
+            self.debug_view = on;
+            // Leaving an inline edit when entering the read-only debug dump.
+            if on {
+                self.editing = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Build the DEBUG dump lines for the current compose result (the C++
+    /// `generateDebugText`, main.cpp:5534) — one `margin|text  ## meta` string per
+    /// composed line. The comment / type-hint columns are derived from the line's
+    /// chips (Rust uses chips where the C++ kept `commentStart`/`typeHintStart`).
+    fn build_debug_lines(&self) -> Vec<String> {
+        let result = self.controller.last_result();
+        let mut out = Vec::with_capacity(result.meta.len());
+        for (i, lm) in result.meta.iter().enumerate() {
+            let margin = lm.offset_text.clone();
+            let text = self.line_text_owned(i);
+            // Comment / type-hint chip start columns (or -1 if absent).
+            let comment_col = lm
+                .chips
+                .iter()
+                .find(|c| {
+                    matches!(
+                        c.kind,
+                        crate::core::linemeta::ChipKind::Comment
+                            | crate::core::linemeta::ChipKind::AddComment
+                    )
+                })
+                .map(|c| c.start_col)
+                .unwrap_or(-1);
+            let hint_col = lm
+                .chips
+                .iter()
+                .find(|c| c.kind == crate::core::linemeta::ChipKind::TypeHint)
+                .map(|c| c.start_col)
+                .unwrap_or(-1);
+            out.push(geometry::debug_line(
+                &margin,
+                &text,
+                lm,
+                i,
+                comment_col,
+                hint_col,
+            ));
+        }
+        out
+    }
+
+    /// Render the DEBUG surface (item 75): a virtualized monospace list of the
+    /// debug dump lines, styled in the dim editor mono palette. Read-only.
+    fn render_debug_surface(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = EditorPalette::from_theme(cx);
+        let lines = self.build_debug_lines();
+        let line_h = self.metrics.line_height;
+        let col_count = lines.len();
+        let lines_rc = std::rc::Rc::new(lines);
+        div()
+            .id("rcx-debug-surface")
+            .size_full()
+            .bg(palette.paper)
+            .text_color(palette.dim)
+            .text_size(px(design::tokens::font::EDITOR_SIZE))
+            .font_family(design::tokens::font::mono_family())
+            .child(
+                uniform_list(
+                    "rcx-debug-rows",
+                    col_count,
+                    cx.processor(move |_this, range: std::ops::Range<usize>, _window, _cx| {
+                        let lines = lines_rc.clone();
+                        range
+                            .map(|ix| {
+                                let text = lines.get(ix).cloned().unwrap_or_default();
+                                div()
+                                    .h(px(line_h))
+                                    .px(px(4.0))
+                                    .whitespace_nowrap()
+                                    .child(SharedString::from(text))
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .size_full()
+                .track_scroll(&self.scroll),
+            )
+            .into_any_element()
+    }
+
     // ── Row rendering ──
 
     /// Build the `RowPaint` for line `idx`: text + colored runs + overlays.
@@ -2547,6 +3180,25 @@ impl RcxEditor {
         }
     }
 
+    /// Item 80: resolve the inline local-offset overlay for `lm` (the C++
+    /// `IND_LOCAL_OFF` Pass 2, editor.cpp:1430). Resolves the `parent_addr` the
+    /// local offset is measured from — ptrBase for a pointer-expanded child,
+    /// else the compose-precomputed `LineMeta::parent_addr`, else the view base —
+    /// then defers the column/slot/text math to the pure
+    /// [`geometry::local_offset_overlay`]. Returns `None` when the row doesn't
+    /// qualify or the slot is too tight.
+    fn local_offset_overlay_for(&self, lm: &LineMeta) -> Option<(i32, i32, String)> {
+        let base = self.controller.last_result().layout.base_address;
+        let parent_addr = if lm.ptr_base != 0 {
+            lm.ptr_base
+        } else if lm.parent_addr != 0 {
+            lm.parent_addr
+        } else {
+            base
+        };
+        geometry::local_offset_overlay(lm, self.relative_offsets, self.tree_lines(), parent_addr)
+    }
+
     /// Build the [`minimap::Minimap`] element from the current compose result: one
     /// proportional bar per composed line, colored by node kind / line role, plus
     /// the viewport indicator from the live scroll offset (item 4). Cheap — it only
@@ -2619,7 +3271,7 @@ impl RcxEditor {
     fn render_row(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         let palette = EditorPalette::from_theme(cx);
         let lm = self.line_meta(idx).cloned().unwrap_or_default();
-        let selected = self.is_row_selected(&lm);
+        let mut selected = self.is_row_selected(&lm);
         // The hover band is gated by the `hover_effects` view toggle (item 3): when
         // off, the row still tracks the pointer but paints no hover wash.
         let hovered = self.hover_effects && self.hovered_line == Some(idx);
@@ -2634,13 +3286,44 @@ impl RcxEditor {
         // multi-selection. A selected row already carries the louder accent fill.
         let active_line = editing_here.is_some();
 
-        // Row background precedence (§7): the accent-tinted selection fill wins,
-        // then the subtle active-line band, then the hover overlay. Each is a
-        // distinct, visible surface against the dark editor paper.
-        let bg = if selected {
+        // Item 71: this row carries a LIVE inline-edit error (the `M_ERR` band) when
+        // the active edit is on it AND validation failed. On error, the C++
+        // suppresses `M_SELECTED` (it sits above M_ERR in priority) so the red band
+        // is unambiguous — mirror that by clearing `selected` here.
+        let edit_error = self
+            .edit_validation
+            .as_ref()
+            .filter(|v| v.line == idx && !v.error.is_empty())
+            .is_some();
+        if edit_error {
+            selected = false;
+        }
+
+        // Item 74: this row participates in the presentation-mode focus glow when
+        // the AI/MCP focus node maps to it. The pulsing alpha is derived from the
+        // glow phase (the C++ `m_glowPhase` sine pulse).
+        let focus_glow = self.presentation_mode
+            && self.focus_node_id != 0
+            && lm.node_id == self.focus_node_id
+            && lm.node_id != 0
+            && lm.line_kind != LineKind::Footer;
+
+        // Row background precedence (§7): the red error band wins (an invalid live
+        // edit), then the accent-tinted selection fill, then the active-line band,
+        // then the focus glow, then the hover overlay. Each is a distinct surface.
+        let bg = if edit_error {
+            Some(palette.error_bg)
+        } else if selected {
             Some(palette.selection_bg)
         } else if active_line {
             Some(palette.active_line_bg)
+        } else if focus_glow {
+            // Pulse the glow alpha: t = 0.5 + 0.5*sin(phase*PI/12), blended onto the
+            // focus-glow base (the C++ dim↔bright pulse, editor.cpp:1897).
+            let t =
+                0.5 + 0.5 * ((self.focus_glow_phase as f32) * std::f32::consts::PI / 12.0).sin();
+            let alpha = 0.18 + 0.22 * t; // dim 0.18 → bright 0.40
+            Some(with_alpha(palette.focus_glow, alpha))
         } else if hovered {
             Some(palette.hover_bg)
         } else {
@@ -2783,6 +3466,35 @@ impl RcxEditor {
             editor: cx.entity().downgrade(),
             line: idx,
         });
+
+        // Item 80: inline LOCAL-OFFSET overlay (the C++ `IND_LOCAL_OFF` Pass 2). In
+        // relative-offset mode, a child row at depth>1 shows a dim `+XX` local
+        // offset (from the enclosing parent / ptrBase / array-element base) in the
+        // indent area before the type column. Painted as an absolute overlay inside
+        // `text_region` (origin == painted-text origin), so its `left` is just the
+        // per-column offset — the same coordinate space the inline-edit field uses.
+        if let Some((start_col, slot_w, off_text)) = self.local_offset_overlay_for(&lm) {
+            let left = px(start_col.max(0) as f32 * cell);
+            let width = px((slot_w.max(1) as f32) * cell);
+            text_region = text_region.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(left)
+                    .h(px(self.metrics.line_height))
+                    .w(width)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .text_size(px(design::tokens::font::EDITOR_SIZE))
+                    .font_family(design::tokens::font::mono_family())
+                    // The faint/dim text role (the C++ `theme.textFaint`,
+                    // editor.cpp:802) so the local offset reads as a quiet hint.
+                    .text_color(palette.dim)
+                    .child(SharedString::from(off_text)),
+            );
+        }
 
         // Address-format hover popover (reclass_address_hover.png + PIC5 "Base
         // Address"): on the class-header command row, an invisible interactive
@@ -2945,6 +3657,63 @@ impl RcxEditor {
                     // and the caret never painted (its paint is gated on focus).
                     .child(field.clone()),
             );
+
+            // Item 71/72: the inline-edit HINT comment — a green
+            // 'Enter=Save Esc=Cancel' on a valid edit, or a red '! <error>' on an
+            // invalid one (the C++ `setEditComment`, editor.cpp:4915/4919). Painted
+            // just past the line text so it sits where the row's `//` comment would.
+            if let Some(v) = self.edit_validation.as_ref().filter(|v| v.line == idx) {
+                let (hint, color) = if v.error.is_empty() {
+                    ("Enter=Save Esc=Cancel".to_string(), palette.comment_green)
+                } else {
+                    (format!("! {}", v.error), palette.error_fg)
+                };
+                // Anchor a couple cells past the longer of the line text / edited
+                // span so the hint clears both the static text and the edit box.
+                let text_cols = self.line_text_owned(idx).chars().count() as i32;
+                let hint_col = text_cols.max(col_end) + 2;
+                let left = px(hint_col.max(0) as f32 * cell);
+                text_region = text_region.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(left)
+                        .h(px(self.metrics.line_height))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .text_size(px(design::tokens::font::EDITOR_SIZE))
+                        .font_family(design::tokens::font::mono_family())
+                        .text_color(color)
+                        .child(SharedString::from(format!("// {hint}"))),
+                );
+            }
+
+            // Item 68/73: the floating expression-RESULT popup ('→ 0xHEX' /
+            // 'Result: 0xHEX') above the edited span when the text is an expression
+            // (the C++ `m_exprResultLabel`, editor.cpp:4923). A small elevated card
+            // anchored at the edit-span column, lifted one row up.
+            if let Some(r) = self.expr_result.as_ref().filter(|r| r.line == idx) {
+                let left = px(r.col.max(0) as f32 * cell);
+                let result_text = r.text.clone();
+                text_region = text_region.child(
+                    div()
+                        .absolute()
+                        // One row UP from the edit line (a floating tooltip-style card).
+                        .top(px(-self.metrics.line_height - 2.0))
+                        .left(left)
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .bg(palette.paper)
+                        .border_1()
+                        .border_color(palette.border)
+                        .rounded_sm()
+                        .text_size(px(design::tokens::font::EDITOR_SIZE))
+                        .font_family(design::tokens::font::mono_family())
+                        .text_color(palette.value_fg)
+                        .child(SharedString::from(result_text)),
+                );
+            }
         }
 
         // Mount the text region (icon gutter + row text + all absolute overlays)
@@ -3102,9 +3871,15 @@ impl RcxEditor {
         if changed_band {
             self.hovered_line = Some(line);
         }
-        // Hover popups are gated by the same toggle as the hover band, and
-        // suppressed while editing (the field owns the surface then).
-        let want = if self.hover_effects && self.editing.is_none() {
+        // Hover popups are gated by the hover-effects toggle. Item 68: the
+        // value-history popup is NOT suppressed while editing — when an edit is
+        // active it is shown WITH 'Set' buttons + relative timestamps so the user
+        // can click a previous value into the field (the C++ recreates the popup
+        // with Set buttons once editing starts; editor.cpp:3579). The other popups
+        // (disasm/struct-preview) are still suppressed while editing because the
+        // field owns the surface; `compute_hover_popup` only returns the
+        // value-history variant when `editing` is active.
+        let want = if self.hover_effects {
             self.compute_hover_popup(line, rel_x, pos)
         } else {
             None
@@ -3161,46 +3936,93 @@ impl RcxEditor {
         let is_void_ptr = matches!(kind, NodeKind::Pointer32 | NodeKind::Pointer64)
             && lm.pointer_target_name.is_empty();
 
-        // 1) Function / void pointer → disasm / hex-dump of the TARGET (item 13).
-        if is_fp || is_void_ptr {
-            if let Some(state) = self.pointer_disasm_popup(&lm, is_fp, pos) {
-                return Some(state);
+        // While an inline edit owns the surface, ONLY the value-history popup is
+        // shown (with Set buttons) — the disasm / struct-preview cards are
+        // suppressed so they don't fight the edit field (item 68).
+        let editing = self.editing.is_some();
+
+        if !editing {
+            // 1) Function / void pointer → disasm / hex-dump of the TARGET (item 13).
+            if is_fp || is_void_ptr {
+                if let Some(state) = self.pointer_disasm_popup(&lm, is_fp, pos) {
+                    return Some(state);
+                }
+                // No readable target — fall through (no popup).
+                return None;
             }
-            // No readable target — fall through (no popup).
-            return None;
+
+            // 1b) Collapsed TYPED pointer → struct-preview card (item 13): the first
+            // few lines of the referenced struct composed at the pointer's target.
+            let is_typed_ptr = matches!(kind, NodeKind::Pointer32 | NodeKind::Pointer64)
+                && !lm.pointer_target_name.is_empty();
+            if is_typed_ptr && lm.fold_collapsed {
+                if let Some(state) = self.struct_preview_popup(&lm, pos) {
+                    return Some(state);
+                }
+            }
         }
 
-        // 1b) Collapsed TYPED pointer → struct-preview card (item 13): the first
-        // few lines of the referenced struct composed at the pointer's target.
-        let is_typed_ptr = matches!(kind, NodeKind::Pointer32 | NodeKind::Pointer64)
-            && !lm.pointer_target_name.is_empty();
-        if is_typed_ptr && lm.fold_collapsed {
-            if let Some(state) = self.struct_preview_popup(&lm, pos) {
-                return Some(state);
-            }
-        }
-
-        // 2) Heated changed value with >1 distinct sample → value-history list.
+        // 2) Heated changed value with >1 distinct sample → value-history list. When
+        // an edit is active on THIS row, the popup gets 'Set' buttons (item 68) so a
+        // previous value can be clicked back into the field.
         if lm.heat_level > 0 {
             if let Some(hist) = self.controller.value_history().get(&lm.node_id) {
                 if hist.unique_count() > 1 {
-                    let mut lines: Vec<String> = Vec::new();
-                    hist.for_each_with_time(|v, _t| {
-                        if lines.len() < crate::core::value_history::K_CAPACITY {
-                            lines.push(v.to_string());
+                    // Capture (value, relative-age) pairs newest→oldest.
+                    let now = Self::now_millis();
+                    let mut entries: Vec<(String, String)> = Vec::new();
+                    hist.for_each_with_time(|v, t| {
+                        if entries.len() < crate::core::value_history::K_CAPACITY {
+                            entries.push((v.to_string(), Self::relative_age(now, t)));
                         }
                     });
-                    if lines.len() > 1 {
+                    if entries.len() > 1 {
+                        let set_buttons = self.editing.as_ref().map(|e| e.line) == Some(line);
                         return Some(HoverPopupState {
                             line,
                             pos,
-                            kind: HoverPopupKind::ValueHistory { lines },
+                            kind: HoverPopupKind::ValueHistory {
+                                entries,
+                                node_idx: lm.node_idx,
+                                sub_line: lm.sub_line,
+                                resolved_addr: lm.offset_addr,
+                                set_buttons,
+                            },
                         });
                     }
                 }
             }
         }
         None
+    }
+
+    /// Current wall-clock time in milliseconds since the Unix epoch (for the
+    /// value-history relative-age labels). Falls back to 0 if the clock is before
+    /// the epoch (which would make every age read 'now').
+    fn now_millis() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Format a value-history timestamp as a relative age ('now' / 'Ns ago' /
+    /// 'Nm ago' / 'Nh ago') — the C++ `ValueHistoryPopup::populate` time string
+    /// (editor.cpp:252). A non-positive timestamp (untracked) yields an empty label.
+    fn relative_age(now: i64, then: i64) -> String {
+        if then <= 0 {
+            return String::new();
+        }
+        let elapsed = (now - then).max(0);
+        if elapsed < 1000 {
+            "now".to_string()
+        } else if elapsed < 60_000 {
+            format!("{}s ago", elapsed / 1000)
+        } else if elapsed < 3_600_000 {
+            format!("{}m ago", elapsed / 60_000)
+        } else {
+            format!("{}h ago", elapsed / 3_600_000)
+        }
     }
 
     /// Build the disasm/hex-dump popup for a function/void pointer node by reading
@@ -3299,6 +4121,28 @@ impl RcxEditor {
         })
     }
 
+    /// Item 68: write a value from the value-history popup's 'Set' button back into
+    /// the node (the C++ `ValueHistoryPopup::m_onSet`). Routes through the
+    /// controller's `set_node_value` (the same path an inline Value commit uses),
+    /// closes any active edit + the popup, and recomposes.
+    fn set_value_from_history(
+        &mut self,
+        node_idx: usize,
+        sub_line: i32,
+        value: &str,
+        resolved_addr: u64,
+        cx: &mut Context<Self>,
+    ) {
+        // Drop the active edit (the Set click replaces whatever was being typed).
+        self.editing = None;
+        self.edit_validation = None;
+        self.expr_result = None;
+        self.controller
+            .set_node_value(node_idx, sub_line, value, false, resolved_addr);
+        self.hover_popup = None;
+        self.after_mutation(cx);
+    }
+
     /// Render the open hover popup (item 13) as a small elevated card anchored near
     /// the cursor, using [`design`] tokens (no ad-hoc hex). Value-history lists the
     /// changed values newest-first; the title/body card shows disasm / hex-dump.
@@ -3306,19 +4150,75 @@ impl RcxEditor {
         let state = self.hover_popup.as_ref()?;
         let palette = EditorPalette::from_theme(cx);
         let card = match &state.kind {
-            HoverPopupKind::ValueHistory { lines } => {
-                let rows: Vec<AnyElement> = lines
+            HoverPopupKind::ValueHistory {
+                entries,
+                node_idx,
+                sub_line,
+                resolved_addr,
+                set_buttons,
+            } => {
+                let node_idx = *node_idx;
+                let sub_line = *sub_line;
+                let resolved_addr = *resolved_addr;
+                let set_buttons = *set_buttons;
+                let rows: Vec<AnyElement> = entries
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| {
-                        div()
+                    .map(|(i, (v, age))| {
+                        let mut row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(design::tokens::space::SM))
                             .text_size(px(design::tokens::font::EDITOR_SIZE))
                             .font_family(design::tokens::font::mono_family())
                             // Newest sample reads in the bright value hue; older
                             // samples fade to the dim text (the heat-history graph).
-                            .text_color(if i == 0 { palette.text } else { palette.dim })
-                            .child(v.clone())
-                            .into_any_element()
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .text_color(if i == 0 { palette.text } else { palette.dim })
+                                    .child(SharedString::from(v.clone())),
+                            );
+                        // Relative-age label (item 68): 'now' / 'Ns ago' / ….
+                        if !age.is_empty() {
+                            row = row.child(
+                                div()
+                                    .text_size(px(design::tokens::font::UI_XS))
+                                    .text_color(palette.dim)
+                                    .child(SharedString::from(age.clone())),
+                            );
+                        }
+                        // Edit-time 'Set' button (item 68): writes this value back
+                        // into the node via the controller's `set_node_value`.
+                        if set_buttons && node_idx >= 0 {
+                            let val = v.clone();
+                            row = row.child(
+                                div()
+                                    .id(("vh-set", i))
+                                    .px(px(4.0))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(design::tokens::font::UI_XS))
+                                    .text_color(palette.dim)
+                                    .hover(|s| s.text_color(palette.text).bg(palette.hover_bg))
+                                    .child("Set")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
+                                            cx.stop_propagation();
+                                            this.set_value_from_history(
+                                                node_idx as usize,
+                                                sub_line,
+                                                &val,
+                                                resolved_addr,
+                                                cx,
+                                            );
+                                        }),
+                                    ),
+                            );
+                        }
+                        row.into_any_element()
                     })
                     .collect();
                 div()
@@ -3329,7 +4229,8 @@ impl RcxEditor {
                         div()
                             .text_size(px(design::tokens::font::UI_XS))
                             .text_color(palette.dim)
-                            .child("Value history"),
+                            // The C++ title is "Previous Values" (editor.cpp:222).
+                            .child("Previous Values"),
                     )
                     .children(rows)
             }
@@ -3477,6 +4378,9 @@ impl RcxEditor {
             let idx = self.controller.tree().index_of_id(target.node_id);
             idx >= 0 && self.controller.tree().nodes[idx as usize].big_endian
         };
+        // Gap 20: the live value-change tracking flag (drives the Tracking submenu
+        // check). Read once here so the menu closure can capture it by value.
+        let track_values = self.controller.track_values();
 
         let editor_focus = self.focus_handle.clone();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
@@ -3598,7 +4502,22 @@ impl RcxEditor {
                             Box::new(EditorCopyAllText),
                         )
                 })
-                .submenu("Tracking", mw, mcx, |sub, _w, _cx| sub.label("(tracking)"))
+                .submenu("Tracking", mw, mcx, move |sub, _w, _cx| {
+                    // Gap 20: live value-change tracking toggle + clear-history. The
+                    // controller already owns `set_track_values` / `reset_change_
+                    // tracking`; these wire them (was a dead "(tracking)" label). The
+                    // check reflects the current `track_values` flag.
+                    sub.menu_with_check(
+                        "Track Value Changes",
+                        track_values,
+                        Box::new(EditorTrackToggle),
+                    )
+                    .menu_with_icon(
+                        "Clear All History",
+                        IconName::Delete,
+                        Box::new(EditorTrackClear),
+                    )
+                })
                 .menu_with_icon(
                     "Copy as C Struct",
                     IconName::SquareTerminal,
@@ -4049,6 +4968,33 @@ impl RcxEditor {
         cx.write_to_clipboard(ClipboardItem::new_string(out));
     }
 
+    /// Gap 20: toggle live value-change tracking (the Tracking submenu "Track Value
+    /// Changes" check). Flips the controller's `track_values` flag.
+    fn action_track_toggle(
+        &mut self,
+        _: &EditorTrackToggle,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let on = !self.controller.track_values();
+        self.controller.set_track_values(on);
+        self.after_mutation(cx);
+    }
+
+    /// Gap 20: clear all recorded value-change history (the Tracking submenu "Clear
+    /// All History"). Resets the controller's per-node change tracking.
+    fn action_track_clear(
+        &mut self,
+        _: &EditorTrackClear,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        self.controller.reset_change_tracking();
+        self.after_mutation(cx);
+    }
+
     /// Item 7: open the ASCII overwrite editor on the hex node at `(line,
     /// node_idx)`. Seeds the field with the node's ASCII preview (one printable
     /// char per byte) and arms [`HexOverwrite::Ascii`].
@@ -4144,10 +5090,32 @@ impl RcxEditor {
 
     fn action_duplicate(&mut self, _: &EditorDuplicate, _w: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
-        if let Some(t) = self.action_target() {
-            self.controller.duplicate_node(t.node_idx);
-            self.apply_document(cx);
+        // Gap 82 / the C++ `duplicateSelectedRequested` (controller.cpp:496):
+        // duplicate EVERY selected node, not just the single target. Resolve the
+        // selection to node ids first (duplicate_node shifts indices as it
+        // inserts, so re-resolve each id → index right before duplicating). A
+        // right-click context target OUTSIDE the selection still duplicates just
+        // that one row (the menu acts on the clicked node).
+        let mut ids: Vec<u64> = self.selected_root_ids();
+        if let Some(t) = self.context_target {
+            if !ids.contains(&t.node_id) {
+                ids = vec![t.node_id];
+            }
         }
+        if ids.is_empty() {
+            if let Some(t) = self.action_target() {
+                self.controller.duplicate_node(t.node_idx);
+                self.apply_document(cx);
+            }
+            return;
+        }
+        for nid in ids {
+            let idx = self.controller.tree().index_of_id(nid);
+            if idx >= 0 {
+                self.controller.duplicate_node(idx as usize);
+            }
+        }
+        self.apply_document(cx);
     }
 
     fn action_delete(&mut self, _: &EditorDelete, _w: &mut Window, cx: &mut Context<Self>) {
@@ -5117,6 +6085,8 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_copy_offset))
             .on_action(cx.listener(Self::action_copy_line))
             .on_action(cx.listener(Self::action_copy_all_text))
+            .on_action(cx.listener(Self::action_track_toggle))
+            .on_action(cx.listener(Self::action_track_clear))
             .on_action(cx.listener(Self::action_toggle_big_endian))
             .on_action(cx.listener(Self::action_duplicate))
             .on_action(cx.listener(Self::action_delete))
@@ -5188,27 +6158,34 @@ impl Render for RcxEditor {
             // Body: the virtualized row list (flex-1) and, when toggled, the
             // right-side minimap overview column (item 4). A flex row keeps the
             // minimap pinned to the right edge without overlapping the rows.
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_row()
-                    .child(
-                        uniform_list(
-                            "rcx-rows",
-                            count,
-                            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                                range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
-                            }),
+            // Item 75: in DEBUG view the row grid is replaced by the read-only debug
+            // dump surface (margin + annotated text + per-line LineMeta).
+            .when(self.debug_view, |this| {
+                this.child(self.render_debug_surface(cx))
+            })
+            .when(!self.debug_view, |this| {
+                this.child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(
+                            uniform_list(
+                                "rcx-rows",
+                                count,
+                                cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                                    range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
+                                }),
+                            )
+                            .flex_grow()
+                            .h_full()
+                            .track_scroll(&self.scroll),
                         )
-                        .flex_grow()
-                        .h_full()
-                        .track_scroll(&self.scroll),
-                    )
-                    .when(self.minimap, |this| {
-                        this.child(self.build_minimap(palette, cx))
-                    }),
-            )
+                        .when(self.minimap, |this| {
+                            this.child(self.build_minimap(palette, cx))
+                        }),
+                )
+            })
             // The node context menu: a Zed PopupMenu floated at the right-click
             // position via the deferred-overlay pattern (gpui_cookbook.md §"deferred
             // overlays"), so it draws above the rows and snaps within the window.
@@ -5240,9 +6217,24 @@ fn with_alpha(c: Hsla, a: f32) -> Hsla {
 fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
     match (a, b) {
         (
-            HoverPopupKind::ValueHistory { lines: la },
-            HoverPopupKind::ValueHistory { lines: lb },
-        ) => la == lb,
+            HoverPopupKind::ValueHistory {
+                entries: la,
+                set_buttons: sa,
+                ..
+            },
+            HoverPopupKind::ValueHistory {
+                entries: lb,
+                set_buttons: sb,
+                ..
+            },
+        ) => {
+            // Compare only the VALUE column (ignore the relative-age labels, which
+            // tick) + the Set-button mode — the C++ `vals == m_values` test. This
+            // avoids constant popup re-creation as the '12s ago' labels advance.
+            sa == sb
+                && la.len() == lb.len()
+                && la.iter().zip(lb.iter()).all(|((va, _), (vb, _))| va == vb)
+        }
         (
             HoverPopupKind::TitleBody {
                 title: ta,
@@ -5646,40 +6638,94 @@ mod tests {
     // ── Node clipboard (item 4) ──
 
     #[test]
-    fn clipboard_blob_round_trips_node_fields() {
-        // A serialized `rcx-clipboard/v1` blob parses back into the same node
-        // fields (kind/name/offset/comment) — the copy→paste fidelity contract.
-        use crate::core::{Node, NodeKind};
-        let n = Node {
-            kind: NodeKind::Int32,
-            name: "health".into(),
-            offset: 8,
-            comment: "hp".into(),
+    fn clipboard_codec_preserves_subtrees_and_remaps_ids() {
+        // Feature 3: the editor now serializes via core::clipboard (subtree
+        // collection) and deserializes via the codec (whole-subtree id remap), so
+        // a copied struct keeps its CHILDREN and the pasted copy gets fresh,
+        // non-colliding ids. This is the copy→paste fidelity contract that the old
+        // flat envelope broke (it dropped children + reset collapsed/ref).
+        use crate::core::clipboard::{deserialize, serialize};
+        use crate::core::{Node, NodeKind, NodeTree};
+        use std::collections::HashSet;
+
+        let mut tree = NodeTree::new();
+        let s = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Outer".into(),
             ..Node::default()
-        };
-        let envelope = serde_json::json!({
-            "format": "rcx-clipboard/v1",
-            "nodes": [n.to_json()],
         });
-        let blob = serde_json::to_string(&envelope).unwrap();
-        let parsed = super::RcxEditor::parse_clipboard_nodes(&blob).expect("parses");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].kind, NodeKind::Int32);
-        assert_eq!(parsed[0].name, "health");
-        assert_eq!(parsed[0].offset, 8);
-        assert_eq!(parsed[0].comment, "hp");
+        let sid = tree.nodes[s].id;
+        let _c1 = tree.add_node(Node {
+            parent_id: sid,
+            kind: NodeKind::Int32,
+            name: "a".into(),
+            offset: 0,
+            ..Node::default()
+        });
+        let _c2 = tree.add_node(Node {
+            parent_id: sid,
+            kind: NodeKind::Hex64,
+            name: "b".into(),
+            offset: 8,
+            ..Node::default()
+        });
+
+        let roots = [sid];
+        let clear: HashSet<u64> = roots.iter().copied().collect();
+        let (blob, _plain) = serialize(&tree, &roots, &clear);
+        assert!(!blob.is_empty());
+
+        // Paste into a DIFFERENT tree: ids must be re-minted; the struct + both
+        // children must all come across (subtree preserved).
+        let mut dest = NodeTree::new();
+        let res = deserialize(&mut dest, &blob);
+        assert_eq!(res.nodes.len(), 3, "struct + 2 children");
+        assert_eq!(res.root_ids.len(), 1);
+        let new_root = res.root_ids[0];
+        // The two children re-parent onto the remapped root (not id 0 / the old id).
+        let kids: Vec<&Node> = res
+            .nodes
+            .iter()
+            .filter(|n| n.parent_id == new_root)
+            .collect();
+        assert_eq!(kids.len(), 2, "both children re-wired under the new root");
+        // The cleared root's parent link is 0 (re-anchors under the paste target).
+        let root_node = res.nodes.iter().find(|n| n.id == new_root).unwrap();
+        assert_eq!(root_node.parent_id, 0);
     }
 
     #[test]
-    fn clipboard_rejects_non_rcx_text() {
-        // A plain-text clipboard (or wrong format tag) must NOT parse as nodes, so
-        // a generic copy does not spuriously paste structure.
-        assert!(super::RcxEditor::parse_clipboard_nodes("just some text").is_none());
-        assert!(super::RcxEditor::parse_clipboard_nodes("{\"format\":\"other\"}").is_none());
-        assert!(
-            super::RcxEditor::parse_clipboard_nodes("{\"format\":\"rcx-clipboard/v1\"}").is_none(),
-            "missing nodes array"
-        );
+    fn clipboard_pasted_span_recurses_over_children() {
+        // The pasted-span helper (controller.cpp:582 `pastedSpan`) measures a
+        // container root by the max child end, not its (zero) kind size — so the
+        // offset-shift + placement math leaves room for the whole subtree.
+        use crate::core::{Node, NodeKind};
+        let root_id = 100u64;
+        let nodes = vec![
+            Node {
+                id: root_id,
+                kind: NodeKind::Struct,
+                ..Node::default()
+            },
+            Node {
+                id: 101,
+                parent_id: root_id,
+                kind: NodeKind::Hex64,
+                offset: 0,
+                ..Node::default()
+            },
+            Node {
+                id: 102,
+                parent_id: root_id,
+                kind: NodeKind::Hex64,
+                offset: 8,
+                ..Node::default()
+            },
+        ];
+        // Two Hex64 children at 0 and 8 → span 16.
+        assert_eq!(super::RcxEditor::pasted_span(&nodes, root_id), 16);
+        // A leaf child uses its kind size (Hex64 = 8).
+        assert_eq!(super::RcxEditor::pasted_span(&nodes, 101), 8);
     }
 
     // ── Hover popup equality (item 13) ──
@@ -5687,21 +6733,45 @@ mod tests {
     #[test]
     fn hover_kind_eq_distinguishes_content_and_variant() {
         use super::{hover_kind_eq, HoverPopupKind};
-        let a = HoverPopupKind::ValueHistory {
-            lines: vec!["1".into(), "2".into()],
+        let mk = |vals: &[&str], set_buttons: bool| HoverPopupKind::ValueHistory {
+            entries: vals.iter().map(|v| (v.to_string(), "now".into())).collect(),
+            node_idx: 0,
+            sub_line: 0,
+            resolved_addr: 0,
+            set_buttons,
         };
-        let a2 = HoverPopupKind::ValueHistory {
-            lines: vec!["1".into(), "2".into()],
+        let a = mk(&["1", "2"], false);
+        let a2 = mk(&["1", "2"], false);
+        // Same VALUES but different age labels must still compare equal (the age
+        // labels tick; only the value column drives popup identity, item 68).
+        let a3 = HoverPopupKind::ValueHistory {
+            entries: vec![("1".into(), "5s ago".into()), ("2".into(), "9s ago".into())],
+            node_idx: 0,
+            sub_line: 0,
+            resolved_addr: 0,
+            set_buttons: false,
         };
-        let b = HoverPopupKind::ValueHistory {
-            lines: vec!["1".into(), "3".into()],
-        };
+        let b = mk(&["1", "3"], false);
+        let with_buttons = mk(&["1", "2"], true);
         let t = HoverPopupKind::TitleBody {
             title: "Disassembly".into(),
             body: "nop".into(),
         };
         assert!(hover_kind_eq(&a, &a2), "same content compares equal");
-        assert!(!hover_kind_eq(&a, &b), "different lines differ");
+        assert!(hover_kind_eq(&a, &a3), "differing age labels still equal");
+        assert!(!hover_kind_eq(&a, &b), "different values differ");
+        assert!(!hover_kind_eq(&a, &with_buttons), "Set-button mode differs");
         assert!(!hover_kind_eq(&a, &t), "different variants differ");
+    }
+
+    #[test]
+    fn relative_age_buckets_match_cpp() {
+        use super::RcxEditor;
+        let now = 10_000_000i64;
+        assert_eq!(RcxEditor::relative_age(now, 0), "", "untracked → empty");
+        assert_eq!(RcxEditor::relative_age(now, now - 500), "now");
+        assert_eq!(RcxEditor::relative_age(now, now - 12_000), "12s ago");
+        assert_eq!(RcxEditor::relative_age(now, now - 180_000), "3m ago");
+        assert_eq!(RcxEditor::relative_age(now, now - 7_200_000), "2h ago");
     }
 }

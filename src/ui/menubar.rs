@@ -79,6 +79,12 @@ pub struct MenuBar {
     /// ([`MainWindow`](super::window::MainWindow)) updates this via
     /// [`set_command_checked`](Self::set_command_checked).
     checked: HashSet<CommandId>,
+    /// Whether the top-level menu titles render upper-cased (the C++
+    /// `menuBarTitleCase` ⇒ `applyMenuBarTitleCase(true)`; main.cpp:1063). `false`
+    /// (the C++ default) renders them Title-Cased. The host
+    /// ([`MainWindow`](super::window::MainWindow)) pushes the persisted preference
+    /// via [`set_title_case`](Self::set_title_case).
+    title_case: bool,
 }
 
 impl EventEmitter<MenuCommand> for MenuBar {}
@@ -91,6 +97,18 @@ impl MenuBar {
             open_index: None,
             open_submenu: Vec::new(),
             checked: HashSet::new(),
+            // The C++ default is Title-Case (`menuBarTitleCase = false`).
+            title_case: false,
+        }
+    }
+
+    /// Set whether the top-level titles render upper-cased (the C++
+    /// `applyMenuBarTitleCase`; main.cpp:1063). `true` ⇒ `FILE EDIT VIEW …`;
+    /// `false` ⇒ `File Edit View …`. Re-renders only when the value changes.
+    pub fn set_title_case(&mut self, title_case: bool, cx: &mut Context<Self>) {
+        if self.title_case != title_case {
+            self.title_case = title_case;
+            cx.notify();
         }
     }
 
@@ -195,6 +213,35 @@ fn clean_title(label: &str) -> String {
     label.replace('&', "")
 }
 
+/// Apply the C++ `applyMenuBarTitleCase` transform to a `&`-stripped title
+/// (main.cpp:1063-1093). `title_case == true` ⇒ the whole word upper-cased;
+/// `false` ⇒ Title-Cased — the first letter of every word capitalized, the rest
+/// lower-cased, with the "capitalize next" flag re-armed after any whitespace
+/// (exactly the C++ char-walk). Pure; unit-tested.
+fn cased_title(clean: &str, title_case: bool) -> String {
+    if title_case {
+        return clean.to_uppercase();
+    }
+    let mut result = String::with_capacity(clean.len());
+    let mut capitalize_next = true;
+    for ch in clean.chars() {
+        if ch.is_alphabetic() {
+            if capitalize_next {
+                result.extend(ch.to_uppercase());
+            } else {
+                result.extend(ch.to_lowercase());
+            }
+            capitalize_next = false;
+        } else {
+            result.push(ch);
+            if ch.is_whitespace() {
+                capitalize_next = true;
+            }
+        }
+    }
+    result
+}
+
 impl Render for MenuBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // One top-level menu per submenu, in declaration order
@@ -206,6 +253,7 @@ impl Render for MenuBar {
         // Snapshot the checked-command set once here (where `self` is borrowed) so
         // the dropdown builders don't re-`read` this same entity mid-render.
         let checked = self.checked.clone();
+        let title_case = self.title_case;
 
         gpui_component::h_flex()
             .id("rcx-menubar")
@@ -216,7 +264,7 @@ impl Render for MenuBar {
                 match node {
                     MenuNode::Submenu { label, children } => Some(render_top_level(
                         i,
-                        clean_title(&label),
+                        cased_title(&clean_title(&label), title_case),
                         children,
                         open_index == Some(i),
                         open_submenu.clone(),
@@ -583,7 +631,7 @@ mod tests {
     // Only the gpui-free helpers are unit-tested headlessly (importing `super::*`
     // would pull the module's `gpui::*` glob into the test hygiene expansion; see
     // the titlebar.rs note).
-    use super::clean_title;
+    use super::{cased_title, clean_title};
 
     #[test]
     fn clean_title_strips_mnemonic_ampersand() {
@@ -592,5 +640,23 @@ mod tests {
         assert_eq!(clean_title("Help"), "Help");
         // Only `&` is stripped; the rest is untouched.
         assert_eq!(clean_title("&Save As…"), "Save As…");
+    }
+
+    #[test]
+    fn cased_title_uppercases_when_title_case_on() {
+        // titleCase == true → the whole word upper-cased (the C++ `toUpper()`).
+        assert_eq!(cased_title("File", true), "FILE");
+        assert_eq!(cased_title("Save As", true), "SAVE AS");
+    }
+
+    #[test]
+    fn cased_title_title_cases_when_off() {
+        // titleCase == false → first letter of every word capitalized, the rest
+        // lower-cased, re-armed after whitespace (the C++ char-walk).
+        assert_eq!(cased_title("FILE", false), "File");
+        assert_eq!(cased_title("save as", false), "Save As");
+        assert_eq!(cased_title("hELP", false), "Help");
+        // Non-letters pass through; a space re-arms the capitalize flag.
+        assert_eq!(cased_title("new  class", false), "New  Class");
     }
 }

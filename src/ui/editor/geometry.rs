@@ -462,8 +462,12 @@ pub fn heat_role_for_level(level: i32) -> Option<SpanRole> {
 /// by `+100h`/`+10h` (the C++ collision guard). Pure (text-scan), unit-tested.
 pub fn footer_pill_spans(text: &str) -> Vec<ColumnSpan> {
     // Longest-first so a longer token's match consumes its columns before a
-    // shorter token can match the suffix.
-    const TOKENS: [&str; 6] = ["+1000h", "+100h", "+10h", "Trim", "Top", "+10"];
+    // shorter token can match the suffix. `+1` (the single-field add pill) comes
+    // LAST — shortest — so the claimed-columns guard blocks it from matching the
+    // `+1` prefix of `+10`/`+10h`/`+100h`/`+1000h` (whose columns are already
+    // claimed by the time `+1` is scanned). This mirrors the C++ footer-click
+    // collision guards (editor.cpp:2592 the space-padded " +1 " probe).
+    const TOKENS: [&str; 7] = ["+1000h", "+100h", "+10h", "Trim", "Top", "+10", "+1"];
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len() as i32;
     // Which columns are already claimed by a longer token.
@@ -503,6 +507,141 @@ pub fn footer_pill_spans(text: &str) -> Vec<ColumnSpan> {
     }
     out.sort_by_key(|s| s.start);
     out
+}
+
+/// Item 80 (pure): the inline LOCAL-OFFSET overlay for a child row in relative
+/// mode (the C++ `IND_LOCAL_OFF` Pass 2, editor.cpp:1403). For a `Field`/`Header`
+/// row at `depth > 1`, the local offset (`node_addr - parent_addr`) is rendered
+/// dimly in the indent area, right-justified in the slot between the parent's and
+/// the child's type column.
+///
+/// Returns `(start_col, slot_width, text)` for the overlay, or `None` when the row
+/// does not qualify: continuation rows, non-Field/Header lines, `depth <= 1`, tree
+/// lines active (the connectors own the indent), absolute mode, or — faithfully —
+/// when the slot is too tight for `+XX` (`slot_width < 3`, the C++ gate; with the
+/// default `K_TREE_INDENT = 2` the per-level slot is 1 char so it normally skips,
+/// exactly as the C++ does). `parent_addr` is resolved by the caller (ptrBase for
+/// pointer-expanded children, else `LineMeta::parent_addr`, else the view base).
+pub fn local_offset_overlay(
+    lm: &LineMeta,
+    relative: bool,
+    tree_lines: bool,
+    parent_addr: u64,
+) -> Option<(i32, i32, String)> {
+    use crate::core::linemeta::{K_FOLD_COL, K_TREE_INDENT};
+    if !relative || tree_lines || lm.is_continuation || lm.depth <= 1 {
+        return None;
+    }
+    if lm.line_kind != LineKind::Field && lm.line_kind != LineKind::Header {
+        return None;
+    }
+    let child_type_col = K_FOLD_COL + lm.depth * K_TREE_INDENT;
+    let parent_type_col = K_FOLD_COL + (lm.depth - 1) * K_TREE_INDENT;
+    let slot_width = child_type_col - parent_type_col - 1; // -1 for the gap before type
+    if slot_width < 3 {
+        return None; // not enough room for "+XX" (the C++ slotWidth gate)
+    }
+    let local_off = lm.offset_addr.saturating_sub(parent_addr);
+    let off = format!("+{:X}", local_off);
+    // Right-justify within the slot (truncating to the slot width if longer).
+    let text: String = if (off.chars().count() as i32) <= slot_width {
+        let pad = slot_width - off.chars().count() as i32;
+        format!("{}{}", " ".repeat(pad.max(0) as usize), off)
+    } else {
+        off.chars().take(slot_width as usize).collect()
+    };
+    Some((parent_type_col, slot_width, text))
+}
+
+/// Item 75 (pure): the human label for a [`LineKind`] in the Debug view (the C++
+/// `lineKindNames`, main.cpp:5541).
+pub fn debug_line_kind_name(k: LineKind) -> &'static str {
+    match k {
+        LineKind::CommandRow => "CmdRow",
+        LineKind::Blank => "Blank",
+        LineKind::Header => "Header",
+        LineKind::Field => "Field",
+        LineKind::Continuation => "Cont",
+        LineKind::Footer => "Footer",
+        LineKind::ArrayElementSeparator => "ArrSep",
+    }
+}
+
+/// Item 75 (pure): annotate a composed line for the Debug view — spell out the
+/// special Unicode glyphs and turn each space into a visible middle-dot `·` (the
+/// C++ `generateDebugText` char switch, main.cpp:5556). So `▸`→`[>]`, `▾`→`[v]`,
+/// `│`→`[|]`, `├`→`[+]`, `└`→`[L]`, `…`→`[..]`, `→`→`[->]`, a margin `·`→`[.]`,
+/// and a plain space → `·`.
+pub fn debug_annotate_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for ch in text.chars() {
+        match ch {
+            '\u{25B8}' => out.push_str("[>]"),  // ▸ fold collapsed
+            '\u{25BE}' => out.push_str("[v]"),  // ▾ fold expanded
+            '\u{2502}' => out.push_str("[|]"),  // │ tree vertical
+            '\u{251C}' => out.push_str("[+]"),  // ├ tree branch
+            '\u{2514}' => out.push_str("[L]"),  // └ tree corner
+            '\u{2026}' => out.push_str("[..]"), // … ellipsis
+            '\u{2192}' => out.push_str("[->]"), // → arrow
+            '\u{00B7}' => out.push_str("[.]"),  // · existing middle dot (margin)
+            ' ' => out.push('\u{00B7}'),        // space → visible dot
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Item 75 (pure): build the one-line Debug dump for line `line_idx` (the C++
+/// `generateDebugText` per-line composition, main.cpp:5545). Returns
+/// `margin|<annotated text>  ## L=N <LineKind> nKind=<kind> depth=N nIdx=N
+/// tW=N nW=N <flags> [cmt@N] [hint@N]`. `comment_col`/`hint_col` are the comment /
+/// type-hint chip start columns (Rust uses chips where the C++ had `commentStart`/
+/// `typeHintStart`); pass `-1` when absent.
+pub fn debug_line(
+    margin: &str,
+    text: &str,
+    lm: &LineMeta,
+    line_idx: usize,
+    comment_col: i32,
+    hint_col: i32,
+) -> String {
+    let annotated = debug_annotate_text(text);
+    let mut meta = format!(
+        "  ## L={} {} nKind={} depth={} nIdx={} tW={} nW={}",
+        line_idx,
+        debug_line_kind_name(lm.line_kind),
+        crate::core::kind_to_string(lm.node_kind),
+        lm.depth,
+        lm.node_idx,
+        lm.effective_type_w,
+        lm.effective_name_w,
+    );
+    if lm.is_static_line {
+        meta.push_str(" static");
+    }
+    if lm.is_continuation {
+        meta.push_str(" cont");
+    }
+    if lm.is_member_line {
+        meta.push_str(" member");
+    }
+    if lm.is_array_element {
+        meta.push_str(" arrElem");
+    }
+    if lm.fold_head {
+        meta.push_str(if lm.fold_collapsed {
+            " fold+"
+        } else {
+            " fold-"
+        });
+    }
+    if comment_col >= 0 {
+        meta.push_str(&format!(" cmt@{comment_col}"));
+    }
+    if hint_col >= 0 {
+        meta.push_str(&format!(" hint@{hint_col}"));
+    }
+    format!("{margin}|{annotated}{meta}")
 }
 
 /// The command-row pill spans (the chevron box + source chip): subtle rounded
@@ -1022,6 +1161,133 @@ mod tests {
     fn footer_pills_empty_when_no_controls() {
         assert!(footer_pill_spans("};").is_empty());
         assert!(footer_pill_spans("").is_empty());
+    }
+
+    #[test]
+    fn footer_pills_real_struct_footer_includes_single_add() {
+        // The actual composed struct footer (compose::render::fmt_struct_footer):
+        // `};  +1 +10h +100h +1000h Trim Top  // 0x..` — the standalone `+1`
+        // single-add pill must be picked up WITHOUT colliding with the `+1`
+        // prefix of `+10h`/`+100h`/`+1000h`.
+        let text = "};  +1 +10h +100h +1000h Trim Top  // 0x20 (32)";
+        let pills = footer_pill_spans(text);
+        let chars: Vec<char> = text.chars().collect();
+        let got: Vec<String> = pills
+            .iter()
+            .map(|s| chars[s.start as usize..s.end as usize].iter().collect())
+            .collect();
+        assert!(got.contains(&"+1".to_string()), "got {got:?}");
+        assert!(got.contains(&"+10h".to_string()), "got {got:?}");
+        assert!(got.contains(&"+100h".to_string()), "got {got:?}");
+        assert!(got.contains(&"+1000h".to_string()), "got {got:?}");
+        assert!(got.contains(&"Trim".to_string()), "got {got:?}");
+        assert!(got.contains(&"Top".to_string()), "got {got:?}");
+        // No spurious `+10` (it would be inside +10h whose cols are claimed).
+        assert!(!got.contains(&"+10".to_string()), "got {got:?}");
+        // 6 pills: +1, +10h, +100h, +1000h, Trim, Top.
+        assert_eq!(got.len(), 6, "got {got:?}");
+        for w in pills.windows(2) {
+            assert!(w[0].end <= w[1].start, "pill spans must not overlap");
+        }
+    }
+
+    #[test]
+    fn debug_annotate_spells_glyphs_and_dots_spaces() {
+        // Item 75: special glyphs are spelled out, spaces become visible dots.
+        assert_eq!(debug_annotate_text("a b"), "a\u{00B7}b");
+        assert_eq!(debug_annotate_text("\u{25B8}x"), "[>]x"); // ▸
+        assert_eq!(debug_annotate_text("\u{25BE}"), "[v]"); // ▾
+        assert_eq!(debug_annotate_text("\u{2502}\u{251C}\u{2514}"), "[|][+][L]");
+        assert_eq!(debug_annotate_text("\u{2026}\u{2192}"), "[..][->]");
+    }
+
+    #[test]
+    fn debug_line_dumps_margin_text_and_meta() {
+        use crate::core::{LineKind, LineMeta, NodeKind};
+        let lm = LineMeta {
+            line_kind: LineKind::Field,
+            node_kind: NodeKind::UInt32,
+            depth: 2,
+            node_idx: 7,
+            effective_type_w: 14,
+            effective_name_w: 22,
+            is_continuation: false,
+            fold_head: true,
+            fold_collapsed: false,
+            ..LineMeta::default()
+        };
+        let s = debug_line("+0x10", "  uint32_t health", &lm, 5, -1, 9);
+        // margin | annotated-text  ## meta
+        assert!(s.starts_with("+0x10|"), "got {s}");
+        assert!(
+            s.contains("\u{00B7}\u{00B7}uint32_t\u{00B7}health"),
+            "got {s}"
+        );
+        assert!(
+            s.contains("## L=5 Field nKind=UInt32 depth=2 nIdx=7 tW=14 nW=22"),
+            "got {s}"
+        );
+        assert!(s.contains(" fold-"), "fold head expanded flag, got {s}");
+        assert!(s.contains(" hint@9"), "type-hint column, got {s}");
+        assert!(!s.contains(" cmt@"), "no comment chip → no cmt@, got {s}");
+    }
+
+    #[test]
+    fn local_offset_overlay_gates_match_cpp() {
+        // Item 80: the local-offset overlay only fires for Field/Header child rows
+        // (depth>1) in relative mode with tree lines OFF — and faithfully skips
+        // when the indent slot is too tight (`slot_width < 3`, which with the
+        // default K_TREE_INDENT=2 is always the case, matching the C++ gate).
+        use crate::core::{LineKind, LineMeta};
+        let base = 0x1000u64;
+        let child = LineMeta {
+            line_kind: LineKind::Field,
+            depth: 2,
+            offset_addr: 0x1010,
+            ..LineMeta::default()
+        };
+        // Absolute mode → no overlay.
+        assert!(local_offset_overlay(&child, false, false, base).is_none());
+        // Tree lines on → no overlay (connectors own the indent).
+        assert!(local_offset_overlay(&child, true, true, base).is_none());
+        // depth <= 1 → no overlay.
+        let shallow = LineMeta {
+            depth: 1,
+            ..child.clone()
+        };
+        assert!(local_offset_overlay(&shallow, true, false, base).is_none());
+        // Continuation row → no overlay.
+        let cont = LineMeta {
+            is_continuation: true,
+            ..child.clone()
+        };
+        assert!(local_offset_overlay(&cont, true, false, base).is_none());
+        // Non-Field/Header (e.g. Footer) → no overlay.
+        let footer = LineMeta {
+            line_kind: LineKind::Footer,
+            ..child.clone()
+        };
+        assert!(local_offset_overlay(&footer, true, false, base).is_none());
+        // A qualifying child with the default tight indent skips on the slot gate
+        // (slot_width = K_TREE_INDENT-1 = 1 < 3) — faithful to the C++.
+        assert!(local_offset_overlay(&child, true, false, base).is_none());
+    }
+
+    #[test]
+    fn footer_pills_real_enum_footer_includes_add_ten() {
+        // The composed enum footer: `};  +1 +10 Top` — here `+10` is a real pill
+        // (no `+10h`), and `+1` is the single-add pill.
+        let text = "};  +1 +10 Top  // 0x4 (4)";
+        let pills = footer_pill_spans(text);
+        let chars: Vec<char> = text.chars().collect();
+        let got: Vec<String> = pills
+            .iter()
+            .map(|s| chars[s.start as usize..s.end as usize].iter().collect())
+            .collect();
+        assert!(got.contains(&"+1".to_string()), "got {got:?}");
+        assert!(got.contains(&"+10".to_string()), "got {got:?}");
+        assert!(got.contains(&"Top".to_string()), "got {got:?}");
+        assert_eq!(got.len(), 3, "got {got:?}");
     }
 
     #[test]

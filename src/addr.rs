@@ -77,6 +77,12 @@ impl AddressParser {
         ptr_size: i32,
         cb: Option<&AddressParserCallbacks<'_>>,
     ) -> AddressParseResult {
+        // Profiler instrumentation (port of the C++ PROFILE_SCOPE peppered over
+        // the hot paths): address evaluation runs on every editor render that
+        // resolves a node's address and on every Goto keystroke, so it's a
+        // meaningful bucket. No-op when profiling is disabled.
+        crate::PROFILE_SCOPE!("AddressParser::evaluate");
+
         // ptrSize is used by the caller to configure the readPointer callback;
         // the parser itself doesn't need it directly. (addressparser.cpp:511)
         let _ = ptr_size;

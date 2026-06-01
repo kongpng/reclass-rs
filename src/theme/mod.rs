@@ -19,6 +19,7 @@ pub mod color;
 pub mod defaults;
 pub mod manager;
 pub mod model;
+pub mod profiler;
 
 #[cfg(feature = "ui")]
 pub mod editor;
@@ -27,3 +28,4 @@ pub use color::{hex_or_black, lerp_rgb, Color};
 pub use defaults::DEFAULT_THEMES;
 pub use manager::{MemSettings, SettingsStore, SubId, ThemeManager};
 pub use model::{FieldId, Theme, ThemeFieldMeta, THEME_FIELDS};
+pub use profiler::{ProfileScope, ProfileStats, Profiler};

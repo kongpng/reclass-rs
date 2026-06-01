@@ -1709,16 +1709,25 @@ fn type_hint_chip_fires_as_overlay() {
     data[K_STRUCT_BASE as usize + 4..K_STRUCT_BASE as usize + 8]
         .copy_from_slice(&20i32.to_le_bytes());
     let prov = BufferProvider::new(data, "synthetic");
+    // type_hints=true (7th arg) — the TypeHint chip is gated on it
+    // (`compose.cpp:441`, `test_rtti_hint.cpp:313`).
     let r = compose(
-        &tree, &prov, root_id, false, false, false, false, true, true, true,
+        &tree, &prov, root_id, false, false, false, true, true, true, true,
     );
     let c = first_chip(&r, ChipKind::TypeHint).expect("typehint chip");
     assert!(c.start_col >= 0);
     assert!(c.end_col > c.start_col);
-    // Chip text must be plain (no brackets) — the inline pill, not "[int32×2]".
+    // Chip text is value-preview + bracketed type label, mirroring
+    // `lm.typeHint = preview + " [" + typeName + "]"` (`compose.cpp:450-458`).
     assert!(
-        !c.text.contains('['),
-        "chip text should be plain: {}",
+        c.text.contains('[') && c.text.ends_with(']'),
+        "chip text should carry a bracketed type label: {}",
+        c.text
+    );
+    // The preview of two int32 lanes (14, 20) should precede the bracket.
+    assert!(
+        c.text.contains("14") && c.text.contains("20"),
+        "chip text should preview both lanes: {}",
         c.text
     );
     assert!(!c.type_hint_kinds.is_empty());
@@ -2026,4 +2035,269 @@ fn format_preview_utf8_nonprintable_first_is_empty() {
 fn format_preview_empty_kinds() {
     let d = [0u8; 4];
     assert_eq!(format_preview(&d, 4, &[]), "");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// test_rtti_hint.cpp — inline {RTTI: …} hint + vtable RTTI auto-detect
+// ═══════════════════════════════════════════════════════════════════════════
+
+const RTTI_IMAGE_BASE: u64 = 0x10000;
+const RTTI_STRUCT_BASE: u64 = 0x30000;
+
+// Build the same synthetic MSVC RTTI shape as `test_rtti.cpp`/`walk.rs`: a
+// "Foo" class (bases Bar/Baz) whose vtable lives at IMAGE_BASE+0x1000, plus a
+// struct-data region at 0x30000. Mirrors `buildAddressSpaceWithRtti`
+// (`test_rtti_hint.cpp:38`).
+fn build_address_space_with_rtti() -> Vec<u8> {
+    let mut rtti = vec![0u8; 0x10000];
+    let wu64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    let wu32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let wcstr = |b: &mut [u8], at: usize, s: &str| {
+        let bytes = s.as_bytes();
+        b[at..at + bytes.len()].copy_from_slice(bytes);
+        b[at + bytes.len()] = 0;
+    };
+
+    let vtable_rva = 0x1000usize;
+    let td_foo = 0x1100usize;
+    let td_bar = 0x1200usize;
+    let td_baz = 0x1300usize;
+    let chd = 0x1400usize;
+    let bca = 0x1500usize;
+    let bcd_foo = 0x1600usize;
+    let bcd_bar = 0x1700usize;
+    let bcd_baz = 0x1800usize;
+    let col = 0x1900usize;
+
+    wu64(&mut rtti, vtable_rva - 8, RTTI_IMAGE_BASE + col as u64);
+    for i in 0..5usize {
+        wu64(
+            &mut rtti,
+            vtable_rva + i * 8,
+            RTTI_IMAGE_BASE + 0x100 + i as u64 * 0x10,
+        );
+    }
+    wu64(&mut rtti, vtable_rva + 5 * 8, 0);
+
+    let write_td = |buf: &mut [u8], rva: usize, name: &str| {
+        wu64(buf, rva, 0xDEAD_BEEF);
+        wu64(buf, rva + 8, 0);
+        wcstr(buf, rva + 16, name);
+    };
+    write_td(&mut rtti, td_foo, ".?AVFoo@@");
+    write_td(&mut rtti, td_bar, ".?AVBar@@");
+    write_td(&mut rtti, td_baz, ".?AVBaz@@");
+
+    wu32(&mut rtti, chd, 0);
+    wu32(&mut rtti, chd + 0x04, 0);
+    wu32(&mut rtti, chd + 0x08, 3);
+    wu32(&mut rtti, chd + 0x0C, bca as u32);
+
+    wu32(&mut rtti, bca, bcd_foo as u32);
+    wu32(&mut rtti, bca + 4, bcd_bar as u32);
+    wu32(&mut rtti, bca + 8, bcd_baz as u32);
+
+    wu32(&mut rtti, bcd_foo, td_foo as u32);
+    wu32(&mut rtti, bcd_bar, td_bar as u32);
+    wu32(&mut rtti, bcd_baz, td_baz as u32);
+
+    wu32(&mut rtti, col + 0x00, 1);
+    wu32(&mut rtti, col + 0x04, 0);
+    wu32(&mut rtti, col + 0x08, 0);
+    wu32(&mut rtti, col + 0x0C, td_foo as u32);
+    wu32(&mut rtti, col + 0x10, chd as u32);
+    wu32(&mut rtti, col + 0x14, RTTI_IMAGE_BASE as u32);
+
+    // [0 .. IMAGE_BASE) zeros, [IMAGE_BASE ..) RTTI, struct region at 0x30000.
+    let mut data = vec![0u8; (RTTI_STRUCT_BASE + 0x1000) as usize];
+    data[RTTI_IMAGE_BASE as usize..RTTI_IMAGE_BASE as usize + rtti.len()].copy_from_slice(&rtti);
+    data
+}
+
+// BufferProvider that additionally reports a single module covering the
+// synthetic RTTI region and counts `enumerate_modules` calls so the test can
+// assert the per-pass cache fires it at most once
+// (`FakeModuleProvider`, `test_rtti_hint.cpp:101`).
+struct FakeModuleProvider {
+    inner: BufferProvider,
+    enum_calls: std::cell::Cell<u32>,
+}
+impl FakeModuleProvider {
+    fn new(data: Vec<u8>) -> Self {
+        FakeModuleProvider {
+            inner: BufferProvider::new(data, "synthetic"),
+            enum_calls: std::cell::Cell::new(0),
+        }
+    }
+}
+impl crate::provider::Provider for FakeModuleProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.inner.read(addr, buf)
+    }
+    fn size(&self) -> i32 {
+        self.inner.size()
+    }
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        self.inner.is_readable(addr, len)
+    }
+    fn enumerate_modules(&self) -> Vec<crate::provider::ModuleEntry> {
+        self.enum_calls.set(self.enum_calls.get() + 1);
+        vec![crate::provider::ModuleEntry {
+            name: "synthetic.dll".into(),
+            full_path: "synthetic.dll".into(),
+            base: RTTI_IMAGE_BASE,
+            size: 0x10000,
+        }]
+    }
+}
+
+fn tree_with_hex64_fields(base: u64, n: i32) -> NodeTree {
+    let mut tree = NodeTree::new();
+    tree.base_address = base;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Demo".into(),
+        struct_type_name: "Demo".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    for i in 0..n {
+        tree.add_node(child(
+            root_id,
+            NodeKind::Hex64,
+            i * 8,
+            &format!("field_{i}"),
+        ));
+    }
+    tree
+}
+
+#[test]
+fn rtti_hint_attaches_when_value_points_at_vtable() {
+    let mut data = build_address_space_with_rtti();
+    let vtable_va = RTTI_IMAGE_BASE + 0x1000;
+    data[RTTI_STRUCT_BASE as usize..RTTI_STRUCT_BASE as usize + 8]
+        .copy_from_slice(&vtable_va.to_le_bytes());
+
+    let prov = FakeModuleProvider::new(data);
+    let tree = tree_with_hex64_fields(RTTI_STRUCT_BASE, 4);
+    let r = compose_default(&tree, &prov);
+
+    // The Hex64 field at offset 0 (absAddr == struct base) must carry an RTTI
+    // chip naming the resolved class.
+    let mut found = false;
+    for lm in &r.meta {
+        if lm.line_kind != LineKind::Field || lm.node_kind != NodeKind::Hex64 {
+            continue;
+        }
+        if lm.offset_addr != RTTI_STRUCT_BASE {
+            continue;
+        }
+        let c = find_chip(lm, ChipKind::Rtti).expect("RTTI chip on vtable field");
+        assert!(
+            c.text.contains("Foo"),
+            "RTTI chip should name the class: {}",
+            c.text
+        );
+        assert!(c.text.starts_with("{RTTI:"), "hint format: {}", c.text);
+        assert_eq!(c.rtti_vtable_addr, vtable_va);
+        found = true;
+        break;
+    }
+    assert!(found, "did not locate the Hex64 field at offset 0");
+}
+
+#[test]
+fn rtti_no_hint_when_value_outside_any_module() {
+    let mut data = build_address_space_with_rtti();
+    let junk = 0xCAFE_BABE_DEAD_BEEFu64;
+    data[RTTI_STRUCT_BASE as usize..RTTI_STRUCT_BASE as usize + 8]
+        .copy_from_slice(&junk.to_le_bytes());
+    let prov = FakeModuleProvider::new(data);
+    let tree = tree_with_hex64_fields(RTTI_STRUCT_BASE, 1);
+    let r = compose_default(&tree, &prov);
+    for lm in &r.meta {
+        if lm.node_kind == NodeKind::Hex64 {
+            assert!(
+                find_chip(lm, ChipKind::Rtti).is_none(),
+                "value outside any module must not resolve RTTI"
+            );
+        }
+    }
+}
+
+#[test]
+fn rtti_modules_enumerated_few_times_not_per_line() {
+    // 32 fields all pointing at the same vtable. Without caching,
+    // `enumerate_modules` would fire once per candidate (32×) plus once inside
+    // each `walk_rtti` success path (>= 64). With the per-pass module cache +
+    // rtti_cache it stays O(1): one call from compose's own cache, plus one
+    // inside `walk_rtti`'s `find_owning_module` for the single unique walk
+    // (whose RttiInfo is then memoized). (`test_rtti_hint.cpp:213-240`.)
+    const FIELD_COUNT: i32 = 32;
+    let mut data = build_address_space_with_rtti();
+    let vtable_va = RTTI_IMAGE_BASE + 0x1000;
+    for i in 0..FIELD_COUNT as usize {
+        let off = RTTI_STRUCT_BASE as usize + i * 8;
+        data[off..off + 8].copy_from_slice(&vtable_va.to_le_bytes());
+    }
+    let prov = FakeModuleProvider::new(data);
+    let tree = tree_with_hex64_fields(RTTI_STRUCT_BASE, FIELD_COUNT);
+    let r = compose_default(&tree, &prov);
+    // Must be O(1) in field count — assert generously (<= 4) so future tweaks
+    // don't trip a brittle exact-match.
+    let calls = prov.enum_calls.get();
+    assert!(
+        calls <= 4,
+        "enumerate_modules called {calls}× for {FIELD_COUNT} fields — should be O(1)"
+    );
+    assert!((calls as i32) < FIELD_COUNT);
+    assert_eq!(
+        count_chips(&r, ChipKind::Rtti),
+        FIELD_COUNT,
+        "every vtable field gets an RTTI chip"
+    );
+}
+
+#[test]
+fn rtti_hint_on_typed_pointer_header() {
+    // A typed Pointer64 whose stored value is the vtable address itself routes
+    // through compose_node; its merged fold header must carry the RTTI hint.
+    let mut data = build_address_space_with_rtti();
+    let vtable_va = RTTI_IMAGE_BASE + 0x1000;
+    data[RTTI_STRUCT_BASE as usize..RTTI_STRUCT_BASE as usize + 8]
+        .copy_from_slice(&vtable_va.to_le_bytes());
+
+    let mut tree = NodeTree::new();
+    tree.base_address = RTTI_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Demo".into(),
+        struct_type_name: "Demo".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // A target struct for the pointer to reference (gives it a typed header).
+    let ti = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Target".into(),
+        struct_type_name: "Target".into(),
+        ..Node::default()
+    });
+    let target_id = tree.nodes[ti].id;
+    let mut ptr = child(root_id, NodeKind::Pointer64, 0, "vptr");
+    ptr.ref_id = target_id;
+    ptr.collapsed = true; // keep the header on one line
+    tree.add_node(ptr);
+
+    let prov = FakeModuleProvider::new(data);
+    let r = compose_default(&tree, &prov);
+
+    let c = first_chip(&r, ChipKind::Rtti).expect("RTTI chip on typed-pointer header");
+    assert!(
+        c.text.contains("Foo"),
+        "header RTTI hint names class: {}",
+        c.text
+    );
+    assert_eq!(c.rtti_vtable_addr, vtable_va);
 }

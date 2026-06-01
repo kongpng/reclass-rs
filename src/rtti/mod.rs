@@ -16,6 +16,7 @@
 //! - [`names`] — `NamedAddress`, `NameProvider`, `NameRegistry`, and the PDB /
 //!   RTTI / bookmark providers (← `names/*`).
 
+pub mod browser;
 pub mod demangle;
 pub mod downloader;
 pub mod names;
@@ -23,6 +24,12 @@ pub mod symbol_store;
 pub mod walk;
 
 // ── Flat re-exports mirroring the C++ `rcx::` namespace surface ──
+pub use browser::{
+    build_text_report, display_class_name, header_lines, resolve_field_vtable, resolve_rtti,
+    RttiFieldError,
+};
+#[cfg(feature = "ui")]
+pub use browser::{RttiBrowserDialog, RttiBrowserEvent};
 pub use demangle::{demangle_itanium_name, demangle_rtti_name, humanize_symbol_name};
 pub use downloader::{cache_dir, DownloadEvent, DownloadRequest, SymbolDownloader};
 pub use names::bookmark::{BookmarkHost, BookmarkNameProvider};

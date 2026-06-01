@@ -1858,3 +1858,220 @@ fn pad_counter_shared_across_render() {
     assert!(result.contains("_pad0000"));
     assert!(result.contains("_pad0001"));
 }
+
+// ── render_code_scoped: scope-aware dispatch (main.cpp:5469-5477 port) ──
+
+/// Two top-level structs where `StructA` holds a pointer to `TargetB`, so the
+/// dependency is genuinely reachable from `StructA` (exercises `WithChildren`;
+/// the reachability walk follows `Pointer*.ref_id`, generator.rs:1792-1796).
+/// Returns `(tree, a_id, b_id)`.
+fn make_two_struct_tree() -> (NodeTree, u64, u64) {
+    let mut tree = NodeTree::new();
+    let bi = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "TargetB".into(),
+        name: "b".into(),
+        parent_id: 0,
+        offset: 0x100,
+        ..d()
+    });
+    let b_id = tree.nodes[bi].id;
+    tree.add_node(Node {
+        kind: NodeKind::Int32,
+        name: "val".into(),
+        parent_id: b_id,
+        offset: 0,
+        ..d()
+    });
+
+    let ai = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "StructA".into(),
+        name: "a".into(),
+        parent_id: 0,
+        offset: 0,
+        ..d()
+    });
+    let a_id = tree.nodes[ai].id;
+    // Pointer to TargetB → reachable dependency of StructA.
+    tree.add_node(Node {
+        kind: NodeKind::Pointer64,
+        name: "ptr_to_b".into(),
+        parent_id: a_id,
+        offset: 0,
+        ref_id: b_id,
+        ..d()
+    });
+    (tree, a_id, b_id)
+}
+
+#[test]
+fn scoped_current_emits_only_selected_struct() {
+    let (tree, a_id, _b_id) = make_two_struct_tree();
+    let out = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::Current,
+        &tree,
+        a_id,
+        None,
+        false,
+    );
+    assert!(out.contains("struct StructA"));
+    // `Current` must NOT pull in the dependency's own definition.
+    assert!(
+        !out.contains("struct TargetB\n{"),
+        "Current scope leaked the dependency definition:\n{}",
+        out
+    );
+}
+
+#[test]
+fn scoped_with_children_pulls_in_deps() {
+    let (tree, a_id, _b_id) = make_two_struct_tree();
+    let out = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::WithChildren,
+        &tree,
+        a_id,
+        None,
+        false,
+    );
+    assert!(out.contains("struct StructA"));
+    assert!(
+        out.contains("struct TargetB"),
+        "WithChildren scope dropped the reachable dependency:\n{}",
+        out
+    );
+    // Equivalent to calling render_code_tree directly.
+    let direct = render_code_tree(CodeFormat::CppHeader, &tree, a_id, None, false);
+    assert_eq!(out, direct);
+}
+
+#[test]
+fn scoped_full_sdk_ignores_root_and_emits_all() {
+    let (tree, _a_id, _b_id) = make_two_struct_tree();
+    // Pass a bogus root id; FullSdk must ignore it and emit every root struct.
+    let out = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::FullSdk,
+        &tree,
+        0xDEAD_BEEF,
+        None,
+        false,
+    );
+    assert!(out.contains("struct StructA"));
+    assert!(out.contains("struct TargetB"));
+    let direct = render_code_all(CodeFormat::CppHeader, &tree, None, false);
+    assert_eq!(out, direct);
+}
+
+#[test]
+fn scoped_no_selection_falls_back_to_all() {
+    let (tree, _a_id, _b_id) = make_two_struct_tree();
+    // root_struct_id == 0 with a non-FullSdk scope → C++ falls back to renderCodeAll.
+    for scope in [CodeScope::Current, CodeScope::WithChildren] {
+        let out = render_code_scoped(CodeFormat::CppHeader, scope, &tree, 0, None, false);
+        let direct = render_code_all(CodeFormat::CppHeader, &tree, None, false);
+        assert_eq!(out, direct, "scope {:?} did not fall back to All", scope);
+        assert!(out.contains("struct StructA"));
+        assert!(out.contains("struct TargetB"));
+    }
+}
+
+#[test]
+fn scoped_threads_emit_asserts() {
+    let tree = make_simple_struct();
+    let root_id = tree.nodes[0].id;
+    let with = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        true,
+    );
+    let without = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        false,
+    );
+    assert!(with.contains("static_assert"));
+    assert!(!without.contains("static_assert"));
+}
+
+#[test]
+fn scoped_threads_type_aliases() {
+    let tree = make_simple_struct();
+    let root_id = tree.nodes[0].id;
+    let mut aliases: TypeAliases = TypeAliases::new();
+    aliases.insert(NodeKind::Int32, "LONG".into());
+    let out = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        Some(&aliases),
+        false,
+    );
+    assert!(
+        out.contains("LONG"),
+        "alias did not thread through:\n{}",
+        out
+    );
+}
+
+#[test]
+fn scoped_honors_every_format() {
+    // Smoke-test that scope dispatch reaches each backend without panicking and
+    // produces that format's signature output (Current scope, real root).
+    let tree = make_simple_struct();
+    let root_id = tree.nodes[0].id;
+    let cpp = render_code_scoped(
+        CodeFormat::CppHeader,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        false,
+    );
+    assert!(cpp.contains("struct Player"));
+    let rust = render_code_scoped(
+        CodeFormat::RustStruct,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        false,
+    );
+    assert!(rust.contains("pub struct Player"));
+    let cs = render_code_scoped(
+        CodeFormat::CSharpStruct,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        false,
+    );
+    assert!(cs.contains("struct Player") || cs.contains("Player"));
+    let py = render_code_scoped(
+        CodeFormat::PythonCtypes,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        false,
+    );
+    assert!(py.contains("Player"));
+    let def = render_code_scoped(
+        CodeFormat::DefineOffsets,
+        CodeScope::Current,
+        &tree,
+        root_id,
+        None,
+        false,
+    );
+    assert!(def.contains("#define"));
+}

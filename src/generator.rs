@@ -2226,6 +2226,47 @@ pub fn render_code_all(
     }
 }
 
+/// Scope-aware dispatch: pick the right `render*` family for a [`CodeScope`].
+///
+/// Ports the live-view / export branch in the C++ UI (`main.cpp:5469-5477`),
+/// which the Rust `generator` did not expose as a single entry point — every
+/// caller (the live code pane, the export flow) re-derived the fallback rules
+/// inline, so the `FullSdk → renderCodeAll` and `rootId == 0 → renderCodeAll`
+/// edge cases were easy to get wrong (and the export path *did* get them
+/// wrong: it passed `type_aliases = None` and ignored `emit_asserts`).
+///
+/// Rules, identical to the C++:
+/// * [`CodeScope::FullSdk`] → [`render_code_all`] (every root struct; `root_struct_id` ignored).
+/// * Otherwise, if `root_struct_id != 0`:
+///   * [`CodeScope::WithChildren`] → [`render_code_tree`] (selected struct + reachable deps).
+///   * [`CodeScope::Current`] → [`render_code`] (just the selected struct).
+/// * Otherwise (`root_struct_id == 0`, i.e. nothing selected) → [`render_code_all`].
+///
+/// `type_aliases` and `emit_asserts` thread straight through to the backend,
+/// so both the live view and export honor the document's alias map and the
+/// persisted `generatorAsserts` option uniformly.
+pub fn render_code_scoped(
+    fmt: CodeFormat,
+    scope: CodeScope,
+    tree: &NodeTree,
+    root_struct_id: u64,
+    type_aliases: Option<&TypeAliases>,
+    emit_asserts: bool,
+) -> String {
+    match scope {
+        CodeScope::FullSdk => render_code_all(fmt, tree, type_aliases, emit_asserts),
+        _ if root_struct_id != 0 => match scope {
+            CodeScope::WithChildren => {
+                render_code_tree(fmt, tree, root_struct_id, type_aliases, emit_asserts)
+            }
+            // `Current` (and any non-`FullSdk` scope) with a real root.
+            _ => render_code(fmt, tree, root_struct_id, type_aliases, emit_asserts),
+        },
+        // Current / WithChildren but no struct selected ⇒ fall back to the whole SDK.
+        _ => render_code_all(fmt, tree, type_aliases, emit_asserts),
+    }
+}
+
 /// `renderNull(...)` (`generator.cpp:1743-1745`).
 pub fn render_null(_tree: &NodeTree, _root_struct_id: u64) -> String {
     String::new()

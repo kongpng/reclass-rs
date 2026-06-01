@@ -9,16 +9,47 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+
+/// Recursively rebuild `value` so every object's keys are in ascending order.
+///
+/// Qt's `QJsonObject` serializes keys sorted, so the C++ bridge emits
+/// sorted-key JSON. serde_json's `Value` is normally a `BTreeMap` (already
+/// sorted), BUT under the default (`ui`) feature set gpui transitively enables
+/// `serde_json/preserve_order`, which switches `Value`'s backing map to an
+/// insertion-ordered `IndexMap`. Cargo feature unification makes that global,
+/// so our wire output would otherwise lose its sorted-key guarantee in the GUI
+/// build. Normalizing explicitly makes the output deterministic regardless of
+/// which map backend `serde_json` was compiled with. (For the `IndexMap`
+/// backend, inserting keys in sorted order preserves that order on serialize;
+/// for `BTreeMap` it is a no-op on ordering.)
+fn sort_value_keys(value: Value) -> Value {
+    match value {
+        Value::Object(obj) => {
+            let mut keys: Vec<String> = obj.keys().cloned().collect();
+            keys.sort();
+            let mut sorted = Map::new();
+            let mut obj = obj;
+            for k in keys {
+                if let Some(v) = obj.remove(&k) {
+                    sorted.insert(k, sort_value_keys(v));
+                }
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_value_keys).collect()),
+        other => other,
+    }
+}
 
 /// `okReply(id, result)` (`mcp_bridge.cpp:245-251`).
 pub fn ok_reply(id: &Value, result: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "result": result})
+    sort_value_keys(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
 /// `errReply(id, code, msg)` (`mcp_bridge.cpp:253-259`).
 pub fn err_reply(id: &Value, code: i64, msg: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
+    sort_value_keys(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}))
 }
 
 /// `makeTextResult(text, isError)` (`mcp_bridge.cpp:284-294`). The `isError`
@@ -78,12 +109,15 @@ pub fn resolve_placeholder(r: &str, map: &HashMap<String, u64>) -> (String, bool
 }
 
 /// Serialize `value` the way `QJsonDocument::toJson(QJsonDocument::Indented)`
-/// does: 4-space indentation, keys sorted (serde's default `Value` map is a
-/// `BTreeMap` → already sorted). Used by the tool-text payloads that embed
-/// indented JSON (`project.state`, `tree.search`, …).
+/// does: 4-space indentation, keys sorted. Keys are sorted explicitly via
+/// [`sort_value_keys`] so the output is deterministic even when `serde_json`
+/// is compiled with `preserve_order` (which the default `ui`/gpui build pulls
+/// in transitively). Used by the tool-text payloads that embed indented JSON
+/// (`project.state`, `tree.search`, …).
 pub fn qt_pretty(value: &Value) -> String {
     use serde::Serialize;
     use serde_json::ser::{PrettyFormatter, Serializer};
+    let value = sort_value_keys(value.clone());
     let mut buf = Vec::new();
     let fmt = PrettyFormatter::with_indent(b"    ");
     let mut ser = Serializer::with_formatter(&mut buf, fmt);
