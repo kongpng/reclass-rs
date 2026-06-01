@@ -878,6 +878,33 @@ mod tests {
     }
 
     #[test]
+    fn command_row_unit_span_seed_survives_an_astral_glyph() {
+        // The command-row span helpers scan in UTF-16 units, so a span's start/end
+        // are unit offsets. When a token *before* the edited span carries a non-BMP
+        // glyph (an astral char counts as 2 UTF-16 units but 1 Rust char), a
+        // char-based `byte_for_col` slice drifts and seeds the wrong substring —
+        // `utf16_to_byte` is the correct conversion for these unit-based spans.
+        // (This is the `byte_for_col`-vs-unit-span hazard called out for the
+        // command-row inline-edit seed.)
+        let text = "[\u{25B8}] '\u{1F4C1}data'\u{25BE}  0x0  struct Player {";
+        let name = compose::command_row_root_name_span(text);
+        assert!(name.valid);
+        let seed_unit: String = text
+            [utf16_to_byte(text, name.start)..utf16_to_byte(text, name.end)]
+            .trim()
+            .into();
+        assert_eq!(seed_unit, "Player", "unit-based seed is the class name");
+        // The char-based slice would be wrong (it lags by one unit per astral glyph).
+        let seed_char: String = text[byte_for_col(text, name.start)..byte_for_col(text, name.end)]
+            .trim()
+            .into();
+        assert_ne!(
+            seed_char, "Player",
+            "char-based slice drifts past the astral glyph (regression guard)"
+        );
+    }
+
+    #[test]
     fn byte_range_for_invalid_span_is_none() {
         let s = "abc";
         assert_eq!(byte_range_for_span(s, ColumnSpan::default()), None);

@@ -104,11 +104,45 @@ pub mod modal {
     use crate::ui::design::{color, tokens};
     use gpui::{
         div, px, App, ClickEvent, Div, FontWeight, InteractiveElement as _, IntoElement,
-        ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled, Window,
+        ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled, Window,
     };
 
     /// The standard modal padding (`XL` = 16px) applied to header/body/footer.
     pub const PAD: f32 = tokens::space::XL;
+
+    /// The minimum horizontal breathing room kept on **each** side of a modal card
+    /// so it never butts against (or overflows) the window edge. The gpui-component
+    /// dialog layer centers a card by `x = window_center - card_width/2` with **no**
+    /// lower clamp, so a card wider than the window pushes its right edge (and its
+    /// footer buttons) off-screen. Reserving this margin keeps the whole card —
+    /// buttons included — inside the visible window even when it is small.
+    pub const EDGE_MARGIN: f32 = tokens::space::XXL;
+
+    /// Clamp a *desired* modal width to what the current window can actually show.
+    ///
+    /// Returns `min(desired, viewport_width - 2·EDGE_MARGIN)` (never below a sane
+    /// floor). This is the in-view counterpart of "modal dialogs clamp to the
+    /// window bounds, not the full screen": pass the design width you'd like and
+    /// you get a width that always fits the live window, so the card stays fully
+    /// visible (and its buttons reachable) even when the window is narrower than
+    /// the design size. Use it for the card's `.w(...)` instead of a hard `px`.
+    pub fn clamp_width(desired: f32, window: &Window) -> Pixels {
+        // A floor so the card is still usable on a pathologically tiny window.
+        const FLOOR: f32 = 280.0;
+        let avail = f32::from(window.viewport_size().width) - 2.0 * EDGE_MARGIN;
+        px(desired.min(avail).max(FLOOR.min(desired)))
+    }
+
+    /// Clamp a *desired* modal height to the current window (the vertical analogue
+    /// of [`clamp_width`]). The dialog layer offsets a card down by `margin_top`
+    /// and never clamps the bottom, so a tall fixed-height card can run off the
+    /// bottom on a short window; capping the height keeps the footer on-screen.
+    /// `reserved_top` is the space already spent above the card (its `margin_top`).
+    pub fn clamp_height(desired: f32, reserved_top: f32, window: &Window) -> Pixels {
+        const FLOOR: f32 = 200.0;
+        let avail = f32::from(window.viewport_size().height) - reserved_top - EDGE_MARGIN;
+        px(desired.min(avail).max(FLOOR.min(desired)))
+    }
 
     /// The elevated modal card shell: `elevated_bg`, 1px border, `XL` (8px)
     /// radius, and a soft drop shadow (`.shadow_lg()`). Callers set their own

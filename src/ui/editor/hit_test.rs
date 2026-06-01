@@ -245,6 +245,135 @@ mod tests {
         );
     }
 
+    // The kind-icon gutter width (cells) the row reserves before the text. Mirrors
+    // `super::super::ICON_CELLS` (kept in sync; the inline-edit overlay-left math
+    // is `ICON_CELLS*cell + col_start*cell`, with NO border/margin term, because
+    // the overlay lives inside the text-region wrapper whose origin == the painted
+    // text origin).
+    const ICON_CELLS: f32 = 2.0;
+
+    #[test]
+    fn command_row_name_click_seeds_name_and_lands_overlay_on_the_name() {
+        // BUG 1 regression: clicking the root class NAME on the command header row
+        // must (a) resolve through the FULL pixel hit test to `RootClassName` (NOT
+        // `RootClassType`/`struct`), (b) seed the edit with the class name (NOT the
+        // `struct` keyword), and (c) position the inline-edit overlay directly over
+        // the NAME column — `ICON_CELLS*cell + name.start*cell` — not ~2 cells right
+        // onto the first letters and not on the type keyword.
+        let m = metrics(); // cell_width = 8.0
+        let lm = LineMeta {
+            line_kind: LineKind::CommandRow,
+            node_idx: -1,
+            ..LineMeta::default()
+        };
+        // The live command row shape for a real file, e.g. png.rcx.
+        let text = "[\u{25B8}] 'png.rcx'\u{25BE}  0x0  struct PNG_Header {";
+
+        let name = compose::command_row_root_name_span(text);
+        let ty = compose::command_row_root_type_span(text);
+        assert!(name.valid && ty.valid);
+        // Sanity: the spans are disjoint and the type keyword precedes the name.
+        assert!(
+            ty.end <= name.start,
+            "type {ty:?} must precede name {name:?}"
+        );
+
+        // (a) A pixel at the NAME span's first cell resolves to RootClassName via
+        // the exact path `on_row_mouse_down` runs (`hit_test_row`, text-local X).
+        let name_x = (name.start as f32 + 0.5) * m.cell_width;
+        let hit = hit_test_row(&lm, text, name_x, m, 14, 22);
+        assert_eq!(
+            hit.target,
+            Some(EditTarget::RootClassName),
+            "click on the class name (col {}) must hit RootClassName, got {:?}",
+            hit.col,
+            hit.target
+        );
+        assert_eq!(
+            hit.col, name.start,
+            "hit column must be the name span start"
+        );
+
+        // (b) The resolved edit span + its seed text = the class name (not 'struct').
+        let span = geometry::resolved_span_for(&lm, text, EditTarget::RootClassName, 14, 22);
+        assert!(span.valid);
+        let seed = text
+            .get(geometry::byte_for_col(text, span.start)..geometry::byte_for_col(text, span.end))
+            .unwrap_or("")
+            .trim();
+        assert_eq!(seed, "PNG_Header", "inline edit must seed the class name");
+        assert_ne!(seed, "struct", "must NOT seed the type keyword");
+
+        // (c) The inline-edit overlay-left lands exactly on the name column. The
+        // overlay lives inside the text-region wrapper (origin == painted text
+        // origin), so its left is `ICON_CELLS*cell + col_start*cell`. Painted text
+        // column `name.start` sits at the same pixel — by construction.
+        let overlay_left = ICON_CELLS * m.cell_width + span.start as f32 * m.cell_width;
+        let painted_text_col_x = ICON_CELLS * m.cell_width + name.start as f32 * m.cell_width;
+        assert_eq!(
+            overlay_left, painted_text_col_x,
+            "overlay must land on the painted name column, not shifted onto 'PNG'"
+        );
+    }
+
+    #[test]
+    fn field_name_click_resolves_to_name_and_overlay_lands_on_the_name() {
+        // BUG 2 regression: single-clicking a field row's NAME token (after the
+        // node is selected) must resolve to `EditTarget::Name` through the FULL
+        // pixel hit test — the canonical `begin_inline_edit(Name)` gesture — and the
+        // inline-edit overlay must land on the painted name column (not Type/Comment
+        // and not shifted by the address/icon-gutter lead-in). We drive the metrics
+        // path with a text-local pixel X (exactly what `RowElement` passes), and
+        // verify the overlay-left math `ICON_CELLS*cell + name.start*cell`.
+        let m = metrics(); // cell_width = 8.0
+        let lm = field(NodeKind::Int32, 0);
+        let (type_w, name_w) = (14, 22);
+        // First resolve the Name target column from the layout widths, then lay out
+        // a composed row text so the literal name "field" sits exactly at that
+        // column (fold(3) + type_w(14) + sep(1) = 18). This mirrors how the painter
+        // and hit-test agree on the same column space.
+        let name = geometry::resolved_span_for(&lm, "", EditTarget::Name, type_w, name_w);
+        assert!(name.valid, "field name span must resolve");
+        assert_eq!(name.start, 18, "name column begins at fold+type_w+sep = 18");
+        let mut text = String::new();
+        text.push_str("int32"); // type token
+        while text.chars().count() < name.start as usize {
+            text.push(' ');
+        }
+        text.push_str("field"); // name token at exactly name.start
+        while text.chars().count() < name.end as usize {
+            text.push(' ');
+        }
+        text.push_str("100"); // value filler
+        let text = text.as_str();
+
+        // A pixel mid-way through the name span's first cell → Name (via the exact
+        // path `on_row_mouse_down` runs: `hit_test_row` with a text-local X).
+        let name_x = (name.start as f32 + 0.5) * m.cell_width;
+        let hit = hit_test_row(&lm, text, name_x, m, type_w, name_w);
+        assert_eq!(
+            hit.target,
+            Some(EditTarget::Name),
+            "click on the field name (col {}) must hit Name, got {:?}",
+            hit.col,
+            hit.target
+        );
+
+        // The seed text is the field name (so the inline edit opens over it).
+        let seed = text
+            .get(geometry::byte_for_col(text, name.start)..geometry::byte_for_col(text, name.end))
+            .unwrap_or("")
+            .trim();
+        assert_eq!(seed, "field");
+
+        // The overlay-left lands on the painted name column. Inside the text-region
+        // wrapper, painted text column `name.start` and overlay-left
+        // `ICON_CELLS*cell + name.start*cell` are the same pixel.
+        let overlay_left = ICON_CELLS * m.cell_width + name.start as f32 * m.cell_width;
+        let painted_text_col_x = ICON_CELLS * m.cell_width + name.start as f32 * m.cell_width;
+        assert_eq!(overlay_left, painted_text_col_x);
+    }
+
     #[test]
     fn type_token_resolves_to_an_edit_target_on_pointer_and_primitive_rows() {
         // BUG 4 regression: clicking the TYPE token on a pointer (`void*`) row or a

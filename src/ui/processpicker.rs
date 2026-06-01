@@ -462,8 +462,13 @@ mod view {
     impl EventEmitter<ProcessPickEvent> for ProcessPicker {}
 
     impl Render for ProcessPicker {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let count = self.table.read(cx).delegate().rows.len();
+            // Clamp the design 720×520 card to the live window so it stays fully
+            // visible — including the Attach/Cancel footer — on a small window
+            // (QA #1; the dialog layer centers with no edge clamp).
+            let card_w = modal::clamp_width(720., window);
+            let card_h = modal::clamp_height(520., 80., window);
 
             let body = modal::body(cx)
                 .child(modal::help_text(
@@ -507,8 +512,8 @@ mod view {
                 .id("rcx-process-picker")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxProcessPicker")
-                .w(px(720.))
-                .h(px(520.))
+                .w(card_w)
+                .h(card_h)
                 .child(
                     modal::header("Attach to Process", cx).child(modal::close_button(
                         "process-close",

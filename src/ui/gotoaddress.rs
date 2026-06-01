@@ -400,10 +400,14 @@ mod view {
     impl EventEmitter<GotoEvent> for GotoAddressDialog {}
 
     impl Render for GotoAddressDialog {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::button::{Button, ButtonVariants as _};
 
             let can_go = self.state.can_go();
+            // Clamp the 460-wide card to the window so it stays fully on-screen on a
+            // narrow window (QA #1; the dialog layer centers with no edge clamp).
+            let card_w = modal::clamp_width(460., window);
+            let card_max_h = modal::clamp_height(560., 120., window);
             let mono = SharedString::from(tokens::font::MONO_FAMILY);
             let (status_text, status_color) = match self.state.status() {
                 GotoStatus::Idle => (" ".to_string(), color::text_muted(cx)),
@@ -480,8 +484,8 @@ mod view {
                 .id("rcx-goto-address")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxGotoAddress")
-                .w(px(460.))
-                .max_h(px(560.))
+                .w(card_w)
+                .max_h(card_max_h)
                 .child(
                     modal::header("Go to Address", cx).child(modal::close_button(
                         "goto-close",

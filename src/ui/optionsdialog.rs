@@ -632,9 +632,14 @@ mod view {
     impl EventEmitter<OptionsEvent> for OptionsDialog {}
 
     impl Render for OptionsDialog {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let nav = self.render_nav(cx);
             let page = self.render_page(cx);
+            // Clamp the design 720×480 card to the live window so it never spills
+            // off the right edge (and its footer buttons stay reachable) when the
+            // window is narrower/shorter than the design size (QA #1).
+            let card_w = modal::clamp_width(720., window);
+            let card_h = modal::clamp_height(480., 48., window);
 
             let body = modal::body(cx).child(
                 gpui_component::h_flex()
@@ -671,8 +676,8 @@ mod view {
                 .id("rcx-options-dialog")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxOptions")
-                .w(px(720.))
-                .h(px(480.))
+                .w(card_w)
+                .h(card_h)
                 .child(modal::header("Options", cx).child(modal::close_button(
                     "opt-close",
                     cx.listener(|this, _e, _window, cx| this.cancel(cx)),

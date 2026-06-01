@@ -385,12 +385,16 @@ mod open {
             .first()
             .map(|b| b.label.clone())
             .unwrap_or_else(|| "OK".to_string());
-        window.open_alert_dialog(cx, move |alert, _window, cx| {
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            // Clamp the alert width to the live window so it never overflows the
+            // right edge (and its buttons stay reachable) on a small window
+            // (QA #1; the dialog layer centers with no edge clamp).
+            let w = crate::ui::dialogs::modal::clamp_width(MSG_MAX_WIDTH, window);
             alert
                 .icon(severity_icon(severity, cx))
                 .title(title.clone())
                 .description(description_body(text.clone(), &detail, cx))
-                .width(px(MSG_MAX_WIDTH))
+                .width(w)
                 .button_props(DialogButtonProps::default().ok_text(ok_label.clone()))
         });
     }
@@ -412,7 +416,9 @@ mod open {
         let cancel = spec.buttons.first().cloned();
         let _focus_accept = spec.default == DefaultButton::Accept;
         let on_accept = std::rc::Rc::new(on_accept);
-        window.open_alert_dialog(cx, move |alert, _window, cx| {
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            // Clamp to the live window so the confirm stays fully visible (QA #1).
+            let w = crate::ui::dialogs::modal::clamp_width(MSG_MAX_WIDTH, window);
             let ok_text = accept
                 .as_ref()
                 .map(|b| b.label.clone())
@@ -430,7 +436,7 @@ mod open {
                 .icon(severity_icon(severity, cx))
                 .title(title.clone())
                 .description(description_body(text.clone(), &detail, cx))
-                .width(px(MSG_MAX_WIDTH))
+                .width(w)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(ok_text)

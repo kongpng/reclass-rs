@@ -137,13 +137,6 @@ const EDITOR_LINE_HEIGHT: f32 = 1.5;
 /// adds this offset alongside the address-margin offset.
 const ICON_CELLS: f32 = 2.0;
 
-/// Width (px) of the per-row left accent border (`border_l_2`). The border lives
-/// inside the row's border-box, so an `absolute`-positioned child's `left(0)` is
-/// the padding-box left — one border-width *short* of where the RowElement paints
-/// text column 0. The inline-edit overlay adds this so its seeded text lands on
-/// the resolved column instead of sliding one column left onto the type token.
-const BORDER_L_PX: f32 = 2.0;
-
 /// The key bindings for the editor surface (bound in the `RcxEditor` context).
 /// Returned so the app can register them once at startup alongside the inline
 /// field bindings ([`inline_edit::field_key_bindings`]).
@@ -821,8 +814,26 @@ impl RcxEditor {
         }
 
         // Seed the field with the current span text (trimmed).
-        let start_byte = geometry::byte_for_col(&text, span.start);
-        let end_byte = geometry::byte_for_col(&text, span.end);
+        //
+        // The command-row spans (`command_row_*_span` → RootClassName / RootClassType
+        // / BaseAddress / Source) are produced by **UTF-16-unit** text scans, so
+        // their `start`/`end` are unit offsets; every other line's resolved span is a
+        // display column (= char index, the painter's cell space). Convert each with
+        // the matching mapping so the seed is the exact token under the click even
+        // when an earlier token carries a non-BMP glyph (e.g. an astral char in the
+        // data-source label would otherwise shift a char-based slice and seed the
+        // wrong substring — the `byte_for_col`-vs-unit-span hazard).
+        let (start_byte, end_byte) = if lm.line_kind == LineKind::CommandRow {
+            (
+                geometry::utf16_to_byte(&text, span.start),
+                geometry::utf16_to_byte(&text, span.end),
+            )
+        } else {
+            (
+                geometry::byte_for_col(&text, span.start),
+                geometry::byte_for_col(&text, span.end),
+            )
+        };
         let initial = text
             .get(start_byte..end_byte)
             .unwrap_or("")
@@ -2009,6 +2020,25 @@ impl RcxEditor {
         // this SVG shows, while fold-col hit-testing (column-based) is untouched.
         // Leaf node rows paint their per-kind icon. The icon size is clamped to the
         // gutter cell box so the column math is unchanged.
+        // The icon gutter + the row-text element + every absolute overlay (the
+        // inline-edit field and the command-row hover strips) now live inside ONE
+        // `relative` wrapper (`text_region`) that begins right after the address
+        // margin. This makes overlay positioning provably aligned with the painted
+        // text WITHOUT guessing the row's border/margin geometry: inside the
+        // wrapper the gutter is the first flex child (width `ICON_CELLS*cell`), the
+        // text follows it, and an absolute overlay's `left(0)` is the wrapper's own
+        // origin — so an overlay at `left = ICON_CELLS*cell + col*cell` lands on the
+        // exact same pixel as painted text column `col`. (The earlier "row-space"
+        // math added a hand-rolled border + margin width and flip-flopped by ±2
+        // cells across passes — items 1/2: the inline-edit box landed on the type
+        // keyword / one column off instead of over the clicked token.)
+        let cell = self.metrics.cell_width;
+        let mut text_region = div()
+            .relative()
+            .flex_grow()
+            .h(px(self.metrics.line_height))
+            .flex()
+            .flex_row();
         {
             let icon_px = (self.metrics.line_height * 0.62).clamp(10.0, 18.0);
             let mut gutter = div()
@@ -2040,13 +2070,13 @@ impl RcxEditor {
                         .text_color(palette.role_color(kg.role)),
                 );
             }
-            row = row.child(gutter);
+            text_region = text_region.child(gutter);
         }
 
         // The text element (static) — always painted as the base layer; it owns
         // the hitbox + row-local click routing back into the view.
         let row_paint = self.build_row_paint(idx, palette);
-        row = row.child(RowElement {
+        text_region = text_region.child(RowElement {
             row: row_paint,
             editor: cx.entity().downgrade(),
             line: idx,
@@ -2068,23 +2098,13 @@ impl RcxEditor {
             let text = self.line_text_owned(idx);
             let addr = crate::compose::command_row_addr_span(&text);
             if addr.valid && addr.end > addr.start {
-                let hex_digits = self
-                    .controller
-                    .last_result()
-                    .layout
-                    .offset_hex_digits
-                    .max(0) as f32;
-                let margin = if hex_digits > 0.0 {
-                    hex_digits + 2.0
-                } else {
-                    0.0
-                };
-                let cell = self.metrics.cell_width;
-                // Clear the address margin AND the kind-icon gutter (item 3): the
-                // hover strip sits in row space, after both lead-ins, so it must
-                // include `ICON_CELLS` like the inline-edit overlay does.
+                // The hover strip lives INSIDE `text_region` (after the address
+                // margin), so its `left` only clears the kind-icon gutter + the
+                // per-column offset — NO margin/border term. The wrapper's absolute
+                // origin == the text origin, so this lands exactly on the painted
+                // address span (the same alignment the inline-edit field uses).
                 let icon_gutter = ICON_CELLS * cell;
-                let left = px(icon_gutter + (margin + addr.start.max(0) as f32) * cell);
+                let left = px(icon_gutter + addr.start.max(0) as f32 * cell);
                 let width = px(((addr.end - addr.start).max(1) as f32) * cell);
                 let base_address = self.controller.last_result().layout.base_address;
                 let module: SharedString = self.controller.document().provider.name().into();
@@ -2093,18 +2113,13 @@ impl RcxEditor {
                 // so without this the base-address inline edit (the `BaseAddress`
                 // hit-test target) would stop working under the tooltip strip.
                 //
-                // BUG 1: `on_row_mouse_down` → `hit_test_row` resolves the column
-                // from a **row-text-local** X (column 0 = the first char of the
-                // composed command-row string, AFTER the address margin + icon
-                // gutter). `left` above is in the *row's* coordinate space (it
-                // includes the `margin + ICON_CELLS` lead-in), so forwarding it
-                // verbatim shifted the hit-test column right by the gutter width and
-                // the `BaseAddress` span never matched — clicking the address did
-                // nothing. Forward a **text-local** X (the address span's first
-                // column + half a cell) so the hit test lands inside the address
-                // span and the base-address edit actually begins.
+                // `on_row_mouse_down` → `hit_test_row` resolves the column from a
+                // **row-text-local** X (column 0 = the first char of the composed
+                // command-row string). Forward a **text-local** X (the address
+                // span's first column + half a cell) so the hit test lands inside
+                // the address span and the base-address edit actually begins.
                 let addr_click_x = (addr.start.max(0) as f32 + 0.5) * cell;
-                row = row.child(
+                text_region = text_region.child(
                     div()
                         .id(("rcx-addr-hover", idx))
                         .absolute()
@@ -2136,22 +2151,11 @@ impl RcxEditor {
 
             // Source-chip + chevron hover affordances (item 5): a pointing-hand
             // cursor + a one-line tooltip ('Data Source' / 'Switch View') over each
-            // interactive command-row chip. These are transparent hover hitboxes
-            // (NO mouse-down handler — the row-text element under them keeps routing
-            // the click to the source/type-selector popup), positioned in row space
-            // (after the address margin + icon gutter), mirroring the address strip.
-            let cell = self.metrics.cell_width;
-            let hex_digits = self
-                .controller
-                .last_result()
-                .layout
-                .offset_hex_digits
-                .max(0) as f32;
-            let margin = if hex_digits > 0.0 {
-                hex_digits + 2.0
-            } else {
-                0.0
-            };
+            // interactive command-row chip. Transparent hover hitboxes living INSIDE
+            // `text_region` (after the address margin), so their `left` only clears
+            // the kind-icon gutter + the per-column offset — the same alignment the
+            // inline-edit field uses. Each forwards its click back to the normal row
+            // routing so the source/type-selector popup still opens (items 1/2/5).
             let icon_gutter = ICON_CELLS * cell;
             for (hover_id, span, tip) in [
                 (
@@ -2166,7 +2170,7 @@ impl RcxEditor {
                 ),
             ] {
                 if span.valid && span.end > span.start {
-                    let left = px(icon_gutter + (margin + span.start.max(0) as f32) * cell);
+                    let left = px(icon_gutter + span.start.max(0) as f32 * cell);
                     let width = px(((span.end - span.start).max(1) as f32) * cell);
                     let tip: SharedString = tip.into();
                     // The hover hitbox occludes the row-text element, so forward its
@@ -2174,7 +2178,7 @@ impl RcxEditor {
                     // span) — exactly like the address strip — so the source/chevron
                     // click still reaches `on_row_mouse_down` → the popup (items 1/2).
                     let click_x = (span.start.max(0) as f32 + 0.5) * cell;
-                    row = row.child(
+                    text_region = text_region.child(
                         div()
                             .id((hover_id, idx))
                             .absolute()
@@ -2198,41 +2202,20 @@ impl RcxEditor {
             }
         }
 
-        // Inline-edit overlay positioned at the edited column — offset by the
-        // address-margin width so it lands over the field, not the margin.
+        // Inline-edit overlay positioned EXACTLY over the edited column.
+        //
+        // The field lives inside `text_region`, whose absolute origin coincides
+        // with the painted text origin (the wrapper sits after the address margin;
+        // its first flex child is the kind-icon gutter, then the row text). So the
+        // overlay only needs to clear the kind-icon gutter (`ICON_CELLS*cell`) and
+        // add the per-column offset — there is NO border/margin term to guess. This
+        // makes the box land directly over the clicked token (e.g. the root class
+        // NAME on the command row), not after the `{` and not on the `struct`
+        // keyword (items 1/2): painted text column `c` and overlay-left
+        // `ICON_CELLS*cell + c*cell` are the same pixel by construction.
         if let Some((field, col_start, col_end)) = editing_here {
-            let hex_digits = self
-                .controller
-                .last_result()
-                .layout
-                .offset_hex_digits
-                .max(0) as f32;
-            let margin = if hex_digits > 0.0 {
-                hex_digits + 2.0
-            } else {
-                0.0
-            };
-            let cell = self.metrics.cell_width;
-            // The overlay is positioned in the row's own coordinate space, so it
-            // must clear BOTH the address margin AND the kind-icon gutter (both
-            // precede the row-text element) before the per-column offset. The
-            // RowElement's text column 0 sits past the 2px left accent border too
-            // (the border is inside the row's border-box, so an `absolute` child's
-            // `left(0)` is the *padding-box* left — one border-width short of the
-            // text). Add `BORDER_L_PX` so the seeded edit text lands exactly on the
-            // NAME column and does not slide one column left onto the type token
-            // (item 3: the earlier overlay covered only the address margin, not the
-            // per-target column nor the accent border).
-            //
-            // BUG (item 3): `render_row` reserves the address-margin div
-            // (`(addr_cols+2)*cell`) AND a separate 2-cell kind-icon gutter
-            // (`ICON_CELLS*cell`) before the RowElement text, but the overlay only
-            // added the address-margin width — so the field landed one icon-gutter
-            // (2 cells) to the LEFT of the column it edits (the root class-name box
-            // sat on the address/icon margin instead of ON the name). Add the
-            // `ICON_CELLS` gutter width so the field aligns to its exact column.
             let icon_gutter = ICON_CELLS * cell;
-            let left = px(BORDER_L_PX + icon_gutter + (margin + col_start.max(0) as f32) * cell);
+            let left = px(icon_gutter + col_start.max(0) as f32 * cell);
             // The opaque band spans the edited column `[col_start, col_end)` (a
             // generous minimum so short seeds still get a visible field box).
             let editing_width = ((col_end - col_start).max(0) as f32).max(6.0);
@@ -2242,7 +2225,7 @@ impl RcxEditor {
             // bleed through behind the seeded text and read as garbled overlap
             // "hexChex64"/"int64_teateTime"). A 1px accent ring + slight rounding make
             // it read as a Zed inline input.
-            row = row.child(
+            text_region = text_region.child(
                 div()
                     .absolute()
                     .top_0()
@@ -2265,6 +2248,11 @@ impl RcxEditor {
                     .child(field.clone()),
             );
         }
+
+        // Mount the text region (icon gutter + row text + all absolute overlays)
+        // after the address margin. Its origin == the painted-text origin, which is
+        // what makes the inline-edit / hover overlays pixel-aligned with the text.
+        row = row.child(text_region);
 
         row.into_any_element()
     }

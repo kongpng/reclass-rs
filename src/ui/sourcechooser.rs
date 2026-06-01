@@ -726,7 +726,14 @@ mod view {
                             gpui_component::h_flex()
                                 .id(("source-row", row))
                                 .w_full()
-                                .h(px(26.))
+                                // Stable min-height (not a tight fixed height): the
+                                // single-line label + trailing dim dll never get
+                                // clipped, and long provider names ("ReClass.NET
+                                // Compat Layer", "Remote Process Memory") can't wrap
+                                // into the next row (defect 1). Matches the C++
+                                // data_options single-line provider layout.
+                                .min_h(px(28.))
+                                .py(px(tokens::space::XS))
                                 .px(px(tokens::space::SM))
                                 .gap(px(tokens::space::MD))
                                 .items_center()
@@ -765,20 +772,28 @@ mod view {
                                                 .size_3()
                                         }),
                                 )
-                                // Name (+ inline plugin hint).
+                                // Name — single-line, truncates with an ellipsis so a
+                                // long provider label can never wrap onto a second
+                                // line and collide with the neighbouring row's dll
+                                // text (defect 1).
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .overflow_hidden()
+                                        .truncate()
                                         .text_color(row_fg)
                                         .when(e.is_active, |d| d.font_weight(FontWeight::SEMIBOLD))
                                         .child(e.display_name.clone()),
                                 )
+                                // Trailing dim slot: the plugin dll filename (or the
+                                // saved-source kind/stale note). Single-line and
+                                // non-shrinking so it stays on the same row as the
+                                // label (the C++ data_options trailing dll text).
                                 .when(!hint.is_empty(), |d| {
                                     d.child(
                                         div()
                                             .flex_none()
+                                            .whitespace_nowrap()
                                             .text_size(px(tokens::font::UI_SM))
                                             .text_color(muted)
                                             .child(hint),
