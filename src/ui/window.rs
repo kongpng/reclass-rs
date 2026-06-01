@@ -1278,11 +1278,7 @@ impl MainWindow {
             "tools.type_aliases" => self.open_type_aliases_dialog(window, cx),
             "tools.mcp" => self.toggle_mcp(window, cx),
             "tools.options" => self.open_options_dialog(window, cx),
-            "tools.profiler" => self.notify(
-                "Performance Profiler is not available in this port yet.",
-                window,
-                cx,
-            ),
+            "tools.profiler" => self.open_profiler_dialog(window, cx),
 
             // ── Plugins ──
             "plugins.manage" => self.open_plugins_dialog(window, cx),
@@ -1858,6 +1854,36 @@ impl MainWindow {
         window.open_dialog(cx, move |d, _window, _cx| {
             d.w(px(620.))
                 .margin_top(px(80.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Tools ▸ Performance Profiler (Ctrl+Shift+F) — open the live
+    /// [`ProfilerDialog`] (the C++ `ProfilerDialog`; profilerdialog.cpp:106).
+    /// The dialog auto-enables profiling on open, takes a live snapshot, and
+    /// auto-refreshes at ~2 Hz while shown; it restores the prior profiling
+    /// flag on close. Close-only, so it reuses the generic [`goto_sub`](Self::goto_sub)
+    /// subscription slot like the other single-button dialogs.
+    fn open_profiler_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use super::dialogs::{ProfilerDialog, ProfilerEvent};
+        let dialog = cx.new(|cx| ProfilerDialog::new(window, cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            |_this, _d, _ev: &ProfilerEvent, window, cx| {
+                window.close_dialog(cx);
+            },
+        ));
+        // The ProfilerDialog renders its own self-clamping card (820×640); the
+        // outer overlay just hosts it (no extra card / close button).
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(820.))
+                .margin_top(px(48.))
                 .close_button(false)
                 .child(dialog_for_modal.clone())
         });
