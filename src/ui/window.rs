@@ -1852,16 +1852,59 @@ impl MainWindow {
         // Skip entries whose file no longer exists (the C++
         // `updateRecentFilesMenu` exists-filter); the command carries the
         // ORIGINAL stored index so a reopen targets the right path.
-        let recent: Vec<RecentMenuEntry> = self
-            .existing_recent_files()
+        let existing = self.existing_recent_files();
+        // Two recent entries can be different files that share a base name
+        // (e.g. /tmp/parity/png.rcx vs /tmp/example/png.rcx). The C++ leans on a
+        // per-action tooltip to disambiguate (main.cpp:8793), but this port's
+        // menu rows have no hover tooltip, so a bare "png.rcx" twice is visually
+        // identical. When a file name repeats among the visible entries, append a
+        // parent-directory hint so each row is distinguishable, e.g.
+        // "png.rcx — parity" / "png.rcx — example".
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut hint_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (_, p) in &existing {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                *name_counts.entry(name).or_insert(0) += 1;
+            }
+            if let Some(dir) = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|s| s.to_str())
+            {
+                *hint_counts.entry(dir).or_insert(0) += 1;
+            }
+        }
+        let recent: Vec<RecentMenuEntry> = existing
             .into_iter()
-            .map(|(i, p)| RecentMenuEntry {
-                label: p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("(file)")
-                    .to_string(),
-                command: format!("file.recent.{i}"),
+            .map(|(i, p)| {
+                let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(file)");
+                let label = if name_counts.get(file_name).copied().unwrap_or(0) > 1 {
+                    // Prefer the short parent-dir name as the hint, but if that
+                    // name itself is shared by another visible entry it would not
+                    // disambiguate — fall back to the full parent path.
+                    let short = p
+                        .parent()
+                        .and_then(|d| d.file_name())
+                        .and_then(|s| s.to_str());
+                    let hint = match short {
+                        Some(dir) if hint_counts.get(dir).copied().unwrap_or(0) <= 1 => {
+                            Some(dir.to_string())
+                        }
+                        _ => p.parent().map(|d| d.to_string_lossy().into_owned()),
+                    };
+                    match hint {
+                        Some(h) => format!("{file_name} \u{2014} {h}"),
+                        None => file_name.to_string(),
+                    }
+                } else {
+                    file_name.to_string()
+                };
+                RecentMenuEntry {
+                    label,
+                    command: format!("file.recent.{i}"),
+                }
             })
             .collect();
         // Saved sources from the active document's controller (the active one is
