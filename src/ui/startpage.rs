@@ -287,6 +287,17 @@ impl StartPage {
         cx.emit(StartPageEvent::Dismissed);
     }
 
+    /// The "Tutorial →" link was clicked (the C++ `continueClicked` →
+    /// dismiss + open the tutorial/help flow; `main.cpp:9415`). We open the
+    /// in-app command palette — the window's help/docs entry point (the
+    /// `help.docs` notify text directs users there) — by dispatching the
+    /// window's [`OpenCommandPalette`](super::window::OpenCommandPalette) action.
+    /// The start-page overlay sits inside the window's `RcxWindow` dispatch
+    /// subtree, so the action bubbles up to the window's `on_action` handler.
+    fn on_tutorial(&mut self, _e: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(super::window::OpenCommandPalette), cx);
+    }
+
     /// Render one action row (`drawCards`) as a Zed welcome-list row: a tinted
     /// leading icon tile, a bold title over a muted subtitle, and a right-aligned
     /// keybinding hint where one applies. The whole row is the click target, with
@@ -520,7 +531,14 @@ impl Render for StartPage {
                             )
                             .child(
                                 // The "Tutorial →" link (the C++ centered tutorial
-                                // link); link target wired with the help workflow.
+                                // link, `startpage.h:321` → `continueClicked` →
+                                // dismiss + open the help/tutorial flow). Wired to
+                                // the window's command palette (`OpenCommandPalette`,
+                                // the in-app help/docs entry point the C++
+                                // help.docs text points users to): dispatching the
+                                // window action from the overlay bubbles up to the
+                                // `RcxWindow` handler, which dismisses nothing here
+                                // and opens the palette over the welcome page.
                                 div()
                                     .id("start-tutorial")
                                     .cursor_pointer()
@@ -530,6 +548,7 @@ impl Render for StartPage {
                                     .text_size(px(tokens::font::UI_SM))
                                     .text_color(color::link(cx))
                                     .hover(|s| s.underline())
+                                    .on_click(cx.listener(Self::on_tutorial))
                                     .child("Tutorial \u{2192}"),
                             ),
                     )

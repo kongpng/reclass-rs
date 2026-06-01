@@ -27,7 +27,7 @@ fn build_small_tree(tree: &mut NodeTree) {
     };
     let ri = tree.add_node(root);
     let root_id = tree.nodes[ri].id;
-    let mut field = |tree: &mut NodeTree, off: i32, k: NodeKind, name: &str| {
+    let field = |tree: &mut NodeTree, off: i32, k: NodeKind, name: &str| {
         tree.add_node(Node {
             kind: k,
             name: name.into(),

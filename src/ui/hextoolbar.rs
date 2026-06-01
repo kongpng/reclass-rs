@@ -265,6 +265,10 @@ mod view {
     pub enum HexToolbarEvent {
         /// Pick a hex size (`sizeSelected(nodeId, kind)`).
         SizeSelected(u64, NodeKind),
+        /// Accept a smart suggestion: convert the hex node to a detected kind
+        /// (`HA_Suggest` — pointer/float/string detected in the bytes). Carries the
+        /// node id + the suggested [`NodeKind`] (`sizeSelected` reuse in the C++).
+        SuggestKind(u64, NodeKind),
         /// Insert a hex node above (`insertAbove`).
         InsertAbove(u64),
         /// Insert a hex node below (`insertBelow`).
@@ -332,6 +336,15 @@ mod view {
                 .trim_start_matches("0X");
             if let Ok(off) = u64::from_str_radix(cleaned, 16) {
                 cx.emit(HexToolbarEvent::FillToOffset(self.ctx.node_id, off));
+            }
+        }
+
+        /// Accept a smart suggestion (`HA_Suggest`): emit the detected kind for the
+        /// node, then dismiss unless pinned.
+        fn pick_suggestion(&mut self, kind: NodeKind, cx: &mut Context<Self>) {
+            cx.emit(HexToolbarEvent::SuggestKind(self.ctx.node_id, kind));
+            if !self.pinned {
+                cx.emit(HexToolbarEvent::Dismissed);
             }
         }
     }
@@ -402,6 +415,65 @@ mod view {
             let preview = self.ctx.preview_for_kind(self.ctx.current_kind);
             let info = self.ctx.info_for_kind(self.ctx.current_kind);
 
+            // Smart-suggestion rows (`hextoolbarpopup.cpp:312` — the pinned panel's
+            // ptr/float/string detections). Each is a small bordered chip painted in
+            // the accent (`indHoverSpan`) hue; clicking converts the hex node to the
+            // detected kind. Only shown when pinned (the C++ `if (!m_pinned) return`
+            // gate precedes the suggestion block).
+            let suggestion_chips: Vec<AnyElement> = {
+                let mut chips: Vec<AnyElement> = Vec::new();
+                let accent_hue = accent;
+                let suggestion_chip =
+                    |id: &'static str,
+                     label: String,
+                     kind: NodeKind,
+                     chips: &mut Vec<AnyElement>| {
+                        chips.push(
+                            gpui_component::h_flex()
+                                .id(id)
+                                .h(px(22.))
+                                .px(px(tokens::space::MD))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(tokens::radius::MD))
+                                .border_1()
+                                .border_color(border)
+                                .text_size(px(tokens::font::UI_SM))
+                                .text_color(accent_hue)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(hover_bg))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.pick_suggestion(kind, cx);
+                                }))
+                                .child(label)
+                                .into_any_element(),
+                        );
+                    };
+                if self.ctx.has_ptr {
+                    // "ptr*" or "ptr* <symbol(≤12)>" (C++ truncates the symbol).
+                    let label = if self.ctx.ptr_symbol.is_empty() {
+                        "ptr*".to_string()
+                    } else {
+                        let sym: String = self.ctx.ptr_symbol.chars().take(12).collect();
+                        format!("ptr* {sym}")
+                    };
+                    suggestion_chip("hex-sug-ptr", label, NodeKind::Pointer64, &mut chips);
+                }
+                if self.ctx.has_float {
+                    // "float Nf" with 4 significant digits (C++ `'g', 4`).
+                    let label = format!("float {:.4}f", self.ctx.float_val);
+                    suggestion_chip("hex-sug-float", label, NodeKind::Float, &mut chips);
+                }
+                if self.ctx.has_string {
+                    // "utf8 \"...\"" with the first ≤6 chars (C++ `left(6)`).
+                    let sval: String = self.ctx.string_preview.chars().take(6).collect();
+                    let label = format!("utf8 \"{sval}\"");
+                    suggestion_chip("hex-sug-string", label, NodeKind::UTF8, &mut chips);
+                }
+                chips
+            };
+            let has_suggestions = !suggestion_chips.is_empty();
+
             super::super::design::elevated_surface(cx)
                 .id("rcx-hex-toolbar")
                 .track_focus(&self.focus_handle)
@@ -460,6 +532,18 @@ mod view {
                 )
                 .when(self.pinned, |this| {
                     this.child(div().h(px(tokens::border::THIN)).w_full().bg(border))
+                        // Smart-suggestion row (ptr / float / string), when any was
+                        // detected in the bytes (the C++ pinned suggestion block).
+                        .when(has_suggestions, |this| {
+                            this.child(
+                                gpui_component::h_flex()
+                                    .w_full()
+                                    .gap(px(tokens::space::XS))
+                                    .flex_wrap()
+                                    .items_center()
+                                    .children(suggestion_chips),
+                            )
+                        })
                         .child(
                             gpui_component::h_flex()
                                 .gap(px(tokens::space::XS))

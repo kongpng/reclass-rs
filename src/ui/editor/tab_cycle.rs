@@ -81,6 +81,31 @@ pub fn next_tab_target(lm: &LineMeta, last: Option<EditTarget>) -> Option<EditTa
     None
 }
 
+/// Reverse Tab (Shift+Tab, item 17): the next applicable target walking [`TAB_ORDER`]
+/// **backward** from before `last`, wrapping once. `None` to start from the bottom.
+/// Returns `None` if the line has no editable target. The forward cycle ignored its
+/// `backward` flag; this is the true reverse traversal it should use.
+pub fn prev_tab_target(lm: &LineMeta, last: Option<EditTarget>) -> Option<EditTarget> {
+    let n = TAB_ORDER.len();
+    // Start one BEFORE `last` (wrapping); with no `last`, start at the bottom.
+    let start = match last {
+        Some(t) => TAB_ORDER
+            .iter()
+            .position(|&x| x == t)
+            .map(|i| (i + n - 1) % n)
+            .unwrap_or(n - 1),
+        None => n - 1,
+    };
+    for offset in 0..n {
+        let idx = (start + n - offset) % n;
+        let target = TAB_ORDER[idx];
+        if target_applies(lm, target) {
+            return Some(target);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +219,45 @@ mod tests {
         assert_eq!(
             next_tab_target(&lm, Some(EditTarget::BaseAddress)),
             Some(EditTarget::Name)
+        );
+    }
+
+    #[test]
+    fn reverse_tab_cycles_backward() {
+        // Item 17: Shift+Tab walks the cycle backward (the mirror of the forward
+        // test). On a plain field the applicable targets are Name/Value/Comment/Type.
+        let lm = field(NodeKind::Int32);
+        // From Value, the previous applicable is Name.
+        assert_eq!(
+            prev_tab_target(&lm, Some(EditTarget::Value)),
+            Some(EditTarget::Name)
+        );
+        // From Name, wrap backward to Type (the last applicable).
+        assert_eq!(
+            prev_tab_target(&lm, Some(EditTarget::Name)),
+            Some(EditTarget::Type)
+        );
+        // From Type, the previous applicable is Comment (array/ptr skipped).
+        assert_eq!(
+            prev_tab_target(&lm, Some(EditTarget::Type)),
+            Some(EditTarget::Comment)
+        );
+        // No `last` → start from the bottom → Type.
+        assert_eq!(prev_tab_target(&lm, None), Some(EditTarget::Type));
+    }
+
+    #[test]
+    fn reverse_tab_skips_inapplicable_on_hex() {
+        // Hex rows block Name/Value; backward from Type → Comment.
+        let lm = field(NodeKind::Hex64);
+        assert_eq!(
+            prev_tab_target(&lm, Some(EditTarget::Type)),
+            Some(EditTarget::Comment)
+        );
+        // Backward from Comment wraps to Type (Name/Value skipped).
+        assert_eq!(
+            prev_tab_target(&lm, Some(EditTarget::Comment)),
+            Some(EditTarget::Type)
         );
     }
 }

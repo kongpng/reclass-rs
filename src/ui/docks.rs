@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use super::bookmarkspanel::BookmarksPanel;
 use super::modulespanel::ModulesPanel;
+use super::scannerpanel::ScannerPanel;
 use super::tabs::DocumentArea;
 use super::workspace::WorkspacePanel;
 
@@ -67,6 +68,13 @@ pub struct LayoutHandles {
     /// [`modules`](Self::modules); the window pushes the document's bookmark list
     /// into it on change and observes its `BookmarkAction` intents.
     pub bookmarks: Entity<BookmarksPanel>,
+    /// The bottom-dock memory [`ScannerPanel`] (the C++ View ▸ Memory Scanner,
+    /// `Ctrl+Shift+M`), **closed by default**. The window MUST keep this handle:
+    /// the scanner is built here but was previously dropped (only its `Arc` went
+    /// into the dock), so `ScannerPanel::set_provider` could never be called and
+    /// the scanner could never scan. Storing it lets the window wire the active
+    /// document's provider in (and observe `ScannerNav` / `ScannerEdit`).
+    pub scanner: Entity<ScannerPanel>,
 }
 
 /// Assemble the canonical default dock layout into `dock_area`
@@ -110,8 +118,8 @@ pub fn build_default_layout(
     // visible; View ▸ Memory Scanner / `Ctrl+Shift+M` toggles it
     // (`MainWindow::toggle_scanner_dock`). The panel is still built + registered
     // here so the toggle has it ready — only its `open` flag starts `false`.
-    let scanner = Arc::new(super::scannerpanel::ScannerPanel::view(window, cx));
-    let bottom = DockItem::tabs(vec![scanner], &weak, window, cx);
+    let scanner = ScannerPanel::view(window, cx);
+    let bottom = DockItem::tabs(vec![Arc::new(scanner.clone())], &weak, window, cx);
 
     // Right: the Modules / Symbols / Types panel + the Bookmarks panel,
     // **tabified together**, **closed by default**. The C++ surfaces both from
@@ -141,5 +149,6 @@ pub fn build_default_layout(
         workspace,
         modules,
         bookmarks,
+        scanner,
     }
 }

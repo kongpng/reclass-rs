@@ -160,6 +160,23 @@ pub fn workspace_node_menu(count: usize, keyword: &str, all_pinned: bool) -> Vec
     items
 }
 
+/// The process-picker row context menu (`processpicker` right-click): copy the
+/// row's PID / Name / Path to the clipboard. The "Copy PID" item is disabled for
+/// synthetic (non-process) rows that have no PID (`has_pid == false`). This is the
+/// menu *data*; the process-picker view turns it into a `PopupMenu` and copies the
+/// corresponding field on activation.
+pub fn process_row_menu(has_pid: bool) -> Vec<MenuItem> {
+    vec![
+        MenuItem::Action {
+            label: "Copy PID".to_string(),
+            command: "process.copy_pid".to_string(),
+            enabled: has_pid,
+        },
+        MenuItem::action("Copy Name", "process.copy_name"),
+        MenuItem::action("Copy Path", "process.copy_path"),
+    ]
+}
+
 // ── gpui menu builder (feature-gated) ────────────────────────────────────────
 
 /// Build a gpui-component `PopupMenu` from a [`MenuItem`] list, routing each item
@@ -610,5 +627,29 @@ mod tests {
         // But still has navigation + find-refs + pin + delete.
         assert!(cmds.contains(&"node.open_current"));
         assert!(cmds.contains(&"node.delete"));
+    }
+
+    #[test]
+    fn process_row_menu_has_copy_actions() {
+        use super::process_row_menu;
+        let items = process_row_menu(true);
+        let cmds = commands(&items);
+        assert!(cmds.contains(&"process.copy_pid"));
+        assert!(cmds.contains(&"process.copy_name"));
+        assert!(cmds.contains(&"process.copy_path"));
+        // Copy PID enabled when the row has a PID.
+        assert!(items.iter().any(|it| matches!(it,
+            MenuItem::Action { command, enabled, .. }
+                if command == "process.copy_pid" && *enabled)));
+    }
+
+    #[test]
+    fn process_row_menu_copy_pid_disabled_without_pid() {
+        use super::process_row_menu;
+        // A synthetic (non-process) row has no PID → "Copy PID" disabled.
+        let items = process_row_menu(false);
+        assert!(items.iter().any(|it| matches!(it,
+            MenuItem::Action { command, enabled, .. }
+                if command == "process.copy_pid" && !*enabled)));
     }
 }

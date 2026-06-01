@@ -46,12 +46,71 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::dock::{Panel, PanelControl, PanelEvent, TitleStyle};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
 use super::design::{color, icon, tokens};
 use super::editor::RcxEditor;
 use super::state::{DataSource, DocId, SourceKind, ViewMode};
 use crate::generator::render_cpp_tree;
+
+// ── Document-tab context-menu actions (the C++ doc-tab `QMenu`, `main.cpp:3652`)
+//
+// The Zed-style right-click menu (gpui-component `ContextMenuExt` + `PopupMenu`)
+// dispatches a gpui `Action` per item; these are the document tab's commands —
+// Close / Close All Tabs / Close All But This / Copy Full Path / Open Containing
+// Folder (`main.cpp:3654-3689`). The area handles them on its tracked-focus root
+// (`on_action`), reading the right-clicked tab from `context_target`. Every one
+// is a live wire: Close / Close-others mutate the tab list, Copy/Reveal act on
+// the document's `.rcx` path (read off the editor's controller).
+actions!(
+    rcx_doc_tabs,
+    [
+        TabClose,
+        TabCloseAll,
+        TabCloseOthers,
+        TabCopyPath,
+        TabRevealPath
+    ]
+);
+
+/// The drag payload + preview for a document-tab reorder (mirrors the C++
+/// movable `QTabBar`; `main.cpp` tab drag detection). Carries the dragged tab's
+/// id so the drop target can resolve the *current* source index (indices shift
+/// as the strip mutates, so resolving by stable [`DocId`] at drop time is
+/// reorder-safe — the C++ `moveTab` semantics). It is its own [`Render`] preview
+/// (a small floating tab chip), the way gpui-component's `DragPanel` is.
+#[derive(Clone)]
+struct TabDrag {
+    id: DocId,
+    title: SharedString,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A compact floating chip that follows the cursor while dragging — the
+        // elevated tab surface at reduced opacity (gpui-component `DragPanel`).
+        div()
+            .id("rcx-tab-drag")
+            .cursor_grabbing()
+            .flex()
+            .items_center()
+            .px(px(tokens::space::LG))
+            .h(px(TAB_STRIP_H))
+            .max_w(px(TAB_MAX_W))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .border_1()
+            .border_color(color::border(cx))
+            .rounded(px(tokens::radius::MD))
+            .bg(color::elevated_bg(cx))
+            .text_color(color::text(cx))
+            .text_size(px(tokens::font::UI_SM))
+            .opacity(0.75)
+            .child(self.title.clone())
+    }
+}
 
 /// Tab-strip height (logical px). The C++ dock tab bar was a fixed 37px
 /// (`MenuBarStyle::sizeFromContents` `CT_TabBarTab`, app-shell §3); Zed runs a
@@ -123,6 +182,10 @@ pub struct DocumentArea {
     /// Monotonic id allocator — independent of the window's [`AppState`] so the
     /// area is self-contained, but kept in lockstep by the window's wiring.
     next_id: u64,
+    /// The tab a right-click context menu targets (the C++ menu's "tab under the
+    /// cursor"; `tabBar->tabAt(pos)`). Set on right-mouse-down over a tab; read by
+    /// the context-menu action handlers. `None` when no tab was right-clicked.
+    context_target: Option<DocId>,
 }
 
 impl DocumentArea {
@@ -134,6 +197,7 @@ impl DocumentArea {
             active: 0,
             focus_handle: cx.focus_handle(),
             next_id: 0,
+            context_target: None,
         };
         area.push_document("Untitled", window, cx);
         area
@@ -273,6 +337,147 @@ impl DocumentArea {
         cx.notify();
     }
 
+    /// Close a tab by id (the C++ doc-tab menu "Close"; `target->close()`).
+    fn close_id(&mut self, id: DocId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = self.index_of(id) {
+            self.close_index(i, window, cx);
+        }
+    }
+
+    /// Close **every** tab (the C++ "Close All Tabs"; `closeAllDocDocks`). The
+    /// "never leave a blank area" reflex still applies — closing the final tab
+    /// re-opens a fresh document — so this collapses to one fresh untitled tab.
+    fn close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Emit a Closed for each existing doc, then reset to a single fresh tab.
+        let ids: Vec<DocId> = self.tabs.iter().map(|t| t.id).collect();
+        self.tabs.clear();
+        for id in ids {
+            cx.emit(DocAreaEvent::Closed(id));
+        }
+        self.active = 0;
+        self.push_document("Untitled", window, cx);
+        cx.emit(DocAreaEvent::NewDocumentRequested);
+        cx.notify();
+    }
+
+    /// Close every tab **except** `keep` (the C++ "Close All But This"; the loop
+    /// `for d in docks: if d != target d->close()`). Order-independent: it walks
+    /// from the end so index removal never disturbs a not-yet-visited tab, and
+    /// keeps `keep` active afterwards.
+    fn close_others(&mut self, keep: DocId, window: &mut Window, cx: &mut Context<Self>) {
+        for i in (0..self.tabs.len()).rev() {
+            if self.tabs[i].id != keep {
+                self.close_index(i, window, cx);
+            }
+        }
+        // `keep` is now the sole tab — make sure it is the active one.
+        if let Some(i) = self.index_of(keep) {
+            self.activate_index(i, cx);
+        }
+    }
+
+    /// The on-disk `.rcx` path of a tab's document, if it has been saved (the C++
+    /// `tabIt->doc->filePath`). `None` for an unsaved/untitled document — the C++
+    /// only shows Copy Full Path / Open Containing Folder when the path is set.
+    /// Reads the editor → controller → document (a read-only borrow; no logic
+    /// change).
+    fn tab_file_path(&self, id: DocId, cx: &App) -> Option<std::path::PathBuf> {
+        let i = self.index_of(id)?;
+        self.tabs[i]
+            .editor
+            .read(cx)
+            .controller()
+            .document()
+            .file_path
+            .clone()
+    }
+
+    /// Reorder a tab: move the tab with id `from_id` to sit at the current index
+    /// of `to_id` (the C++ movable `QTabBar` `moveTab`). Resolving both endpoints
+    /// by stable [`DocId`] at drop time keeps the swap correct even though strip
+    /// indices shift during a drag. The dragged tab stays active after the move.
+    fn reorder(&mut self, from_id: DocId, to_id: DocId, cx: &mut Context<Self>) {
+        if from_id == to_id {
+            return;
+        }
+        let (Some(from), Some(to)) = (self.index_of(from_id), self.index_of(to_id)) else {
+            return;
+        };
+        let entry = self.tabs.remove(from);
+        // After removal, the target's index may have shifted left by one.
+        let mut insert = self.index_of(to_id).map_or(to, |t| t);
+        if from < insert {
+            insert += 1;
+        }
+        let insert = insert.min(self.tabs.len());
+        self.tabs.insert(insert, entry);
+        // Keep the dragged tab active (it was the gesture's subject).
+        if let Some(i) = self.index_of(from_id) {
+            self.active = i;
+            cx.emit(DocAreaEvent::Activated(from_id));
+        }
+        cx.notify();
+    }
+
+    // ── Context-menu action handlers ─────────────────────────────────────────
+    //
+    // Dispatched by the `PopupMenu` built in `tab_context_menu`; the targeted tab
+    // was recorded in `context_target` on right-mouse-down. Every item is live:
+    // Close / Close-others mutate the strip, Copy/Reveal act on the document path.
+
+    /// "Close" — close the right-clicked tab (`target->close()`).
+    fn action_close(&mut self, _: &TabClose, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.context_target.take() {
+            self.close_id(id, window, cx);
+        }
+    }
+
+    /// "Close All Tabs" — `closeAllDocDocks`.
+    fn action_close_all(&mut self, _: &TabCloseAll, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_target = None;
+        self.close_all(window, cx);
+    }
+
+    /// "Close All But This" — close every other tab (`d != target`).
+    fn action_close_others(
+        &mut self,
+        _: &TabCloseOthers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.context_target.take() {
+            self.close_others(id, window, cx);
+        }
+    }
+
+    /// "Copy Full Path" — copy the document's `.rcx` path to the clipboard
+    /// (`QGuiApplication::clipboard()->setText(path)`). No-op when unsaved.
+    fn action_copy_path(&mut self, _: &TabCopyPath, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.context_target.take() {
+            if let Some(path) = self.tab_file_path(id, cx) {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    path.to_string_lossy().to_string(),
+                ));
+            }
+        }
+    }
+
+    /// "Open Containing Folder" — reveal the document's `.rcx` file in the OS file
+    /// manager (`QDesktopServices::openUrl(absolutePath)`; gpui `reveal_path`
+    /// opens the folder with the file selected). No-op when unsaved.
+    fn action_reveal_path(
+        &mut self,
+        _: &TabRevealPath,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.context_target.take() {
+            if let Some(path) = self.tab_file_path(id, cx) {
+                cx.reveal_path(&path);
+            }
+        }
+    }
+
     /// Toggle the active tab's view mode (the dual tree/rendered toggle). Emits
     /// [`DocAreaEvent::ViewModeChanged`].
     fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
@@ -341,8 +546,25 @@ impl DocumentArea {
     ) -> impl IntoElement {
         let id = entry.id;
         let group_name = SharedString::from(format!("rcx-tab-{}", id.get()));
-        // Per-tab source icon — a real SVG (full opacity = live, dimmed = off).
-        let source_badge = source_icon(entry.source.kind, entry.source.live, cx);
+        // Per-tab source-status icon — a real SVG (full opacity = live, dimmed =
+        // stale/none; the C++ `drawTabSourceIcon` ×0.35 live opacity). Wrapped in
+        // a hoverable element carrying the source's tooltip ("File: x.bin" /
+        // "No source"), the way the C++ tab provided a per-tab source tooltip.
+        let source_tooltip = SharedString::from(source_status_label(&entry.source));
+        let source_badge = div()
+            .id(SharedString::from(format!("rcx-tab-src-{}", id.get())))
+            .flex_none()
+            .flex()
+            .items_center()
+            .child(source_icon(entry.source.kind, entry.source.live, cx))
+            .tooltip(move |window, cx| Tooltip::new(source_tooltip.clone()).build(window, cx));
+        // The drag payload carries the tab's stable id + title for the preview.
+        let drag_title = entry.title.clone();
+        // Context-menu gating: Copy/Reveal only when the doc is saved (a non-empty
+        // `.rcx` path; the C++ `!doc->filePath.isEmpty()`), and "Close All But
+        // This" only when more than one tab is open (`m_docDocks.size() > 1`).
+        let has_path = self.tab_file_path(id, cx).is_some();
+        let multi_tab = self.tabs.len() > 1;
 
         // Trailing slot: the modified dot at rest, the close ✕ on hover. Both
         // occupy the same fixed-width slot so the title never shifts.
@@ -444,6 +666,50 @@ impl DocumentArea {
             .on_click(cx.listener(move |this, _e, _window, cx| {
                 this.activate_index(ix, cx);
             }))
+            // Middle-click closes the tab (the C++ event filter
+            // `me->button() == Qt::MiddleButton` → `d->close()`; main.cpp:3855).
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _e, window, cx| {
+                    this.close_id(id, window, cx);
+                }),
+            )
+            // Record the right-clicked tab so the context-menu action handlers
+            // know which tab fired (before the menu opens; the C++ `tabAt(pos)`).
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _e, _window, cx| {
+                    this.context_target = Some(id);
+                    cx.notify();
+                }),
+            )
+            // Drag-to-reorder within the strip (the C++ movable `QTabBar`). The
+            // payload carries the dragged tab's id; the drop target resolves the
+            // swap by stable id so the reorder is index-shift-safe.
+            .on_drag(
+                TabDrag {
+                    id,
+                    title: drag_title,
+                },
+                |drag, _pos, _window, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                },
+            )
+            // Drop-target feedback + the actual reorder when another tab is
+            // dropped onto this one (`moveTab(from, to)`).
+            .drag_over::<TabDrag>(|style, _drag, _window, cx| {
+                style.border_l_2().border_color(color::accent(cx))
+            })
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _window, cx| {
+                this.reorder(drag.id, id, cx);
+            }))
+            // The Zed right-click context menu — Close / Close All Tabs / Close
+            // All But This / Copy Full Path / Open Containing Folder (the C++
+            // doc-tab `QMenu`; main.cpp:3652). The last two only appear when the
+            // document has been saved (a non-empty `.rcx` path), mirroring the C++
+            // `!doc->filePath.isEmpty()` guard.
+            .context_menu(move |menu, _window, _cx| tab_context_menu(menu, has_path, multi_tab))
     }
 
     /// The trailing "+" affordance — a ghost icon button (real SVG) that opens a
@@ -977,6 +1243,15 @@ impl Render for DocumentArea {
         div()
             .id("rcx-document-area")
             .track_focus(&self.focus_handle)
+            .key_context("RcxDocumentArea")
+            // Document-tab context-menu actions dispatched by the per-tab
+            // right-click `PopupMenu` bubble to here (the menu is a child of this
+            // tracked-focus subtree). Each acts on `context_target`.
+            .on_action(cx.listener(Self::action_close))
+            .on_action(cx.listener(Self::action_close_all))
+            .on_action(cx.listener(Self::action_close_others))
+            .on_action(cx.listener(Self::action_copy_path))
+            .on_action(cx.listener(Self::action_reveal_path))
             .size_full()
             .flex()
             .flex_col()
@@ -984,6 +1259,83 @@ impl Render for DocumentArea {
             .child(strip)
             .child(div().flex_1().min_h_0().child(body))
             .child(view_toggle)
+    }
+}
+
+/// Build the document-tab right-click [`PopupMenu`] (the C++ doc-tab `QMenu`,
+/// `main.cpp:3652` — Close / Close All Tabs / Close All But This / Copy Full Path
+/// / Open Containing Folder). Each item dispatches its tab action; the area
+/// handles them. Rendered by gpui-component on the shared elevated-surface look
+/// (6px radius, 1px border, soft shadow, hover overlay), so it matches the Zed
+/// design system. Dismiss-on-select / escape / click-out is handled by the
+/// `ContextMenuExt` machinery.
+///
+/// `has_path` gates the path actions (the C++ `!doc->filePath.isEmpty()`):
+/// Copy Full Path / Open Containing Folder only appear for a saved document.
+/// `multi_tab` gates "Close All But This" (the C++ `m_docDocks.size() > 1`).
+fn tab_context_menu(menu: PopupMenu, has_path: bool, multi_tab: bool) -> PopupMenu {
+    let menu = menu
+        // Close — the right-clicked tab (trailing ⌘W hint, the editor accelerator).
+        .menu_element_with_icon(IconName::Close, Box::new(TabClose), |_w, cx| {
+            menu_row("Close", "\u{2318}W", cx)
+        })
+        .separator()
+        // Close All Tabs.
+        .menu_element_with_icon(IconName::Close, Box::new(TabCloseAll), |_w, cx| {
+            menu_row("Close All Tabs", "", cx)
+        });
+    // Close All But This — only with more than one tab open.
+    let menu = if multi_tab {
+        menu.menu_element(Box::new(TabCloseOthers), |_w, cx| {
+            menu_row("Close All But This", "", cx)
+        })
+    } else {
+        menu
+    };
+    // Copy Full Path / Open Containing Folder — only for a saved document.
+    if has_path {
+        menu.separator()
+            .menu_element_with_icon(IconName::Copy, Box::new(TabCopyPath), |_w, cx| {
+                menu_row("Copy Full Path", "", cx)
+            })
+            .menu_element_with_icon(IconName::FolderOpen, Box::new(TabRevealPath), |_w, cx| {
+                menu_row("Open Containing Folder", "", cx)
+            })
+    } else {
+        menu
+    }
+}
+
+/// One context-menu row body: the item `label` filling the row with a trailing
+/// right-aligned dim `keys` shortcut hint (Zed's label↔accelerator layout). The
+/// leading icon is supplied by `menu_element_with_icon`; this is the row's text.
+fn menu_row(label: &'static str, keys: &'static str, cx: &App) -> impl IntoElement {
+    gpui_component::h_flex()
+        .w_full()
+        .min_w(px(184.0))
+        .gap(px(tokens::space::LG))
+        .items_center()
+        .justify_between()
+        .child(div().flex_1().child(label))
+        .when(!keys.is_empty(), |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(tokens::font::UI_XS))
+                    .text_color(color::text_disabled(cx))
+                    .child(keys),
+            )
+        })
+}
+
+/// The per-tab source-status tooltip text (the C++ per-tab source tooltip): the
+/// source kind + target ("File: x.bin") or its plain label ("No source"). Pure;
+/// unit-tested.
+fn source_status_label(source: &DataSource) -> String {
+    if source.target.is_empty() {
+        source.kind.label().to_string()
+    } else {
+        format!("{}: {}", source.kind.label(), source.target)
     }
 }
 
@@ -1077,6 +1429,46 @@ mod tests {
                 self.active = self.active.min(self.ids.len() - 1);
             }
         }
+        fn index_of(&self, id: DocId) -> Option<usize> {
+            self.ids.iter().position(|&x| x == id)
+        }
+        // Mirror of close_others: close every tab except `keep`.
+        fn close_others(&mut self, keep: DocId) {
+            for i in (0..self.ids.len()).rev() {
+                if self.ids[i] != keep {
+                    self.close(i);
+                }
+            }
+            if let Some(i) = self.index_of(keep) {
+                self.active = i;
+            }
+        }
+        // Mirror of close_all: collapse to one fresh tab.
+        fn close_all(&mut self) {
+            self.ids.clear();
+            self.active = 0;
+            self.push();
+        }
+        // Mirror of reorder: move `from_id` to sit at `to_id`'s position, keeping
+        // the moved tab active (the same index math as `DocumentArea::reorder`).
+        fn reorder(&mut self, from_id: DocId, to_id: DocId) {
+            if from_id == to_id {
+                return;
+            }
+            let (Some(from), Some(to)) = (self.index_of(from_id), self.index_of(to_id)) else {
+                return;
+            };
+            let id = self.ids.remove(from);
+            let mut insert = self.index_of(to_id).unwrap_or(to);
+            if from < insert {
+                insert += 1;
+            }
+            let insert = insert.min(self.ids.len());
+            self.ids.insert(insert, id);
+            if let Some(i) = self.index_of(from_id) {
+                self.active = i;
+            }
+        }
     }
 
     #[test]
@@ -1149,5 +1541,71 @@ mod tests {
     #[test]
     fn view_mode_default_is_tree() {
         assert_eq!(ViewMode::default(), ViewMode::Tree);
+    }
+
+    #[test]
+    fn close_others_keeps_only_the_target() {
+        // The C++ "Close All But This": every tab except `keep` closes.
+        let mut m = TabModel::new(); // [1]
+        m.push(); // [1,2]
+        m.push(); // [1,2,3]
+        let keep = m.ids[1];
+        m.close_others(keep);
+        assert_eq!(m.ids, vec![keep]);
+        assert_eq!(m.active, 0);
+    }
+
+    #[test]
+    fn close_all_collapses_to_one_fresh_tab() {
+        // The C++ "Close All Tabs" + "never leave a blank area": all tabs close,
+        // a single fresh (new-id) tab remains.
+        let mut m = TabModel::new();
+        m.push();
+        m.push();
+        let old: Vec<DocId> = m.ids.clone();
+        m.close_all();
+        assert_eq!(m.ids.len(), 1);
+        assert_eq!(m.active, 0);
+        // The surviving tab is brand-new (not any previously open id).
+        assert!(!old.contains(&m.ids[0]));
+    }
+
+    #[test]
+    fn reorder_moves_tab_to_target_position_and_keeps_it_active() {
+        // Drag tab #1 (index 0) onto tab #3 (index 2): the strip becomes
+        // [2, 3, 1] and the dragged tab stays active (the C++ movable QTabBar).
+        let mut m = TabModel::new(); // [1]
+        let a = m.ids[0];
+        let b = m.push(); // [1,2]
+        let c = m.push(); // [1,2,3]
+        m.reorder(a, c);
+        assert_eq!(m.ids, vec![b, c, a]);
+        // The moved tab is the active one.
+        assert_eq!(m.ids[m.active], a);
+
+        // Drag it back to the front (onto b): [1, 2, 3].
+        m.reorder(a, b);
+        assert_eq!(m.ids, vec![a, b, c]);
+        assert_eq!(m.ids[m.active], a);
+
+        // Reordering onto itself is a no-op.
+        let before = m.ids.clone();
+        m.reorder(a, a);
+        assert_eq!(m.ids, before);
+    }
+
+    #[test]
+    fn source_status_label_describes_kind_and_target() {
+        use super::super::state::{DataSource, SourceKind};
+        use super::source_status_label;
+        // A live file source → "File: <target>".
+        let s = DataSource::new(SourceKind::File, "game.bin");
+        assert_eq!(
+            source_status_label(&s),
+            format!("{}: game.bin", SourceKind::File.label())
+        );
+        // No source → just the kind label (no trailing ": ").
+        let none = DataSource::none();
+        assert_eq!(source_status_label(&none), SourceKind::None.label());
     }
 }

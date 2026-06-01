@@ -209,26 +209,54 @@ impl Element for RowElement {
             let editor = self.editor.clone();
             let line = self.line;
             let left = bounds.left();
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+            {
+                let hitbox = hitbox.clone();
+                let editor = editor.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+                        return;
+                    }
+                    match event.button {
+                        MouseButton::Left => {
+                            let rel_x = f32::from(event.position.x - left).max(0.0);
+                            let modifiers = event.modifiers;
+                            // `click_count == 2` is the double-click-to-edit
+                            // affordance (item 26): select the token, then begin its
+                            // edit/picker. A single click routes the normal path.
+                            let double = event.click_count >= 2;
+                            let _ = editor.update(cx, |this, cx| {
+                                if double {
+                                    this.dispatch_row_double_click(
+                                        line, rel_x, modifiers, window, cx,
+                                    );
+                                } else {
+                                    this.dispatch_row_click(line, rel_x, modifiers, window, cx);
+                                }
+                            });
+                        }
+                        MouseButton::Right => {
+                            let pos = event.position;
+                            let _ = editor.update(cx, |this, cx| {
+                                this.dispatch_row_context_menu(line, pos, window, cx);
+                            });
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            // Byte-selection drag (item 11): while the left button is held and the
+            // pointer moves over this row's hitbox, extend the armed byte selection
+            // to the byte under the cursor. The editor decides whether a selection
+            // is armed (a no-op otherwise), so this is cheap.
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || !event.dragging() || !hitbox.is_hovered(window)
+                {
                     return;
                 }
-                match event.button {
-                    MouseButton::Left => {
-                        let rel_x = f32::from(event.position.x - left).max(0.0);
-                        let modifiers = event.modifiers;
-                        let _ = editor.update(cx, |this, cx| {
-                            this.dispatch_row_click(line, rel_x, modifiers, window, cx);
-                        });
-                    }
-                    MouseButton::Right => {
-                        let pos = event.position;
-                        let _ = editor.update(cx, |this, cx| {
-                            this.dispatch_row_context_menu(line, pos, window, cx);
-                        });
-                    }
-                    _ => {}
-                }
+                let rel_x = f32::from(event.position.x - left).max(0.0);
+                let _ = editor.update(cx, |this, cx| {
+                    this.dispatch_row_drag(line, rel_x, window, cx);
+                });
             });
         }
     }

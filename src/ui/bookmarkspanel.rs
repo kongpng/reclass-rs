@@ -77,6 +77,20 @@ pub fn build_bookmark_rows(bookmarks: &[Bookmark]) -> Vec<BookmarkRow> {
         .collect()
 }
 
+/// Filter bookmark rows by a case-insensitive substring of the name OR formula
+/// (the C++ "Filter bookmarks…" line edit). An empty query keeps everything;
+/// the row's stable `index` (the `remove_bookmark` key) is preserved so a
+/// filtered view still removes the right bookmark. Pure + unit-tested.
+pub fn filter_bookmark_rows<'a>(rows: &'a [BookmarkRow], query: &str) -> Vec<&'a BookmarkRow> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return rows.iter().collect();
+    }
+    rows.iter()
+        .filter(|r| r.name.to_lowercase().contains(&q) || r.formula.to_lowercase().contains(&q))
+        .collect()
+}
+
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
@@ -87,10 +101,19 @@ mod view {
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::dock::{Panel, PanelEvent};
+    use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 
-    use super::{build_bookmark_rows, BookmarkRow};
+    use super::{build_bookmark_rows, filter_bookmark_rows, BookmarkRow};
     use crate::core::Bookmark;
     use crate::ui::design::{color, icon, tokens};
+
+    // ── Row context-menu actions (the C++ bookmark row right-click) ──
+    //
+    // Dispatched by the `PopupMenu` a row builds; the panel records the
+    // right-clicked row's index in `context_target` so the action handler knows
+    // which bookmark to act on, then re-emits the matching `BookmarkAction`.
+    gpui::actions!(rcx_bookmarks, [BmNavigate, BmRemove]);
 
     /// An intent raised by the bookmarks panel for the window to resolve onto the
     /// controller (the read-only-surface pattern — the panel does not own the
@@ -119,22 +142,45 @@ mod view {
     /// structure; raises [`BookmarkAction`] for the window to resolve.
     pub struct BookmarksPanel {
         rows: Vec<BookmarkRow>,
+        /// The substring filter input (the C++ "Filter bookmarks…" line edit).
+        filter_input: Entity<InputState>,
+        /// Current filter text (synced from the input on change).
+        filter: String,
+        /// The row index a right-click context menu targets (the C++
+        /// right-clicked bookmark), set before the menu's action fires.
+        context_target: Option<usize>,
         focus_handle: FocusHandle,
+        _subs: Vec<Subscription>,
     }
 
     impl BookmarksPanel {
         /// Build an empty bookmarks panel.
-        pub fn new(cx: &mut Context<Self>) -> Self {
+        pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let filter_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Filter bookmarks..."));
+            let mut subs = Vec::new();
+            subs.push(
+                cx.subscribe(&filter_input, |this, input, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        this.filter = input.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                }),
+            );
             BookmarksPanel {
                 rows: Vec::new(),
+                filter_input,
+                filter: String::new(),
+                context_target: None,
                 focus_handle: cx.focus_handle(),
+                _subs: subs,
             }
         }
 
         /// Construct as an [`Entity`] (the form a dock holds). Takes `window` to
         /// match the other panels' `view(window, cx)` shape.
-        pub fn view(_window: &mut Window, cx: &mut App) -> Entity<Self> {
-            cx.new(BookmarksPanel::new)
+        pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
+            cx.new(|cx| BookmarksPanel::new(window, cx))
         }
 
         /// Replace the displayed bookmark rows (the window calls this on document
@@ -170,11 +216,37 @@ mod view {
         }
     }
 
+    impl BookmarksPanel {
+        /// Context-menu "Navigate" (the C++ row right-click → Navigate): re-emit
+        /// `BookmarkAction::Navigate` for the right-clicked row.
+        fn on_ctx_navigate(&mut self, _: &BmNavigate, _w: &mut Window, cx: &mut Context<Self>) {
+            if let Some(ix) = self.context_target {
+                if let Some(row) = self.rows.get(ix) {
+                    let formula = row.formula.clone();
+                    cx.emit(BookmarkAction::Navigate { formula });
+                }
+            }
+        }
+
+        /// Context-menu "Remove" (the C++ row right-click → Remove).
+        fn on_ctx_remove(&mut self, _: &BmRemove, _w: &mut Window, cx: &mut Context<Self>) {
+            if let Some(index) = self.context_target {
+                cx.emit(BookmarkAction::Remove { index });
+            }
+        }
+    }
+
     impl Render for BookmarksPanel {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let view = cx.entity();
-            let rows = self.rows.clone();
+            // Apply the substring filter (the C++ "Filter bookmarks…" line edit),
+            // keeping each row's stable remove-index.
+            let rows: Vec<BookmarkRow> = filter_bookmark_rows(&self.rows, &self.filter)
+                .into_iter()
+                .cloned()
+                .collect();
             let is_empty = rows.is_empty();
+            let has_bookmarks = !self.rows.is_empty();
 
             gpui_component::v_flex()
                 .id("rcx-bookmarks-panel")
@@ -182,7 +254,18 @@ mod view {
                 .size_full()
                 .bg(color::panel_bg(cx))
                 .text_color(color::text(cx))
-                .child(render_header(&view, rows.len(), cx))
+                .on_action(cx.listener(Self::on_ctx_navigate))
+                .on_action(cx.listener(Self::on_ctx_remove))
+                .child(render_header(&view, self.rows.len(), cx))
+                // Filter row (only when there are bookmarks to filter).
+                .when(has_bookmarks, |col| {
+                    col.child(
+                        gpui_component::h_flex()
+                            .px(px(tokens::space::LG))
+                            .py(px(tokens::space::XS))
+                            .child(Input::new(&self.filter_input).small().flex_1()),
+                    )
+                })
                 .child(div().flex_1().min_h_0().child(if is_empty {
                     empty_state(cx).into_any_element()
                 } else {
@@ -271,6 +354,7 @@ mod view {
         let nav_view = view.clone();
         let nav_formula = row.formula.clone();
         let rm_view = view.clone();
+        let ctx_view = view.clone();
 
         gpui_component::h_flex()
             .id(("rcx-bookmark-row", index))
@@ -281,6 +365,11 @@ mod view {
             .items_center()
             .rounded(px(tokens::radius::MD))
             .hover(|s| s.bg(color::hover_overlay(cx)))
+            // Record the right-clicked row before the context menu's action
+            // fires, so Navigate/Remove know which bookmark they target.
+            .on_mouse_down(MouseButton::Right, move |_e, _w, cx| {
+                ctx_view.update(cx, |this, _cx| this.context_target = Some(index));
+            })
             .child(
                 icon::pointer()
                     .with_size(px(12.0))
@@ -336,6 +425,13 @@ mod view {
                         });
                     }),
             )
+            // Right-click context menu: Navigate / Remove (the C++ row menu).
+            // Attached last so the interactive builders above stay accessible.
+            .context_menu(move |menu: PopupMenu, _window, _cx| {
+                menu.menu("Navigate", Box::new(BmNavigate))
+                    .separator()
+                    .menu("Remove", Box::new(BmRemove))
+            })
     }
 
     /// The clean empty-state body: a centered muted caption (Zed panel state).
@@ -363,7 +459,7 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_bookmark_rows, BookmarkRow};
+    use super::{build_bookmark_rows, filter_bookmark_rows, BookmarkRow};
     use crate::core::Bookmark;
 
     fn bm(name: &str, formula: &str) -> Bookmark {
@@ -371,6 +467,32 @@ mod tests {
             name: name.to_string(),
             address_formula: formula.to_string(),
         }
+    }
+
+    #[test]
+    fn filter_matches_name_or_formula_and_keeps_index() {
+        let bms = vec![
+            bm("Player base", "<game.exe>+0x100"),
+            bm("Health", "<game.exe>+0x200"),
+            bm("Ammo", "0xDEAD"),
+        ];
+        let rows = build_bookmark_rows(&bms);
+        // Match by name substring (case-insensitive).
+        let by_name = filter_bookmark_rows(&rows, "health");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "Health");
+        // The preserved index is the remove key (position 1).
+        assert_eq!(by_name[0].index, 1);
+        // Match by formula substring.
+        let by_formula = filter_bookmark_rows(&rows, "dead");
+        assert_eq!(by_formula.len(), 1);
+        assert_eq!(by_formula[0].index, 2);
+        // "game.exe" matches the two with that module formula.
+        assert_eq!(filter_bookmark_rows(&rows, "game.exe").len(), 2);
+        // Empty query keeps all.
+        assert_eq!(filter_bookmark_rows(&rows, "   ").len(), 3);
+        // No match.
+        assert!(filter_bookmark_rows(&rows, "zzz").is_empty());
     }
 
     #[test]

@@ -99,6 +99,16 @@ impl MenuBar {
         cx.new(Self::new)
     }
 
+    /// Replace the whole menu tree (the C++ menus rebuilt on `aboutToShow` for
+    /// the dynamic Recent-Files / Data-Source submenus and the dynamic MCP
+    /// Start/Stop label). The host builds the tree from live data via
+    /// [`menu_tree_with`](crate::ui::commandpalette::menu_tree_with) and pushes it
+    /// here; always re-renders so the next open shows the fresh rows.
+    pub fn set_menus(&mut self, menus: Vec<MenuNode>, cx: &mut Context<Self>) {
+        self.menus = menus;
+        cx.notify();
+    }
+
     /// Set whether a command's menu item renders a leading checkmark (the C++
     /// checkable `QAction`). The host calls this to reflect live toggle state —
     /// e.g. `view.scanner` checked while the scanner pop-out is open. Re-renders

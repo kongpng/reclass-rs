@@ -16,8 +16,13 @@
 //!   unit-tested against the C++ rule (name OR page-keywords OR any child).
 //! - [`FONT_CHOICES`] — the three font combo items (source-faithful, not the
 //!   stale 2-item test; widgets-dialogs §5 / §24 Q1).
+//! - [`parse_refresh_ms`] / [`font_choice_index`] — the General-page control
+//!   value reducers (the refresh spinbox parse+clamp and the font-combo index),
+//!   unit-tested headlessly.
 //! - [`OptionsDialog`] / [`OptionsEvent`] — the gpui view raising `Apply(result)`
-//!   / `Cancel`.
+//!   / `Cancel`, with real interactive Theme/Font dropdowns and an editable
+//!   refresh-rate (ms) input on the General page, plus a generator-page deep
+//!   link ([`OptionsDialog::view_on_page`]).
 //!
 //! Gated behind the `ui` feature.
 
@@ -73,9 +78,42 @@ pub const REFRESH_MAX: i32 = 60000;
 /// The default refresh description value (660 ms).
 pub const REFRESH_DEFAULT: i32 = 660;
 
+/// The C++ refresh-spin description (`optionsdialog.cpp:87-89`), shown under the
+/// "Interval:" spinbox on the General page.
+pub const REFRESH_DESC: &str =
+    "How often live memory is re-read and the view is updated, in milliseconds. \
+     Lower values give faster updates but use more CPU. Default: 660 ms.";
+
 /// The font combo items (`optionsdialog.cpp:111-113`) — three, per the **source**
 /// (the lagging test asserts two; widgets-dialogs §24 Q1 resolves to the source).
 pub const FONT_CHOICES: [&str; 3] = ["IBM Plex Mono", "JetBrains Mono", "Consolas"];
+
+/// Parse a refresh-rate edit string into a clamped ms value
+/// (`m_refreshSpin`): keep the leading run of ASCII digits (the C++ spinbox only
+/// accepts digits; a trailing `" ms"` suffix or stray text is ignored), parse,
+/// then clamp to `1..=60000`. An empty / all-non-digit string clamps to the min.
+pub fn parse_refresh_ms(text: &str) -> i32 {
+    let digits: String = text
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse::<i64>()
+        .unwrap_or(REFRESH_MIN as i64)
+        .clamp(REFRESH_MIN as i64, REFRESH_MAX as i64) as i32
+}
+
+/// The index of `font_name` within [`FONT_CHOICES`] (the combo's current row);
+/// an empty/unknown font falls back to the first item, matching the C++
+/// `setCurrentText` (which leaves the combo on its first item when the stored
+/// font is not one of the listed choices).
+pub fn font_choice_index(font_name: &str) -> usize {
+    FONT_CHOICES
+        .iter()
+        .position(|f| f.eq_ignore_ascii_case(font_name))
+        .unwrap_or(0)
+}
 
 /// The three settings pages (`m_pages`, `optionsdialog.cpp`). The integer value
 /// is the page index the nav tree maps to (`m_itemPageIndex`).
@@ -174,12 +212,18 @@ pub use view::{OptionsDialog, OptionsEvent};
 
 #[cfg(feature = "ui")]
 mod view {
-    use super::{filter_visible, OptionsPage, OptionsResult, FONT_CHOICES, REFRESH_DEFAULT};
+    use super::{
+        filter_visible, font_choice_index, parse_refresh_ms, OptionsPage, OptionsResult,
+        FONT_CHOICES, REFRESH_DESC,
+    };
     use crate::ui::design::{color, section_label, tokens, zed_list_row};
     use crate::ui::dialogs::modal;
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
+    use gpui_component::button::{Button, ButtonVariants as _};
     use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::popover::Popover;
+    use gpui_component::Sizable as _;
 
     /// The dialog's outcome (the C++ `accept`/`reject`).
     #[derive(Clone, Debug)]
@@ -199,8 +243,14 @@ mod view {
         page: OptionsPage,
         search: Entity<InputState>,
         query: String,
+        /// The editable refresh-rate (ms) input (`m_refreshSpin`); its value is
+        /// parsed + clamped back into `result.refresh_ms` on every change.
+        refresh: Entity<InputState>,
+        /// Whether the Theme / Font dropdown popovers are open.
+        theme_open: bool,
+        font_open: bool,
         focus_handle: FocusHandle,
-        _subscription: Subscription,
+        _subscriptions: Vec<Subscription>,
     }
 
     impl OptionsDialog {
@@ -213,8 +263,19 @@ mod view {
         ) -> Self {
             let search =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Search Options (Ctrl+E)"));
-            let subscription =
-                cx.subscribe_in(&search, window, |this, _s, ev: &InputEvent, _window, cx| {
+            let refresh = {
+                let initial = current.refresh_ms.to_string();
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("660")
+                        .default_value(initial)
+                })
+            };
+            let mut subs = Vec::new();
+            subs.push(cx.subscribe_in(
+                &search,
+                window,
+                |this, _s, ev: &InputEvent, _window, cx| {
                     if matches!(ev, InputEvent::Change) {
                         this.query = this.search.read(cx).value().to_string();
                         // If the selected page is filtered out, jump to the first
@@ -225,16 +286,48 @@ mod view {
                         }
                         cx.notify();
                     }
-                });
+                },
+            ));
+            subs.push(cx.subscribe_in(
+                &refresh,
+                window,
+                |this, _s, ev: &InputEvent, _window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let raw = this.refresh.read(cx).value().to_string();
+                        this.result.refresh_ms = parse_refresh_ms(&raw);
+                        cx.notify();
+                    }
+                },
+            ));
             OptionsDialog {
                 result: current,
                 themes,
                 page: OptionsPage::General,
                 search,
                 query: String::new(),
+                refresh,
+                theme_open: false,
+                font_open: false,
                 focus_handle: cx.focus_handle(),
-                _subscription: subscription,
+                _subscriptions: subs,
             }
+        }
+
+        /// Build the dialog as an [`Entity`] opened directly on `page` — the C++
+        /// `showOptionsDialog(int page)` / `selectPage` deep link (e.g. the
+        /// generator UI opening Options on the Generator page).
+        pub fn view_on_page(
+            current: OptionsResult,
+            themes: Vec<String>,
+            page: OptionsPage,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Entity<Self> {
+            cx.new(|cx| {
+                let mut this = OptionsDialog::new(current, themes, window, cx);
+                this.page = page;
+                this
+            })
         }
 
         /// Read-only access to the live result (for tests / wiring).
@@ -261,6 +354,38 @@ mod view {
 
         fn cancel(&mut self, cx: &mut Context<Self>) {
             cx.emit(OptionsEvent::Cancel);
+        }
+
+        /// Pick a theme (the C++ `m_themeCombo->setCurrentIndex`).
+        fn set_theme(&mut self, index: usize, cx: &mut Context<Self>) {
+            self.result.theme_index = index;
+            self.theme_open = false;
+            cx.notify();
+        }
+
+        /// Pick an editor font (the C++ `m_fontCombo->setCurrentText`).
+        fn set_font(&mut self, name: &str, cx: &mut Context<Self>) {
+            self.result.font_name = name.to_string();
+            self.font_open = false;
+            cx.notify();
+        }
+
+        /// The current theme combo label (the selected theme name, or a synthetic
+        /// "Theme #N" when the manager supplied no names).
+        fn theme_label(&self) -> String {
+            self.themes
+                .get(self.result.theme_index)
+                .cloned()
+                .unwrap_or_else(|| format!("Theme #{}", self.result.theme_index))
+        }
+
+        /// The current font combo label (the stored font, or the first choice).
+        fn font_label(&self) -> &str {
+            if self.result.font_name.is_empty() {
+                FONT_CHOICES[font_choice_index(&self.result.font_name)]
+            } else {
+                self.result.font_name.as_str()
+            }
         }
 
         /// Render the left nav: a search box above the filtered page list, styled
@@ -311,39 +436,54 @@ mod view {
 
         fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::checkbox::Checkbox;
-            let theme_summary = format!(
-                "Theme #{}  \u{00b7}  Font: {}",
-                self.result.theme_index,
-                if self.result.font_name.is_empty() {
-                    FONT_CHOICES[0]
-                } else {
-                    self.result.font_name.as_str()
-                }
-            );
             gpui_component::v_flex()
                 .gap(px(tokens::space::SM))
                 .flex_1()
+                // ── Refresh Rate group (the C++ `m_refreshSpin` + description) ──
                 .child(section_label("Refresh Rate", cx))
-                .child(modal::help_text(
-                    format!(
-                        "Default {REFRESH_DEFAULT} ms (current {} ms).",
-                        self.result.refresh_ms
-                    ),
-                    cx,
-                ))
+                .child(
+                    gpui_component::h_flex()
+                        .w_full()
+                        .gap(px(tokens::space::MD))
+                        .items_center()
+                        .child(modal::field_label("Interval:", cx))
+                        .child(Input::new(&self.refresh).small().w(px(110.)))
+                        .child(
+                            div()
+                                .text_size(px(tokens::font::UI_SM))
+                                .text_color(color::text_muted(cx))
+                                .child("ms"),
+                        ),
+                )
+                .child(modal::help_text(REFRESH_DESC, cx))
+                // ── Visual Experience group (theme + font combos) ──
                 .child(section_label("Visual Experience", cx))
                 .child(
-                    div()
-                        .text_size(px(tokens::font::UI_MD))
-                        .text_color(color::text(cx))
-                        .child(theme_summary),
+                    gpui_component::h_flex()
+                        .w_full()
+                        .gap(px(tokens::space::MD))
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(96.))
+                                .flex_none()
+                                .child(modal::field_label("Color theme:", cx)),
+                        )
+                        .child(self.render_theme_combo(cx)),
                 )
-                .when(!self.themes.is_empty(), |this| {
-                    this.child(modal::help_text(
-                        format!("{} themes available.", self.themes.len()),
-                        cx,
-                    ))
-                })
+                .child(
+                    gpui_component::h_flex()
+                        .w_full()
+                        .gap(px(tokens::space::MD))
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(96.))
+                                .flex_none()
+                                .child(modal::field_label("Editor Font:", cx)),
+                        )
+                        .child(self.render_font_combo(cx)),
+                )
                 .child(
                     Checkbox::new("opt-titlecase")
                         .label("Uppercase menu items")
@@ -371,6 +511,71 @@ mod view {
                             cx.notify();
                         })),
                 )
+        }
+
+        /// The Theme combo (`m_themeCombo`): a Zed dropdown over the available
+        /// theme names, applying the pick to `result.theme_index`.
+        fn render_theme_combo(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            let dialog = cx.entity().downgrade();
+            let current = self.result.theme_index;
+            // Fall back to a single synthetic row if the manager gave no names, so
+            // the control is still interactive (and the label is meaningful).
+            let themes: Vec<String> = if self.themes.is_empty() {
+                vec![self.theme_label()]
+            } else {
+                self.themes.clone()
+            };
+            Popover::new("opt-theme-pop")
+                .anchor(Anchor::TopLeft)
+                .open(self.theme_open)
+                .on_open_change(cx.listener(|this, open: &bool, _w, cx| {
+                    this.theme_open = *open;
+                    cx.notify();
+                }))
+                .trigger(dropdown_trigger("opt-theme", self.theme_label()))
+                .content(move |_state, _window, cx| {
+                    let mut menu = dropdown_menu(cx);
+                    for (i, name) in themes.iter().enumerate() {
+                        let dialog = dialog.clone();
+                        menu = menu.child(
+                            dropdown_row(("opt-theme-row", i), name.clone(), i == current, cx)
+                                .on_click(move |_e, _w, cx| {
+                                    dialog.update(cx, |this, cx| this.set_theme(i, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                })
+        }
+
+        /// The Font combo (`m_fontCombo`): a Zed dropdown over [`FONT_CHOICES`],
+        /// applying the pick to `result.font_name`.
+        fn render_font_combo(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            let dialog = cx.entity().downgrade();
+            let current = font_choice_index(&self.result.font_name);
+            Popover::new("opt-font-pop")
+                .anchor(Anchor::TopLeft)
+                .open(self.font_open)
+                .on_open_change(cx.listener(|this, open: &bool, _w, cx| {
+                    this.font_open = *open;
+                    cx.notify();
+                }))
+                .trigger(dropdown_trigger("opt-font", self.font_label().to_string()))
+                .content(move |_state, _window, cx| {
+                    let mut menu = dropdown_menu(cx);
+                    for (i, name) in FONT_CHOICES.iter().enumerate() {
+                        let dialog = dialog.clone();
+                        let name = *name;
+                        menu = menu.child(
+                            dropdown_row(("opt-font-row", i), name, i == current, cx).on_click(
+                                move |_e, _w, cx| {
+                                    dialog.update(cx, |this, cx| this.set_font(name, cx)).ok();
+                                },
+                            ),
+                        );
+                    }
+                    menu
+                })
         }
 
         fn render_ai(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -428,7 +633,6 @@ mod view {
 
     impl Render for OptionsDialog {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            use gpui_component::button::{Button, ButtonVariants as _};
             let nav = self.render_nav(cx);
             let page = self.render_page(cx);
 
@@ -478,12 +682,64 @@ mod view {
                 .child(footer)
         }
     }
+
+    // ── Zed dropdown scaffolding (mirrors the scanner-panel combos) ──────────
+
+    /// A compact Zed dropdown trigger: an outline button showing the current pick
+    /// with a trailing chevron glyph (the app does not bundle the gpui-component
+    /// SVG icon assets, so a `"⌄"` glyph reads as the combo affordance with no
+    /// missing-asset box).
+    fn dropdown_trigger(id: impl Into<SharedString>, text: impl Into<SharedString>) -> Button {
+        let id: SharedString = id.into();
+        let text: SharedString = text.into();
+        Button::new(SharedString::from(format!("opt-trig-{id}")))
+            .outline()
+            .small()
+            .label(SharedString::from(format!("{text}  \u{2304}")))
+    }
+
+    /// The elevated container the dropdown popovers drop into (§5.10 menu surface).
+    fn dropdown_menu(cx: &App) -> Div {
+        gpui_component::v_flex()
+            .min_w(px(160.))
+            .p(px(tokens::space::XS))
+            .gap(px(1.))
+            .bg(color::elevated_bg(cx))
+            .border_1()
+            .border_color(color::border(cx))
+            .rounded(px(tokens::radius::LG))
+            .shadow_md()
+    }
+
+    /// A clickable inset dropdown row with the soft-accent fill on the current pick.
+    fn dropdown_row(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        selected: bool,
+        cx: &App,
+    ) -> Stateful<Div> {
+        let label: SharedString = label.into();
+        gpui_component::h_flex()
+            .id(id)
+            .w_full()
+            .h(px(24.))
+            .px(px(tokens::space::MD))
+            .items_center()
+            .rounded(px(tokens::radius::MD))
+            .text_size(px(tokens::font::UI_MD))
+            .text_color(color::text(cx))
+            .cursor_pointer()
+            .when(selected, |r| r.bg(color::selected_bg(cx)))
+            .when(!selected, |r| r.hover(|s| s.bg(color::hover_overlay(cx))))
+            .child(label)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_visible, OptionsPage, OptionsResult, FONT_CHOICES, REFRESH_MAX, REFRESH_MIN,
+        filter_visible, font_choice_index, parse_refresh_ms, OptionsPage, OptionsResult,
+        FONT_CHOICES, REFRESH_MAX, REFRESH_MIN,
     };
 
     #[test]
@@ -561,5 +817,32 @@ mod tests {
         r.refresh_ms = 999_999;
         r.clamp_refresh();
         assert_eq!(r.refresh_ms, REFRESH_MAX);
+    }
+
+    #[test]
+    fn parse_refresh_ms_reads_digits_and_clamps() {
+        // Plain digits.
+        assert_eq!(parse_refresh_ms("250"), 250);
+        // A trailing " ms" suffix (the spinbox display) is ignored.
+        assert_eq!(parse_refresh_ms("660 ms"), 660);
+        assert_eq!(parse_refresh_ms("  120  "), 120);
+        // Below/above the range clamps (the QSpinBox range 1..=60000).
+        assert_eq!(parse_refresh_ms("0"), REFRESH_MIN);
+        assert_eq!(parse_refresh_ms("999999"), REFRESH_MAX);
+        // Empty / non-numeric → the minimum (defensive, like an empty spinbox).
+        assert_eq!(parse_refresh_ms(""), REFRESH_MIN);
+        assert_eq!(parse_refresh_ms("abc"), REFRESH_MIN);
+    }
+
+    #[test]
+    fn font_choice_index_resolves_or_falls_back() {
+        assert_eq!(font_choice_index("IBM Plex Mono"), 0);
+        assert_eq!(font_choice_index("JetBrains Mono"), 1);
+        assert_eq!(font_choice_index("Consolas"), 2);
+        // Case-insensitive (the combo stores the display text).
+        assert_eq!(font_choice_index("consolas"), 2);
+        // Empty / unknown → first item (the C++ combo default).
+        assert_eq!(font_choice_index(""), 0);
+        assert_eq!(font_choice_index("Comic Sans"), 0);
     }
 }

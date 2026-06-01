@@ -202,12 +202,16 @@ fn example_menu_items() -> Vec<MenuNode> {
 
 /// Build the **View ▸ Theme ▸** fly-out children: one checkable-style leaf per
 /// available theme, `view.theme.<name>` (the active theme is shown checked via
-/// the live checked-set, not baked into the tree).
+/// the live checked-set, not baked into the tree), followed by a separator and
+/// the C++ "Edit Theme…" entry (`view.theme_edit`; main.cpp:1332-1333).
 fn theme_menu_items() -> Vec<MenuNode> {
-    theme_display_names()
+    let mut items: Vec<MenuNode> = theme_display_names()
         .into_iter()
         .map(|name| MenuNode::item(&name, "", &format!("view.theme.{name}")))
-        .collect()
+        .collect();
+    items.push(MenuNode::Separator);
+    items.push(MenuNode::item("Edit Theme…", "", "view.theme_edit"));
+    items
 }
 
 /// The Reclass menu bar as data (app-shell §7 `createMenus`) — the full command
@@ -218,7 +222,64 @@ fn theme_menu_items() -> Vec<MenuNode> {
 /// Examples ▸ children come from the bundled set; Theme ▸ children from the
 /// shipped themes.
 pub fn default_menu_tree() -> Vec<MenuNode> {
+    menu_tree_with(&[], &[])
+}
+
+/// One Recent-Files entry: the absolute path (its file name is the menu label,
+/// its full path the command suffix). Mirrors the C++ `recentFiles` QSettings
+/// list rendered by `updateRecentFilesMenu` (main.cpp:8780).
+#[derive(Clone, Debug)]
+pub struct RecentMenuEntry {
+    /// The label shown in the menu (the file name).
+    pub label: String,
+    /// The command id (`file.recent.<index>`); the host maps it back to a path.
+    pub command: String,
+}
+
+/// One Data-Source menu entry built dynamically from the controller's saved
+/// sources (the C++ `populateSourceMenu` rows; main.cpp:8802). `active` drives
+/// the live checkmark.
+#[derive(Clone, Debug)]
+pub struct SourceMenuEntry {
+    pub label: String,
+    pub command: String,
+    pub active: bool,
+}
+
+/// The Reclass menu bar as data, with the **dynamic** Recent-Files and saved
+/// Data-Source rows supplied by the host. `default_menu_tree()` passes empties
+/// (the construction-time tree); the window rebuilds with live data via
+/// [`MenuBar::set_menus`](crate::ui::menubar::MenuBar::set_menus).
+pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -> Vec<MenuNode> {
     use MenuNode as N;
+    // Recent Files children — the C++ shows "(empty)" disabled when none.
+    let recent_children: Vec<MenuNode> = if recent.is_empty() {
+        vec![N::disabled_item("(empty)", "", "file.recent.empty")]
+    } else {
+        recent
+            .iter()
+            .map(|e| N::item(&e.label, "", &e.command))
+            .collect()
+    };
+    // Data Source children — the registered built-in providers, then any saved
+    // sources (active one rendered checked via the host's checked-set), then
+    // Clear All (the C++ `populateSourceMenu` layout; main.cpp:8802).
+    let mut source_children = vec![
+        N::item("File", "", "source.file"),
+        N::item("Process Memory", "", "source.process"),
+        N::item("Kernel Memory", "", "source.kernel"),
+        N::item("Remote Process Memory", "", "source.remote"),
+        N::item("WinDbg Memory", "", "source.windbg"),
+        N::item("ReClass.NET Compat", "", "source.rcnet"),
+    ];
+    if !sources.is_empty() {
+        source_children.push(N::Separator);
+        for s in sources {
+            source_children.push(N::item(&s.label, "", &s.command));
+        }
+    }
+    source_children.push(N::Separator);
+    source_children.push(N::item("Clear All", "", "source.clear"));
     vec![
         N::submenu(
             "&File",
@@ -227,11 +288,12 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::item("New Struct", "Ctrl+T", "file.new_struct"),
                 N::item("New Enum", "Ctrl+E", "file.new_enum"),
                 N::item("Open…", "Ctrl+O", "file.open"),
-                // Dynamic — populated by the host as the user opens files. Empty
-                // submenu (still shows a ▸ fly-out with no children for now).
-                N::submenu("Recent Files", vec![]),
+                // Dynamic — the host rebuilds the tree with the live recent list
+                // (or a disabled "(empty)" row) via `MenuBar::set_menus`.
+                N::submenu("Recent Files", recent_children),
                 N::Separator,
                 N::item("Save", "Ctrl+S", "file.save"),
+                // Save As is QKeySequence::SaveAs (Ctrl+Shift+S on Win/Linux).
                 N::item("Save As…", "Ctrl+Shift+S", "file.save_as"),
                 N::Separator,
                 N::submenu(
@@ -257,19 +319,7 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::Separator,
                 N::item("Close Project", "Ctrl+W", "file.close"),
                 N::Separator,
-                N::submenu(
-                    "Data Source",
-                    vec![
-                        N::item("File", "", "source.file"),
-                        N::item("Process Memory", "", "source.process"),
-                        N::item("Kernel Memory", "", "source.kernel"),
-                        N::item("Remote Process Memory", "", "source.remote"),
-                        N::item("WinDbg Memory", "", "source.windbg"),
-                        N::item("ReClass.NET Compat", "", "source.rcnet"),
-                        N::Separator,
-                        N::item("Clear All", "", "source.clear"),
-                    ],
-                ),
+                N::submenu("Data Source", source_children),
                 N::Separator,
                 N::item("Exit", "", "file.exit"),
             ],
@@ -277,15 +327,17 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
         N::submenu(
             "&Edit",
             vec![
+                // C++ Edit menu (main.cpp:1188-1215): Undo / Redo / —— / Add
+                // Bookmark… (Ctrl+B) / Quick Bookmark Here (Ctrl+Alt+B). The Rust
+                // tree previously invented a Cut/Copy/Paste/Delete/Select-All set
+                // that has no C++ counterpart; replaced to match parity.
                 N::item("Undo", "Ctrl+Z", "edit.undo"),
+                // Redo is QKeySequence::Redo — Ctrl+Y (Windows/Linux) or
+                // Ctrl+Shift+Z. Show the primary platform sequence.
                 N::item("Redo", "Ctrl+Y", "edit.redo"),
                 N::Separator,
-                N::item("Cut", "Ctrl+X", "edit.cut"),
-                N::item("Copy", "Ctrl+C", "edit.copy"),
-                N::item("Paste", "Ctrl+V", "edit.paste"),
-                N::item("Delete", "Del", "edit.delete"),
-                N::Separator,
-                N::item("Select All", "Ctrl+A", "edit.select_all"),
+                N::item("Add Bookmark…", "Ctrl+B", "edit.add_bookmark"),
+                N::item("Quick Bookmark Here", "Ctrl+Alt+B", "edit.quick_bookmark"),
             ],
         ),
         N::submenu(
@@ -293,12 +345,15 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
             vec![
                 N::item("Reset Windows", "", "view.reset_windows"),
                 N::Separator,
+                // C++ Font submenu (main.cpp:1300-1315) is an exclusive
+                // font-FAMILY picker persisted to settings("font") and applied
+                // via setEditorFont — NOT a rem-scaling control. The active
+                // family is shown checked via the live checked-set.
                 N::submenu(
                     "Font",
                     vec![
-                        N::item("Increase", "", "view.font.inc"),
-                        N::item("Decrease", "", "view.font.dec"),
-                        N::item("Reset", "", "view.font.reset"),
+                        N::item("Consolas", "", "view.font.consolas"),
+                        N::item("JetBrains Mono", "", "view.font.jetbrains"),
                     ],
                 ),
                 N::submenu("Theme", theme_menu_items()),
@@ -319,22 +374,34 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
                 N::item("Unsplit Editor", "Ctrl+Shift+\\", "view.unsplit"),
                 N::Separator,
                 N::item("Project", "", "view.project"),
+                // C++ binds Memory Scanner to Ctrl+Shift+S (main.cpp:1452), but in
+                // this single global key context that collides with Save As
+                // (QKeySequence::SaveAs = Ctrl+Shift+S). The port keeps the scanner
+                // on Ctrl+Shift+M and reserves Ctrl+Shift+S for Save As; the label
+                // matches the actual binding.
                 N::item("Memory Scanner", "Ctrl+Shift+M", "view.scanner"),
                 N::item("Modules", "Ctrl+Shift+Y", "view.modules"),
                 N::item("Bookmarks", "Ctrl+Shift+B", "view.bookmarks"),
                 N::Separator,
-                N::item("Presentation Mode", "Ctrl+Shift+P", "view.presentation"),
+                // C++ Presentation Mode is Ctrl+Shift+P (main.cpp:1510) but in
+                // this port Ctrl+Shift+P is the Zed Command Palette trigger; keep
+                // Presentation Mode reachable without a colliding accelerator.
+                N::item("Presentation Mode", "", "view.presentation"),
             ],
         ),
+        // C++ Tools menu (main.cpp:1522-1572): RTTI Browser (Ctrl+Shift+R),
+        // Type Aliases…, Performance Profiler… (Ctrl+Shift+F), —— , Start/Stop
+        // MCP Server, —— , Options…. The previous tree invented a "Validate
+        // Project… Ctrl+Shift+V" item with no C++ counterpart (removed). The MCP
+        // label is dynamic (Start vs Stop); the live label is pushed by the host.
         N::submenu(
             "&Tools",
             vec![
                 N::item("RTTI Browser", "Ctrl+Shift+R", "tools.rtti"),
                 N::item("Type Aliases…", "", "tools.type_aliases"),
-                N::item("Validate Project…", "Ctrl+Shift+V", "tools.validate"),
                 N::item("Performance Profiler…", "Ctrl+Shift+F", "tools.profiler"),
                 N::Separator,
-                N::item("Start/Stop MCP Server", "", "tools.mcp"),
+                N::item("Start MCP Server", "", "tools.mcp"),
                 N::Separator,
                 N::item("Options…", "", "tools.options"),
             ],
@@ -343,11 +410,15 @@ pub fn default_menu_tree() -> Vec<MenuNode> {
             "&Plugins",
             vec![N::item("Manage Plugins…", "", "plugins.manage")],
         ),
+        // C++ Help menu (main.cpp:1579-1584): Keyboard Shortcuts… (F1), —— ,
+        // About Reclass. The previous tree invented a "Documentation" item that
+        // has no C++ counterpart (replaced with the real Shortcuts item).
         N::submenu(
             "&Help",
             vec![
+                N::item("Keyboard Shortcuts…", "F1", "help.shortcuts"),
+                N::Separator,
                 N::item("About Reclass", "", "help.about"),
-                N::item("Documentation", "", "help.docs"),
             ],
         ),
     ]
@@ -972,12 +1043,15 @@ mod tests {
         let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
         // Spot-check load-bearing commands + the palette/goto entries.
         assert!(cmds.contains(&"file.save"));
-        assert!(cmds.contains(&"edit.select_all"));
+        assert!(cmds.contains(&"edit.add_bookmark"));
+        assert!(cmds.contains(&"edit.quick_bookmark"));
         assert!(cmds.contains(&"view.goto_address"));
         assert!(cmds.contains(&"view.command_palette"));
         assert!(cmds.contains(&"tools.options"));
-        // Recent Files (empty submenu) contributes no leaf entries.
-        assert!(!cmds.iter().any(|c| c.contains("recent")));
+        // With no recents, the Recent Files submenu contributes only the disabled
+        // "(empty)" placeholder (never a live, activatable recent entry).
+        let recent: Vec<&&str> = cmds.iter().filter(|c| c.contains("recent")).collect();
+        assert_eq!(recent, vec![&"file.recent.empty"]);
     }
 
     #[test]
@@ -1029,9 +1103,11 @@ mod tests {
             "view.comments",
             "view.hover",
             "view.minimap",
-            "view.font.inc",
+            "view.font.consolas",
+            "view.font.jetbrains",
             "view.split",
             "view.presentation",
+            "view.theme_edit",
         ] {
             assert!(cmds.contains(&c), "View menu missing {c}");
         }
@@ -1043,6 +1119,54 @@ mod tests {
                 "missing theme command {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn edit_menu_matches_cpp_bookmark_structure() {
+        // The Edit menu is Undo/Redo/——/Add Bookmark…/Quick Bookmark Here — the
+        // C++ structure (main.cpp:1188). The invented clipboard items are gone.
+        let entries = flatten_menu_bar(&default_menu_tree());
+        let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        assert!(cmds.contains(&"edit.undo"));
+        assert!(cmds.contains(&"edit.redo"));
+        assert!(cmds.contains(&"edit.add_bookmark"));
+        assert!(cmds.contains(&"edit.quick_bookmark"));
+        // No phantom clipboard/select-all/validate/docs entries.
+        for gone in [
+            "edit.cut",
+            "edit.copy",
+            "edit.paste",
+            "edit.select_all",
+            "tools.validate",
+            "help.docs",
+        ] {
+            assert!(!cmds.contains(&gone), "{gone} should be removed");
+        }
+    }
+
+    #[test]
+    fn dynamic_recent_and_source_rows_appear() {
+        use super::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        let recent = vec![RecentMenuEntry {
+            label: "foo.rcx".into(),
+            command: "file.recent.0".into(),
+        }];
+        let sources = vec![SourceMenuEntry {
+            label: "File 'game.bin'".into(),
+            command: "source.saved.0".into(),
+            active: true,
+        }];
+        let entries = flatten_menu_bar(&menu_tree_with(&recent, &sources));
+        let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        assert!(cmds.contains(&"file.recent.0"), "recent row missing");
+        assert!(cmds.contains(&"source.saved.0"), "saved-source row missing");
+        // Empty recent list → a disabled "(empty)" placeholder, never a live row.
+        let empty = flatten_menu_bar(&menu_tree_with(&[], &[]));
+        let placeholder = empty
+            .iter()
+            .find(|e| e.command == "file.recent.empty")
+            .expect("empty placeholder present");
+        assert!(!placeholder.enabled);
     }
 
     #[test]

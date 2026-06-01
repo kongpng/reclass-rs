@@ -192,6 +192,20 @@ impl KindGroup {
     }
 }
 
+/// The list sort mode for the empty-filter (group-bucketed) view's column-header
+/// sort toolbar (`SortMode` in `typeselectorpopup.cpp:640`). `Group` is the
+/// default bucketed layout; `Name`/`Size` flatten the list and sort by that key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortMode {
+    /// Group-bucketed sections in the fixed [`KindGroup::ALL`] order (default).
+    #[default]
+    Group,
+    /// A flat list sorted by display name.
+    Name,
+    /// A flat list sorted by byte size.
+    Size,
+}
+
 /// `kindGroupFor(NodeKind)` (`typeselectorpopup.cpp:91`).
 pub fn kind_group_for(k: NodeKind) -> KindGroup {
     if is_hex_node(k) {
@@ -405,6 +419,13 @@ pub struct TypeModel {
     selected: Option<usize>,
     mode: TypePopupMode,
     modifier: Modifier,
+    sort_mode: SortMode,
+    /// Sort direction for the flat (Name/Size) sort modes: +1 ascending, -1
+    /// descending. Toggled when the active sort header is re-clicked (`m_sortDir`).
+    sort_dir: i32,
+    /// The last filter applied — kept so a sort/category change can re-run the
+    /// filter without the host re-pushing the query text.
+    last_filter: String,
 }
 
 impl TypeModel {
@@ -416,9 +437,36 @@ impl TypeModel {
             selected: None,
             mode: TypePopupMode::default(),
             modifier: Modifier::None,
+            sort_mode: SortMode::default(),
+            sort_dir: 1,
+            last_filter: String::new(),
         };
         m.apply_filter("");
         m
+    }
+
+    /// The current list sort mode.
+    pub fn sort_mode(&self) -> SortMode {
+        self.sort_mode
+    }
+
+    /// The current sort direction (+1 ascending / -1 descending).
+    pub fn sort_dir(&self) -> i32 {
+        self.sort_dir
+    }
+
+    /// Re-click a sort header (`m_sortMode`/`m_sortDir`): re-clicking the active
+    /// mode flips the direction, picking a new mode resets to ascending. Re-runs
+    /// the last filter so the rows re-layout immediately.
+    pub fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode == mode {
+            self.sort_dir = -self.sort_dir;
+        } else {
+            self.sort_mode = mode;
+            self.sort_dir = 1;
+        }
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
     }
 
     /// All candidate entries.
@@ -488,13 +536,58 @@ impl TypeModel {
     /// headers). Selects the first selectable row.
     pub fn apply_filter(&mut self, filter: &str) {
         let trimmed = filter.trim();
+        self.last_filter = filter.to_string();
         self.rows.clear();
         if trimmed.is_empty() {
-            self.build_bucketed();
+            // Empty filter honors the sort mode: Group → bucketed sections; the
+            // flat sort modes (Name/Size) produce a single sorted list, no
+            // section headers (the C++ `m_sortMode != SortGroup` branch).
+            match self.sort_mode {
+                SortMode::Group => self.build_bucketed(),
+                SortMode::Name | SortMode::Size => self.build_sorted_flat(),
+            }
         } else {
             self.build_filtered(trimmed);
         }
         self.selected = self.first_selectable_row();
+    }
+
+    /// Build the empty-filter **flat** sorted view for the Name/Size sort modes:
+    /// every selectable entry in one list, sorted by the active key + direction,
+    /// with no section headers (the C++ `SortName`/`SortSize` branch).
+    fn build_sorted_flat(&mut self) {
+        let dir = self.sort_dir;
+        let mut entries: Vec<TypeEntry> = self.entries.clone();
+        match self.sort_mode {
+            SortMode::Name => {
+                entries.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+            }
+            SortMode::Size => {
+                entries.sort_by(|a, b| {
+                    a.size_bytes
+                        .cmp(&b.size_bytes)
+                        .then_with(|| a.display_name.cmp(&b.display_name))
+                });
+            }
+            SortMode::Group => {}
+        }
+        if dir < 0 {
+            entries.reverse();
+        }
+        let mut rows: Vec<TypeRow> = entries
+            .into_iter()
+            .map(|e| TypeRow {
+                entry: e,
+                match_positions: Vec::new(),
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(TypeRow {
+                entry: TypeEntry::section("No types available"),
+                match_positions: Vec::new(),
+            });
+        }
+        self.rows = rows;
     }
 
     /// Build the empty-filter bucketed view: per-group sections in fixed order.
@@ -630,7 +723,8 @@ pub use view::{TypeSelectorEvent, TypeSelectorPopup};
 #[cfg(feature = "ui")]
 mod view {
     use super::{
-        default_type_entries, EntryKind, KindGroup, Modifier, TypeEntry, TypeModel, TypePopupMode,
+        default_type_entries, EntryKind, KindGroup, Modifier, SortMode, TypeEntry, TypeModel,
+        TypePopupMode,
     };
     use crate::core::kind::NodeKind;
     use crate::theme::model::Theme;
@@ -802,14 +896,38 @@ mod view {
             cx.notify();
         }
 
-        /// Whether an entry's group passes the active category-chip filter (empty
-        /// set = all visible).
+        /// The explicit "none" sentinel key inserted by [`select_no_groups`] — its
+        /// presence in `active_groups` hides *every* group (the C++ "none" chip).
+        const NONE_SENTINEL: &'static str = "\u{0}none";
+
+        /// Whether an entry's group passes the active category-chip filter.
+        ///
+        /// - empty set → all visible (the "all" state);
+        /// - the `none` sentinel present → nothing visible (the "none" chip);
+        /// - groups WITHOUT a category chip (Vec/Str/Ctr/Common) are always
+        ///   visible (the C++ `catAllowed`: only chip-bearing groups can be
+        ///   filtered out);
+        /// - otherwise a chip-bearing group is visible iff its key is active.
         fn group_visible(&self, group: KindGroup) -> bool {
-            self.active_groups.is_empty() || self.active_groups.contains(group.key())
+            // "none" sentinel → hide everything.
+            if self.active_groups.contains(Self::NONE_SENTINEL) {
+                return false;
+            }
+            // No active chips → show all.
+            if self.active_groups.is_empty() {
+                return true;
+            }
+            // Groups without a chip toggle are always visible.
+            if !group.has_chip() {
+                return true;
+            }
+            self.active_groups.contains(group.key())
         }
 
-        /// Toggle a category chip (Hex/Int/Float/Ptr).
+        /// Toggle a category chip (Hex/Int/Float/Ptr). Clears the "none" sentinel
+        /// first so toggling a chip out of the "none" state actually re-shows it.
         fn toggle_group(&mut self, group: KindGroup, cx: &mut Context<Self>) {
+            self.active_groups.remove(Self::NONE_SENTINEL);
             let key = group.key();
             if self.active_groups.contains(key) {
                 self.active_groups.remove(key);
@@ -830,7 +948,7 @@ mod view {
         /// sentinel: an active set containing only an unused key hides every group.
         fn select_no_groups(&mut self, cx: &mut Context<Self>) {
             self.active_groups.clear();
-            self.active_groups.insert("\u{0}none");
+            self.active_groups.insert(Self::NONE_SENTINEL);
             cx.notify();
         }
 
@@ -857,10 +975,69 @@ mod view {
             }
         }
 
+        /// The "+ New" footer button (`createNewTypeRequested`,
+        /// `typeselectorpopup.cpp:924`): create a brand-new struct/class and apply
+        /// it to the node, carrying the active `*`/`**`/`[]` modifier. Emitted as a
+        /// [`TypeSelectorEvent::Chosen`] with [`NodeKind::Struct`] — the editor's
+        /// existing apply path (`change_node_kind` → struct) creates the new
+        /// composite and applies it, so this works end-to-end without a new
+        /// contract variant (keeping the editor's `Chosen`/`Cancel` match stable).
+        fn create_new(&mut self, cx: &mut Context<Self>) {
+            let modifier = match self.model.modifier() {
+                Modifier::None => None,
+                m => Some(m),
+            };
+            cx.emit(TypeSelectorEvent::Chosen {
+                kind: NodeKind::Struct,
+                modifier,
+            });
+        }
+
         fn theme(&self, cx: &App) -> Theme {
             // The popover tints rows from our theme; pull the current one from the
             // app-shared manager so chip/group colors match the editor.
             super::super::theme_apply::ThemeRegistryGlobal::current(cx)
+        }
+
+        /// Keyboard navigation (`typeselectorpopup.cpp:1881` `eventFilter`):
+        /// Up/Down move the selection (skipping section headers), Enter accepts the
+        /// selected type, Esc cancels, Ctrl+F focuses the filter input. Returns
+        /// `true` when handled so the caller stops propagation.
+        fn handle_nav_key(
+            &mut self,
+            key: &str,
+            modifiers: &Modifiers,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> bool {
+            // Ctrl+F focuses the filter from anywhere.
+            if key == "f" && modifiers.control {
+                let input = self.input.clone();
+                window.focus(&input.read(cx).focus_handle(cx), cx);
+                cx.notify();
+                return true;
+            }
+            match key {
+                "down" => {
+                    self.model.move_down();
+                    cx.notify();
+                    true
+                }
+                "up" => {
+                    self.model.move_up();
+                    cx.notify();
+                    true
+                }
+                "enter" => {
+                    self.accept_selected(cx);
+                    true
+                }
+                "escape" => {
+                    cx.emit(TypeSelectorEvent::Cancel);
+                    true
+                }
+                _ => false,
+            }
         }
     }
 
@@ -1045,6 +1222,19 @@ mod view {
                 .id("rcx-type-selector")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxTypeSelector")
+                // Capture-phase key handling so Up/Down/Enter/Esc/Ctrl+F drive the
+                // list even when the filter input owns focus (the C++ `eventFilter`
+                // that forwarded these from the line-edit to the list).
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if this.handle_nav_key(
+                        ev.keystroke.key.as_str(),
+                        &ev.keystroke.modifiers,
+                        window,
+                        cx,
+                    ) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .flex()
                 .flex_col()
                 .w(px(380.))
@@ -1175,7 +1365,7 @@ mod view {
             };
 
             let all_active = self.active_groups.is_empty();
-            let none_active = self.active_groups.contains("\u{0}none");
+            let none_active = self.active_groups.contains(Self::NONE_SENTINEL);
 
             gpui_component::h_flex()
                 .w_full()
@@ -1231,12 +1421,55 @@ mod view {
                 )
         }
 
-        /// The column header "group · name · size" with the sort + layout-toggle
-        /// icons on the right (the C++ list header).
+        /// The column header with the working `group` / `name` / `size` sort
+        /// toggles (the C++ list-header sort toolbar, `typeselectorpopup.cpp:640`).
+        /// Clicking a sort key re-sorts the list; re-clicking the active key flips
+        /// the direction (shown with an ↑/↓ arrow). The trailing list/grid icons
+        /// are the layout affordances mirroring the C++ density toggle.
         fn render_column_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
             let muted = color::text_muted(cx);
+            let fg = color::text(cx);
+            let accent = color::accent(cx);
             let hover_bg = color::hover_overlay(cx);
-            let icon_btn = |id: &'static str, ic: Icon| -> AnyElement {
+            let sel_bg = color::selected_bg(cx);
+            let active_mode = self.model.sort_mode();
+            let dir_arrow = if self.model.sort_dir() >= 0 {
+                " \u{2191}"
+            } else {
+                " \u{2193}"
+            };
+
+            // A clickable sort-key text button.
+            let sort_btn = |id: &'static str, label: &'static str, mode: SortMode| -> AnyElement {
+                let is_active = active_mode == mode;
+                let text = if is_active {
+                    format!("{label}{dir_arrow}")
+                } else {
+                    label.to_string()
+                };
+                div()
+                    .id(id)
+                    .px(px(tokens::space::SM))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(tokens::radius::SM))
+                    .text_color(if is_active { accent } else { muted })
+                    .cursor_pointer()
+                    .when(is_active, |d| d.bg(sel_bg))
+                    .when(!is_active, |d| d.hover(|s| s.bg(hover_bg).text_color(fg)))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.model.set_sort_mode(mode);
+                        cx.notify();
+                    }))
+                    .child(text)
+                    .into_any_element()
+            };
+
+            // A layout-toggle icon button: sets the bucketed (Group) layout vs a
+            // flat name-sorted layout (the C++ density/layout toggle).
+            let layout_btn = |id: &'static str, ic: Icon, mode: SortMode| -> AnyElement {
+                let is_active = active_mode == mode;
                 div()
                     .id(id)
                     .flex_none()
@@ -1245,29 +1478,40 @@ mod view {
                     .justify_center()
                     .size(px(18.))
                     .rounded(px(tokens::radius::SM))
-                    .text_color(muted)
+                    .text_color(if is_active { accent } else { muted })
                     .cursor_pointer()
-                    .hover(|s| s.bg(hover_bg))
+                    .when(is_active, |d| d.bg(sel_bg))
+                    .when(!is_active, |d| d.hover(|s| s.bg(hover_bg)))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.model.set_sort_mode(mode);
+                        cx.notify();
+                    }))
                     .child(ic.size_3())
                     .into_any_element()
             };
+
             gpui_component::h_flex()
                 .w_full()
                 .h(px(20.))
                 .px(px(tokens::space::MD))
-                .gap(px(tokens::space::MD))
+                .gap(px(tokens::space::XS))
                 .items_center()
                 .text_size(px(tokens::font::UI_XS))
                 .text_color(muted)
-                .child(div().flex_none().child("group"))
-                .child(div().flex_1().min_w_0().child("name"))
-                .child(div().flex_none().child("size"))
-                // Sort + layout toggles (cosmetic affordances mirroring the C++).
-                .child(icon_btn("col-sort", Icon::new(IconName::SortAscending)))
-                .child(icon_btn("col-layout-list", Icon::new(IconName::Menu)))
-                .child(icon_btn(
+                .child(sort_btn("col-sort-group", "group", SortMode::Group))
+                .child(sort_btn("col-sort-name", "name", SortMode::Name))
+                .child(sort_btn("col-sort-size", "size", SortMode::Size))
+                .child(div().flex_1())
+                // Layout toggles: bucketed sections (Group) vs a flat list (Name).
+                .child(layout_btn(
+                    "col-layout-list",
+                    Icon::new(IconName::Menu),
+                    SortMode::Group,
+                ))
+                .child(layout_btn(
                     "col-layout-grid",
                     Icon::new(IconName::LayoutDashboard),
+                    SortMode::Name,
                 ))
         }
 
@@ -1381,7 +1625,10 @@ mod view {
                                 .ghost()
                                 .small()
                                 .icon(IconName::Plus)
-                                .label("New"),
+                                .label("New")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.create_new(cx);
+                                })),
                         )
                         .child(div().flex_1())
                         .child(
@@ -1401,8 +1648,8 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        kind_group_for, parse_type_spec, EntryKind, KindGroup, Modifier, TypeEntry, TypeModel,
-        TypePopupMode,
+        kind_group_for, parse_type_spec, EntryKind, KindGroup, Modifier, SortMode, TypeEntry,
+        TypeModel, TypePopupMode,
     };
     use crate::core::kind::NodeKind;
 
@@ -1627,5 +1874,71 @@ mod tests {
             .position(|r| r.entry.entry_kind == EntryKind::Section)
             .unwrap();
         assert!(!model.select_row(first_section));
+    }
+
+    // ── sort modes (defect 6: working sort toolbar) ──
+
+    #[test]
+    fn default_sort_mode_is_group_bucketed() {
+        let model = TypeModel::new(sample_entries());
+        assert_eq!(model.sort_mode(), SortMode::Group);
+        // Group layout has section headers.
+        assert!(model
+            .rows()
+            .iter()
+            .any(|r| r.entry.entry_kind == EntryKind::Section));
+    }
+
+    #[test]
+    fn name_sort_flattens_and_orders_by_name() {
+        let mut model = TypeModel::new(sample_entries());
+        model.set_sort_mode(SortMode::Name);
+        assert_eq!(model.sort_mode(), SortMode::Name);
+        // Flat list: no section headers.
+        assert!(model
+            .rows()
+            .iter()
+            .all(|r| r.entry.entry_kind != EntryKind::Section));
+        // Ascending by display name.
+        let names: Vec<&str> = model
+            .rows()
+            .iter()
+            .map(|r| r.entry.display_name.as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn size_sort_orders_by_byte_size() {
+        let mut model = TypeModel::new(sample_entries());
+        model.set_sort_mode(SortMode::Size);
+        let sizes: Vec<i32> = model.rows().iter().map(|r| r.entry.size_bytes).collect();
+        let mut sorted = sizes.clone();
+        sorted.sort();
+        assert_eq!(sizes, sorted);
+    }
+
+    #[test]
+    fn reclicking_active_sort_flips_direction() {
+        let mut model = TypeModel::new(sample_entries());
+        model.set_sort_mode(SortMode::Name);
+        assert_eq!(model.sort_dir(), 1);
+        let asc: Vec<String> = model
+            .rows()
+            .iter()
+            .map(|r| r.entry.display_name.clone())
+            .collect();
+        // Re-clicking the active mode flips to descending.
+        model.set_sort_mode(SortMode::Name);
+        assert_eq!(model.sort_dir(), -1);
+        let mut desc: Vec<String> = model
+            .rows()
+            .iter()
+            .map(|r| r.entry.display_name.clone())
+            .collect();
+        desc.reverse();
+        assert_eq!(asc, desc);
     }
 }

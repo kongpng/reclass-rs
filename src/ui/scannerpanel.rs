@@ -492,10 +492,238 @@ pub fn filter_rows<'a>(rows: &'a [ScanRow], query: &str) -> Vec<&'a ScanRow> {
         .collect()
 }
 
+/// The displayed-row cap (the C++ `kMaxRows`): the results table only ever
+/// shows the first 10,000 rows, with a banner above when the real result count
+/// exceeds it.
+pub const MAX_DISPLAY_ROWS: usize = 10_000;
+
+/// The signed delta between two cached value byte-slices, decoded as `vt`
+/// (the C++ `computeDelta`, `scannerpanel.cpp:2099-2137`). Returns the
+/// rendered delta text (`"+N"` / `"-N"`), the direction (`1`/`0`/`-1` for
+/// up/none/down), and whether the decode succeeded. A too-short / non-numeric
+/// value yields `ok == false` so the caller can degrade to a plain "→" arrow.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DeltaInfo {
+    /// The rendered delta (`"+3"`, `"-12"`, `"+0.5"`); empty when `!ok`.
+    pub text: String,
+    /// `1` = increase, `-1` = decrease, `0` = unchanged.
+    pub direction: i32,
+    /// Whether the value type decoded to a numeric delta.
+    pub ok: bool,
+}
+
+/// `computeDelta(vt, prev, cur)` (`scannerpanel.cpp:2099-2137`).
+pub fn compute_delta(vt: ValueType, prev: &[u8], cur: &[u8]) -> DeltaInfo {
+    let mut d = DeltaInfo::default();
+    if prev.is_empty() || cur.is_empty() {
+        return d;
+    }
+    let sign = |v: f64| -> i32 {
+        if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        }
+    };
+    let mut fmt_int = |delta: i64| {
+        d.direction = sign(delta as f64);
+        d.text = if delta >= 0 {
+            format!("+{delta}")
+        } else {
+            // The negative sign is already in the formatted integer.
+            format!("{delta}")
+        };
+        d.ok = true;
+    };
+    macro_rules! int_delta {
+        ($t:ty, $w:expr) => {{
+            if prev.len() >= $w && cur.len() >= $w {
+                let a = <$t>::from_le_bytes(prev[..$w].try_into().unwrap()) as i64;
+                let b = <$t>::from_le_bytes(cur[..$w].try_into().unwrap()) as i64;
+                fmt_int(b - a);
+                return d;
+            }
+        }};
+    }
+    match vt {
+        ValueType::Int8 => int_delta!(i8, 1),
+        ValueType::UInt8 => int_delta!(u8, 1),
+        ValueType::Int16 => int_delta!(i16, 2),
+        ValueType::UInt16 => int_delta!(u16, 2),
+        ValueType::Int32 => int_delta!(i32, 4),
+        ValueType::UInt32 => int_delta!(u32, 4),
+        ValueType::Int64 => int_delta!(i64, 8),
+        ValueType::UInt64 => {
+            // u64 wraps via i64 to match the C++ `(long long)(int64_t)(b - a)`.
+            if prev.len() >= 8 && cur.len() >= 8 {
+                let a = u64::from_le_bytes(prev[..8].try_into().unwrap());
+                let b = u64::from_le_bytes(cur[..8].try_into().unwrap());
+                fmt_int(b.wrapping_sub(a) as i64);
+                return d;
+            }
+        }
+        ValueType::Float => {
+            if prev.len() >= 4 && cur.len() >= 4 {
+                let a = f32::from_le_bytes(prev[..4].try_into().unwrap()) as f64;
+                let b = f32::from_le_bytes(cur[..4].try_into().unwrap()) as f64;
+                let delta = b - a;
+                d.direction = sign(delta);
+                let num = format_float(delta, 6);
+                d.text = if delta >= 0.0 { format!("+{num}") } else { num };
+                d.ok = true;
+                return d;
+            }
+        }
+        ValueType::Double => {
+            if prev.len() >= 8 && cur.len() >= 8 {
+                let a = f64::from_le_bytes(prev[..8].try_into().unwrap());
+                let b = f64::from_le_bytes(cur[..8].try_into().unwrap());
+                let delta = b - a;
+                d.direction = sign(delta);
+                let num = format_float(delta, 6);
+                d.text = if delta >= 0.0 { format!("+{num}") } else { num };
+                d.ok = true;
+                return d;
+            }
+        }
+        _ => {}
+    }
+    d // ok == false: caller falls back to byte-equality "→" arrow
+}
+
+/// The Previous-column text for a row showing a delta (the C++ `"<prev>  →  <Δ>"`
+/// composition, `scannerpanel.cpp:1581-1590`). Empty when there is no previous
+/// value; a bare `"<prev>  →"` arrow when the value changed but is non-numeric.
+pub fn previous_delta_text(prev_text: &str, delta: &DeltaInfo, changed: bool) -> String {
+    if prev_text.is_empty() {
+        return String::new();
+    }
+    if delta.ok {
+        format!("{prev_text}  →  {}", delta.text)
+    } else if changed {
+        format!("{prev_text}  →")
+    } else {
+        prev_text.to_string()
+    }
+}
+
+/// The status line after a Re-scan (`scannerpanel.cpp:1716-1735`): the
+/// `Narrowed N → M (eliminated K)` / `All N still match` / `M results` variants.
+/// `before` is the pre-rescan count (0 = no narrowing context).
+pub fn rescan_status(before: usize, after: usize) -> String {
+    if after == 0 {
+        "0 results — the condition eliminated everything. Click Reset to start over, \
+         or relax the condition and try again."
+            .to_string()
+    } else if before > 0 && after < before {
+        format!(
+            "Narrowed {before} → {after}  (eliminated {})",
+            before - after
+        )
+    } else if before > 0 && after == before {
+        format!("All {after} results still match")
+    } else if after == 1 {
+        "1 result".to_string()
+    } else {
+        format!("{after} results")
+    }
+}
+
+/// The scan-generation breadcrumb (`scannerpanel.cpp:updateStageLabel`,
+/// 2256-2328) reduced to plain text: the "Step N — phase: count" stage line
+/// shown next to the action buttons. `generation` is 0 (idle), 1 (first scan),
+/// or ≥2 (re-scan); `before`/`after` give the narrowed counts on a re-scan.
+pub fn stage_breadcrumb(generation: u32, before: usize, after: usize) -> String {
+    match generation {
+        0 => String::new(),
+        1 => {
+            if after == 0 {
+                "Step 1 — First scan: 0 results".to_string()
+            } else if after == 1 {
+                "Step 1 — First scan: 1 result".to_string()
+            } else {
+                format!("Step 1 — First scan: {after} results")
+            }
+        }
+        g => {
+            if after == 0 {
+                format!("Step {g} — 0 results (condition eliminated everything)")
+            } else if before > 0 && after < before {
+                format!(
+                    "Step {g} — Narrowed {before} → {after} (eliminated {})",
+                    before - after
+                )
+            } else if before > 0 && after == before {
+                format!("Step {g} — All {after} results still match")
+            } else if after == 1 {
+                format!("Step {g} — 1 result")
+            } else {
+                format!("Step {g} — {after} results")
+            }
+        }
+    }
+}
+
+/// The truncation banner text when the result count exceeds [`MAX_DISPLAY_ROWS`]
+/// (the C++ `m_truncBanner`, `scannerpanel.cpp:1485-1488`). Returns `None` when
+/// no banner is needed.
+pub fn truncation_banner(total: usize) -> Option<String> {
+    if total > MAX_DISPLAY_ROWS {
+        Some(format!(
+            "Showing first {MAX_DISPLAY_ROWS} of {total} results — narrow the scan to see fewer."
+        ))
+    } else {
+        None
+    }
+}
+
+/// Serialize a result list to the C++ scanner JSON shape (`saveResultsTo`,
+/// `scannerpanel.cpp:2386-2406`): `{version, scanMode, valueType, count,
+/// results:[{address, value, module?}]}` with hex address + hex-encoded bytes.
+pub fn serialize_results_json(
+    last_mode: ScanMode,
+    last_value_type: ValueType,
+    rows: &[(u64, Vec<u8>, String)],
+) -> String {
+    fn hex_bytes(b: &[u8]) -> String {
+        let mut s = String::with_capacity(b.len() * 2);
+        for byte in b {
+            s.push_str(&format!("{byte:02x}"));
+        }
+        s
+    }
+    let mut entries = String::new();
+    for (i, (addr, value, module)) in rows.iter().enumerate() {
+        if i > 0 {
+            entries.push(',');
+        }
+        entries.push_str(&format!(
+            "{{\"address\":\"{addr:x}\",\"value\":\"{}\"",
+            hex_bytes(value)
+        ));
+        if !module.is_empty() {
+            entries.push_str(&format!(",\"module\":\"{module}\""));
+        }
+        entries.push('}');
+    }
+    let mode = if last_mode == ScanMode::Signature {
+        0
+    } else {
+        1
+    };
+    format!(
+        "{{\"version\":1,\"scanMode\":{mode},\"valueType\":{},\"count\":{},\"results\":[{entries}]}}",
+        last_value_type as i32,
+        rows.len()
+    )
+}
+
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
-pub use view::{ScannerNav, ScannerPanel};
+pub use view::{ScannerEdit, ScannerNav, ScannerPanel};
 
 #[cfg(feature = "ui")]
 mod view {
@@ -515,11 +743,15 @@ mod view {
     use gpui_component::{Disableable as _, Sizable as _};
 
     use super::{
-        filter_rows, split_address_dim, value_type_entries, CondEntry, ScanMode, ScanRow,
-        ScannerForm, FAST_SCAN_ALIGNMENTS,
+        compute_delta, previous_delta_text, rescan_status, serialize_results_json,
+        split_address_dim, stage_breadcrumb, truncation_banner, value_type_entries, CondEntry,
+        ScanMode, ScanRow, ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
     use crate::provider::Provider;
-    use crate::scanner::{run_scan, NullObserver, ScanCondition, ScanResult, ValueType};
+    use crate::scanner::{
+        run_rescan, run_scan, serialize_value, value_size_for_type, NullObserver, ScanCondition,
+        ScanResult, ValueType,
+    };
     use crate::ui::design::{color, tokens};
 
     /// A "go to this address" request raised when a result row is activated
@@ -530,30 +762,69 @@ mod view {
         pub address: u64,
     }
 
+    /// An inline-edit intent raised when a result cell is double-clicked (the
+    /// C++ `onCellEdited`). The provider held here is read-only (`Arc`, no `&mut`
+    /// for `write`), and address-expression evaluation lives in the controller's
+    /// parser, so the panel raises the intent for the window to resolve against
+    /// its mutable source — the read-only-surface pattern bookmarks use.
+    #[derive(Clone, Debug)]
+    pub enum ScannerEdit {
+        /// Re-evaluate the Address cell as an address expression, then move the
+        /// row to + navigate to the result (the C++ col-0 edit). `row` indexes
+        /// into the panel's result list.
+        EvalAddress { row: usize },
+        /// Write the Value cell back to memory at the row's address (the C++
+        /// col-1 edit). `row` indexes into the panel's result list.
+        WriteValue { row: usize, address: u64 },
+    }
+
     /// The result columns. The C++ scanner table is 2 columns (Address, Value);
-    /// PIC6 additionally surfaces a Previous column (the pre-rescan value), so
-    /// the port shows three: Address / Value / Previous.
+    /// PIC6 additionally surfaces a Previous→Δ column (the pre-rescan value with
+    /// its signed delta) and a Module column (when any result falls in a known
+    /// module), so the port shows up to four: Address / Value / Previous / Module.
     const COL_ADDRESS: usize = 0;
     const COL_VALUE: usize = 1;
     const COL_PREVIOUS: usize = 2;
 
+    /// One displayed row plus its render metadata — the formatted strings, the
+    /// per-row delta direction (drives green/red coloring on the Value + Previous
+    /// columns, the C++ `computeDelta` foreground), and the module name (the
+    /// C++ `regionModule`, shown only when present).
+    #[derive(Clone, Debug)]
+    pub(super) struct DisplayRow {
+        pub(super) row: ScanRow,
+        /// `1` = increase (green), `-1` = decrease (red), `0` = none.
+        pub(super) delta_dir: i32,
+        /// The module the address falls inside (empty when unknown).
+        pub(super) module: String,
+    }
+
     /// The [`TableDelegate`] backing the results [`DataTable`]: owns the displayed
     /// rows and paints the Address cell with the dimmed leading-zero prefix (the
     /// C++ `AddressDelegate`). Sorting is wired via [`TableDelegate::perform_sort`]
-    /// over the address (the C++ sortable header).
+    /// over the address (the C++ sortable header). `show_previous` mirrors the C++
+    /// `populateTable(showPrevious)` — the Previous→Δ column only appears after a
+    /// re-scan; `show_module` appears when any row has a module name.
     struct ScanResultsDelegate {
-        rows: Vec<ScanRow>,
+        rows: Vec<DisplayRow>,
+        show_previous: bool,
+        show_module: bool,
     }
 
     impl ScanResultsDelegate {
         fn new() -> Self {
-            ScanResultsDelegate { rows: Vec::new() }
+            ScanResultsDelegate {
+                rows: Vec::new(),
+                show_previous: false,
+                show_module: false,
+            }
         }
     }
 
     impl TableDelegate for ScanResultsDelegate {
         fn columns_count(&self, _cx: &App) -> usize {
-            3
+            let base = if self.show_previous { 3 } else { 2 };
+            base + if self.show_module { 1 } else { 0 }
         }
 
         fn rows_count(&self, _cx: &App) -> usize {
@@ -561,10 +832,16 @@ mod view {
         }
 
         fn column(&self, col_ix: usize, _cx: &App) -> Column {
+            // When the Previous column is hidden the Module column slides into
+            // slot 2; resolve the logical column for the physical index.
+            let module_ix = if self.show_previous { 3 } else { 2 };
+            if col_ix == module_ix && self.show_module {
+                return Column::new("module", "Module").width(px(140.)).sortable();
+            }
             match col_ix {
                 COL_VALUE => Column::new("value", "Value").width(px(160.)).sortable(),
-                COL_PREVIOUS => Column::new("previous", "Previous")
-                    .width(px(160.))
+                COL_PREVIOUS => Column::new("previous", "Previous → Δ")
+                    .width(px(180.))
                     .sortable(),
                 _ => Column::new("address", "Address").width(px(176.)).sortable(),
             }
@@ -578,12 +855,19 @@ mod view {
             _cx: &mut Context<TableState<Self>>,
         ) {
             let asc = !matches!(sort, ColumnSort::Descending);
-            match col_ix {
-                COL_ADDRESS => self.rows.sort_by_key(|r| r.address),
-                COL_PREVIOUS => self
-                    .rows
-                    .sort_by(|a, b| a.previous_text.cmp(&b.previous_text)),
-                _ => self.rows.sort_by(|a, b| a.value_text.cmp(&b.value_text)),
+            let module_ix = if self.show_previous { 3 } else { 2 };
+            if col_ix == module_ix && self.show_module {
+                self.rows.sort_by(|a, b| a.module.cmp(&b.module));
+            } else {
+                match col_ix {
+                    COL_ADDRESS => self.rows.sort_by_key(|r| r.row.address),
+                    COL_PREVIOUS => self
+                        .rows
+                        .sort_by(|a, b| a.row.previous_text.cmp(&b.row.previous_text)),
+                    _ => self
+                        .rows
+                        .sort_by(|a, b| a.row.value_text.cmp(&b.row.value_text)),
+                }
             }
             if !asc {
                 self.rows.reverse();
@@ -597,8 +881,20 @@ mod view {
             _window: &mut Window,
             cx: &mut Context<TableState<Self>>,
         ) -> impl IntoElement {
-            let Some(row) = self.rows.get(row_ix) else {
+            let Some(d) = self.rows.get(row_ix) else {
                 return div();
+            };
+            let row = &d.row;
+            let module_ix = if self.show_previous { 3 } else { 2 };
+            // Green/red direction tint (the C++ `#7BC97B` / `#E07B7B`): the
+            // theme greens an increase, reds a decrease.
+            let delta_color = |cx: &App| -> Option<gpui::Hsla> {
+                use gpui_component::ActiveTheme as _;
+                match d.delta_dir {
+                    n if n > 0 => Some(cx.theme().green),
+                    n if n < 0 => Some(cx.theme().red),
+                    _ => None,
+                }
             };
             if col_ix == COL_ADDRESS {
                 // Dim the leading-zero prefix, bright the rest (AddressDelegate):
@@ -618,35 +914,54 @@ mod view {
                             )
                             .child(div().text_color(color::text(cx)).child(bright.to_string())),
                     )
+            } else if col_ix == module_ix && self.show_module {
+                // Module column: muted truncating name.
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_size(px(tokens::font::UI_XS))
+                    .text_color(color::text_muted(cx))
+                    .child(d.module.clone())
             } else {
                 // Numeric / hex value column: monospace, right-aligned so digits
                 // line up the way the original scanner table presents them. The
-                // Previous column is dimmed (it's the stale, pre-rescan value).
-                let (text, muted) = if col_ix == COL_PREVIOUS {
-                    (row.previous_text.clone(), true)
+                // Value + Previous columns carry the green/red direction tint.
+                let muted = col_ix == COL_PREVIOUS;
+                let text = if col_ix == COL_PREVIOUS {
+                    row.previous_text.clone()
                 } else {
-                    (row.value_text.clone(), false)
+                    row.value_text.clone()
                 };
+                let tint = delta_color(cx);
                 div()
                     .w_full()
                     .flex()
                     .justify_end()
                     .font_family(tokens::font::MONO_FAMILY)
                     .text_size(px(tokens::font::EDITOR_SIZE))
-                    .when(muted, |d| d.text_color(color::text_muted(cx)))
-                    .when(!muted, |d| d.text_color(color::text(cx)))
+                    .when_some(tint, |dv, c| dv.text_color(c))
+                    .when(tint.is_none() && muted, |dv| {
+                        dv.text_color(color::text_muted(cx))
+                    })
+                    .when(tint.is_none() && !muted, |dv| {
+                        dv.text_color(color::text(cx))
+                    })
                     .child(text)
             }
         }
 
         fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
-            let Some(row) = self.rows.get(row_ix) else {
+            let Some(d) = self.rows.get(row_ix) else {
                 return String::new();
             };
+            let module_ix = if self.show_previous { 3 } else { 2 };
+            if col_ix == module_ix && self.show_module {
+                return d.module.clone();
+            }
             match col_ix {
-                COL_ADDRESS => row.address_text.clone(),
-                COL_PREVIOUS => row.previous_text.clone(),
-                _ => row.value_text.clone(),
+                COL_ADDRESS => d.row.address_text.clone(),
+                COL_PREVIOUS => d.row.previous_text.clone(),
+                _ => d.row.value_text.clone(),
             }
         }
     }
@@ -666,13 +981,38 @@ mod view {
         value2_input: Entity<InputState>,
         filter_input: Entity<InputState>,
         table: Entity<TableState<ScanResultsDelegate>>,
-        /// The full (unfiltered) result rows; the table holds the filtered view.
-        all_rows: Vec<ScanRow>,
+        /// The live result list (the C++ `m_results`) — the raw [`ScanResult`]s
+        /// the Re-scan / inline-edit paths re-read + filter. The table delegate
+        /// holds the formatted, filtered display view derived from these.
+        results: Vec<ScanResult>,
+        /// Whether a re-scan has run yet — drives the Previous→Δ column
+        /// (the C++ `populateTable(showPrevious)`).
+        show_previous: bool,
+        /// The undo stack of pre-rescan result snapshots (the C++ `m_undoStack`),
+        /// capped at [`MAX_UNDO`] so a long narrowing chain stays bounded.
+        undo_stack: Vec<Vec<ScanResult>>,
+        /// The scan generation (0 = idle, 1 = first scan, ≥2 = re-scan) — drives
+        /// the stage breadcrumb (the C++ `m_scanGeneration`).
+        generation: u32,
+        /// The pre-rescan count, for the "Narrowed N → M" status (the C++
+        /// `m_lastResultCount`).
+        last_result_count: usize,
         provider: Option<Arc<dyn Provider + Send + Sync>>,
+        /// The attached source's display name, for the floating dock title
+        /// ("Memory Scanner — notepad.exe (Process)"); empty when none.
+        source_title: Option<String>,
         status: String,
         /// The currently-selected result row (drives the footer goto/copy
         /// buttons), tracked from [`TableEvent::SelectRow`].
         selected_row: Option<usize>,
+        /// `true` while a scan/rescan is running off-thread — shows the progress
+        /// bar + Cancel control (the C++ `m_progressBar` / Esc cancel).
+        scanning: bool,
+        /// Scan progress 0..=100, pushed from the off-thread observer.
+        progress: i32,
+        /// The flippable abort flag a running scan polls (the C++ `m_abort`);
+        /// the Cancel / Esc control sets it.
+        abort: Arc<AtomicBool>,
         /// Controlled-open state for the toolbar dropdown popovers (scan-type /
         /// condition / value-type / fast-scan), so picking an item dismisses the
         /// popover.
@@ -683,6 +1023,9 @@ mod view {
         focus_handle: FocusHandle,
         _subs: Vec<Subscription>,
     }
+
+    /// The undo-stack cap (the C++ `kMaxUndo`).
+    const MAX_UNDO: usize = 16;
 
     impl ScannerPanel {
         /// Build an empty scanner panel.
@@ -734,9 +1077,31 @@ mod view {
                             .delegate()
                             .rows
                             .get(*row_ix)
-                            .map(|r| r.address);
+                            .map(|r| r.row.address);
                         if let Some(address) = addr {
                             cx.emit(ScannerNav { address });
+                        }
+                    }
+                    // Double-click a cell to edit it (the C++ onCellEdited):
+                    // the Address cell re-evaluates + navigates, the Value cell
+                    // writes back to memory. The window resolves the intent
+                    // against its mutable source.
+                    TableEvent::DoubleClickedCell(row_ix, col_ix) => {
+                        let addr = table
+                            .read(cx)
+                            .delegate()
+                            .rows
+                            .get(*row_ix)
+                            .map(|r| r.row.address);
+                        if let Some(address) = addr {
+                            if *col_ix == COL_ADDRESS {
+                                cx.emit(ScannerEdit::EvalAddress { row: *row_ix });
+                            } else if *col_ix == COL_VALUE {
+                                cx.emit(ScannerEdit::WriteValue {
+                                    row: *row_ix,
+                                    address,
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -749,10 +1114,18 @@ mod view {
                 value2_input,
                 filter_input,
                 table,
-                all_rows: Vec::new(),
+                results: Vec::new(),
+                show_previous: false,
+                undo_stack: Vec::new(),
+                generation: 0,
+                last_result_count: 0,
                 provider: None,
+                source_title: None,
                 status: String::new(),
                 selected_row: None,
+                scanning: false,
+                progress: 0,
+                abort: Arc::new(AtomicBool::new(false)),
                 mode_open: false,
                 cond_open: false,
                 type_open: false,
@@ -768,9 +1141,32 @@ mod view {
         }
 
         /// Attach the active tab's [`Provider`] (the C++ `setProviderGetter`
-        /// result). Scans run against this source.
+        /// result). Scans run against this source; the source name + kind feed
+        /// the floating dock title (the C++ `updateScannerTitle`,
+        /// "Memory Scanner — notepad.exe (Process)").
         pub fn set_provider(&mut self, provider: Option<Arc<dyn Provider + Send + Sync>>) {
+            self.source_title = provider.as_ref().map(|p| {
+                let name = p.name();
+                let kind = p.kind();
+                if kind.is_empty() {
+                    name
+                } else {
+                    format!("{name} ({kind})")
+                }
+            });
             self.provider = provider;
+        }
+
+        /// Attach the active source by [`Entity`] handle is not needed — the
+        /// window passes the provider directly via [`set_provider`].
+        ///
+        /// The floating dock title reflecting the attached source (the C++
+        /// `updateScannerTitle`). "Memory Scanner" alone when no source.
+        pub fn dock_title(&self) -> String {
+            match &self.source_title {
+                Some(s) => format!("Memory Scanner — {s}"),
+                None => "Memory Scanner".to_string(),
+            }
         }
 
         /// The form reducer (for tests / external wiring).
@@ -831,48 +1227,289 @@ mod view {
             self.form.struct_only = on;
             cx.notify();
         }
+        fn toggle_private_only(&mut self, on: bool, cx: &mut Context<Self>) {
+            self.form.private_only = on;
+            cx.notify();
+        }
+        fn toggle_skip_system(&mut self, on: bool, cx: &mut Context<Self>) {
+            self.form.skip_system_modules = on;
+            cx.notify();
+        }
+        fn toggle_user_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+            self.form.user_mode_only = on;
+            cx.notify();
+        }
 
-        /// Run the scan over the attached provider (the C++ `onScanClicked` →
-        /// `runScan`, run synchronously here). Builds the request, runs the
-        /// engine, formats the rows, and refreshes the table + status line.
+        /// Run a **first scan** over the attached provider (the C++
+        /// `onScanClicked` → `runScan`). Builds the request, runs the engine
+        /// off the UI thread (so the panel can show a progress bar + Cancel),
+        /// and refreshes the table + breadcrumb when it finishes.
         fn run_scan(&mut self, cx: &mut Context<Self>) {
+            if self.scanning {
+                return;
+            }
             let Some(provider) = self.provider.clone() else {
-                // No live data source wired yet (a provider is attached from the
-                // document; see window.rs). Surface the graceful hint instead of
-                // attempting a scan.
                 self.status = "No data source — attach a process or file to scan".to_string();
                 cx.notify();
                 return;
             };
             let ptr_size = provider.pointer_size();
-            match self.form.build_request(ptr_size, None) {
+            let req = match self.form.build_request(ptr_size, None) {
                 Err(msg) => {
                     self.status = msg;
+                    cx.notify();
+                    return;
                 }
-                Ok(req) => {
-                    let abort = AtomicBool::new(false);
-                    let obs = NullObserver;
-                    let results: Vec<ScanResult> = run_scan(provider.as_ref(), &req, &abort, &obs);
-                    self.all_rows = results
-                        .iter()
-                        .map(|r| ScanRow::from_result(&self.form, r))
-                        .collect();
-                    self.selected_row = None;
-                    let n = self.all_rows.len();
-                    self.status = if n == 1 {
-                        "1 result".to_string()
-                    } else {
-                        format!("{n} results")
-                    };
-                    self.refresh_table(cx);
+                Ok(req) => req,
+            };
+
+            // Fresh first-scan: drop the undo history + previous column.
+            self.undo_stack.clear();
+            self.show_previous = false;
+            self.generation = 1;
+            self.last_result_count = 0;
+            self.begin_scan(cx);
+
+            let abort = self.abort.clone();
+            let form = self.form.clone();
+            cx.spawn(async move |this, cx| {
+                let results = cx
+                    .background_spawn(async move {
+                        let obs = NullObserver;
+                        run_scan(provider.as_ref(), &req, &abort, &obs)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.finish_first_scan(results, &form, cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
+
+        /// Run a **next scan** (the C++ `onUpdateClicked`): re-read ONLY the
+        /// current result addresses and narrow them by the comparison condition,
+        /// instead of running a brand-new full scan. Snapshots the pre-rescan
+        /// list onto the undo stack first.
+        fn next_scan(&mut self, cx: &mut Context<Self>) {
+            if self.scanning || self.results.is_empty() {
+                return;
+            }
+            let Some(provider) = self.provider.clone() else {
+                self.status = "No source attached".to_string();
+                cx.notify();
+                return;
+            };
+
+            let last_mode = self.form.mode();
+            let read_size = if last_mode == ScanMode::Value {
+                value_size_for_type(self.form.value_type)
+            } else {
+                16
+            };
+
+            // Resolve the rescan condition (the C++ onUpdateClicked mapping).
+            let mut cond = if last_mode == ScanMode::Value {
+                self.form.effective_condition()
+            } else {
+                ScanCondition::ExactValue
+            };
+            // UnknownValue on rescan means "update only" — re-read, no filter.
+            if cond == ScanCondition::UnknownValue {
+                cond = ScanCondition::ExactValue;
+            }
+
+            // Build the filter pattern from the current input (only when the
+            // condition consumes a typed/exact value).
+            let mut filter_pattern: Vec<u8> = Vec::new();
+            let mut filter_mask: Vec<u8> = Vec::new();
+            let mut filter_pattern2: Vec<u8> = Vec::new();
+            let vt = self.form.value_type;
+            let needs_typed = matches!(
+                cond,
+                ScanCondition::ExactValue
+                    | ScanCondition::BiggerThan
+                    | ScanCondition::SmallerThan
+                    | ScanCondition::Between
+                    | ScanCondition::IncreasedBy
+                    | ScanCondition::DecreasedBy
+            );
+            if needs_typed && !self.form.value_text.trim().is_empty() {
+                if last_mode == ScanMode::Signature {
+                    match crate::scanner::parse_signature(&self.form.value_text) {
+                        Ok((p, m)) => {
+                            filter_pattern = p;
+                            filter_mask = m;
+                        }
+                        Err(e) => {
+                            self.status = format!("Pattern error: {e}");
+                            cx.notify();
+                            return;
+                        }
+                    }
+                } else {
+                    match serialize_value(vt, &self.form.value_text) {
+                        Ok((p, m)) => {
+                            filter_pattern = p;
+                            filter_mask = m;
+                        }
+                        Err(e) => {
+                            self.status = format!("Value error: {e}");
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    if cond == ScanCondition::Between && !self.form.value2_text.trim().is_empty() {
+                        match serialize_value(vt, &self.form.value2_text) {
+                            Ok((p, _)) => filter_pattern2 = p,
+                            Err(e) => {
+                                self.status = format!("Upper bound error: {e}");
+                                cx.notify();
+                                return;
+                            }
+                        }
+                    }
                 }
             }
+
+            // Snapshot the pre-rescan list so Undo Scan can roll back.
+            self.push_undo_snapshot();
+            self.last_result_count = self.results.len();
+            self.generation = self.generation.max(1) + 1;
+            self.show_previous = true;
+            self.begin_scan(cx);
+
+            let abort = self.abort.clone();
+            let form = self.form.clone();
+            let seed = std::mem::take(&mut self.results);
+            cx.spawn(async move |this, cx| {
+                let results = cx
+                    .background_spawn(async move {
+                        let obs = NullObserver;
+                        run_rescan(
+                            provider.as_ref(),
+                            seed,
+                            read_size,
+                            cond,
+                            vt,
+                            &filter_pattern,
+                            &filter_mask,
+                            &filter_pattern2,
+                            &abort,
+                            &obs,
+                        )
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.finish_rescan(results, &form, cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
+
+        /// Mark the scan as running (progress bar + Cancel) and clear the abort.
+        fn begin_scan(&mut self, cx: &mut Context<Self>) {
+            self.abort = Arc::new(AtomicBool::new(false));
+            self.scanning = true;
+            self.progress = 0;
+            self.status = "Scanning…".to_string();
+            cx.notify();
+        }
+
+        /// Cancel a running scan / rescan (the C++ Esc / Cancel button): flip the
+        /// abort flag the worker polls.
+        fn cancel_scan(&mut self, cx: &mut Context<Self>) {
+            if self.scanning {
+                self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.status = "Cancelling…".to_string();
+                cx.notify();
+            }
+        }
+
+        /// Apply the results of a finished first scan.
+        fn finish_first_scan(
+            &mut self,
+            mut results: Vec<ScanResult>,
+            form: &ScannerForm,
+            cx: &mut Context<Self>,
+        ) {
+            // Exact-value scans override the cached bytes with the searched
+            // pattern (the engine caches raw chunk bytes); previous is cleared.
+            for r in &mut results {
+                r.previous_value.clear();
+            }
+            self.scanning = false;
+            self.results = results;
+            self.show_previous = false;
+            self.selected_row = None;
+            self.form = form.clone();
+            let n = self.results.len();
+            self.status = if n == 1 {
+                "1 result".to_string()
+            } else {
+                format!("{n} results")
+            };
+            self.refresh_table(cx);
+            cx.notify();
+        }
+
+        /// Apply the results of a finished re-scan (the C++ `onRescanFinished`):
+        /// the narrowed-count status + the Previous→Δ column.
+        fn finish_rescan(
+            &mut self,
+            results: Vec<ScanResult>,
+            form: &ScannerForm,
+            cx: &mut Context<Self>,
+        ) {
+            self.scanning = false;
+            self.results = results;
+            self.form = form.clone();
+            self.selected_row = None;
+            let n = self.results.len();
+            self.status = rescan_status(self.last_result_count, n);
+            self.refresh_table(cx);
+            cx.notify();
+        }
+
+        /// Push the current result list onto the undo stack (capped).
+        fn push_undo_snapshot(&mut self) {
+            self.undo_stack.push(self.results.clone());
+            if self.undo_stack.len() > MAX_UNDO {
+                self.undo_stack.remove(0);
+            }
+        }
+
+        /// Restore the previous result list (the C++ `popUndoSnapshot` / "Undo
+        /// Scan"): roll back the last re-scan when a condition over-narrowed.
+        fn undo_scan(&mut self, cx: &mut Context<Self>) {
+            let Some(prev) = self.undo_stack.pop() else {
+                return;
+            };
+            self.results = prev;
+            self.last_result_count = 0;
+            if self.generation > 1 {
+                self.generation -= 1;
+            }
+            self.show_previous = self.undo_stack.iter().count() > 0 || self.generation > 1;
+            let n = self.results.len();
+            self.status = if n == 1 {
+                "Restored — 1 result".to_string()
+            } else {
+                format!("Restored — {n} results")
+            };
+            self.selected_row = None;
+            self.refresh_table(cx);
             cx.notify();
         }
 
         /// Clear the result list (the C++ `onNewScanClicked` / Reset).
         fn reset(&mut self, cx: &mut Context<Self>) {
-            self.all_rows.clear();
+            self.results.clear();
+            self.undo_stack.clear();
+            self.show_previous = false;
+            self.generation = 0;
+            self.last_result_count = 0;
             self.status.clear();
             self.selected_row = None;
             self.refresh_table(cx);
@@ -888,7 +1525,7 @@ mod view {
                 .delegate()
                 .rows
                 .get(ix)
-                .map(|r| r.address)
+                .map(|r| r.row.address)
         }
 
         /// "Go to Address" footer button — raise a [`ScannerNav`] for the selected
@@ -920,17 +1557,148 @@ mod view {
             cx.notify();
         }
 
-        /// Push the (filtered) rows into the table delegate.
+        /// Build the formatted display rows from the live [`ScanResult`] list
+        /// (capped at [`MAX_DISPLAY_ROWS`]), computing the per-row delta + module
+        /// metadata, then push the post-scan-filtered view into the table.
         fn refresh_table(&mut self, cx: &mut Context<Self>) {
             let query = self.filter_text(cx);
-            let rows: Vec<ScanRow> = filter_rows(&self.all_rows, &query)
-                .into_iter()
-                .cloned()
+            let show_previous = self.show_previous;
+            let vt = self.form.value_type;
+
+            // Format every result into a ScanRow, computing the delta from the
+            // recorded previous value (the C++ populateTable foreground tint).
+            let all: Vec<DisplayRow> = self
+                .results
+                .iter()
+                .take(MAX_DISPLAY_ROWS)
+                .map(|r| {
+                    let mut row = ScanRow::from_result(&self.form, r);
+                    let mut delta_dir = 0;
+                    if show_previous && !r.previous_value.is_empty() {
+                        let d = compute_delta(vt, &r.previous_value, &r.scan_value);
+                        delta_dir = d.direction;
+                        let changed = r.previous_value != r.scan_value;
+                        row.previous_text = previous_delta_text(&row.previous_text, &d, changed);
+                    }
+                    DisplayRow {
+                        row,
+                        delta_dir,
+                        module: r.region_module.clone(),
+                    }
+                })
                 .collect();
+
+            let show_module = all.iter().any(|d| !d.module.is_empty());
+
+            // Post-scan substring filter against the formatted row strings.
+            let q = query.trim().to_lowercase();
+            let rows: Vec<DisplayRow> = if q.is_empty() {
+                all
+            } else {
+                all.into_iter()
+                    .filter(|d| {
+                        d.row.address_text.to_lowercase().contains(&q)
+                            || d.row.value_text.to_lowercase().contains(&q)
+                            || d.module.to_lowercase().contains(&q)
+                    })
+                    .collect()
+            };
+
             self.table.update(cx, |state, cx| {
-                state.delegate_mut().rows = rows;
+                let del = state.delegate_mut();
+                del.rows = rows;
+                del.show_previous = show_previous;
+                del.show_module = show_module;
                 cx.notify();
             });
+        }
+
+        /// The current value type / scan mode (so the window can decode/encode
+        /// a value for an inline write or address re-eval).
+        pub fn last_value_type(&self) -> ValueType {
+            self.form.value_type
+        }
+        pub fn last_scan_mode(&self) -> ScanMode {
+            self.form.mode()
+        }
+
+        /// The current text in the Value/pattern input (the inline-edit source —
+        /// the window reads this to know what the user typed before writing).
+        pub fn value_input_text(&self, cx: &App) -> String {
+            self.value_input.read(cx).value().to_string()
+        }
+
+        /// The address of result row `row`, if present.
+        pub fn row_address(&self, row: usize) -> Option<u64> {
+            self.results.get(row).map(|r| r.address)
+        }
+
+        /// Apply an inline Address-cell edit (the C++ col-0 `onCellEdited`): set
+        /// the row's address to the re-evaluated value + its re-read bytes, then
+        /// refresh. The window evaluates the expression (the parser is a logic
+        /// module) and re-reads via its provider.
+        pub fn apply_address_edit(
+            &mut self,
+            row: usize,
+            new_address: u64,
+            new_value: Vec<u8>,
+            cx: &mut Context<Self>,
+        ) {
+            if let Some(r) = self.results.get_mut(row) {
+                r.address = new_address;
+                if !new_value.is_empty() {
+                    r.scan_value = new_value;
+                }
+                self.refresh_table(cx);
+                cx.notify();
+            }
+        }
+
+        /// Apply an inline Value-cell write (the C++ col-1 `onCellEdited`): record
+        /// the freshly-read bytes after a successful write, then refresh.
+        pub fn apply_value_write(
+            &mut self,
+            row: usize,
+            new_value: Vec<u8>,
+            cx: &mut Context<Self>,
+        ) {
+            if let Some(r) = self.results.get_mut(row) {
+                r.previous_value = r.scan_value.clone();
+                r.scan_value = new_value;
+                self.status = format!("Wrote {} bytes to 0x{:X}", r.scan_value.len(), r.address);
+                self.refresh_table(cx);
+                cx.notify();
+            }
+        }
+
+        /// Load a result list previously saved with [`results_json`]
+        /// (the C++ `loadResultsFrom`): replace the results + refresh.
+        pub fn load_results(&mut self, results: Vec<ScanResult>, cx: &mut Context<Self>) {
+            let n = results.len();
+            self.results = results;
+            self.show_previous = false;
+            self.generation = if n > 0 { 1 } else { 0 };
+            self.undo_stack.clear();
+            self.selected_row = None;
+            self.status = if n == 1 {
+                "Loaded 1 result".to_string()
+            } else {
+                format!("Loaded {n} results")
+            };
+            self.refresh_table(cx);
+            cx.notify();
+        }
+
+        /// Serialize the current result list to the C++ scanner JSON shape
+        /// (the C++ `saveResultsTo`). Pure-string output the window can write to
+        /// a file.
+        pub fn results_json(&self) -> String {
+            let rows: Vec<(u64, Vec<u8>, String)> = self
+                .results
+                .iter()
+                .map(|r| (r.address, r.scan_value.clone(), r.region_module.clone()))
+                .collect();
+            serialize_results_json(self.form.mode(), self.form.value_type, &rows)
         }
 
         /// The scan-type dropdown label (PIC3/PIC6: "Signature" vs "Value").
@@ -1005,12 +1773,13 @@ mod view {
         }
 
         fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            SharedString::from("Memory Scanner")
+            SharedString::from(self.dock_title())
         }
     }
 
     impl EventEmitter<PanelEvent> for ScannerPanel {}
     impl EventEmitter<ScannerNav> for ScannerPanel {}
+    impl EventEmitter<ScannerEdit> for ScannerPanel {}
 
     impl Focusable for ScannerPanel {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1041,8 +1810,14 @@ mod view {
     impl Render for ScannerPanel {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let vis = self.form.field_visibility();
-            let has_results = !self.all_rows.is_empty();
+            let has_results = !self.results.is_empty();
             let has_selection = self.selected_row.is_some();
+            let has_undo = !self.undo_stack.is_empty();
+            let scanning = self.scanning;
+            let progress = self.progress;
+            let breadcrumb =
+                stage_breadcrumb(self.generation, self.last_result_count, self.results.len());
+            let trunc = truncation_banner(self.results.len());
             let cur_cond = self.form.condition;
             let cur_type = self.form.value_type;
             let cur_align = self.form.alignment.max(1);
@@ -1198,7 +1973,7 @@ mod view {
             } else if !has_provider {
                 "No data source — attach a process or file to scan".to_string()
             } else {
-                let n = self.all_rows.len();
+                let n = self.results.len();
                 if n == 1 {
                     "1 result".to_string()
                 } else {
@@ -1212,6 +1987,12 @@ mod view {
                 .size_full()
                 .bg(color::panel_bg(cx))
                 .text_color(color::text(cx))
+                // Esc cancels a running scan (the C++ Cancel shortcut).
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                    if ev.keystroke.key == "escape" && this.scanning {
+                        this.cancel_scan(cx);
+                    }
+                }))
                 // ── Panel header (uppercase muted title strip) ──
                 .child(crate::ui::design::panel_header("Scanner", cx))
                 .child(
@@ -1245,34 +2026,60 @@ mod view {
                                     gpui_component::h_flex()
                                         .gap(px(tokens::space::SM))
                                         .items_center()
-                                        .child(
-                                            Button::new("scanner-scan")
-                                                .primary()
-                                                .small()
-                                                .label("Scan")
-                                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                                    this.run_scan(cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("scanner-rescan")
-                                                .small()
-                                                .label("Re-scan")
-                                                .disabled(!has_results)
-                                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                                    this.run_scan(cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("scanner-reset")
-                                                .ghost()
-                                                .small()
-                                                .label("Reset")
-                                                .disabled(!has_results)
-                                                .on_click(
-                                                    cx.listener(|this, _e, _w, cx| this.reset(cx)),
-                                                ),
-                                        ),
+                                        // While a scan runs, the First Scan slot
+                                        // becomes the Cancel control (the C++ Esc
+                                        // / Cancel during a running scan).
+                                        .when(scanning, |row| {
+                                            row.child(
+                                                Button::new("scanner-cancel")
+                                                    .danger()
+                                                    .small()
+                                                    .label("Cancel  (Esc)")
+                                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.cancel_scan(cx)
+                                                    })),
+                                            )
+                                        })
+                                        .when(!scanning, |row| {
+                                            row.child(
+                                                Button::new("scanner-scan")
+                                                    .primary()
+                                                    .small()
+                                                    .label("First Scan")
+                                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.run_scan(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("scanner-rescan")
+                                                    .small()
+                                                    .label("Next Scan")
+                                                    .disabled(!has_results)
+                                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.next_scan(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("scanner-undo")
+                                                    .ghost()
+                                                    .small()
+                                                    .label("Undo Scan")
+                                                    .disabled(!has_undo)
+                                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.undo_scan(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("scanner-reset")
+                                                    .ghost()
+                                                    .small()
+                                                    .label("Reset")
+                                                    .disabled(!has_results)
+                                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.reset(cx)
+                                                    })),
+                                            )
+                                        }),
                                 ),
                         )
                         // Row 2: Pattern:/Value: label + compact input(s).
@@ -1335,9 +2142,94 @@ mod view {
                                         .on_click(cx.listener(|this, on: &bool, _w, cx| {
                                             this.toggle_struct_only(*on, cx)
                                         })),
+                                )
+                                // The C++ build_request also honors these filters;
+                                // render them so they're reachable (gap 16).
+                                .child(
+                                    Checkbox::new("scanner-private")
+                                        .label("Private only")
+                                        .checked(self.form.private_only)
+                                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                            this.toggle_private_only(*on, cx)
+                                        })),
+                                )
+                                .child(
+                                    Checkbox::new("scanner-skip-sys")
+                                        .label("Skip system modules")
+                                        .checked(self.form.skip_system_modules)
+                                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                            this.toggle_skip_system(*on, cx)
+                                        })),
+                                )
+                                .child(
+                                    Checkbox::new("scanner-usermode")
+                                        .label("User-mode only")
+                                        .checked(self.form.user_mode_only)
+                                        .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                                            this.toggle_user_mode(*on, cx)
+                                        })),
                                 ),
-                        ),
+                        )
+                        // ── Stage breadcrumb + progress bar (the C++ stage label
+                        // + m_progressBar). ──
+                        .when(!breadcrumb.is_empty() || scanning, |col| {
+                            col.child(
+                                gpui_component::v_flex()
+                                    .gap(px(tokens::space::XS))
+                                    .when(!breadcrumb.is_empty(), |c| {
+                                        c.child(
+                                            gpui_component::h_flex()
+                                                .gap(px(tokens::space::XS))
+                                                .items_center()
+                                                .child(
+                                                    div()
+                                                        .size(px(6.))
+                                                        .rounded_full()
+                                                        .bg(color::accent(cx)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::font::UI_SM))
+                                                        .text_color(color::text_muted(cx))
+                                                        .child(breadcrumb.clone()),
+                                                ),
+                                        )
+                                    })
+                                    .when(scanning, |c| {
+                                        // A 2px progress track filling to `progress`%.
+                                        c.child(
+                                            div()
+                                                .w_full()
+                                                .h(px(2.))
+                                                .rounded_full()
+                                                .bg(color::border(cx))
+                                                .child(
+                                                    div()
+                                                        .h_full()
+                                                        .w(relative(
+                                                            (progress.clamp(0, 100) as f32) / 100.0,
+                                                        ))
+                                                        .rounded_full()
+                                                        .bg(color::accent(cx)),
+                                                ),
+                                        )
+                                    }),
+                            )
+                        }),
                 )
+                // ── Truncation banner (the C++ m_truncBanner). ──
+                .when_some(trunc, |col, banner| {
+                    col.child(
+                        div()
+                            .w_full()
+                            .px(px(tokens::space::LG))
+                            .py(px(tokens::space::XS))
+                            .text_size(px(tokens::font::UI_XS))
+                            .text_color(color::text_muted(cx))
+                            .bg(color::hover_overlay(cx))
+                            .child(banner),
+                    )
+                })
                 // ── Post-scan filter + status ──
                 .child(
                     gpui_component::h_flex()
@@ -1402,10 +2294,100 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_rows, format_value, split_address_dim, value_type_entries, CondEntry, ScanMode,
-        ScanRow, ScannerForm, FAST_SCAN_ALIGNMENTS,
+        compute_delta, filter_rows, format_value, previous_delta_text, rescan_status,
+        serialize_results_json, split_address_dim, stage_breadcrumb, truncation_banner,
+        value_type_entries, CondEntry, ScanMode, ScanRow, ScannerForm, FAST_SCAN_ALIGNMENTS,
+        MAX_DISPLAY_ROWS,
     };
     use crate::scanner::{ScanCondition, ScanResult, ValueType};
+
+    // ── Delta / narrowed-count / breadcrumb / truncation / JSON helpers ──
+
+    #[test]
+    fn compute_delta_int32_increase_and_decrease() {
+        let up = compute_delta(ValueType::Int32, &10i32.to_le_bytes(), &15i32.to_le_bytes());
+        assert!(up.ok);
+        assert_eq!(up.direction, 1);
+        assert_eq!(up.text, "+5");
+        let down = compute_delta(ValueType::Int32, &15i32.to_le_bytes(), &10i32.to_le_bytes());
+        assert_eq!(down.direction, -1);
+        assert_eq!(down.text, "-5");
+        let same = compute_delta(ValueType::Int32, &7i32.to_le_bytes(), &7i32.to_le_bytes());
+        assert_eq!(same.direction, 0);
+        assert_eq!(same.text, "+0");
+    }
+
+    #[test]
+    fn compute_delta_too_short_is_not_ok() {
+        let d = compute_delta(ValueType::Int64, &[1, 2], &[3, 4]);
+        assert!(!d.ok);
+        assert_eq!(d.direction, 0);
+    }
+
+    #[test]
+    fn previous_delta_text_variants() {
+        let inc = compute_delta(ValueType::Int32, &1i32.to_le_bytes(), &2i32.to_le_bytes());
+        assert_eq!(previous_delta_text("1", &inc, true), "1  →  +1");
+        // Non-numeric change degrades to a bare arrow.
+        let none = super::DeltaInfo::default();
+        assert_eq!(previous_delta_text("AB", &none, true), "AB  →");
+        // Unchanged non-numeric: just the prev text.
+        assert_eq!(previous_delta_text("AB", &none, false), "AB");
+        // No previous value: empty.
+        assert_eq!(previous_delta_text("", &inc, true), "");
+    }
+
+    #[test]
+    fn rescan_status_narrowed_and_eliminated() {
+        assert_eq!(rescan_status(100, 30), "Narrowed 100 → 30  (eliminated 70)");
+        assert_eq!(rescan_status(40, 40), "All 40 results still match");
+        assert!(rescan_status(50, 0).starts_with("0 results"));
+        assert_eq!(rescan_status(0, 1), "1 result");
+        assert_eq!(rescan_status(0, 7), "7 results");
+    }
+
+    #[test]
+    fn stage_breadcrumb_per_generation() {
+        assert_eq!(stage_breadcrumb(0, 0, 0), "");
+        assert_eq!(
+            stage_breadcrumb(1, 0, 47),
+            "Step 1 — First scan: 47 results"
+        );
+        assert_eq!(
+            stage_breadcrumb(2, 47, 12),
+            "Step 2 — Narrowed 47 → 12 (eliminated 35)"
+        );
+        assert_eq!(
+            stage_breadcrumb(3, 12, 12),
+            "Step 3 — All 12 results still match"
+        );
+    }
+
+    #[test]
+    fn truncation_banner_only_past_cap() {
+        assert!(truncation_banner(MAX_DISPLAY_ROWS).is_none());
+        let b = truncation_banner(MAX_DISPLAY_ROWS + 1).unwrap();
+        assert!(b.contains(&MAX_DISPLAY_ROWS.to_string()));
+    }
+
+    #[test]
+    fn serialize_results_json_shape() {
+        let rows = vec![
+            (0x401000u64, vec![0x39, 0x05, 0x00, 0x00], String::new()),
+            (0x7ff0u64, vec![0xFFu8], "game.exe".to_string()),
+        ];
+        let json = serialize_results_json(ScanMode::Value, ValueType::Int32, &rows);
+        assert!(json.contains("\"version\":1"));
+        assert!(json.contains("\"scanMode\":1"));
+        assert!(json.contains("\"count\":2"));
+        assert!(json.contains("\"address\":\"401000\""));
+        assert!(json.contains("\"value\":\"39050000\""));
+        assert!(json.contains("\"module\":\"game.exe\""));
+        // Signature mode records scanMode 0.
+        let sig = serialize_results_json(ScanMode::Signature, ValueType::Int32, &[]);
+        assert!(sig.contains("\"scanMode\":0"));
+        assert!(sig.contains("\"count\":0"));
+    }
 
     // ── Field-visibility reducer (onConditionChanged) ──
 

@@ -39,7 +39,7 @@ pub use super::gotoaddress::{GotoAddressDialog, GotoEvent};
 #[cfg(feature = "ui")]
 pub use super::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
 #[cfg(feature = "ui")]
-pub use super::optionsdialog::{OptionsDialog, OptionsEvent};
+pub use super::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
 #[cfg(feature = "ui")]
 pub use super::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 #[cfg(feature = "ui")]

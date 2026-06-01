@@ -40,6 +40,8 @@ use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
 use crate::core::linemeta::K_COMMAND_ROW_ID;
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
+use crate::ui::findbar::{FindBar, FindEvent};
+use crate::ui::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 use crate::ui::{design, tooltip};
 
 use element::{RowElement, RowPaint};
@@ -80,6 +82,39 @@ actions!(
         EditorDelete,
         EditorFold,
         EditorCopyCStruct,
+        // Find bar (Ctrl+F) — mounts the `FindBar` over the editor (items 4/91/92).
+        EditorFind,
+        // Normal-mode quick keys (editor.cpp `handleNormalKey`, item 12). Quick
+        // type changes (P/F/S/U), hex sizing (Space / 1-5), node navigation
+        // (Up/Down/PageUp/Down/Home/End), value edit (Enter), insert (Insert), and
+        // comment edit (`;`).
+        EditorQuickPointer,
+        EditorQuickFloat,
+        EditorQuickSigned,
+        EditorQuickUnsigned,
+        EditorHexCycleNext,
+        EditorHexCyclePrev,
+        EditorHex8,
+        EditorHex16,
+        EditorHex32,
+        EditorHex64,
+        EditorHex128,
+        EditorNavUp,
+        EditorNavDown,
+        EditorNavPageUp,
+        EditorNavPageDown,
+        EditorNavHome,
+        EditorNavEnd,
+        EditorBeginValueEdit,
+        EditorInsertHex64,
+        EditorInsertHex32,
+        EditorCommentEdit,
+        EditorCycleLeft,
+        EditorCycleRight,
+        EditorGoToDefinition,
+        // Collapse-all / expand-all (item 19).
+        EditorCollapseAll,
+        EditorExpandAll,
     ]
 );
 
@@ -129,6 +164,40 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-d", EditorDuplicate, Some("RcxEditor")),
         KeyBinding::new("ctrl-d", EditorDuplicate, Some("RcxEditor")),
         KeyBinding::new("delete", EditorDelete, Some("RcxEditor")),
+        // Find bar (Ctrl+F / Cmd+F).
+        KeyBinding::new("ctrl-f", EditorFind, Some("RcxEditor")),
+        KeyBinding::new("cmd-f", EditorFind, Some("RcxEditor")),
+        // Normal-mode quick keys (item 12). The letter keys are bare (no modifier)
+        // to match the C++ `handleNormalKey` accelerators.
+        KeyBinding::new("p", EditorQuickPointer, Some("RcxEditor")),
+        KeyBinding::new("f", EditorQuickFloat, Some("RcxEditor")),
+        KeyBinding::new("s", EditorQuickSigned, Some("RcxEditor")),
+        KeyBinding::new("u", EditorQuickUnsigned, Some("RcxEditor")),
+        KeyBinding::new("space", EditorHexCycleNext, Some("RcxEditor")),
+        KeyBinding::new("shift-space", EditorHexCyclePrev, Some("RcxEditor")),
+        KeyBinding::new("1", EditorHex8, Some("RcxEditor")),
+        KeyBinding::new("2", EditorHex16, Some("RcxEditor")),
+        KeyBinding::new("3", EditorHex32, Some("RcxEditor")),
+        KeyBinding::new("4", EditorHex64, Some("RcxEditor")),
+        KeyBinding::new("5", EditorHex128, Some("RcxEditor")),
+        KeyBinding::new("up", EditorNavUp, Some("RcxEditor")),
+        KeyBinding::new("down", EditorNavDown, Some("RcxEditor")),
+        KeyBinding::new("pageup", EditorNavPageUp, Some("RcxEditor")),
+        KeyBinding::new("pagedown", EditorNavPageDown, Some("RcxEditor")),
+        KeyBinding::new("home", EditorNavHome, Some("RcxEditor")),
+        KeyBinding::new("end", EditorNavEnd, Some("RcxEditor")),
+        KeyBinding::new("enter", EditorBeginValueEdit, Some("RcxEditor")),
+        KeyBinding::new("insert", EditorInsertHex64, Some("RcxEditor")),
+        KeyBinding::new("shift-insert", EditorInsertHex32, Some("RcxEditor")),
+        KeyBinding::new("semicolon", EditorCommentEdit, Some("RcxEditor")),
+        // Left/Right cycle same-size type variants (item 18).
+        KeyBinding::new("left", EditorCycleLeft, Some("RcxEditor")),
+        KeyBinding::new("right", EditorCycleRight, Some("RcxEditor")),
+        // F12 Go To Definition (item 20).
+        KeyBinding::new("f12", EditorGoToDefinition, Some("RcxEditor")),
+        // Collapse-all / expand-all (item 19).
+        KeyBinding::new("ctrl-shift-[", EditorCollapseAll, Some("RcxEditor")),
+        KeyBinding::new("ctrl-shift-]", EditorExpandAll, Some("RcxEditor")),
     ]
 }
 
@@ -184,6 +253,18 @@ pub struct RcxEditor {
     /// The open TypeSelector popup subscription (Change Type / `T` / type-token
     /// click → the menus-agent `TypeSelectorPopup`, consumed via the contract).
     _type_selector_sub: Option<Subscription>,
+    /// The open SourceChooser popup subscription (click the class-header `source▾`
+    /// chip → the data-source picker, consumed via the contract; items 1/5).
+    _source_chooser_sub: Option<Subscription>,
+    /// The mounted FindBar entity (Ctrl+F), and the active find-match highlight the
+    /// editor paints over the matched line (items 4/91/92). `find_bar` is `Some`
+    /// while the bar is open; `find_match` is the current navigated match.
+    find_bar: Option<Entity<crate::ui::findbar::FindBar>>,
+    find_match: Option<crate::ui::findbar::FindMatch>,
+    _find_bar_sub: Option<Subscription>,
+    /// The open EnumPicker / HexToolbar popup subscriptions (items 8/9).
+    _enum_picker_sub: Option<Subscription>,
+    _hex_toolbar_sub: Option<Subscription>,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
 }
@@ -240,6 +321,12 @@ impl RcxEditor {
             _context_menu_sub: None,
             context_target: None,
             _type_selector_sub: None,
+            _source_chooser_sub: None,
+            find_bar: None,
+            find_match: None,
+            _find_bar_sub: None,
+            _enum_picker_sub: None,
+            _hex_toolbar_sub: None,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
@@ -510,6 +597,13 @@ impl RcxEditor {
             return;
         }
 
+        // Footer pill click (item 10): the add-bytes / Top pills dispatch their op.
+        if lm.line_kind == LineKind::Footer {
+            if self.on_footer_click(&lm, &text, hit.col, cx) {
+                return;
+            }
+        }
+
         let node_id = lm.node_id;
         let already_selected = node_id != 0
             && node_id != K_COMMAND_ROW_ID
@@ -518,6 +612,67 @@ impl RcxEditor {
                 .selected_ids()
                 .iter()
                 .any(|&id| crate::controller::strip_sel_pub(id) == node_id);
+
+        // Picker-target interception (the C++ `beginInlineEdit` early-returns for
+        // these, emitting a popup request instead — editor.cpp:3535-3573). These
+        // fire on a PLAIN click (no Shift/Ctrl) and, for the command-row
+        // chevron/source chip, regardless of node selection (the command row has no
+        // selectable node). Without this, the hit-test target falls into
+        // `begin_inline_edit` → `resolved_span_for` and starts a plain text edit on
+        // the chip/chevron instead of opening the picker (items 1/2/5/6).
+        if let Some(target) = hit.target {
+            if !modifiers.shift && !modifiers.control {
+                match target {
+                    // Class-header SOURCE chip → the Data Source picker (item 1).
+                    EditTarget::Source if lm.line_kind == LineKind::CommandRow => {
+                        self.open_source_chooser(window, cx);
+                        return;
+                    }
+                    // Class-header CHEVRON → the Root-mode Type Selector (item 2).
+                    EditTarget::TypeSelector if lm.line_kind == LineKind::CommandRow => {
+                        self.open_root_type_selector(window, cx);
+                        return;
+                    }
+                    // Enum-value click → the EnumPickerPopup (item 8): an enum
+                    // field's Value column opens the member picker (pre-selecting
+                    // the current member) instead of a plain numeric edit.
+                    EditTarget::Value
+                        if already_selected
+                            && lm.node_idx >= 0
+                            && self.node_is_enum(lm.node_idx as usize) =>
+                    {
+                        self.open_enum_picker(line, lm.node_idx as usize, window, cx);
+                        return;
+                    }
+                    // Hex node Type token → the Hex size toolbar (item 9), not the
+                    // generic type selector: hex nodes pick a SIZE (8/16/32/64/128)
+                    // + join/split, which the toolbar drives.
+                    EditTarget::Type
+                        if already_selected && lm.node_idx >= 0 && is_hex_preview(lm.node_kind) =>
+                    {
+                        self.open_hex_toolbar(lm.node_idx as usize, window, cx);
+                        return;
+                    }
+                    // Field Type token / array element type / pointer target →
+                    // the Type Selector in the matching mode (item 6). Only on a
+                    // real node row that is already selected (matches the C++
+                    // "click already-selected token → picker" affordance).
+                    EditTarget::Type | EditTarget::ArrayElementType | EditTarget::PointerTarget
+                        if already_selected && lm.node_idx >= 0 =>
+                    {
+                        let ctx = ContextTarget {
+                            line,
+                            node_idx: lm.node_idx as usize,
+                            node_id: lm.node_id,
+                            kind: lm.node_kind,
+                        };
+                        self.open_type_selector_in_mode(ctx, target, window, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Click on an editable target of an already-selected node → begin edit
         // (§9 "Click on already-selected (plain) → beginInlineEdit").
@@ -555,6 +710,91 @@ impl RcxEditor {
         };
         let _ = text;
         selection::byte_addr_at(lm, vs, count, col)
+    }
+
+    /// Footer-pill click dispatch (item 10). Returns `true` when a pill was hit and
+    /// its op ran. `Top` scrolls to the top; `+10h/+100h/+1000h` append that many
+    /// bytes (as `Hex64` fields) to the footer's struct. `Trim`/`+10` need
+    /// controller ops not exposed here; they hit-test but no-op gracefully.
+    fn on_footer_click(
+        &mut self,
+        lm: &LineMeta,
+        text: &str,
+        col: i32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Identify which pill token the column lands in.
+        let chars: Vec<char> = text.chars().collect();
+        let mut hit_tok: Option<&str> = None;
+        for span in geometry::footer_pill_spans(text) {
+            if col >= span.start && col < span.end {
+                let s = span.start.max(0) as usize;
+                let e = (span.end.max(0) as usize).min(chars.len());
+                let tok: String = chars[s..e].iter().collect();
+                hit_tok = match tok.as_str() {
+                    "Top" => Some("Top"),
+                    "+10h" => Some("+10h"),
+                    "+100h" => Some("+100h"),
+                    "+1000h" => Some("+1000h"),
+                    "Trim" => Some("Trim"),
+                    "+10" => Some("+10"),
+                    _ => None,
+                };
+                break;
+            }
+        }
+        let Some(tok) = hit_tok else {
+            return false;
+        };
+        match tok {
+            "Top" => {
+                self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
+                true
+            }
+            "+10h" | "+100h" | "+1000h" => {
+                let bytes = match tok {
+                    "+10h" => 0x10,
+                    "+100h" => 0x100,
+                    _ => 0x1000,
+                };
+                self.append_bytes_to_struct(lm.node_id, bytes, cx);
+                true
+            }
+            // Trim trailing hex / +10 enum members need controller ops not exposed
+            // here; consume the click without mutating (the pill still highlights).
+            _ => true,
+        }
+    }
+
+    /// Append `bytes` worth of `Hex64` fields to the struct identified by the
+    /// footer row's `node_id` (item 10, the `+Nh` pills). Inserts at the struct's
+    /// tail offset; rounds the byte count up to a whole `Hex64`.
+    fn append_bytes_to_struct(&mut self, struct_id: u64, bytes: i32, cx: &mut Context<Self>) {
+        if struct_id == 0 || struct_id == K_COMMAND_ROW_ID {
+            return;
+        }
+        let count = (bytes + 7) / 8; // Hex64 = 8 bytes each
+        if count <= 0 {
+            return;
+        }
+        // The tail offset of the struct = max(child.offset + size) over its members.
+        let tail = {
+            let tree = self.controller.tree();
+            tree.children_of(struct_id)
+                .iter()
+                .map(|&ci| {
+                    let c = &tree.nodes[ci];
+                    c.offset + crate::core::size_for_kind(c.kind).max(0)
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        for i in 0..count {
+            self.controller
+                .insert_node(struct_id, tail + i * 8, NodeKind::Hex64, "");
+        }
+        self.apply_document(cx);
     }
 
     // ── Inline editing (editor-surface.md §11) ──
@@ -700,12 +940,131 @@ impl RcxEditor {
                     commit.resolved_addr,
                 );
             }
-            // Comment / array-count / pointer-target / static-expr edits have
-            // controller paths that the later edit-wiring workflow connects; for
-            // now recompose so the overlay clears without corrupting the tree.
+            // Comment / pointer-target / array-element-count / static-expr commits
+            // (item 15): the prior `_ => {}` arm silently dropped these. Write each
+            // to the tree via its undoable `Command`. The node id is resolved from
+            // `idx` so the command survives an index shift on undo/redo.
+            EditTarget::Comment => {
+                self.commit_comment(idx, commit.text.trim(), cx);
+            }
+            EditTarget::PointerTarget => {
+                self.commit_pointer_target(idx, commit.text.trim(), cx);
+            }
+            EditTarget::ArrayElementCount | EditTarget::ArrayCount => {
+                self.commit_array_count(idx, commit.text.trim(), cx);
+            }
+            EditTarget::StaticExpr => {
+                self.commit_static_expr(idx, commit.text.trim(), cx);
+            }
             _ => {}
         }
         self.after_mutation(cx);
+    }
+
+    /// Write a committed comment edit (item 15) via the undoable `ChangeComment`.
+    fn commit_comment(&mut self, idx: usize, text: &str, _cx: &mut Context<Self>) {
+        let tree = self.controller.tree();
+        if idx >= tree.nodes.len() {
+            return;
+        }
+        let n = &tree.nodes[idx];
+        let node_id = n.id;
+        let old_comment = n.comment.clone();
+        if old_comment == text {
+            return;
+        }
+        self.controller
+            .push_command(crate::core::Command::ChangeComment {
+                node_id,
+                old_comment,
+                new_comment: text.to_string(),
+            });
+    }
+
+    /// Write a committed pointer-target type edit (item 15). The typed text names
+    /// the struct the pointer should reference; resolve it to a struct id and push
+    /// `ChangePointerRef`. An unrecognized name falls back to `apply_type_text`
+    /// (which the controller parses for primitive/`*` forms).
+    fn commit_pointer_target(&mut self, idx: usize, text: &str, _cx: &mut Context<Self>) {
+        let tree = self.controller.tree();
+        if idx >= tree.nodes.len() {
+            return;
+        }
+        let node_id = tree.nodes[idx].id;
+        let old_ref_id = tree.nodes[idx].ref_id;
+        // Find a struct whose type name matches the typed target.
+        let new_ref_id = tree
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Struct && n.struct_type_name == text)
+            .map(|n| n.id);
+        match new_ref_id {
+            Some(new_ref_id) if new_ref_id != old_ref_id => {
+                self.controller
+                    .push_command(crate::core::Command::ChangePointerRef {
+                        node_id,
+                        old_ref_id,
+                        new_ref_id,
+                    });
+            }
+            _ => {
+                // Not a known struct: let the controller's type parser handle it.
+                self.controller.apply_type_text(idx, text);
+            }
+        }
+    }
+
+    /// Write a committed array element count (item 15) via `ChangeArrayMeta`,
+    /// keeping the element kind and setting the new length from the typed number.
+    fn commit_array_count(&mut self, idx: usize, text: &str, _cx: &mut Context<Self>) {
+        let count: i32 = match text
+            .trim_start_matches("0x")
+            .parse::<i32>()
+            .ok()
+            .or_else(|| i32::from_str_radix(text.trim_start_matches("0x"), 16).ok())
+        {
+            Some(c) if c > 0 => c,
+            _ => return,
+        };
+        let tree = self.controller.tree();
+        if idx >= tree.nodes.len() {
+            return;
+        }
+        let n = &tree.nodes[idx];
+        let node_id = n.id;
+        let old_element_kind = n.element_kind;
+        let old_array_len = n.array_len;
+        if old_array_len == count {
+            return;
+        }
+        self.controller
+            .push_command(crate::core::Command::ChangeArrayMeta {
+                node_id,
+                old_element_kind,
+                new_element_kind: old_element_kind,
+                old_array_len,
+                new_array_len: count,
+            });
+    }
+
+    /// Write a committed static-expression edit (item 15) via `ChangeOffsetExpr`.
+    fn commit_static_expr(&mut self, idx: usize, text: &str, _cx: &mut Context<Self>) {
+        let tree = self.controller.tree();
+        if idx >= tree.nodes.len() {
+            return;
+        }
+        let n = &tree.nodes[idx];
+        let node_id = n.id;
+        let old_expr = n.offset_expr.clone();
+        if old_expr == text {
+            return;
+        }
+        self.controller
+            .push_command(crate::core::Command::ChangeOffsetExpr {
+                node_id,
+                old_expr,
+                new_expr: text.to_string(),
+            });
     }
 
     /// Apply a committed **command-row** edit (the synthetic class-header row,
@@ -765,11 +1124,14 @@ impl RcxEditor {
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
-        // `backward` (Shift+Tab) is accepted; full reverse-order cycling is a
-        // later refinement — for now both directions advance the forward cycle
-        // from `m_lastTabTarget`, matching the common Tab path (§10).
-        let _ = backward;
-        if let Some(target) = tab_cycle::next_tab_target(&lm, self.last_tab_target) {
+        // Shift+Tab walks the cycle backward (item 17); Tab advances forward. Both
+        // start from `m_lastTabTarget` and skip inapplicable targets.
+        let next = if backward {
+            tab_cycle::prev_tab_target(&lm, self.last_tab_target)
+        } else {
+            tab_cycle::next_tab_target(&lm, self.last_tab_target)
+        };
+        if let Some(target) = next {
             self.begin_inline_edit(line, target, window, cx);
         }
     }
@@ -798,7 +1160,19 @@ impl RcxEditor {
     /// internally via `refresh`, but draining keeps the event queue bounded.
     fn after_mutation(&mut self, cx: &mut Context<Self>) {
         let _events = self.controller.take_events();
+        self.sync_find_bar_lines(cx);
         cx.notify();
+    }
+
+    /// Re-feed the find bar the current line texts after a recompose (item 4) so the
+    /// search set tracks the document. No-op when the bar is closed.
+    fn sync_find_bar_lines(&mut self, cx: &mut Context<Self>) {
+        if self.find_bar.is_some() {
+            let lines = self.current_line_texts();
+            if let Some(bar) = self.find_bar.clone() {
+                bar.update(cx, |b, cx| b.set_lines(lines, cx));
+            }
+        }
     }
 
     // ── Action handlers (editor-surface.md §10) ──
@@ -810,8 +1184,13 @@ impl RcxEditor {
         self.tab_to_next_field(true, window, cx);
     }
     fn action_escape(&mut self, _: &EditorEscape, window: &mut Window, cx: &mut Context<Self>) {
-        // Two-stage Esc (§10): drop byte selection first, else clear node
-        // selection. An active edit is cancelled by the field's own Esc binding.
+        // Two-stage Esc (§10): close the find bar first, then drop byte selection,
+        // else clear node selection. An active edit is cancelled by the field's own
+        // Esc binding.
+        if self.find_bar.is_some() {
+            self.close_find_bar(cx);
+            return;
+        }
         if self.editing.is_some() {
             // Cancel the active edit without writing.
             self.editing = None;
@@ -832,6 +1211,494 @@ impl RcxEditor {
     }
     fn action_redo(&mut self, _: &EditorRedo, _window: &mut Window, cx: &mut Context<Self>) {
         self.redo(cx);
+    }
+
+    // ── Find bar (Ctrl+F, items 4/91/92) ──
+
+    fn action_find(&mut self, _: &EditorFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find_bar(window, cx);
+    }
+
+    /// Mount the [`FindBar`] over the editor (item 4). Builds it over the current
+    /// rendered line texts, subscribes to [`FindEvent`] (Navigate → scroll +
+    /// highlight, Close → dismiss), focuses the input, and toggles it shut if it is
+    /// already open. Without this the Ctrl+F binding fired but no bar existed.
+    fn open_find_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Toggle: a second Ctrl+F closes the bar.
+        if self.find_bar.is_some() {
+            self.close_find_bar(cx);
+            return;
+        }
+        if self.editing.is_some() {
+            self.commit_active_edit(window, cx);
+        }
+        let lines = self.current_line_texts();
+        let bar = cx.new(|cx| FindBar::new(lines, window, cx));
+        let focus = bar.read(cx).focus_handle(cx);
+        self._find_bar_sub = Some(cx.subscribe_in(
+            &bar,
+            window,
+            move |this, _b, ev: &FindEvent, _window, cx| match ev {
+                FindEvent::Navigate(m) => {
+                    this.find_match = Some(*m);
+                    // Scroll the matched line into view + repaint the highlight.
+                    this.scroll.scroll_to_item(m.line, ScrollStrategy::Center);
+                    cx.notify();
+                }
+                FindEvent::Close => {
+                    this.close_find_bar(cx);
+                }
+            },
+        ));
+        self.find_bar = Some(bar);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn close_find_bar(&mut self, cx: &mut Context<Self>) {
+        self.find_bar = None;
+        self._find_bar_sub = None;
+        self.find_match = None;
+        cx.notify();
+    }
+
+    /// The rendered text of every composed line (the find bar searches these — the
+    /// same strings the rows paint, including the live command-row substitution).
+    fn current_line_texts(&self) -> Vec<String> {
+        let count = self.controller.last_result().meta.len();
+        (0..count).map(|i| self.line_text_owned(i)).collect()
+    }
+
+    // ── Normal-mode quick keys (editor.cpp `handleNormalKey`, item 12) ──
+
+    /// The `(line, LineMeta)` of the current node — the primary-selected data row
+    /// (`currentNodeIndex`). Skips chrome rows. `None` when no node is selected.
+    fn current_node(&self) -> Option<(usize, LineMeta)> {
+        let line = self.first_selected_line()?;
+        let lm = self.line_meta(line)?.clone();
+        if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+            return None;
+        }
+        Some((line, lm))
+    }
+
+    /// Change the current node's kind via the controller (the `quickTypeChange`
+    /// helper the P/F/S/U/1-5/Space handlers funnel through).
+    fn quick_change_kind(&mut self, new_kind: NodeKind, cx: &mut Context<Self>) {
+        if let Some((_line, lm)) = self.current_node() {
+            self.controller
+                .change_node_kind(lm.node_idx as usize, new_kind);
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_quick_pointer(
+        &mut self,
+        _: &EditorQuickPointer,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // P → pointer (size ≥ 4): 8-byte → Pointer64, else Pointer32 (editor.cpp).
+        if let Some((_l, lm)) = self.current_node() {
+            let sz = crate::core::size_for_kind(lm.node_kind);
+            if sz < 4 {
+                return;
+            }
+            let target = if sz >= 8 {
+                NodeKind::Pointer64
+            } else {
+                NodeKind::Pointer32
+            };
+            self.quick_change_kind(target, cx);
+        }
+    }
+
+    fn action_quick_float(
+        &mut self,
+        _: &EditorQuickFloat,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            match crate::core::size_for_kind(lm.node_kind) {
+                4 => self.quick_change_kind(NodeKind::Float, cx),
+                8 => self.quick_change_kind(NodeKind::Double, cx),
+                _ => {}
+            }
+        }
+    }
+
+    fn action_quick_signed(
+        &mut self,
+        _: &EditorQuickSigned,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            let target = match crate::core::size_for_kind(lm.node_kind) {
+                1 => NodeKind::Int8,
+                2 => NodeKind::Int16,
+                4 => NodeKind::Int32,
+                8 => NodeKind::Int64,
+                _ => return,
+            };
+            if target != lm.node_kind {
+                self.quick_change_kind(target, cx);
+            }
+        }
+    }
+
+    fn action_quick_unsigned(
+        &mut self,
+        _: &EditorQuickUnsigned,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            let target = match crate::core::size_for_kind(lm.node_kind) {
+                1 => NodeKind::UInt8,
+                2 => NodeKind::UInt16,
+                4 => NodeKind::UInt32,
+                8 => NodeKind::UInt64,
+                _ => return,
+            };
+            if target != lm.node_kind {
+                self.quick_change_kind(target, cx);
+            }
+        }
+    }
+
+    /// The 4-step hex cycle used by Space/Shift+Space.
+    const HEX_CYCLE: [NodeKind; 4] = [
+        NodeKind::Hex8,
+        NodeKind::Hex16,
+        NodeKind::Hex32,
+        NodeKind::Hex64,
+    ];
+
+    fn hex_cycle(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let Some((_l, lm)) = self.current_node() else {
+            return;
+        };
+        let sz = crate::core::size_for_kind(lm.node_kind);
+        if sz <= 0 {
+            return; // containers
+        }
+        // Non-hex node: convert to the hex of the same size first.
+        if !is_hex_preview(lm.node_kind) {
+            if let Some(hk) = Self::HEX_CYCLE
+                .iter()
+                .find(|&&hk| crate::core::size_for_kind(hk) == sz)
+            {
+                self.quick_change_kind(*hk, cx);
+            }
+            return;
+        }
+        let Some(cur) = Self::HEX_CYCLE.iter().position(|&k| k == lm.node_kind) else {
+            return; // hex128 / unknown — not in the 4-cycle
+        };
+        let n = Self::HEX_CYCLE.len() as i32;
+        let next = Self::HEX_CYCLE[(((cur as i32 + dir) % n + n) % n) as usize];
+        self.quick_change_kind(next, cx);
+    }
+
+    fn action_hex_cycle_next(
+        &mut self,
+        _: &EditorHexCycleNext,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hex_cycle(1, cx);
+    }
+    fn action_hex_cycle_prev(
+        &mut self,
+        _: &EditorHexCyclePrev,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hex_cycle(-1, cx);
+    }
+
+    /// 1-5 → Hex8/16/32/64/128 on any non-container node.
+    fn hex_size(&mut self, kind: NodeKind, cx: &mut Context<Self>) {
+        if let Some((_l, lm)) = self.current_node() {
+            if crate::core::size_for_kind(lm.node_kind) > 0 {
+                self.quick_change_kind(kind, cx);
+            }
+        }
+    }
+    fn action_hex8(&mut self, _: &EditorHex8, _w: &mut Window, cx: &mut Context<Self>) {
+        self.hex_size(NodeKind::Hex8, cx);
+    }
+    fn action_hex16(&mut self, _: &EditorHex16, _w: &mut Window, cx: &mut Context<Self>) {
+        self.hex_size(NodeKind::Hex16, cx);
+    }
+    fn action_hex32(&mut self, _: &EditorHex32, _w: &mut Window, cx: &mut Context<Self>) {
+        self.hex_size(NodeKind::Hex32, cx);
+    }
+    fn action_hex64(&mut self, _: &EditorHex64, _w: &mut Window, cx: &mut Context<Self>) {
+        self.hex_size(NodeKind::Hex64, cx);
+    }
+    fn action_hex128(&mut self, _: &EditorHex128, _w: &mut Window, cx: &mut Context<Self>) {
+        self.hex_size(NodeKind::Hex128, cx);
+    }
+
+    /// Navigate to the next/prev selectable data node from the current line, in
+    /// `dir` (±1). Skips chrome + continuation rows. On a forward walk off the end,
+    /// auto-appends a hex field to the last node's struct (the "+1" keyboard
+    /// affordance). Selects the landed node via `handle_node_click`.
+    fn navigate_node(&mut self, dir: i32, step: usize, cx: &mut Context<Self>) {
+        let result = self.controller.last_result();
+        let count = result.meta.len();
+        if count == 0 {
+            return;
+        }
+        let start = self
+            .first_selected_line()
+            .map(|l| l as i64)
+            .unwrap_or(if dir > 0 { 0 } else { count as i64 });
+        let mut i = start + dir as i64 * step.max(1) as i64;
+        let mut found: Option<(usize, u64)> = None;
+        while i >= 0 && (i as usize) < count {
+            let lm = &result.meta[i as usize];
+            if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation {
+                found = Some((i as usize, lm.node_id));
+                break;
+            }
+            i += dir as i64;
+        }
+        if let Some((line, node_id)) = found {
+            self.controller
+                .handle_node_click(line as i64, node_id, CtrlMods::NONE);
+            self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+            self.after_mutation(cx);
+            return;
+        }
+        // Forward walk fell off the end → auto-append a field to the last data
+        // node's struct (mirrors the "+1" footer pill). Up-at-top is a no-op.
+        if dir > 0 {
+            let last = self
+                .controller
+                .last_result()
+                .meta
+                .iter()
+                .rev()
+                .find(|lm| lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation)
+                .map(|lm| (lm.node_idx, lm.node_kind));
+            if let Some((node_idx, _)) = last {
+                if node_idx >= 0 {
+                    let (parent_id, offset) = self.insert_anchor(node_idx as usize);
+                    self.controller
+                        .insert_node(parent_id, offset, NodeKind::Hex64, "");
+                    self.apply_document(cx);
+                }
+            }
+        }
+    }
+
+    fn action_nav_up(&mut self, _: &EditorNavUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_node(-1, 1, cx);
+    }
+    fn action_nav_down(&mut self, _: &EditorNavDown, _w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_node(1, 1, cx);
+    }
+    fn action_nav_page_up(&mut self, _: &EditorNavPageUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_node(-1, self.page_step(), cx);
+    }
+    fn action_nav_page_down(
+        &mut self,
+        _: &EditorNavPageDown,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_node(1, self.page_step(), cx);
+    }
+
+    /// One screenful of rows for PageUp/Down (the measured view height / line
+    /// height; falls back to 20 before the first layout).
+    fn page_step(&self) -> usize {
+        let state = self.scroll.0.borrow();
+        let view_h = f32::from(state.base_handle.bounds().size.height);
+        if self.metrics.line_height > 0.0 && view_h > 0.0 {
+            ((view_h / self.metrics.line_height).floor() as usize).max(1)
+        } else {
+            20
+        }
+    }
+
+    fn action_nav_home(&mut self, _: &EditorNavHome, _w: &mut Window, cx: &mut Context<Self>) {
+        // Jump to the first data node.
+        let result = self.controller.last_result();
+        for (i, lm) in result.meta.iter().enumerate() {
+            if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation {
+                let node_id = lm.node_id;
+                self.controller
+                    .handle_node_click(i as i64, node_id, CtrlMods::NONE);
+                self.scroll.scroll_to_item(i, ScrollStrategy::Top);
+                self.after_mutation(cx);
+                return;
+            }
+        }
+    }
+
+    fn action_nav_end(&mut self, _: &EditorNavEnd, _w: &mut Window, cx: &mut Context<Self>) {
+        // Jump to the last data node (excluding footers).
+        let result = self.controller.last_result();
+        for (i, lm) in result.meta.iter().enumerate().rev() {
+            if lm.node_id != 0
+                && lm.node_id != K_COMMAND_ROW_ID
+                && !lm.is_continuation
+                && lm.line_kind != LineKind::Footer
+            {
+                let node_id = lm.node_id;
+                self.controller
+                    .handle_node_click(i as i64, node_id, CtrlMods::NONE);
+                self.scroll.scroll_to_item(i, ScrollStrategy::Center);
+                self.after_mutation(cx);
+                return;
+            }
+        }
+    }
+
+    fn action_begin_value_edit(
+        &mut self,
+        _: &EditorBeginValueEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((line, _lm)) = self.current_node() {
+            self.begin_inline_edit(line, EditTarget::Value, window, cx);
+        }
+    }
+
+    fn action_insert_hex64(
+        &mut self,
+        _: &EditorInsertHex64,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            self.controller
+                .insert_node_above(lm.node_idx as usize, NodeKind::Hex64, "");
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_insert_hex32(
+        &mut self,
+        _: &EditorInsertHex32,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            self.controller
+                .insert_node_above(lm.node_idx as usize, NodeKind::Hex32, "");
+            self.apply_document(cx);
+        }
+    }
+
+    fn action_comment_edit(
+        &mut self,
+        _: &EditorCommentEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((line, _lm)) = self.current_node() {
+            self.begin_inline_edit(line, EditTarget::Comment, window, cx);
+        }
+    }
+
+    /// Left/Right → cycle same-size type variants on the focused node (item 18).
+    /// Reuses the menu's forward/back kind cyclers.
+    fn action_cycle_left(&mut self, _: &EditorCycleLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_l, lm)) = self.current_node() {
+            if crate::core::size_for_kind(lm.node_kind) > 0 {
+                self.controller
+                    .change_node_kind(lm.node_idx as usize, prev_kind_for(lm.node_kind));
+                self.apply_document(cx);
+            }
+        }
+    }
+    fn action_cycle_right(
+        &mut self,
+        _: &EditorCycleRight,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_l, lm)) = self.current_node() {
+            if crate::core::size_for_kind(lm.node_kind) > 0 {
+                self.controller
+                    .change_node_kind(lm.node_idx as usize, alt_kind_for(lm.node_kind));
+                self.apply_document(cx);
+            }
+        }
+    }
+
+    /// F12 Go To Definition (item 20): resolve the focused node's referenced struct
+    /// (pointer `ref_id` / struct `ref_id` / array element struct) and switch the
+    /// view root to it.
+    fn action_go_to_definition(
+        &mut self,
+        _: &EditorGoToDefinition,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_l, lm)) = self.current_node() else {
+            return;
+        };
+        let idx = lm.node_idx as usize;
+        let tree = self.controller.tree();
+        if idx >= tree.nodes.len() {
+            return;
+        }
+        let n = &tree.nodes[idx];
+        // The referenced struct id: a typed pointer/struct carries `ref_id`.
+        let ref_id = n.ref_id;
+        if ref_id != 0 && tree.index_of_id(ref_id) >= 0 {
+            self.controller.set_view_root_id(ref_id);
+            self.controller.clear_selection();
+            self.apply_document(cx);
+        }
+    }
+
+    /// Collapse / expand every container node (item 19). Iterates the tree's
+    /// container nodes and toggles those whose `collapsed` state differs from the
+    /// target, via the existing `toggle_collapse` op (no dedicated bulk op).
+    fn set_all_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        let targets: Vec<usize> = self
+            .controller
+            .tree()
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| crate::core::is_container_kind(n.kind) && n.collapsed != collapsed)
+            .map(|(i, _)| i)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        for idx in targets {
+            // Re-check by re-reading (toggle_collapse may recompose between calls,
+            // but indices are stable for collapse toggles in this controller).
+            if let Some(n) = self.controller.tree().nodes.get(idx) {
+                if crate::core::is_container_kind(n.kind) && n.collapsed != collapsed {
+                    self.controller.toggle_collapse(idx);
+                }
+            }
+        }
+        self.apply_document(cx);
+    }
+
+    fn action_collapse_all(
+        &mut self,
+        _: &EditorCollapseAll,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_all_collapsed(true, cx);
+    }
+    fn action_expand_all(&mut self, _: &EditorExpandAll, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_all_collapsed(false, cx);
     }
 
     // ── Undo / redo (editor-surface.md §1: routed through the controller) ──
@@ -879,6 +1746,20 @@ impl RcxEditor {
                         overlays.push((s, e, with_alpha(palette.byte_sel, 0.35)));
                     }
                 }
+            }
+        }
+
+        // Find-match highlight (item 4): paint a translucent accent band over the
+        // current navigated match's char range on its line. The match's `[start,
+        // end)` are char columns into the line text (the same text the row paints),
+        // so they map straight onto the overlay column space.
+        if let Some(m) = self.find_match {
+            if m.line == idx && m.end > m.start {
+                overlays.push((
+                    m.start as i32,
+                    m.end as i32,
+                    with_alpha(palette.accent, 0.35),
+                ));
             }
         }
 
@@ -1080,6 +1961,7 @@ impl RcxEditor {
             };
             row = row.child(
                 div()
+                    .id(("rcx-margin", idx))
                     .flex_shrink_0()
                     .w(px((addr_cols as f32 + 2.0) * self.metrics.cell_width))
                     .h(px(self.metrics.line_height))
@@ -1090,6 +1972,19 @@ impl RcxEditor {
                     .pr(px(self.metrics.cell_width))
                     .bg(palette.gutter_bg)
                     .text_color(palette.gutter_fg)
+                    // Double-click the offset margin → flip relative/absolute
+                    // offsets (item 25; the C++ `MouseButtonDblClick` over margin 0).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
+                            if e.click_count >= 2 {
+                                cx.stop_propagation();
+                                let rel = this.relative_offsets;
+                                this.relative_offsets = !rel;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .child(SharedString::from(margin_text)),
             );
         }
@@ -1185,7 +2080,11 @@ impl RcxEditor {
                     0.0
                 };
                 let cell = self.metrics.cell_width;
-                let left = px((margin + addr.start.max(0) as f32) * cell);
+                // Clear the address margin AND the kind-icon gutter (item 3): the
+                // hover strip sits in row space, after both lead-ins, so it must
+                // include `ICON_CELLS` like the inline-edit overlay does.
+                let icon_gutter = ICON_CELLS * cell;
+                let left = px(icon_gutter + (margin + addr.start.max(0) as f32) * cell);
                 let width = px(((addr.end - addr.start).max(1) as f32) * cell);
                 let base_address = self.controller.last_result().layout.base_address;
                 let module: SharedString = self.controller.document().provider.name().into();
@@ -1234,6 +2133,69 @@ impl RcxEditor {
                         }),
                 );
             }
+
+            // Source-chip + chevron hover affordances (item 5): a pointing-hand
+            // cursor + a one-line tooltip ('Data Source' / 'Switch View') over each
+            // interactive command-row chip. These are transparent hover hitboxes
+            // (NO mouse-down handler — the row-text element under them keeps routing
+            // the click to the source/type-selector popup), positioned in row space
+            // (after the address margin + icon gutter), mirroring the address strip.
+            let cell = self.metrics.cell_width;
+            let hex_digits = self
+                .controller
+                .last_result()
+                .layout
+                .offset_hex_digits
+                .max(0) as f32;
+            let margin = if hex_digits > 0.0 {
+                hex_digits + 2.0
+            } else {
+                0.0
+            };
+            let icon_gutter = ICON_CELLS * cell;
+            for (hover_id, span, tip) in [
+                (
+                    "rcx-src-hover",
+                    crate::compose::command_row_src_span(&text),
+                    "Data Source",
+                ),
+                (
+                    "rcx-chevron-hover",
+                    crate::compose::command_row_chevron_span(&text),
+                    "Switch View",
+                ),
+            ] {
+                if span.valid && span.end > span.start {
+                    let left = px(icon_gutter + (margin + span.start.max(0) as f32) * cell);
+                    let width = px(((span.end - span.start).max(1) as f32) * cell);
+                    let tip: SharedString = tip.into();
+                    // The hover hitbox occludes the row-text element, so forward its
+                    // click back into the normal row routing (text-local X inside the
+                    // span) — exactly like the address strip — so the source/chevron
+                    // click still reaches `on_row_mouse_down` → the popup (items 1/2).
+                    let click_x = (span.start.max(0) as f32 + 0.5) * cell;
+                    row = row.child(
+                        div()
+                            .id((hover_id, idx))
+                            .absolute()
+                            .top_0()
+                            .left(left)
+                            .h(px(self.metrics.line_height))
+                            .w(width)
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.on_row_mouse_down(idx, click_x, e.modifiers, window, cx);
+                                }),
+                            )
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                            }),
+                    );
+                }
+            }
         }
 
         // Inline-edit overlay positioned at the edited column — offset by the
@@ -1252,7 +2214,7 @@ impl RcxEditor {
             };
             let cell = self.metrics.cell_width;
             // The overlay is positioned in the row's own coordinate space, so it
-            // must clear BOTH the address margin and the kind-icon gutter (both
+            // must clear BOTH the address margin AND the kind-icon gutter (both
             // precede the row-text element) before the per-column offset. The
             // RowElement's text column 0 sits past the 2px left accent border too
             // (the border is inside the row's border-box, so an `absolute` child's
@@ -1261,7 +2223,16 @@ impl RcxEditor {
             // NAME column and does not slide one column left onto the type token
             // (item 3: the earlier overlay covered only the address margin, not the
             // per-target column nor the accent border).
-            let left = px(BORDER_L_PX + (margin + col_start.max(0) as f32) * cell);
+            //
+            // BUG (item 3): `render_row` reserves the address-margin div
+            // (`(addr_cols+2)*cell`) AND a separate 2-cell kind-icon gutter
+            // (`ICON_CELLS*cell`) before the RowElement text, but the overlay only
+            // added the address-margin width — so the field landed one icon-gutter
+            // (2 cells) to the LEFT of the column it edits (the root class-name box
+            // sat on the address/icon margin instead of ON the name). Add the
+            // `ICON_CELLS` gutter width so the field aligns to its exact column.
+            let icon_gutter = ICON_CELLS * cell;
+            let left = px(BORDER_L_PX + icon_gutter + (margin + col_start.max(0) as f32) * cell);
             // The opaque band spans the edited column `[col_start, col_end)` (a
             // generous minimum so short seeds still get a visible field box).
             let editing_width = ((col_end - col_start).max(0) as f32).max(6.0);
@@ -1309,6 +2280,66 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.on_row_mouse_down(line, rel_x, modifiers, window, cx);
+    }
+
+    /// Double-click-to-edit (item 26): select the clicked node first, then begin the
+    /// edit/picker for the token under the cursor (the C++ `MouseButtonDblClick`
+    /// path — narrow selection to the node, then `beginInlineEdit`). Falls back to a
+    /// single-click route when the column resolves no editable target.
+    pub(crate) fn dispatch_row_double_click(
+        &mut self,
+        line: usize,
+        rel_x: f32,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_some() {
+            self.commit_active_edit(window, cx);
+        }
+        let Some(lm) = self.line_meta(line).cloned() else {
+            return;
+        };
+        let text = self.line_text_owned(line);
+        let (type_w, name_w) = geometry::effective_widths(&lm);
+        let hit = hit_test::hit_test_row(&lm, &text, rel_x, self.metrics, type_w, name_w);
+        // Select the node first (single-select), so the edit acts on it.
+        if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID {
+            self.controller
+                .handle_node_click(line as i64, lm.node_id, CtrlMods::NONE);
+            let _ = self.controller.take_events();
+        }
+        // Now route the token under the cursor exactly as a click on an
+        // already-selected node would (pickers + inline edits).
+        if hit.target.is_some() {
+            self.on_row_mouse_down(line, rel_x, modifiers, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Byte-selection drag (item 11): extend the armed hex byte selection to the
+    /// byte under the dragged cursor. No-op when no byte selection is armed or the
+    /// row column maps to no byte.
+    pub(crate) fn dispatch_row_drag(
+        &mut self,
+        line: usize,
+        rel_x: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.byte_sel.is_active() {
+            return;
+        }
+        let Some(lm) = self.line_meta(line).cloned() else {
+            return;
+        };
+        let text = self.line_text_owned(line);
+        let col = self.metrics.col_containing_x(rel_x);
+        if let Some(addr) = self.byte_addr_for_hit(&lm, &text, col) {
+            self.byte_sel.shift_extend_to(addr);
+            cx.notify();
+        }
     }
 
     // ── Node context menu (reclass `customContextMenuRequested`) ──
@@ -1706,8 +2737,109 @@ impl RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Change-Type / `T` is the field-type flow (modifiers allowed).
+        self.open_type_selector_in_mode(target, EditTarget::Type, window, cx);
+    }
+
+    /// The full type catalogue: the built-in primitives + every user-declared
+    /// composite (struct/class/enum) in the tree (item 6 — "composites + user
+    /// structs"). Composites are appended after the primitives, mirroring the C++
+    /// catalogue. `exclude_id` drops a struct from the list (so a struct cannot
+    /// reference itself).
+    fn full_type_entries(&self, exclude_id: u64) -> Vec<crate::ui::typeselectorpopup::TypeEntry> {
+        use crate::ui::typeselectorpopup::{default_type_entries, TypeEntry};
+        let mut entries = default_type_entries();
+        let tree = self.controller.tree();
+        let mut composites: Vec<TypeEntry> = Vec::new();
+        for n in tree.nodes.iter() {
+            // Named composite declarations (a struct with a type name), excluding
+            // the self-reference target.
+            if n.kind == NodeKind::Struct && !n.struct_type_name.is_empty() && n.id != exclude_id {
+                let size = crate::core::size_for_kind(n.kind).max(0);
+                let keyword = if n.class_keyword.is_empty() {
+                    "struct"
+                } else {
+                    n.class_keyword.as_str()
+                };
+                composites.push(TypeEntry::composite(
+                    n.id,
+                    &n.struct_type_name,
+                    keyword,
+                    size,
+                ));
+            }
+        }
+        // Dedup composites by type name (the same struct can appear via several
+        // pointer refs); keep the first occurrence.
+        composites.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        composites.dedup_by(|a, b| a.display_name == b.display_name);
+        entries.extend(composites);
+        entries
+    }
+
+    /// Open the Type Selector for `target` in the mode implied by `edit_target`
+    /// (item 6): `Type` → FieldType (modifiers), `ArrayElementType` → ArrayElement
+    /// (modifiers), `PointerTarget` → PointerTarget (no modifiers). The catalogue
+    /// includes composites + primitives.
+    fn open_type_selector_in_mode(
+        &mut self,
+        target: ContextTarget,
+        edit_target: EditTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::typeselectorpopup::TypePopupMode;
+        let mode = match edit_target {
+            EditTarget::ArrayElementType => TypePopupMode::ArrayElement,
+            EditTarget::PointerTarget => TypePopupMode::PointerTarget,
+            _ => TypePopupMode::FieldType,
+        };
+        let entries = self.full_type_entries(target.node_id);
+        self.spawn_type_selector(entries, target, mode, window, cx);
+    }
+
+    /// Open the Root-mode Type Selector (item 2): the class-header chevron switches
+    /// the *viewed* struct. We list every declared composite (Root mode hides the
+    /// `*`/`[]` modifiers); on Chosen the kind is applied to the root node via
+    /// [`apply_type_choice`].
+    fn open_root_type_selector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::ui::typeselectorpopup::TypePopupMode;
+        let root_id = self.controller.view_root_id();
+        let root_idx = self.controller.tree().index_of_id(root_id);
+        let kind = if root_idx >= 0 {
+            self.controller.tree().nodes[root_idx as usize].kind
+        } else {
+            NodeKind::Struct
+        };
+        let target = ContextTarget {
+            line: 0,
+            node_idx: root_idx.max(0) as usize,
+            node_id: root_id,
+            kind,
+        };
+        // Root mode lists every declared composite so the user can re-root onto a
+        // different struct (do NOT exclude the current root — it may be re-picked).
+        let entries = self.full_type_entries(0);
+        self.spawn_type_selector(entries, target, TypePopupMode::Root, window, cx);
+    }
+
+    /// Shared opener: build the [`TypeSelectorPopup`] over `entries`, set `mode`,
+    /// subscribe to its outcome (apply via [`apply_type_choice`]), and float it
+    /// through `window.open_dialog`.
+    fn spawn_type_selector(
+        &mut self,
+        entries: Vec<crate::ui::typeselectorpopup::TypeEntry>,
+        target: ContextTarget,
+        mode: crate::ui::typeselectorpopup::TypePopupMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use crate::ui::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
-        let popup = TypeSelectorPopup::view(target.kind, window, cx);
+        let popup = cx.new(|cx| {
+            let mut p = TypeSelectorPopup::new(entries, window, cx);
+            p.set_mode(mode, cx);
+            p
+        });
         let focus = popup.read(cx).focus_handle(cx);
         let node_idx = target.node_idx;
         let node_id = target.node_id;
@@ -1753,21 +2885,361 @@ impl RcxEditor {
         use crate::ui::typeselectorpopup::Modifier;
         // Base kind first.
         self.controller.change_node_kind(node_idx, kind);
-        // Then the modifier (pointer/array) via the existing controller ops,
-        // re-resolving the node id (change_node_kind may have shifted indices).
+        // Then the modifier (pointer / double-pointer / array) via the controller
+        // ops, re-resolving the node id (change_node_kind may have shifted indices).
         match modifier {
-            Some(Modifier::Pointer) | Some(Modifier::PointerPointer) => {
+            // `*` single pointer to a fresh class.
+            Some(Modifier::Pointer) => {
                 self.controller.convert_to_typed_pointer(node_id);
             }
+            // `**` double pointer (item 7): the C++ keeps a distinct pointer DEPTH.
+            // We have no dedicated double-pointer op, so make the node a typed
+            // pointer to a fresh class AND retarget that class's first field as a
+            // pointer too — the on-disk `**` shape (a pointer whose pointee is a
+            // pointer), rather than silently collapsing `**` to a single `*`.
+            Some(Modifier::PointerPointer) => {
+                self.controller.convert_to_typed_pointer(node_id);
+                // Resolve the new pointee struct's first child and make it a pointer
+                // as well, giving the second level of indirection.
+                let inner_kind = if self.controller.tree().pointer_size >= 8 {
+                    NodeKind::Pointer64
+                } else {
+                    NodeKind::Pointer32
+                };
+                if let Some(first_child_idx) = self.first_pointee_field_idx(node_id) {
+                    self.controller
+                        .convert_to_typed_pointer(self.controller.tree().nodes[first_child_idx].id);
+                    let _ = inner_kind;
+                }
+            }
+            // `[N]` array with the chosen element COUNT (item 7): change to Array,
+            // then push a `ChangeArrayMeta` carrying the element kind + the count so
+            // the `[N]` is not dropped.
             Some(Modifier::Array(count)) => {
                 let idx = self.controller.tree().index_of_id(node_id);
                 if idx >= 0 {
                     self.controller
                         .change_node_kind(idx as usize, NodeKind::Array);
-                    let _ = count; // element count is applied via the array header edit path
+                    self.set_array_meta(node_id, kind, count.max(1));
                 }
             }
             Some(Modifier::None) | None => {}
+        }
+        self.apply_document(cx);
+    }
+
+    /// The tree index of the FIRST child field of the struct a typed pointer
+    /// (`node_id`) references (its `ref_id`'s first child), if any — used to apply
+    /// the second level of a `**` double pointer (item 7).
+    fn first_pointee_field_idx(&self, node_id: u64) -> Option<usize> {
+        let tree = self.controller.tree();
+        let pi = tree.index_of_id(node_id);
+        if pi < 0 {
+            return None;
+        }
+        let ref_id = tree.nodes[pi as usize].ref_id;
+        if ref_id == 0 {
+            return None;
+        }
+        tree.children_of(ref_id).first().copied()
+    }
+
+    /// Push an undoable `ChangeArrayMeta` setting the array element kind + length
+    /// (item 7). Reads the node's current array meta for the undo half. No-op when
+    /// the node id no longer resolves.
+    fn set_array_meta(&mut self, node_id: u64, element_kind: NodeKind, count: i32) {
+        let idx = self.controller.tree().index_of_id(node_id);
+        if idx < 0 {
+            return;
+        }
+        let n = &self.controller.tree().nodes[idx as usize];
+        let old_element_kind = n.element_kind;
+        let old_array_len = n.array_len;
+        if old_element_kind == element_kind && old_array_len == count {
+            return;
+        }
+        self.controller
+            .push_command(crate::core::Command::ChangeArrayMeta {
+                node_id,
+                old_element_kind,
+                new_element_kind: element_kind,
+                old_array_len,
+                new_array_len: count,
+            });
+    }
+
+    // ── Data-source picker (SourceChooserPopup; items 1/5, contract CONSUMES) ──
+
+    /// Open the [`SourceChooserPopup`] over the controller's saved sources +
+    /// providers (the class-header `source▾` chip click, item 1). Subscribes to the
+    /// [`SourceChooserEvent`] and applies the pick through the controller's
+    /// data-source API: `SourceSelected` → `switch_to_saved_source`,
+    /// `ClearRequested` → `clear_sources`. Provider selection needs the app shell's
+    /// file/attach dialogs (out of the editor's ownership), so it closes cleanly
+    /// (the documented stub the controller itself uses for plugin sources). Opened
+    /// through `window.open_dialog`, mirroring the type selector + command palette.
+    fn open_source_chooser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Build the `(name, kind_label, active)` recent tuples from the controller's
+        // saved sources, flagging the active one with its checkmark (PIC4).
+        let active = self.controller.active_source_index();
+        let recent: Vec<(String, String, bool)> = self
+            .controller
+            .saved_sources()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.display_name.clone(), s.kind.clone(), i as i32 == active))
+            .collect();
+        let popup = SourceChooserPopup::view(recent, window, cx);
+        let focus = popup.read(cx).focus_handle(cx);
+        self._source_chooser_sub = Some(cx.subscribe_in(
+            &popup,
+            window,
+            move |this, _p, ev: &SourceChooserEvent, window, cx| {
+                use crate::ui::sourcechooser::SourcePick;
+                window.close_dialog(cx);
+                this._source_chooser_sub = None;
+                match ev {
+                    SourceChooserEvent::Pick(SourcePick::SavedSource(idx)) => {
+                        this.controller.switch_to_saved_source(*idx);
+                        this.after_mutation(cx);
+                    }
+                    SourceChooserEvent::Clear => {
+                        this.controller.clear_sources();
+                        this.after_mutation(cx);
+                    }
+                    // Provider activation (Open File / Kernel / Process / …) drives
+                    // the app shell's file/attach dialogs, which the editor does not
+                    // own; close cleanly (documented stub, like plugin sources).
+                    SourceChooserEvent::Pick(SourcePick::Provider(_))
+                    | SourceChooserEvent::OpenFile
+                    | SourceChooserEvent::Cancel => {
+                        cx.notify();
+                    }
+                }
+            },
+        ));
+        let popup_for_modal = popup.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .w(px(360.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(popup_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    // ── Enum-value picker (EnumPickerPopup; item 8) ──
+
+    /// Whether node `idx` is an enum (its resolved class keyword is `enum`).
+    fn node_is_enum(&self, idx: usize) -> bool {
+        self.controller
+            .tree()
+            .nodes
+            .get(idx)
+            .is_some_and(|n| n.is_enum())
+    }
+
+    /// Open the [`EnumPickerPopup`] for the enum field at `idx` (item 8). Builds the
+    /// member list from the node's `enum_members`, pre-selecting the current value,
+    /// and on Chosen writes the value back through `set_node_value`.
+    fn open_enum_picker(
+        &mut self,
+        line: usize,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::enumpicker::{EnumPickerEvent, Member};
+        let (enum_name, members, current) = {
+            let n = &self.controller.tree().nodes[idx];
+            let members: Vec<Member> = n
+                .enum_members
+                .iter()
+                .map(|(name, value)| Member::new(name, *value))
+                .collect();
+            // The current value: read it through the value-history snapshot if any,
+            // else default to 0 (the picker pre-selects the nearest member).
+            (n.struct_type_name.clone(), members, 0i64)
+        };
+        if members.is_empty() {
+            // No members → fall back to a plain inline value edit.
+            self.begin_inline_edit(line, EditTarget::Value, window, cx);
+            return;
+        }
+        let resolved_addr = self.line_meta(line).map(|lm| lm.offset_addr).unwrap_or(0);
+        let sub_line = self.line_meta(line).map(|lm| lm.sub_line).unwrap_or(0);
+        let popup = cx.new(|cx| {
+            crate::ui::enumpicker::EnumPickerPopup::new(&enum_name, members, current, window, cx)
+        });
+        let focus = popup.read(cx).focus_handle(cx);
+        self._enum_picker_sub = Some(cx.subscribe_in(
+            &popup,
+            window,
+            move |this, _p, ev: &EnumPickerEvent, window, cx| match ev {
+                EnumPickerEvent::Chosen(value) => {
+                    window.close_dialog(cx);
+                    this._enum_picker_sub = None;
+                    this.controller.set_node_value(
+                        idx,
+                        sub_line,
+                        &value.to_string(),
+                        false,
+                        resolved_addr,
+                    );
+                    this.after_mutation(cx);
+                }
+                EnumPickerEvent::Dismissed => {
+                    window.close_dialog(cx);
+                    this._enum_picker_sub = None;
+                }
+            },
+        ));
+        let popup_for_modal = popup.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .w(px(360.))
+                .margin_top(px(120.))
+                .close_button(false)
+                .child(popup_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    // ── Hex size toolbar (HexToolbarPopup; item 9) ──
+
+    /// Build the [`HexPopupContext`] for the hex node at `idx`: its current kind +
+    /// raw bytes + up to 15 adjacent same-parent hex nodes (for join previews).
+    fn build_hex_context(&self, idx: usize) -> Option<crate::ui::hextoolbar::HexPopupContext> {
+        use crate::ui::hextoolbar::{Adjacent, HexPopupContext};
+        let tree = self.controller.tree();
+        let n = tree.nodes.get(idx)?;
+        if !is_hex_preview(n.kind) {
+            return None;
+        }
+        let node_id = n.id;
+        let kind = n.kind;
+        let parent_id = n.parent_id;
+        let size = crate::core::size_for_kind(kind).max(0);
+        let (addr, _ok) = tree.absolute_address(idx as i32);
+        let provider = &self.controller.document().provider;
+        let data = provider.read_bytes(addr, size);
+        // Adjacent same-parent hex siblings after this node (for join previews).
+        let siblings = tree.children_of(parent_id);
+        let mut nexts: Vec<Adjacent> = Vec::new();
+        if let Some(pos) = siblings.iter().position(|&s| s == idx) {
+            for &sib in siblings.iter().skip(pos + 1).take(15) {
+                let sn = &tree.nodes[sib];
+                if !is_hex_preview(sn.kind) {
+                    break;
+                }
+                let sz = crate::core::size_for_kind(sn.kind).max(0);
+                let (saddr, _) = tree.absolute_address(sib as i32);
+                let bytes = provider.read_bytes(saddr, sz);
+                nexts.push(Adjacent {
+                    exists: true,
+                    kind: sn.kind,
+                    data: bytes,
+                });
+            }
+        }
+        Some(HexPopupContext {
+            node_id,
+            current_kind: kind,
+            data,
+            nexts,
+            ..HexPopupContext::default()
+        })
+    }
+
+    /// Open the [`HexToolbarPopup`] for the hex node at `idx` (item 9). On
+    /// `SizeSelected` apply the size change via `split_hex_node` (smaller) or
+    /// `join_hex_nodes` (larger); Insert above/below + dismiss route accordingly.
+    fn open_hex_toolbar(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::ui::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
+        let Some(ctx) = self.build_hex_context(idx) else {
+            return;
+        };
+        let node_id = ctx.node_id;
+        let popup = cx.new(|cx| HexToolbarPopup::new(ctx, window, cx));
+        let focus = popup.read(cx).focus_handle(cx);
+        self._hex_toolbar_sub = Some(cx.subscribe_in(
+            &popup,
+            window,
+            move |this, _p, ev: &HexToolbarEvent, window, cx| match ev {
+                HexToolbarEvent::SizeSelected(id, kind)
+                | HexToolbarEvent::SuggestKind(id, kind) => {
+                    window.close_dialog(cx);
+                    this._hex_toolbar_sub = None;
+                    this.apply_hex_size(*id, *kind, cx);
+                }
+                HexToolbarEvent::InsertAbove(id) => {
+                    window.close_dialog(cx);
+                    this._hex_toolbar_sub = None;
+                    let i = this.controller.tree().index_of_id(*id);
+                    if i >= 0 {
+                        this.controller
+                            .insert_node_above(i as usize, NodeKind::Hex64, "");
+                        this.apply_document(cx);
+                    }
+                }
+                HexToolbarEvent::InsertBelow(id) => {
+                    window.close_dialog(cx);
+                    this._hex_toolbar_sub = None;
+                    let i = this.controller.tree().index_of_id(*id);
+                    if i >= 0 {
+                        let (parent_id, offset) = this.insert_anchor(i as usize);
+                        this.controller
+                            .insert_node(parent_id, offset, NodeKind::Hex64, "");
+                        this.apply_document(cx);
+                    }
+                }
+                HexToolbarEvent::JoinSelected
+                | HexToolbarEvent::FillToOffset(_, _)
+                | HexToolbarEvent::Dismissed => {
+                    window.close_dialog(cx);
+                    this._hex_toolbar_sub = None;
+                    cx.notify();
+                }
+            },
+        ));
+        let popup_for_modal = popup.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .w(px(320.))
+                .margin_top(px(140.))
+                .close_button(false)
+                .child(popup_for_modal.clone())
+        });
+        let _ = node_id;
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Apply a hex-toolbar size choice (item 9): a smaller target splits the node,
+    /// a larger target joins it with the following same-kind siblings, same size is
+    /// a no-op. Routes to the controller's `split_hex_node` / `join_hex_nodes`.
+    fn apply_hex_size(&mut self, node_id: u64, target: NodeKind, cx: &mut Context<Self>) {
+        let idx = self.controller.tree().index_of_id(node_id);
+        if idx < 0 {
+            return;
+        }
+        let cur = self.controller.tree().nodes[idx as usize].kind;
+        let cur_sz = crate::core::size_for_kind(cur);
+        let tgt_sz = crate::core::size_for_kind(target);
+        if tgt_sz == cur_sz {
+            // Same size (e.g. a suggested non-hex kind): change kind directly.
+            if target != cur {
+                self.controller.change_node_kind(idx as usize, target);
+            }
+        } else if tgt_sz < cur_sz {
+            self.controller.split_hex_node(node_id);
+            // After a split the node becomes the next smaller hex; if the target is
+            // smaller still, the user can split again from the refreshed toolbar.
+        } else {
+            self.controller.join_hex_nodes(node_id, target);
         }
         self.apply_document(cx);
     }
@@ -1937,6 +3409,7 @@ impl Render for RcxEditor {
             .id("rcx-editor")
             .track_focus(&self.focus_handle)
             .key_context("RcxEditor")
+            .relative()
             .size_full()
             .bg(palette.paper)
             .text_color(palette.text)
@@ -1967,12 +3440,54 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_delete))
             .on_action(cx.listener(Self::action_fold))
             .on_action(cx.listener(Self::action_copy_c_struct))
+            .on_action(cx.listener(Self::action_find))
+            // Normal-mode quick keys (item 12) + same-size cycle (18) + F12 (20).
+            .on_action(cx.listener(Self::action_quick_pointer))
+            .on_action(cx.listener(Self::action_quick_float))
+            .on_action(cx.listener(Self::action_quick_signed))
+            .on_action(cx.listener(Self::action_quick_unsigned))
+            .on_action(cx.listener(Self::action_hex_cycle_next))
+            .on_action(cx.listener(Self::action_hex_cycle_prev))
+            .on_action(cx.listener(Self::action_hex8))
+            .on_action(cx.listener(Self::action_hex16))
+            .on_action(cx.listener(Self::action_hex32))
+            .on_action(cx.listener(Self::action_hex64))
+            .on_action(cx.listener(Self::action_hex128))
+            .on_action(cx.listener(Self::action_nav_up))
+            .on_action(cx.listener(Self::action_nav_down))
+            .on_action(cx.listener(Self::action_nav_page_up))
+            .on_action(cx.listener(Self::action_nav_page_down))
+            .on_action(cx.listener(Self::action_nav_home))
+            .on_action(cx.listener(Self::action_nav_end))
+            .on_action(cx.listener(Self::action_begin_value_edit))
+            .on_action(cx.listener(Self::action_insert_hex64))
+            .on_action(cx.listener(Self::action_insert_hex32))
+            .on_action(cx.listener(Self::action_comment_edit))
+            .on_action(cx.listener(Self::action_cycle_left))
+            .on_action(cx.listener(Self::action_cycle_right))
+            .on_action(cx.listener(Self::action_go_to_definition))
+            .on_action(cx.listener(Self::action_collapse_all))
+            .on_action(cx.listener(Self::action_expand_all))
             .on_mouse_down_out(cx.listener(|this, _e: &MouseDownEvent, window, cx| {
                 // Clicking outside the editor commits an active edit.
                 if this.editing.is_some() {
                     this.commit_active_edit(window, cx);
                 }
             }))
+            // The find bar (Ctrl+F) floats over the top of the editor when open
+            // (item 4): a thin overlaid strip that takes input focus, navigates to
+            // matches, and drives the per-line highlight painted in build_row_paint.
+            .when_some(self.find_bar.clone(), |this, bar| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .mt(px(design::tokens::space::SM))
+                        .mr(px(design::tokens::space::MD))
+                        .child(bar),
+                )
+            })
             // Body: the virtualized row list (flex-1) and, when toggled, the
             // right-side minimap overview column (item 4). A flex row keeps the
             // minimap pinned to the right edge without overlapping the rows.

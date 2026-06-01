@@ -92,6 +92,10 @@ pub struct ModuleRow {
     pub base_text: String,
     /// The formatted size (`0x...` bytes, uppercase hex; empty when zero).
     pub size_text: String,
+    /// The count of loaded PDB symbols for this module (0 = none loaded). Drives
+    /// the "✓ N syms" indicator. Populated from the global symbol store on
+    /// render; the pure builder leaves it 0.
+    pub symbol_count: usize,
 }
 
 impl ModuleRow {
@@ -118,6 +122,7 @@ impl ModuleRow {
             } else {
                 format!("0x{:X}", m.size)
             },
+            symbol_count: 0,
         }
     }
 }
@@ -130,10 +135,75 @@ pub fn build_module_rows(entries: &[ModuleEntry]) -> Vec<ModuleRow> {
     rows
 }
 
+/// One resolved-symbol row's display strings — a symbol name + its module + the
+/// `module+RVA` offset (the C++ Symbols tab). Pure + unit-tested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolRow {
+    /// The owning module's canonical name.
+    pub module: String,
+    /// The symbol name (e.g. `NtCreateFile`).
+    pub name: String,
+    /// The RVA within the module.
+    pub rva: u32,
+    /// The formatted `module+0xRVA` offset string.
+    pub offset_text: String,
+}
+
+/// Build the Symbols-tab rows from the loaded module symbol sets: every
+/// `(name, rva)` pair across the loaded modules, sorted by `(module, rva)`,
+/// capped at `cap` so a giant PDB doesn't stall the list. Pure + unit-tested.
+pub fn build_symbol_rows(sets: &[(String, Vec<(String, u32)>)], cap: usize) -> Vec<SymbolRow> {
+    let mut rows: Vec<SymbolRow> = Vec::new();
+    for (module, syms) in sets {
+        for (name, rva) in syms {
+            rows.push(SymbolRow {
+                module: module.clone(),
+                name: name.clone(),
+                rva: *rva,
+                offset_text: format!("{module}+0x{rva:X}"),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.module.cmp(&b.module).then(a.rva.cmp(&b.rva)));
+    rows.truncate(cap);
+    rows
+}
+
+/// One imported-PDB-type row's display strings — the type name + module + a
+/// kind tag (struct/class/union/enum) + size (the C++ Types tab). Pure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeRow {
+    /// The owning module's canonical name.
+    pub module: String,
+    /// The type name.
+    pub name: String,
+    /// The kind tag ("enum" / "union" / "struct").
+    pub kind: &'static str,
+    /// The formatted size (`0x...` bytes; empty when zero).
+    pub size_text: String,
+}
+
+/// The kind tag for a PDB type (enum > union > struct, matching the C++ tag).
+pub fn pdb_type_kind(is_enum: bool, is_union: bool) -> &'static str {
+    if is_enum {
+        "enum"
+    } else if is_union {
+        "union"
+    } else {
+        "struct"
+    }
+}
+
+/// The `module+RVA` offset string for a symbol (the C++ Symbols tab offset
+/// column). Pure helper so the view never formats inline.
+pub fn format_symbol_offset(module: &str, rva: u32) -> String {
+    format!("{module}+0x{rva:X}")
+}
+
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
-pub use view::ModulesPanel;
+pub use view::{ModuleAction, ModulesPanel};
 
 #[cfg(feature = "ui")]
 mod view {
@@ -143,9 +213,31 @@ mod view {
     use gpui::*;
     use gpui_component::dock::{Panel, PanelEvent};
 
-    use super::{build_module_rows, ModuleRow, ModulesTab};
+    use super::{
+        build_module_rows, build_symbol_rows, pdb_type_kind, ModuleRow, ModulesTab, SymbolRow,
+        TypeRow,
+    };
     use crate::provider::Provider;
+    use crate::rtti::SymbolStore;
     use crate::ui::design::{color, icon, tokens};
+
+    /// The max symbol rows the Symbols tab lists (a full ntdll PDB has tens of
+    /// thousands; cap so the non-virtualized list stays responsive).
+    const SYMBOL_ROW_CAP: usize = 2000;
+
+    /// An intent the modules panel raises for the window to resolve onto the
+    /// active document / controller (the read-only-surface pattern). The panel
+    /// does not own the document base or the PDB loader, so it emits requests.
+    #[derive(Clone, Debug)]
+    pub enum ModuleAction {
+        /// Double-click a module row: set the active document's base address to
+        /// the module base + kick off its PDB symbol load (the C++ module-row
+        /// activation). Carries the module base + name.
+        Activate { base: u64, name: String },
+        /// "Download All" header action: load/download PDB symbols for every
+        /// module of the active source (the C++ `download_all`).
+        DownloadAll,
+    }
 
     /// The Modules right-dock panel — a Modules / Symbols / Types tab strip with
     /// a "Download All" action over the active source's module list.
@@ -196,16 +288,75 @@ mod view {
             cx.notify();
         }
 
-        /// The module rows for the active source (empty without a provider, or
-        /// for the Symbols / Types tabs which aren't enumerated here yet).
+        /// The module rows for the active source (empty without a provider).
+        /// Each row carries a symbol-loaded indicator computed from the global
+        /// [`SymbolStore`] (the C++ "✓ N syms" badge).
         fn rows(&self) -> Vec<ModuleRow> {
-            if self.tab != ModulesTab::Modules {
-                return Vec::new();
-            }
-            match &self.provider {
+            let mut rows = match &self.provider {
                 Some(p) => build_module_rows(&p.enumerate_modules()),
                 None => Vec::new(),
+            };
+            if let Ok(store) = SymbolStore::global().lock() {
+                for r in &mut rows {
+                    if let Some(set) = store.module_data(&r.name) {
+                        r.symbol_count = set.name_to_rva.len();
+                    }
+                }
             }
+            rows
+        }
+
+        /// The resolved-symbol rows for the Symbols tab — every `(name, rva)` of
+        /// every loaded module in the global [`SymbolStore`] (the C++ Symbols
+        /// tab). Empty until a module's PDB is loaded.
+        fn symbol_rows(&self) -> Vec<SymbolRow> {
+            let store = match SymbolStore::global().lock() {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let sets: Vec<(String, Vec<(String, u32)>)> = store
+                .loaded_modules()
+                .into_iter()
+                .filter_map(|m| {
+                    store.module_data(&m).map(|set| {
+                        let syms: Vec<(String, u32)> = set
+                            .name_to_rva
+                            .iter()
+                            .map(|(n, rva)| (n.clone(), *rva))
+                            .collect();
+                        (m, syms)
+                    })
+                })
+                .collect();
+            build_symbol_rows(&sets, SYMBOL_ROW_CAP)
+        }
+
+        /// The imported-PDB-type rows for the Types tab — every TPI type of every
+        /// loaded module in the global [`SymbolStore`] (the C++ Types tab).
+        fn type_rows(&self) -> Vec<TypeRow> {
+            let store = match SymbolStore::global().lock() {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let mut rows: Vec<TypeRow> = Vec::new();
+            for m in store.loaded_modules() {
+                if let Some(set) = store.module_data(&m) {
+                    for t in &set.types {
+                        rows.push(TypeRow {
+                            module: m.clone(),
+                            name: t.name.clone(),
+                            kind: pdb_type_kind(t.is_enum, t.is_union),
+                            size_text: if t.size == 0 {
+                                String::new()
+                            } else {
+                                format!("0x{:X}", t.size)
+                            },
+                        });
+                    }
+                }
+            }
+            rows.sort_by(|a, b| a.module.cmp(&b.module).then(a.name.cmp(&b.name)));
+            rows
         }
     }
 
@@ -220,6 +371,7 @@ mod view {
     }
 
     impl EventEmitter<PanelEvent> for ModulesPanel {}
+    impl EventEmitter<ModuleAction> for ModulesPanel {}
 
     impl Focusable for ModulesPanel {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -229,8 +381,36 @@ mod view {
 
     impl Render for ModulesPanel {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let rows = self.rows();
             let cur = self.tab;
+            let view = cx.entity();
+
+            // Resolve the body per active tab (the C++ Modules / Symbols / Types).
+            let body: AnyElement = match cur {
+                ModulesTab::Modules => {
+                    let rows = self.rows();
+                    if rows.is_empty() {
+                        empty_state(cur.empty_caption(), cx).into_any_element()
+                    } else {
+                        module_list(&view, rows, cx).into_any_element()
+                    }
+                }
+                ModulesTab::Symbols => {
+                    let rows = self.symbol_rows();
+                    if rows.is_empty() {
+                        empty_state(cur.empty_caption(), cx).into_any_element()
+                    } else {
+                        symbol_list(rows, cx).into_any_element()
+                    }
+                }
+                ModulesTab::Types => {
+                    let rows = self.type_rows();
+                    if rows.is_empty() {
+                        empty_state(cur.empty_caption(), cx).into_any_element()
+                    } else {
+                        type_list(rows, cx).into_any_element()
+                    }
+                }
+            };
 
             gpui_component::v_flex()
                 .id("rcx-modules-panel")
@@ -239,11 +419,7 @@ mod view {
                 .bg(color::panel_bg(cx))
                 .text_color(color::text(cx))
                 .child(self.render_header(cur, cx))
-                .child(div().flex_1().min_h_0().child(if rows.is_empty() {
-                    empty_state(cur.empty_caption(), cx).into_any_element()
-                } else {
-                    module_list(rows, cx).into_any_element()
-                }))
+                .child(div().flex_1().min_h_0().child(body))
         }
     }
 
@@ -276,7 +452,12 @@ mod view {
                         })),
                 )
                 // ── Download All action ──
-                .child(download_all_button(cx))
+                .child({
+                    let view = cx.entity();
+                    download_all_button(cx).on_click(move |_e, _w, cx| {
+                        view.update(cx, |_this, cx| cx.emit(ModuleAction::DownloadAll));
+                    })
+                })
         }
     }
 
@@ -305,11 +486,10 @@ mod view {
     }
 
     /// The "Download All" header action (the `data_options.png` top-right
-    /// button): a compact ghost button with a leading download/source glyph. It
-    /// is a restrained chrome affordance here — the symbol-download workflow is
-    /// out of this surface's scope — so it shows the hint state but performs no
-    /// mutation yet.
-    fn download_all_button(cx: &App) -> impl IntoElement {
+    /// button): a compact ghost button with a leading download/source glyph.
+    /// Clicking emits [`ModuleAction::DownloadAll`] for the window to resolve
+    /// against the active source's PDB loader.
+    fn download_all_button(cx: &App) -> Stateful<Div> {
         gpui_component::h_flex()
             .id("rcx-modules-download-all")
             .flex_none()
@@ -325,9 +505,15 @@ mod view {
             .child("Download All")
     }
 
-    /// The module list — one row per loaded module (name + base + size). Not
-    /// virtualized: a source's module count is small enough to render directly.
-    fn module_list(rows: Vec<ModuleRow>, cx: &App) -> impl IntoElement {
+    /// The module list — one row per loaded module (name + size + base +
+    /// symbol-loaded indicator). Not virtualized: a source's module count is
+    /// small enough to render directly. Each row double-clicks to activate
+    /// (set base + load PDB).
+    fn module_list(
+        view: &Entity<ModulesPanel>,
+        rows: Vec<ModuleRow>,
+        cx: &App,
+    ) -> impl IntoElement {
         gpui_component::v_flex()
             .id("rcx-modules-list")
             .size_full()
@@ -337,13 +523,24 @@ mod view {
             .children(
                 rows.into_iter()
                     .enumerate()
-                    .map(|(ix, row)| module_row(ix, row, cx)),
+                    .map(|(ix, row)| module_row(view, ix, row, cx)),
             )
     }
 
-    /// One module row: a leading source glyph, the truncating module name, and a
-    /// trailing monospace `0x...` base (the C++ module-list row).
-    fn module_row(ix: usize, row: ModuleRow, cx: &App) -> impl IntoElement {
+    /// One module row: a leading source glyph, the truncating module name, a
+    /// `✓ N syms` symbol-loaded indicator (when symbols are loaded), and a
+    /// trailing monospace size + `0x...` base (the C++ module-list row).
+    /// Double-clicking emits [`ModuleAction::Activate`].
+    fn module_row(
+        view: &Entity<ModulesPanel>,
+        ix: usize,
+        row: ModuleRow,
+        cx: &App,
+    ) -> impl IntoElement {
+        use gpui_component::ActiveTheme as _;
+        let act_view = view.clone();
+        let base = row.base;
+        let name = row.name.clone();
         gpui_component::h_flex()
             .id(("rcx-module-row", ix))
             .w_full()
@@ -353,6 +550,16 @@ mod view {
             .items_center()
             .rounded(px(tokens::radius::MD))
             .hover(|s| s.bg(color::hover_overlay(cx)))
+            .on_click(move |e: &gpui::ClickEvent, _w, cx| {
+                // Double-click activates: set base + load PDB (the C++ row
+                // activation). A single click is a no-op selection.
+                if e.click_count() >= 2 {
+                    let name = name.clone();
+                    act_view.update(cx, |_this, cx| {
+                        cx.emit(ModuleAction::Activate { base, name });
+                    });
+                }
+            })
             .child(
                 icon::source()
                     .with_size(px(12.0))
@@ -367,6 +574,27 @@ mod view {
                     .text_color(color::text(cx))
                     .child(SharedString::from(row.name)),
             )
+            // ✓ N syms indicator (the C++ symbol-loaded badge).
+            .when(row.symbol_count > 0, |r| {
+                r.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(cx.theme().green)
+                        .child(SharedString::from(format!("✓ {} syms", row.symbol_count))),
+                )
+            })
+            // Size column (the C++ ModuleRow.size_text — was dropped).
+            .when(!row.size_text.is_empty(), |r| {
+                r.child(
+                    div()
+                        .flex_none()
+                        .font_family(tokens::font::MONO_FAMILY)
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(color::text_muted(cx))
+                        .child(SharedString::from(row.size_text)),
+                )
+            })
             .child(
                 div()
                     .flex_none()
@@ -375,6 +603,91 @@ mod view {
                     .text_color(color::syntax_address(cx))
                     .child(SharedString::from(row.base_text)),
             )
+    }
+
+    /// The Symbols list — one row per resolved symbol (name + `module+RVA`).
+    fn symbol_list(rows: Vec<SymbolRow>, cx: &App) -> impl IntoElement {
+        gpui_component::v_flex()
+            .id("rcx-symbols-list")
+            .size_full()
+            .px(px(tokens::space::SM))
+            .py(px(tokens::space::XS))
+            .overflow_y_scroll()
+            .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                gpui_component::h_flex()
+                    .id(("rcx-symbol-row", ix))
+                    .w_full()
+                    .h(px(22.0))
+                    .px(px(tokens::space::MD))
+                    .gap(px(tokens::space::MD))
+                    .items_center()
+                    .rounded(px(tokens::radius::MD))
+                    .hover(|s| s.bg(color::hover_overlay(cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text(cx))
+                            .child(SharedString::from(row.name)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(tokens::font::MONO_FAMILY)
+                            .text_size(px(tokens::font::UI_XS))
+                            .text_color(color::syntax_address(cx))
+                            .child(SharedString::from(row.offset_text)),
+                    )
+            }))
+    }
+
+    /// The Types list — one row per imported PDB type (kind tag + name + size).
+    fn type_list(rows: Vec<TypeRow>, cx: &App) -> impl IntoElement {
+        gpui_component::v_flex()
+            .id("rcx-types-list")
+            .size_full()
+            .px(px(tokens::space::SM))
+            .py(px(tokens::space::XS))
+            .overflow_y_scroll()
+            .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                gpui_component::h_flex()
+                    .id(("rcx-type-row", ix))
+                    .w_full()
+                    .h(px(22.0))
+                    .px(px(tokens::space::MD))
+                    .gap(px(tokens::space::MD))
+                    .items_center()
+                    .rounded(px(tokens::radius::MD))
+                    .hover(|s| s.bg(color::hover_overlay(cx)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(tokens::font::UI_XS))
+                            .text_color(color::text_muted(cx))
+                            .child(row.kind),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text(cx))
+                            .child(SharedString::from(row.name)),
+                    )
+                    .when(!row.size_text.is_empty(), |r| {
+                        r.child(
+                            div()
+                                .flex_none()
+                                .font_family(tokens::font::MONO_FAMILY)
+                                .text_size(px(tokens::font::UI_XS))
+                                .text_color(color::text_muted(cx))
+                                .child(SharedString::from(row.size_text)),
+                        )
+                    })
+            }))
     }
 
     /// The clean empty-state body: a centered muted caption (the Zed "nothing
@@ -404,8 +717,58 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_module_rows, ModuleRow, ModulesTab};
+    use super::{
+        build_module_rows, build_symbol_rows, format_symbol_offset, pdb_type_kind, ModuleRow,
+        ModulesTab,
+    };
     use crate::provider::ModuleEntry;
+
+    #[test]
+    fn symbol_rows_sorted_by_module_then_rva_and_capped() {
+        let sets = vec![
+            (
+                "game".to_string(),
+                vec![("zzz".to_string(), 0x200u32), ("aaa".to_string(), 0x10u32)],
+            ),
+            ("ntdll".to_string(), vec![("Nt".to_string(), 0x5u32)]),
+        ];
+        let rows = build_symbol_rows(&sets, 100);
+        // game's rows come first (module sort), ordered by rva ascending.
+        assert_eq!(rows[0].module, "game");
+        assert_eq!(rows[0].name, "aaa");
+        assert_eq!(rows[0].rva, 0x10);
+        assert_eq!(rows[0].offset_text, "game+0x10");
+        assert_eq!(rows[1].name, "zzz");
+        assert_eq!(rows[2].module, "ntdll");
+        // Cap truncates.
+        let capped = build_symbol_rows(&sets, 1);
+        assert_eq!(capped.len(), 1);
+    }
+
+    #[test]
+    fn pdb_type_kind_precedence() {
+        assert_eq!(pdb_type_kind(true, false), "enum");
+        assert_eq!(pdb_type_kind(true, true), "enum"); // enum wins
+        assert_eq!(pdb_type_kind(false, true), "union");
+        assert_eq!(pdb_type_kind(false, false), "struct");
+    }
+
+    #[test]
+    fn symbol_offset_is_module_plus_hex_rva() {
+        assert_eq!(format_symbol_offset("ntdll", 0x1234), "ntdll+0x1234");
+        assert_eq!(format_symbol_offset("game.exe", 0), "game.exe+0x0");
+    }
+
+    #[test]
+    fn module_row_defaults_symbol_count_to_zero() {
+        let entry = ModuleEntry {
+            name: "x.dll".into(),
+            full_path: String::new(),
+            base: 0x1000,
+            size: 0x10,
+        };
+        assert_eq!(ModuleRow::from_entry(&entry).symbol_count, 0);
+    }
 
     #[test]
     fn tabs_are_in_display_order() {

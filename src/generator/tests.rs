@@ -461,25 +461,24 @@ fn full_sdk_export() {
 #[test]
 fn duplicate_type_name_disambiguation() {
     let mut tree = NodeTree::new();
-    let mut make_root =
-        |tree: &mut NodeTree, type_name: &str, offset: i32, field_kind: NodeKind| {
-            let ri = tree.add_node(Node {
-                kind: NodeKind::Struct,
-                struct_type_name: type_name.into(),
-                parent_id: 0,
-                offset,
-                ..d()
-            });
-            let rid = tree.nodes[ri].id;
-            tree.add_node(Node {
-                kind: field_kind,
-                name: "val".into(),
-                parent_id: rid,
-                offset: 0,
-                ..d()
-            });
-            rid
-        };
+    let make_root = |tree: &mut NodeTree, type_name: &str, offset: i32, field_kind: NodeKind| {
+        let ri = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            struct_type_name: type_name.into(),
+            parent_id: 0,
+            offset,
+            ..d()
+        });
+        let rid = tree.nodes[ri].id;
+        tree.add_node(Node {
+            kind: field_kind,
+            name: "val".into(),
+            parent_id: rid,
+            offset: 0,
+            ..d()
+        });
+        rid
+    };
     make_root(&mut tree, "Shared", 0x000, NodeKind::UInt32);
     make_root(&mut tree, "Shared", 0x100, NodeKind::UInt64);
 

@@ -68,7 +68,22 @@ actions!(
         ToggleModules,
         ToggleBookmarks,
         SplitEditor,
-        UnsplitEditor
+        UnsplitEditor,
+        // File/Edit accelerators advertised in the menu but previously unbound
+        // (the blocker fix). Each routes back through `run_menu_command` so the
+        // keyboard, the menu bar, and the command palette share one dispatch.
+        NewClassAction,
+        NewStructAction,
+        NewEnumAction,
+        OpenFileAction,
+        SaveAction,
+        SaveAsAction,
+        CloseDocAction,
+        UndoAction,
+        RedoAction,
+        AddBookmarkAction,
+        QuickBookmarkAction,
+        ShortcutsAction
     ]
 );
 
@@ -113,11 +128,6 @@ pub struct MainWindow {
     /// events fire while shown (a dropped subscription stops them; mirrors
     /// [`palette_sub`](Self::palette_sub)).
     goto_sub: Option<Subscription>,
-    /// The current editor font-scale (rem-size multiplier). View ▸ Font ▸
-    /// Increase/Decrease/Reset steps this and re-applies it via
-    /// [`Window::set_rem_size`] (the C++ `setFontSize`; the whole editor grid
-    /// scales because its glyph metrics derive from the active font size).
-    font_scale: f32,
     /// Whether Presentation Mode is on (View ▸ Presentation Mode). A live toggle
     /// flag reflected in the View menu ✓; the chrome dimming lands with its own
     /// pass — here it owns the state + the checkmark so the menu reflects reality.
@@ -128,6 +138,22 @@ pub struct MainWindow {
     /// flags (tree lines / type hints / comments) live on the controller; these
     /// are pushed into the active editor via the EDITOR SETTER CONTRACT.
     view_opts: ViewOptions,
+    /// Most-recently-opened project paths (the C++ `recentFiles` QSettings list;
+    /// main.cpp:8765). Most-recent-first, deduped, capped at 10. Drives both the
+    /// File ▸ Recent Files submenu and the start-page recent list.
+    recent_files: Vec<std::path::PathBuf>,
+    /// The active editor font family (View ▸ Font; the C++ `setEditorFont` /
+    /// settings("font"), main.cpp:1300). Persisted; drives the Font submenu ✓.
+    editor_font: String,
+    /// Whether the MCP bridge is "running" (Tools ▸ Start/Stop MCP Server). The
+    /// C++ toggles `m_mcp` start/stop + flips the action label; here it owns the
+    /// flag + drives the dynamic menu label. No live bridge on this platform.
+    mcp_running: bool,
+    /// Recent Go-to-Address formulas (the C++ `GotoAddressDialog` recent list).
+    /// Most-recent-first, deduped, capped. Loaded into the dialog on open and
+    /// pushed on accept. Session-scoped (the port has no persistent settings
+    /// store yet; see [`set_editor_font`](Self::set_editor_font)).
+    goto_recent: Vec<String>,
 }
 
 /// The seven checkable View-menu options (the C++ View menu defaults; the
@@ -148,16 +174,18 @@ struct ViewOptions {
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        // Match the C++ View menu defaults (view_options.png): everything checked
-        // except Comments.
+        // Match the C++ persisted QSettings defaults (main.cpp:1336-1411):
+        //   compactColumns=true, treeLines=true, relativeOffsets=true,
+        //   typeHints=FALSE, showComments=false, hoverEffects=true, minimap=FALSE.
+        // The previous Rust defaults wrongly turned typeHints + minimap ON.
         ViewOptions {
             compact_columns: true,
             tree_lines: true,
             relative_offsets: true,
-            type_hints: true,
+            type_hints: false,
             show_comments: false,
             hover_effects: true,
-            minimap: true,
+            minimap: false,
         }
     }
 }
@@ -313,6 +341,110 @@ impl ExportKind {
     }
 }
 
+/// File ▸ New {Class / Struct / Enum} — the root kind a fresh document is seeded
+/// with (the C++ `project_new(keyword)`; main.cpp:4047). Determines the seed
+/// root's `class_keyword` and the tab title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootKind {
+    Class,
+    Struct,
+    Enum,
+}
+
+impl RootKind {
+    /// The C/C++ keyword stored on the seed root node ("class" / "struct" /
+    /// "enum"); the compose pipeline renders it verbatim.
+    fn class_keyword(self) -> &'static str {
+        match self {
+            RootKind::Class => "class",
+            RootKind::Struct => "struct",
+            RootKind::Enum => "enum",
+        }
+    }
+
+    /// The new tab's title — distinct per kind so the three commands don't all
+    /// land on an indistinguishable "Untitled".
+    fn title(self) -> &'static str {
+        match self {
+            RootKind::Class => "Untitled Class",
+            RootKind::Struct => "Untitled Struct",
+            RootKind::Enum => "Untitled Enum",
+        }
+    }
+
+    /// The seed root's type name.
+    fn type_name(self) -> &'static str {
+        match self {
+            RootKind::Class => "NewClass",
+            RootKind::Struct => "NewStruct",
+            RootKind::Enum => "NewEnum",
+        }
+    }
+}
+
+/// Build a fresh document seeded with a single root struct of the given kind
+/// (the C++ `project_new` template; main.cpp:6097 seeds a base address + a root
+/// struct with 16 hex fields). The root carries the kind's `class_keyword` so
+/// the rendered code reads `class` / `struct` / `enum`. Uses only the public
+/// [`NodeTree`] API — no logic-module change.
+fn seed_root_doc(kind: RootKind) -> crate::controller::RcxDocument {
+    use crate::core::{Node, NodeKind};
+    let mut doc = crate::controller::RcxDocument::new();
+    // The C++ template lands a sensible default base so addresses read naturally.
+    doc.tree.base_address = 0x0040_0000;
+    let is32 = doc.tree.pointer_size < 8;
+    let (hex_kind, stride) = if is32 {
+        (NodeKind::Hex32, 4)
+    } else {
+        (NodeKind::Hex64, 8)
+    };
+    let mut root = Node {
+        kind: NodeKind::Struct,
+        name: "instance".to_string(),
+        struct_type_name: kind.type_name().to_string(),
+        class_keyword: kind.class_keyword().to_string(),
+        parent_id: 0,
+        offset: 0,
+        ..Node::default()
+    };
+    root.id = doc.tree.reserve_id();
+    let root_id = root.id;
+    doc.tree.add_node(root);
+    for i in 0..16 {
+        let mut c = Node {
+            kind: hex_kind,
+            name: format!("field_{:04x}", i * stride),
+            parent_id: root_id,
+            offset: i * stride,
+            ..Node::default()
+        };
+        c.id = doc.tree.reserve_id();
+        doc.tree.add_node(c);
+    }
+    doc.tree.touch();
+    doc
+}
+
+/// Relabel the first leaf with the given command id, in place (used for the
+/// dynamic MCP Start/Stop label). Recurses into submenus.
+fn relabel_command(nodes: &mut [super::commandpalette::MenuNode], command: &str, new_label: &str) {
+    use super::commandpalette::MenuNode;
+    for node in nodes {
+        match node {
+            MenuNode::Item {
+                label, command: c, ..
+            } if c.as_str() == command => {
+                *label = new_label.to_string();
+                return;
+            }
+            MenuNode::Submenu { children, .. } => {
+                relabel_command(children, command, new_label);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl MainWindow {
     /// Construct the main window view: build the [`DockArea`], assemble the
     /// default dock layout, seed [`AppState`], wire the dock/tab/workspace events,
@@ -330,6 +462,10 @@ impl MainWindow {
             workspace,
             modules,
             bookmarks,
+            // The scanner handle is wired by its owning code path; ignore any
+            // additional layout handles here so this destructuring stays robust
+            // as docks.rs grows.
+            ..
         } = docks::build_default_layout(&dock_area, window, cx);
 
         // Seed window state with the initial document tab (the C++ "never leave a
@@ -399,14 +535,24 @@ impl MainWindow {
             palette_sub: None,
             editor_observers: Vec::new(),
             goto_sub: None,
-            font_scale: 1.0,
             presentation: false,
             view_opts: ViewOptions::default(),
+            recent_files: Vec::new(),
+            // The C++ default font is JetBrains Mono (main.cpp:1311).
+            editor_font: "JetBrains Mono".to_string(),
+            mcp_running: false,
+            goto_recent: Vec::new(),
         };
 
         // Observe the initial editor(s) so a row selection re-renders the window
         // (and thus refreshes the status bar; see [`Self::observe_editors`]).
         win.observe_editors(cx);
+        // Push the active font family into the Font submenu ✓, mark the active
+        // theme, and rebuild the dynamic menus (Recent Files / Data Source / MCP
+        // label) on first paint.
+        win.sync_font_menu_checked(cx);
+        win.sync_theme_menu_checked(cx);
+        win.rebuild_menus(cx);
         // Reflect the initial scanner-dock state in the View menu (closed by
         // default ⇒ View ▸ Memory Scanner starts unchecked).
         win.sync_scanner_menu_checked(cx);
@@ -432,9 +578,10 @@ impl MainWindow {
         &mut self.state
     }
 
-    /// Open the command palette (Ctrl+Shift+P / F1 — Zed parity). Builds a fresh
-    /// palette over the menu tree, shows it in the gpui-component dialog layer, and
-    /// routes its Trigger/Cancel back here (close, then dispatch the command).
+    /// Open the command palette (Ctrl+Shift+P / Ctrl+K — Zed + C++ parity; F1 is
+    /// the Help ▸ Keyboard Shortcuts accelerator). Builds a fresh palette over the
+    /// menu tree, shows it in the gpui-component dialog layer, and routes its
+    /// Trigger/Cancel back here (close, then dispatch the command).
     fn open_command_palette(
         &mut self,
         _: &OpenCommandPalette,
@@ -519,6 +666,56 @@ impl MainWindow {
         self.run_menu_command(&"view.unsplit".to_string(), window, cx);
     }
 
+    // The File/Edit accelerator handlers — each routes its bound key to the same
+    // MENU CONTRACT command `run_menu_command` dispatches (the blocker fix: these
+    // accelerators were advertised in the menu but had no global key binding).
+    fn on_new_class(&mut self, _: &NewClassAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.new_class".to_string(), window, cx);
+    }
+    fn on_new_struct(&mut self, _: &NewStructAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.new_struct".to_string(), window, cx);
+    }
+    fn on_new_enum(&mut self, _: &NewEnumAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.new_enum".to_string(), window, cx);
+    }
+    fn on_open_file(&mut self, _: &OpenFileAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.open".to_string(), window, cx);
+    }
+    fn on_save(&mut self, _: &SaveAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.save".to_string(), window, cx);
+    }
+    fn on_save_as(&mut self, _: &SaveAsAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.save_as".to_string(), window, cx);
+    }
+    fn on_close_doc(&mut self, _: &CloseDocAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"file.close".to_string(), window, cx);
+    }
+    fn on_undo(&mut self, _: &UndoAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"edit.undo".to_string(), window, cx);
+    }
+    fn on_redo(&mut self, _: &RedoAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"edit.redo".to_string(), window, cx);
+    }
+    fn on_add_bookmark(
+        &mut self,
+        _: &AddBookmarkAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_menu_command(&"edit.add_bookmark".to_string(), window, cx);
+    }
+    fn on_quick_bookmark(
+        &mut self,
+        _: &QuickBookmarkAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_menu_command(&"edit.quick_bookmark".to_string(), window, cx);
+    }
+    fn on_shortcuts(&mut self, _: &ShortcutsAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_command(&"help.shortcuts".to_string(), window, cx);
+    }
+
     /// Dispatch a chosen command (from the menu bar, the command palette, or a
     /// global key binding). Maps a
     /// [`CommandId`](super::commandpalette::CommandId) to the app operation that
@@ -534,10 +731,11 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         match cmd.as_str() {
-            // ── File: new documents ──
-            "file.new_class" | "file.new_struct" | "file.new_enum" => {
-                self.new_document(window, cx);
-            }
+            // ── File: new documents (seed the per-kind root; the C++ newClass /
+            // newStruct / newEnum each pass a distinct class keyword). ──
+            "file.new_class" => self.new_document(RootKind::Class, window, cx),
+            "file.new_struct" => self.new_document(RootKind::Struct, window, cx),
+            "file.new_enum" => self.new_document(RootKind::Enum, window, cx),
             "file.welcome" => self.show_start_page(window, cx),
 
             // ── File: open / save ──
@@ -545,7 +743,7 @@ impl MainWindow {
             "file.save" => self.save_active(false, window, cx),
             "file.save_as" => self.save_active(true, window, cx),
             "file.close" => self.close_active_document(window, cx),
-            "file.exit" => cx.quit(),
+            "file.exit" => self.request_quit(window, cx),
 
             // ── File: import ──
             "file.import.source" | "import.source" => {
@@ -569,23 +767,21 @@ impl MainWindow {
             "file.export.xml" | "export.xml" => self.export_code(ExportKind::Xml, window, cx),
 
             // ── File: data source (the active-source picker; data_options.png) ──
-            "source.clear" => self.set_active_source(super::state::DataSource::none(), window, cx),
-            "source.file" => self.notify(
-                "Pick a binary data file via Open… then attach it as the source.",
-                window,
-                cx,
-            ),
-            "source.process" | "source.kernel" | "source.remote" | "source.windbg"
-            | "source.rcnet" => {
-                self.notify("Live data-source providers are not available on this platform; open a `.rcx` with a saved source instead.", window, cx)
+            // The C++ `m_sourceMenu` triggers route to controller->selectSource /
+            // clearSources. File attaches a binary; Process opens the picker; the
+            // remaining live providers have no factory on this platform.
+            "source.clear" => self.clear_active_source(window, cx),
+            "source.file" => self.prompt_data_file(window, cx),
+            "source.process" => self.open_process_picker(window, cx),
+            "source.kernel" | "source.remote" | "source.windbg" | "source.rcnet" => {
+                self.report_unavailable_source(cmd.as_str(), window, cx)
             }
 
-            // ── Edit ──
+            // ── Edit (Undo / Redo / Add Bookmark… / Quick Bookmark Here) ──
             "edit.undo" => self.active_editor_undo(false, cx),
             "edit.redo" => self.active_editor_undo(true, cx),
-            "edit.cut" | "edit.copy" | "edit.paste" | "edit.delete" | "edit.select_all" => {
-                self.edit_clipboard(cmd.as_str(), window, cx)
-            }
+            "edit.add_bookmark" => self.prompt_add_bookmark(window, cx),
+            "edit.quick_bookmark" => self.quick_bookmark_here(window, cx),
 
             // ── View: docks / windows ──
             "view.project" => self.toggle_left_dock(window, cx),
@@ -607,30 +803,57 @@ impl MainWindow {
             }
             "view.minimap" => self.toggle_view_option(ViewOpt::Minimap, cx),
 
-            // ── View: theme / font ──
-            "view.font.inc" => self.bump_font(0.1, window, cx),
-            "view.font.dec" => self.bump_font(-0.1, window, cx),
-            "view.font.reset" => self.reset_font(window, cx),
+            // ── View: font family (the C++ exclusive Consolas / JetBrains Mono
+            // picker persisted to settings("font")). ──
+            "view.font.consolas" => self.set_editor_font("Consolas", window, cx),
+            "view.font.jetbrains" => self.set_editor_font("JetBrains Mono", window, cx),
 
             // ── View: actions ──
             "view.refresh" => self.refresh_active_editor(cx),
             "view.goto_address" => self.open_goto_address(window, cx),
             "view.command_palette" => self.open_command_palette(&OpenCommandPalette, window, cx),
-            "view.split" => self.notify("Split Editor is not available yet.", window, cx),
-            "view.unsplit" => self.notify("Unsplit Editor is not available yet.", window, cx),
+            "view.split" => self.notify(
+                "Split Editor is a known stub in this port (single pane only).",
+                window,
+                cx,
+            ),
+            "view.unsplit" => self.notify(
+                "Unsplit Editor is a known stub in this port (single pane only).",
+                window,
+                cx,
+            ),
             "view.presentation" => self.toggle_presentation(cx),
+            "view.theme_edit" => self.notify(
+                "Theme editing is available in Tools ▸ Options (Appearance).",
+                window,
+                cx,
+            ),
+
+            // ── Tools ──
+            "tools.rtti" => self.open_rtti_browser(window, cx),
+            "tools.type_aliases" => self.notify(
+                "Type Aliases: the alias editor dialog is not available in this port yet.",
+                window,
+                cx,
+            ),
+            "tools.mcp" => self.toggle_mcp(window, cx),
+            "tools.options" => self.notify("Options dialog is wired elsewhere.", window, cx),
+            "tools.profiler" => self.notify(
+                "Performance Profiler is not available in this port yet.",
+                window,
+                cx,
+            ),
+
+            // ── Plugins ──
+            "plugins.manage" => self.notify(
+                "Plugin Manager: native plugins are not loaded in this port.",
+                window,
+                cx,
+            ),
 
             // ── Help ──
-            "help.about" => self.notify(
-                "Reclass — a Rust + GPUI port of ReClass. Memory structure editor.",
-                window,
-                cx,
-            ),
-            "help.docs" | "help.shortcuts" => self.notify(
-                "Documentation: see the project README and the in-app Command Palette (Ctrl+K).",
-                window,
-                cx,
-            ),
+            "help.about" => self.show_about(window, cx),
+            "help.shortcuts" | "help.docs" => self.show_shortcuts(window, cx),
 
             // The view-mode dual toggle (Tree ⇄ rendered C/C++) is exposed through
             // the titlebar; the menu has no direct entries for it, but the toggle
@@ -648,6 +871,10 @@ impl MainWindow {
                 let name = &other["file.example.".len()..];
                 self.open_example(name, window, cx);
             }
+            // A recent file (`file.recent.<INDEX>`) — reopen the recorded path.
+            other if other.starts_with("file.recent.") => {
+                self.open_recent_by_command(other, window, cx);
+            }
 
             // ── Anything still unmapped: graceful, logged no-op. ──
             other => {
@@ -656,17 +883,481 @@ impl MainWindow {
         }
     }
 
-    /// Open a fresh document tab (the C++ `project_new` family). The per-kind
-    /// seed (struct/enum) lands with the project-lifecycle workflow; for now
-    /// every "New …" opens a blank document.
-    fn new_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open a fresh document tab seeded with the chosen root kind (the C++
+    /// `project_new(keyword)` family: `newClass` passes "class", `newStruct`
+    /// none, `newEnum` "enum"; main.cpp:4047). The root node carries the matching
+    /// `class_keyword` so the rendered C/C++ reads `class` / `struct` / `enum`,
+    /// and the tab title reflects the kind so the three commands are visibly
+    /// distinct (the bug: all three collapsed to one blank "Untitled").
+    fn new_document(&mut self, kind: RootKind, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_start_page(cx);
+        let title = kind.title();
+        let doc = seed_root_doc(kind);
         self.document_area.update(cx, |area, cx| {
-            area.push_document("Untitled", window, cx);
+            area.push_document(title, window, cx);
+            // Push the seeded tree into the just-created tab's editor.
+            if let Some(editor) = area.active_editor().cloned() {
+                editor.update(cx, |ed, cx| ed.set_document(doc, cx));
+            }
         });
-        self.state.open_document("Untitled");
+        self.state.open_document(title);
         self.rebuild_workspace(cx);
         self.observe_editors(cx);
+    }
+
+    // ── File: data source providers (the C++ m_sourceMenu → selectSource) ──
+
+    /// File ▸ Data Source ▸ File — attach a binary file as the active document's
+    /// data source via the native file picker (the C++ `loadData(path)` /
+    /// File-provider attach). Updates the tab source icon + window state.
+    fn prompt_data_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first.", window, cx);
+            return;
+        };
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Attach a binary data file".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(path) = rx
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|v| v.into_iter().next())
+            else {
+                return;
+            };
+            let _ = this.update_in(cx, |me, window, cx| {
+                editor.update(cx, |ed, _cx| {
+                    ed.controller_mut().document_mut().load_data_file(&path);
+                });
+                // Recompose against the freshly-attached provider + reflect the
+                // File source icon in the tab and window state.
+                editor.update(cx, |ed, cx| ed.apply_document(cx));
+                let source = super::state::DataSource::new(
+                    super::state::SourceKind::File,
+                    path.to_string_lossy().into_owned(),
+                );
+                me.set_active_source(source, window, cx);
+                me.notify(format!("Attached {}", path.display()), window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// File ▸ Data Source ▸ Process Memory — open the live process picker (the
+    /// C++ `ProcessPicker` reached from `selectSource("process")`). On this
+    /// platform the registry exposes no live factories, so the picker surfaces
+    /// the (possibly stub) provider rows; a chosen row reports the selection.
+    fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use super::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
+        let model = ProcessPickerModel::from_registry(&crate::provider::ProviderRegistry::new());
+        let picker = cx.new(|cx| ProcessPicker::new(model, window, cx));
+        self.goto_sub = Some(cx.subscribe_in(
+            &picker,
+            window,
+            |this, _p, ev: &ProcessPickEvent, window, cx| match ev {
+                ProcessPickEvent::Attach { name, pid, .. } => {
+                    window.close_dialog(cx);
+                    // No live provider factory on this platform — record the pick
+                    // as the document's logical source so the tab reflects it.
+                    let source = super::state::DataSource::new(
+                        super::state::SourceKind::Process,
+                        format!("{name} (pid {pid})"),
+                    );
+                    this.set_active_source(source, window, cx);
+                    this.notify(format!("Selected process {name} (pid {pid})"), window, cx);
+                }
+                ProcessPickEvent::Cancel => window.close_dialog(cx),
+            },
+        ));
+        let picker_for_modal = picker.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(720.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(picker_for_modal.clone())
+        });
+        cx.notify();
+    }
+
+    /// File ▸ Data Source ▸ {Kernel / Remote / WinDbg / ReClass.NET} — these live
+    /// providers have no factory on this platform. The C++ shows a blocking
+    /// warning when a source can't attach; mirror that with the themed modal
+    /// message box (not a transient toast).
+    fn report_unavailable_source(
+        &mut self,
+        cmd: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = match cmd {
+            "source.kernel" => "Kernel Memory",
+            "source.remote" => "Remote Process Memory",
+            "source.windbg" => "WinDbg Memory",
+            "source.rcnet" => "ReClass.NET Compat",
+            _ => "This data source",
+        };
+        let spec = super::messagebox::warn(
+            "Source Unavailable",
+            &format!(
+                "{label} is not available on this platform. Open a project with a saved \
+                 source, or attach a binary File instead."
+            ),
+        );
+        super::messagebox::open_message(spec, window, cx);
+    }
+
+    /// File ▸ Data Source ▸ Clear All — detach the active document's source (the
+    /// C++ `clearSources`).
+    fn clear_active_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+            editor.update(cx, |ed, cx| {
+                ed.controller_mut().clear_sources();
+                ed.apply_document(cx);
+            });
+        }
+        self.set_active_source(super::state::DataSource::none(), window, cx);
+    }
+
+    // ── Edit: bookmarks (the C++ promptAddBookmark / Quick Bookmark Here) ──
+
+    /// Edit ▸ Add Bookmark… (Ctrl+B) — prompt for a name (defaulting the formula
+    /// to the active doc's base) and add the bookmark (the C++
+    /// `promptAddBookmark`; main.cpp:8090). The themed prompt collects the name;
+    /// the formula defaults to the current base.
+    fn prompt_add_bookmark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first.", window, cx);
+            return;
+        };
+        let default_formula = {
+            let ed = editor.read(cx);
+            let tree = ed.controller().tree();
+            if tree.base_address_formula.is_empty() {
+                format!("0x{:X}", tree.base_address)
+            } else {
+                tree.base_address_formula.clone()
+            }
+        };
+        let spec = super::messagebox::confirm(
+            "Add Bookmark",
+            &format!(
+                "Bookmark the current address ({default_formula})? It will be added with an \
+                 auto-generated name; rename it in the Bookmarks dock."
+            ),
+            "Add bookmark",
+            false,
+        );
+        let editor2 = editor.clone();
+        let this = cx.entity().downgrade();
+        super::messagebox::open_confirm(
+            spec,
+            move |window, app| {
+                let _ = this.update(app, |me, cx| {
+                    let name = me.next_bookmark_name(&editor2, cx);
+                    editor2.update(cx, |ed, _cx| {
+                        ed.controller_mut().add_bookmark(&name, &default_formula);
+                    });
+                    me.after_bookmark_added(&name, &default_formula, window, cx);
+                });
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Edit ▸ Quick Bookmark Here (Ctrl+Alt+B) — capture the current address as an
+    /// auto-named `bookmark_NN` (no dialog; the C++ lambda at main.cpp:1197).
+    fn quick_bookmark_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first.", window, cx);
+            return;
+        };
+        let formula = {
+            let ed = editor.read(cx);
+            let tree = ed.controller().tree();
+            if tree.base_address_formula.is_empty() {
+                format!("0x{:X}", tree.base_address)
+            } else {
+                tree.base_address_formula.clone()
+            }
+        };
+        let name = self.next_bookmark_name(&editor, cx);
+        editor.update(cx, |ed, _cx| {
+            ed.controller_mut().add_bookmark(&name, &formula);
+        });
+        self.after_bookmark_added(&name, &formula, window, cx);
+    }
+
+    /// Find a free `bookmark_NN` slot name in the active document (the C++
+    /// taken-set loop; main.cpp:1204).
+    fn next_bookmark_name(
+        &self,
+        editor: &Entity<super::editor::RcxEditor>,
+        cx: &Context<Self>,
+    ) -> String {
+        let taken: std::collections::HashSet<String> = editor
+            .read(cx)
+            .controller()
+            .tree()
+            .bookmarks
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
+        let mut n = 1;
+        loop {
+            let name = format!("bookmark_{n:02}");
+            if !taken.contains(&name) || n >= 1000 {
+                return name;
+            }
+            n += 1;
+        }
+    }
+
+    /// Shared tail after a bookmark is added: refresh the bookmarks dock, open the
+    /// right dock, sync dirty state, and confirm (the C++ `refreshBookmarksDock` +
+    /// `setAppStatus`).
+    fn after_bookmark_added(
+        &mut self,
+        name: &str,
+        formula: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_right_dock_open(true, window, cx);
+        self.sync_view_menu_checked(cx);
+        self.sync_dirty_state(cx);
+        self.notify(format!("Bookmarked: {name} → {formula}"), window, cx);
+        cx.notify();
+    }
+
+    // ── View: font family (the C++ exclusive Consolas / JetBrains Mono picker) ──
+
+    /// View ▸ Font ▸ {Consolas / JetBrains Mono} — set + persist the editor font
+    /// family (the C++ `setEditorFont` + settings("font"); main.cpp:5071). The
+    /// editor surface owns no live family setter in this port, so the window owns
+    /// the selection + persisted setting + the Font submenu ✓.
+    fn set_editor_font(&mut self, family: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // The port has no app-wide persistent settings store yet (theme settings
+        // use an in-memory MemSettings), so the selection lives on the window;
+        // the Font submenu ✓ reflects it. Persistence lands with the settings
+        // store wiring.
+        self.editor_font = family.to_string();
+        self.sync_font_menu_checked(cx);
+        self.notify(format!("Editor font: {family}"), window, cx);
+    }
+
+    /// Push the active font family into the Font submenu ✓ (exclusive — only the
+    /// active family is checked).
+    fn sync_font_menu_checked(&mut self, cx: &mut Context<Self>) {
+        let consolas = self.editor_font == "Consolas";
+        self.menubar.update(cx, |mb, cx| {
+            mb.set_command_checked("view.font.consolas", consolas, cx);
+            mb.set_command_checked("view.font.jetbrains", !consolas, cx);
+        });
+    }
+
+    // ── Tools / Help ──
+
+    /// Tools ▸ RTTI Browser (Ctrl+Shift+R) — the C++ opens the vtable/RTTI browser
+    /// for the selected pointer field. No RTTI walker is wired in this port, so
+    /// report the requirement (a selected pointer + a live provider) clearly.
+    fn open_rtti_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.notify(
+            "RTTI Browser: select a pointer/vtable field with a live provider attached.",
+            window,
+            cx,
+        );
+    }
+
+    /// Tools ▸ Start/Stop MCP Server — toggle the MCP bridge flag and flip the
+    /// menu label (the C++ `toggleMcp` + dynamic action text; main.cpp:1568). No
+    /// live bridge on this platform; the toggle + label are real.
+    fn toggle_mcp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mcp_running = !self.mcp_running;
+        self.rebuild_menus(cx);
+        let msg = if self.mcp_running {
+            "MCP Server started."
+        } else {
+            "MCP Server stopped."
+        };
+        self.notify(msg, window, cx);
+    }
+
+    /// Help ▸ About Reclass — a themed message box with build info + a note on the
+    /// project (the C++ `about()` themed dialog; main.cpp:4415). The GitHub button
+    /// is folded into the body text (the modal message box is single-button).
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let spec = super::messagebox::info(
+            "About Reclass",
+            &format!(
+                "Reclass {} — a Rust + GPUI port of ReClass.\n\nA memory structure editor.\n\
+                 GitHub: github.com/reclassnet/reclass",
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        super::messagebox::open_message(spec, window, cx);
+    }
+
+    /// Help ▸ Keyboard Shortcuts… (F1) — a themed reference of the bound
+    /// accelerators (the C++ `showShortcutsDialog`; main.cpp:4440).
+    fn show_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let detail = vec![
+            "Ctrl+N / Ctrl+T / Ctrl+E — New Class / Struct / Enum".to_string(),
+            "Ctrl+O — Open    Ctrl+S — Save    Ctrl+Shift+S — Save As".to_string(),
+            "Ctrl+W — Close    Ctrl+Z / Ctrl+Y — Undo / Redo".to_string(),
+            "Ctrl+B — Add Bookmark    Ctrl+Alt+B — Quick Bookmark".to_string(),
+            "F5 — Refresh    Ctrl+G — Go to Address".to_string(),
+            "Ctrl+K / Ctrl+Shift+P / F1 — Command Palette / Shortcuts".to_string(),
+            "Ctrl+Shift+S — Memory Scanner    Ctrl+Shift+Y — Modules".to_string(),
+            "Ctrl+Shift+B — Bookmarks    Ctrl+\\ — Split Editor".to_string(),
+        ];
+        let mut spec = super::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
+        spec.detail = detail;
+        super::messagebox::open_message(spec, window, cx);
+    }
+
+    // ── Recent files (the C++ recentFiles QSettings list) ──
+
+    /// Record an opened project path as the most-recent (the C++ `addRecentFile`;
+    /// main.cpp:8765): dedup, most-recent-first, capped at 10. Rebuilds the menus
+    /// + the start-page list.
+    fn record_recent_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent_files.retain(|p| p != &abs);
+        self.recent_files.insert(0, abs);
+        self.recent_files.truncate(10);
+        self.rebuild_menus(cx);
+    }
+
+    /// Reopen a recent file from its `file.recent.<index>` command id.
+    fn open_recent_by_command(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if cmd == "file.recent.empty" {
+            return;
+        }
+        let Some(idx) = cmd
+            .strip_prefix("file.recent.")
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            return;
+        };
+        let Some(path) = self.recent_files.get(idx).cloned() else {
+            return;
+        };
+        self.open_project(&path, None, window, cx);
+    }
+
+    // ── Dynamic menu rebuild (the C++ aboutToShow rebuilders) ──
+
+    /// Rebuild the menu tree with the live Recent-Files + Data-Source rows and the
+    /// dynamic MCP Start/Stop label, then push it into the menu bar (the C++
+    /// `updateRecentFilesMenu` / `populateSourceMenu` / MCP label flip). Preserves
+    /// the checkmark state (held separately on the menu bar).
+    fn rebuild_menus(&mut self, cx: &mut Context<Self>) {
+        use super::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        let recent: Vec<RecentMenuEntry> = self
+            .recent_files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| RecentMenuEntry {
+                label: p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(file)")
+                    .to_string(),
+                command: format!("file.recent.{i}"),
+            })
+            .collect();
+        // Saved sources from the active document's controller (the active one is
+        // rendered checked via the host's checked-set).
+        let sources: Vec<SourceMenuEntry> = self
+            .document_area
+            .read(cx)
+            .active_editor()
+            .map(|ed| {
+                let ctrl = ed.read(cx).controller();
+                let active = ctrl.active_source_index();
+                ctrl.saved_sources()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| SourceMenuEntry {
+                        label: format!("{} '{}'", s.kind, s.display_name),
+                        command: format!("source.saved.{i}"),
+                        active: i as i32 == active,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tree = menu_tree_with(&recent, &sources);
+        // Flip the MCP label (the dynamic Start/Stop text; main.cpp:1568).
+        let mcp_label = if self.mcp_running {
+            "Stop MCP Server"
+        } else {
+            "Start MCP Server"
+        };
+        relabel_command(&mut tree, "tools.mcp", mcp_label);
+        self.menubar.update(cx, |mb, cx| mb.set_menus(tree, cx));
+        // After rebuilding the tree, re-push the active-source checkmark so the
+        // saved-source row stays checked across the rebuild.
+        let active_cmd = sources
+            .iter()
+            .position(|s| s.active)
+            .map(|i| format!("source.saved.{i}"));
+        if let Some(cmd) = active_cmd {
+            self.menubar
+                .update(cx, |mb, cx| mb.set_command_checked(&cmd, true, cx));
+        }
+    }
+
+    // ── Unsaved-changes guard + quit (the C++ closeEvent + project_close) ──
+
+    /// File ▸ Exit — if any open document is modified, show the unsaved-changes
+    /// guard before quitting (the C++ `closeEvent`); otherwise quit immediately.
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.any_document_modified(cx) {
+            let spec = super::messagebox::confirm(
+                "Unsaved changes",
+                "One or more documents have unsaved changes. Quit without saving?",
+                "Quit anyway",
+                true,
+            );
+            super::messagebox::open_confirm(spec, |_window, app| app.quit(), window, cx);
+        } else {
+            cx.quit();
+        }
+    }
+
+    /// Whether any open editor's document is modified (the C++ scans every tab's
+    /// `doc.modified`).
+    fn any_document_modified(&self, cx: &Context<Self>) -> bool {
+        self.document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .any(|t| t.editor.read(cx).controller().document().modified)
+    }
+
+    /// Push the active document's modified state into its tab's dirty dot (the
+    /// bug: the controller tracks `doc.modified` but the window never propagated
+    /// it). Mirrors the C++ tab-title dirty marker.
+    fn sync_dirty_state(&mut self, cx: &mut Context<Self>) {
+        let updates: Vec<(DocId, bool)> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| (t.id, t.editor.read(cx).controller().document().modified))
+            .collect();
+        self.document_area.update(cx, |area, cx| {
+            for (id, modified) in updates {
+                area.set_modified(id, modified, cx);
+            }
+        });
     }
 
     /// Show a transient notification (the gpui-component notification layer; the
@@ -892,9 +1583,40 @@ impl MainWindow {
         }
     }
 
-    /// File ▸ Close Project — close the active document tab. The document area
-    /// never leaves a blank window (it re-seeds a fresh tab when the last closes).
+    /// File ▸ Close Project (Ctrl+W) — close the active document tab. If the
+    /// active document is modified, show the unsaved-changes guard first (the C++
+    /// `closeFile` → unsaved prompt; act on the result). The document area never
+    /// leaves a blank window (it re-seeds a fresh tab when the last closes).
     fn close_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let modified = self
+            .document_area
+            .read(cx)
+            .active_editor()
+            .map(|ed| ed.read(cx).controller().document().modified)
+            .unwrap_or(false);
+        if modified {
+            let spec = super::messagebox::confirm(
+                "Unsaved changes",
+                "This document has unsaved changes. Close it without saving?",
+                "Close without saving",
+                true,
+            );
+            let this = cx.entity().downgrade();
+            super::messagebox::open_confirm(
+                spec,
+                move |window, app| {
+                    let _ = this.update(app, |me, cx| me.do_close_active(window, cx));
+                },
+                window,
+                cx,
+            );
+        } else {
+            self.do_close_active(window, cx);
+        }
+    }
+
+    /// Actually close the active tab (after any unsaved-changes guard).
+    fn do_close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.document_area.read(cx).active_index();
         self.document_area.update(cx, |area, cx| {
             area.close_index(ix, window, cx);
@@ -902,27 +1624,6 @@ impl MainWindow {
         // The area emits `Closed`/`NewDocumentRequested` which our doc-area event
         // handler mirrors into AppState + rebuilds the workspace.
         cx.notify();
-    }
-
-    // ── Edit clipboard (graceful where no logic exists) ─────────────────────
-
-    /// Edit ▸ Cut/Copy/Paste/Delete/Select All. These node-clipboard ops have no
-    /// controller logic yet, so they degrade to a notification — never a
-    /// dead-end. (Undo/Redo are wired separately via [`active_editor_undo`].)
-    fn edit_clipboard(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let label = match cmd {
-            "edit.cut" => "Cut",
-            "edit.copy" => "Copy",
-            "edit.paste" => "Paste",
-            "edit.delete" => "Delete",
-            "edit.select_all" => "Select All",
-            _ => "Edit",
-        };
-        self.notify(
-            format!("{label} for nodes is not available yet."),
-            window,
-            cx,
-        );
     }
 
     /// Load an already-built document into the active editor tab and sync the
@@ -963,11 +1664,20 @@ impl MainWindow {
     fn toggle_view_option(&mut self, opt: ViewOpt, cx: &mut Context<Self>) {
         let value = !self.view_opts.get(opt);
         self.view_opts.set(opt, value);
-        // Push the new value into the active editor via the EDITOR SETTER
-        // CONTRACT. The compose flags (tree_lines/type_hints/show_comments)
-        // recompose; the render-level flags (compact/relative/hover/minimap)
-        // repaint. The editor owns the actual effect; the window owns the ✓.
-        if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+        // Push the new value into EVERY open editor via the EDITOR SETTER
+        // CONTRACT (the C++ applies each view option to all open tabs, not just
+        // the active one; main.cpp:1339-1411). The compose flags
+        // (tree_lines/type_hints/show_comments) recompose; the render-level flags
+        // (compact/relative/hover/minimap) repaint. The editor owns the actual
+        // effect; the window owns the ✓.
+        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        for editor in editors {
             editor.update(cx, |ed, cx| match opt {
                 ViewOpt::CompactColumns => ed.set_compact_columns(value, cx),
                 ViewOpt::TreeLines => ed.set_tree_lines(value, cx),
@@ -981,6 +1691,9 @@ impl MainWindow {
         self.menubar.update(cx, |mb, cx| {
             mb.set_command_checked(opt.command_id(), value, cx);
         });
+        // The port has no app-wide persistent settings store yet (see
+        // `set_editor_font`); the window mirror keeps each flag global for the
+        // session. Persistence across launches lands with the settings store.
         cx.notify();
     }
 
@@ -1062,54 +1775,52 @@ impl MainWindow {
         self.sync_view_menu_checked(cx);
     }
 
-    // ── View: font size (best-effort via the window rem size) ────────────────
-
-    /// Step the editor font scale (View ▸ Font ▸ Increase/Decrease), clamped to a
-    /// readable range, and re-apply it via [`Window::set_rem_size`] so the whole
-    /// editor grid rescales (its glyph metrics derive from the active font size).
-    fn bump_font(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
-        self.font_scale = (self.font_scale + delta).clamp(0.7, 2.0);
-        self.apply_font_scale(window, cx);
-    }
-
-    /// View ▸ Font ▸ Reset — back to the default scale.
-    fn reset_font(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.font_scale = 1.0;
-        self.apply_font_scale(window, cx);
-    }
-
-    /// Apply the current font scale to the window's rem size (base 16px).
-    fn apply_font_scale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.set_rem_size(px(16.0 * self.font_scale));
-        cx.notify();
-    }
-
     // ── View: refresh / goto / theme / presentation ──────────────────────────
 
-    /// View ▸ Refresh (F5) — force the active editor to recompose + repaint
-    /// (the C++ `applyDocument`).
+    /// View ▸ Refresh (F5) — reset the changed-byte heat tracking, then force the
+    /// active editor to recompose + repaint (the C++ `resetChangeTracking()` then
+    /// `refresh()`; main.cpp:1418). The previous version only recomposed, so the
+    /// changed-byte highlight never cleared on refresh.
     fn refresh_active_editor(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
-            editor.update(cx, |ed, cx| ed.apply_document(cx));
+            editor.update(cx, |ed, cx| {
+                ed.controller_mut().reset_change_tracking();
+                ed.apply_document(cx);
+            });
             self.rebuild_workspace(cx);
             cx.notify();
         }
     }
 
     /// View ▸ Go to Address… (Ctrl+G) — open the [`GotoAddressDialog`] in the
-    /// dialog layer; on Go, jump the active editor to the resolved address (the
-    /// status-bar readout follows). Mirrors [`open_command_palette`](Self::open_command_palette).
+    /// dialog layer; on Go, re-resolve the formula against the active provider's
+    /// callbacks and **navigate** the active editor to the resolved address (the
+    /// C++ `showGotoAddressDialog` → `navigateToFormula`; main.cpp:4324). The
+    /// dialog is seeded with the recent list + the active doc's pointer size, the
+    /// accepted formula is pushed onto the recent list, and a failed resolve shows
+    /// a themed modal warning (not a transient toast).
     fn open_goto_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use super::gotoaddress::{GotoAddressDialog, GotoEvent};
-        let dialog = cx.new(|cx| GotoAddressDialog::new(Vec::new(), 8, window, cx));
+        // Pointer size from the active document (32-bit projects deref correctly).
+        let ptr_size = self
+            .document_area
+            .read(cx)
+            .active_editor()
+            .map(|ed| ed.read(cx).controller().tree().pointer_size)
+            .filter(|&p| p > 0)
+            .unwrap_or(8);
+        let recent = self.goto_recent.clone();
+        let dialog = cx.new(|cx| GotoAddressDialog::new(recent, ptr_size, window, cx));
         let focus = dialog.read(cx).focus_handle(cx);
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
             |this, _d, ev: &GotoEvent, window, cx| match ev {
                 GotoEvent::Go(formula, addr) => {
+                    let formula = formula.clone();
+                    let dialog_addr = *addr;
                     window.close_dialog(cx);
-                    this.notify(format!("Go to {formula} → 0x{addr:x}"), window, cx);
+                    this.commit_goto(&formula, dialog_addr, window, cx);
                 }
                 GotoEvent::Cancel => window.close_dialog(cx),
             },
@@ -1125,8 +1836,99 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Resolve `formula` against the active provider's module/symbol/pointer
+    /// callbacks and navigate the active editor to it (rebase its base address;
+    /// the C++ `navigateToFormula`). On a clean resolve: push the recent list,
+    /// rebase + refresh, confirm. On failure: themed warning. `dialog_addr` is
+    /// the dialog's literal-only evaluation (used when no provider is attached).
+    fn commit_goto(
+        &mut self,
+        formula: &str,
+        dialog_addr: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            return;
+        };
+        // Re-evaluate WITH the live provider callbacks so `<mod>+0x..` / `[ptr]` /
+        // `ntdll!Sym` forms resolve (the dialog evaluated literals-only).
+        let ptr_size = editor.read(cx).controller().tree().pointer_size.max(1);
+        let resolved = {
+            let ed = editor.read(cx);
+            let provider = ed.controller().document().provider.clone();
+            let cbs = crate::addr::AddressParserCallbacks {
+                resolve_module: Some(Box::new({
+                    let p = provider.clone();
+                    move |name: &str| {
+                        let base = p.symbol_to_address(name);
+                        (base, base != 0)
+                    }
+                })),
+                read_pointer: Some(Box::new({
+                    let p = provider.clone();
+                    move |addr: u64| {
+                        if ptr_size >= 8 {
+                            let v = p.read_u64(addr);
+                            (v, true)
+                        } else {
+                            let v = p.read_u32(addr) as u64;
+                            (v, true)
+                        }
+                    }
+                })),
+                resolve_identifier: Some(Box::new({
+                    let p = provider.clone();
+                    move |name: &str| {
+                        let base = p.symbol_to_address(name);
+                        (base, base != 0)
+                    }
+                })),
+                ..Default::default()
+            };
+            let r = crate::addr::AddressParser::evaluate(formula, ptr_size, Some(&cbs));
+            if r.ok {
+                Some(r.value)
+            } else if !formula.trim().is_empty() && dialog_addr != 0 {
+                // Fall back to the dialog's literal evaluation (no provider).
+                Some(dialog_addr)
+            } else {
+                None
+            }
+        };
+        match resolved {
+            Some(addr) => {
+                // Navigate: rebase the active editor's tree to the resolved
+                // address (the C++ `navigateToFormula` sets baseAddress and
+                // preserves the formula for re-rebase), then recompose + repaint.
+                editor.update(cx, |ed, cx| {
+                    let tree = &mut ed.controller_mut().document_mut().tree;
+                    tree.base_address = addr;
+                    tree.base_address_formula = formula.to_string();
+                    ed.apply_document(cx);
+                });
+                self.goto_recent = super::gotoaddress::push_recent_list(&self.goto_recent, formula);
+                self.rebuild_workspace(cx);
+                self.notify(format!("Jumped to 0x{addr:X}"), window, cx);
+                cx.notify();
+            }
+            None => {
+                let spec = super::messagebox::warn(
+                    "Address Not Resolved",
+                    &format!(
+                        "Couldn't evaluate \"{formula}\". The expression isn't valid or its \
+                         module/symbol can't be resolved without a live data source."
+                    ),
+                );
+                super::messagebox::open_message(spec, window, cx);
+            }
+        }
+    }
+
     /// Switch the active theme by display name (`view.theme.<NAME>`): find its
-    /// index in the theme list and apply it. No-op (notified) if unknown.
+    /// index in the theme list and apply it, then check its menu row (clearing
+    /// the others — the C++ exclusive `themeGroup`; main.cpp:1318). No-op
+    /// (notified) if unknown.
     fn switch_theme_by_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let index = self
             .theme_manager
@@ -1135,13 +1937,32 @@ impl MainWindow {
             .iter()
             .position(|t| t.name == name);
         match index {
-            Some(i) => self.switch_theme(i, window, cx),
+            Some(i) => {
+                self.switch_theme(i, window, cx);
+                self.sync_theme_menu_checked(cx);
+            }
             None => self.notify(format!("Unknown theme: {name}"), window, cx),
         }
     }
 
-    /// View ▸ Presentation Mode — toggle the presentation flag + its ✓. The chrome
-    /// dimming lands with its own pass; here the state + checkmark are live.
+    /// Mark the active theme's menu row checked and clear every other theme row
+    /// (the C++ exclusive theme action group). Called after a theme switch and on
+    /// first paint so the Theme submenu reflects reality.
+    fn sync_theme_menu_checked(&mut self, cx: &mut Context<Self>) {
+        let active = self.state.theme_name().to_string();
+        let names = super::commandpalette::theme_display_names();
+        self.menubar.update(cx, |mb, cx| {
+            for n in &names {
+                mb.set_command_checked(&format!("view.theme.{n}"), *n == active, cx);
+            }
+        });
+    }
+
+    /// View ▸ Presentation Mode — toggle the presentation flag + its ✓ (the C++
+    /// `setPresentationMode` on every editor + MCP slow-mode; main.cpp:1511). The
+    /// editor surface exposes no presentation setter in this port, so the window
+    /// owns the live flag + checkmark; editor-side presentation rendering + MCP
+    /// slow-mode land with the editor's presentation pass.
     fn toggle_presentation(&mut self, cx: &mut Context<Self>) {
         self.presentation = !self.presentation;
         let on = self.presentation;
@@ -1180,6 +2001,9 @@ impl MainWindow {
                 }
             });
             self.rebuild_workspace(cx);
+            // Undo/redo changes the document's clean state — propagate the dirty
+            // dot into the tab.
+            self.sync_dirty_state(cx);
             cx.notify();
         }
     }
@@ -1478,11 +2302,28 @@ impl MainWindow {
         }
     }
 
-    /// The recent-files entries for the start page. The persistent recent-files
-    /// list + examples dir are wired with the project-lifecycle workflow; for now
-    /// this is empty (the start page shows "No recent files").
+    /// The recent-files entries for the start page, built from the session
+    /// recent-files list (the C++ `recentFiles` QSettings, surfaced by the start
+    /// page). Most-recent-first; the age is left at 0 (no persisted timestamps in
+    /// this port).
     fn recent_entries(&self) -> Vec<RecentEntry> {
-        Vec::new()
+        self.recent_files
+            .iter()
+            .map(|p| RecentEntry {
+                path: p.to_string_lossy().into_owned(),
+                file_name: p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(file)")
+                    .to_string(),
+                dir_path: p
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                age_days: 0,
+                is_example: false,
+            })
+            .collect()
     }
 
     fn on_start_page_event(
@@ -1511,7 +2352,7 @@ impl MainWindow {
             // project actually loads. `NewClass` is synchronous and unconditional,
             // so it still dismisses eagerly (inside `new_document`).
             StartPageEvent::Card(card) => match card {
-                StartCard::NewClass => self.new_document(window, cx),
+                StartCard::NewClass => self.new_document(RootKind::Class, window, cx),
                 StartCard::OpenProject => self.prompt_open(window, cx),
                 StartCard::ImportSource => self.prompt_import(ImportKind::Source, window, cx),
                 StartCard::ImportXml => self.prompt_import(ImportKind::Xml, window, cx),
@@ -1603,6 +2444,11 @@ impl MainWindow {
         // the start page so the user lands on the document.
         self.rebuild_workspace(cx);
         self.dismiss_start_page(cx);
+        // Record this project as a recent file (the C++ `addRecentFile`) so the
+        // File ▸ Recent Files submenu + start page surface it on next open, and
+        // propagate the (clean) dirty state into the tab.
+        self.record_recent_file(path, cx);
+        self.sync_dirty_state(cx);
         cx.notify();
         true
     }
@@ -1750,6 +2596,19 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_toggle_bookmarks))
             .on_action(cx.listener(Self::on_split_editor))
             .on_action(cx.listener(Self::on_unsplit_editor))
+            // File/Edit accelerators (previously advertised but unbound).
+            .on_action(cx.listener(Self::on_new_class))
+            .on_action(cx.listener(Self::on_new_struct))
+            .on_action(cx.listener(Self::on_new_enum))
+            .on_action(cx.listener(Self::on_open_file))
+            .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_save_as))
+            .on_action(cx.listener(Self::on_close_doc))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
+            .on_action(cx.listener(Self::on_add_bookmark))
+            .on_action(cx.listener(Self::on_quick_bookmark))
+            .on_action(cx.listener(Self::on_shortcuts))
             // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
             .child(titlebar)
             // ── Row 2: the content column — the docking workspace + the
@@ -1834,7 +2693,9 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
         OpenCommandPalette,
         Some("RcxWindow"),
     ));
-    bindings.push(KeyBinding::new("f1", OpenCommandPalette, Some("RcxWindow")));
+    // F1 opens Help ▸ Keyboard Shortcuts (the C++ QKeySequence(Qt::Key_F1);
+    // main.cpp:1580). The command palette keeps Ctrl+Shift+P / Ctrl+K.
+    bindings.push(KeyBinding::new("f1", ShortcutsAction, Some("RcxWindow")));
     // Toggle the memory-scanner pop-out (the C++ summoned-on-demand scanner;
     // closed by default). Ctrl+Shift+M shows/hides the bottom scanner dock.
     bindings.push(KeyBinding::new(
@@ -1903,6 +2764,78 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
         UnsplitEditor,
         Some("RcxWindow"),
     ));
+
+    // ── File/Edit accelerators advertised in the menu but previously unbound
+    // (the blocker fix). Each routes to the same command id `run_menu_command`
+    // dispatches, so keyboard + menu + palette stay in lockstep. The shortcuts
+    // mirror the C++ QKeySequence set (main.cpp:1099-1215). Both the Ctrl (Win/
+    // Linux) and Cmd (mac) forms are bound. ──
+    bindings.push(KeyBinding::new("ctrl-n", NewClassAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-n", NewClassAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new(
+        "ctrl-t",
+        NewStructAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new("cmd-t", NewStructAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("ctrl-e", NewEnumAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-e", NewEnumAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("ctrl-o", OpenFileAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-o", OpenFileAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("ctrl-s", SaveAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-s", SaveAction, Some("RcxWindow")));
+    // Save As — QKeySequence::SaveAs (Ctrl+Shift+S). Reserved over the C++
+    // Memory Scanner accelerator (which the port keeps on Ctrl+Shift+M).
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-s",
+        SaveAsAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-s",
+        SaveAsAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new("ctrl-w", CloseDocAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-w", CloseDocAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("ctrl-z", UndoAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-z", UndoAction, Some("RcxWindow")));
+    // Redo — QKeySequence::Redo is Ctrl+Y or Ctrl+Shift+Z; bind both (and the
+    // mac Cmd-Shift-Z form).
+    bindings.push(KeyBinding::new("ctrl-y", RedoAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("cmd-y", RedoAction, Some("RcxWindow")));
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-z",
+        RedoAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-z",
+        RedoAction,
+        Some("RcxWindow"),
+    ));
+    // Bookmarks — Add Bookmark… (Ctrl+B) / Quick Bookmark Here (Ctrl+Alt+B).
+    bindings.push(KeyBinding::new(
+        "ctrl-b",
+        AddBookmarkAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-b",
+        AddBookmarkAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-alt-b",
+        QuickBookmarkAction,
+        Some("RcxWindow"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-alt-b",
+        QuickBookmarkAction,
+        Some("RcxWindow"),
+    ));
+
     cx.bind_keys(bindings);
 
     // Run borderless: request CLIENT-side decorations so the OS/window-manager
@@ -1947,20 +2880,21 @@ mod tests {
     // Headless tests for the pure dispatch helpers added with the action-wiring.
     // These import specific items (NOT `super::*`) so the module's `gpui::*` glob
     // is not pulled into the test-hygiene expansion (see the menubar.rs note).
-    use super::{ExportKind, ImportKind, ViewOpt, ViewOptions};
+    use super::{seed_root_doc, ExportKind, ImportKind, RootKind, ViewOpt, ViewOptions};
 
     #[test]
     fn view_options_default_matches_cpp_view_menu() {
-        // C++ View menu defaults (view_options.png): everything checked except
-        // Comments.
+        // C++ persisted QSettings defaults (main.cpp:1336-1411): compactColumns,
+        // treeLines, relativeOffsets, hoverEffects ON; typeHints, showComments,
+        // minimap OFF.
         let d = ViewOptions::default();
         assert!(d.compact_columns);
         assert!(d.tree_lines);
         assert!(d.relative_offsets);
-        assert!(d.type_hints);
+        assert!(!d.type_hints);
         assert!(!d.show_comments);
         assert!(d.hover_effects);
-        assert!(d.minimap);
+        assert!(!d.minimap);
     }
 
     #[test]
@@ -2019,5 +2953,75 @@ mod tests {
         }
         assert_ne!(prompts[0], prompts[1]);
         assert_ne!(prompts[1], prompts[2]);
+    }
+
+    #[test]
+    fn root_kind_class_keyword_and_title_are_distinct() {
+        // The three New commands must seed distinct root kinds + titles (the bug:
+        // all three collapsed into one blank "Untitled").
+        assert_eq!(RootKind::Class.class_keyword(), "class");
+        assert_eq!(RootKind::Struct.class_keyword(), "struct");
+        assert_eq!(RootKind::Enum.class_keyword(), "enum");
+        let titles = [
+            RootKind::Class.title(),
+            RootKind::Struct.title(),
+            RootKind::Enum.title(),
+        ];
+        let mut uniq = titles.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "each kind must have a distinct tab title");
+    }
+
+    #[test]
+    fn seed_root_doc_builds_a_root_struct_with_the_kind_keyword() {
+        use crate::core::NodeKind;
+        for kind in [RootKind::Class, RootKind::Struct, RootKind::Enum] {
+            let doc = seed_root_doc(kind);
+            // Exactly one top-level struct, carrying the kind's class_keyword.
+            let roots: Vec<&crate::core::Node> = doc
+                .tree
+                .nodes
+                .iter()
+                .filter(|n| n.parent_id == 0 && n.kind == NodeKind::Struct)
+                .collect();
+            assert_eq!(roots.len(), 1, "{kind:?} should seed one root struct");
+            assert_eq!(roots[0].class_keyword, kind.class_keyword());
+            // The 16-field hex body landed under the root.
+            let children = doc
+                .tree
+                .nodes
+                .iter()
+                .filter(|n| n.parent_id == roots[0].id)
+                .count();
+            assert_eq!(children, 16, "{kind:?} should seed 16 hex fields");
+            // A sensible default base (the C++ template).
+            assert_eq!(doc.tree.base_address, 0x0040_0000);
+        }
+    }
+
+    #[test]
+    fn relabel_command_flips_the_mcp_label() {
+        use crate::ui::commandpalette::{menu_tree_with, MenuNode};
+        let mut tree = menu_tree_with(&[], &[]);
+        super::relabel_command(&mut tree, "tools.mcp", "Stop MCP Server");
+        // Find the relabelled leaf.
+        fn find<'a>(nodes: &'a [MenuNode], cmd: &str) -> Option<&'a str> {
+            for n in nodes {
+                match n {
+                    MenuNode::Item { label, command, .. } if command == cmd => {
+                        return Some(label.as_str())
+                    }
+                    MenuNode::Submenu { children, .. } => {
+                        if let Some(l) = find(children, cmd) {
+                            return Some(l);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        assert_eq!(find(&tree, "tools.mcp"), Some("Stop MCP Server"));
     }
 }

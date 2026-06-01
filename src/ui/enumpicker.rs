@@ -291,6 +291,35 @@ mod view {
                 cx.emit(EnumPickerEvent::Chosen(value));
             }
         }
+
+        /// Keyboard navigation (the C++ enum picker `eventFilter`): Up/Down move the
+        /// selected member (clamped), Enter chooses it, Esc dismisses. Returns
+        /// `true` when handled so the caller stops propagation.
+        fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            match key {
+                "down" => {
+                    self.model.move_down();
+                    cx.notify();
+                    true
+                }
+                "up" => {
+                    self.model.move_up();
+                    cx.notify();
+                    true
+                }
+                "enter" => {
+                    if let Some(value) = self.model.selected_value() {
+                        cx.emit(EnumPickerEvent::Chosen(value));
+                    }
+                    true
+                }
+                "escape" => {
+                    cx.emit(EnumPickerEvent::Dismissed);
+                    true
+                }
+                _ => false,
+            }
+        }
     }
 
     impl Focusable for EnumPickerPopup {
@@ -378,6 +407,14 @@ mod view {
                 .id("rcx-enum-picker")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxEnumPicker")
+                // Capture-phase key handling so Up/Down/Enter/Esc drive the member
+                // list even while the filter input owns focus (the C++ eventFilter
+                // forwarding from the line-edit to the list).
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                    if this.handle_nav_key(ev.keystroke.key.as_str(), cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .flex()
                 .flex_col()
                 .min_w(px(280.))

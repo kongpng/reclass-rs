@@ -426,7 +426,7 @@ pub fn default_entries(recent: &[(String, String, bool)]) -> Vec<SourceEntry> {
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
-pub use view::{SourceChooserEvent, SourceChooserPopup};
+pub use view::{SourceChooserEvent, SourceChooserPopup, SourcePick};
 
 /// The leading SVG icon for a source row, chosen from the kind label / provider
 /// identifier (the C++ paints a per-provider icon). Maps each provider family to a
@@ -462,24 +462,42 @@ pub fn source_icon(kind_label: &str, provider_identifier: &str) -> gpui_componen
 
 #[cfg(feature = "ui")]
 mod view {
-    use super::{source_icon, SourceAccept, SourceEntryKind, SourceModel};
+    use super::{default_entries, source_icon, SourceAccept, SourceEntryKind, SourceModel};
     use crate::ui::design::{color, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
     use gpui_component::ActiveTheme as _;
 
-    /// The popup's outcome.
-    #[derive(Clone, Debug)]
+    /// What the user picked in the chooser — the descriptor the editor applies
+    /// through the controller/document data-source API (the C++
+    /// `sourceSelected`/`providerSelected`/`clearRequested` signals collapsed to
+    /// the menus↔editor CONTRACT shape).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SourcePick {
+        /// Switch to a saved source by its `saved_index` (`sourceSelected`).
+        SavedSource(i32),
+        /// Activate a provider by its identifier (`providerSelected`). The
+        /// `process`/`processmemory` identifier is the editor's cue to open the
+        /// ProcessPicker (defect 1); other identifiers attach that provider.
+        Provider(String),
+    }
+
+    /// The popup's outcome (the menus↔editor CONTRACT: the editor opens the chooser
+    /// under the source chip and applies the pick through the controller/document
+    /// data-source API).
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum SourceChooserEvent {
-        /// Switch to a saved source (`sourceSelected`).
-        SourceSelected(i32),
-        /// Activate a provider (`providerSelected`).
-        ProviderSelected(String),
+        /// A saved source or provider was chosen — apply it as the document's
+        /// data source.
+        Pick(SourcePick),
+        /// The "File" provider was chosen — the editor opens the file-open flow
+        /// (`providerSelected("file")` shortcut for the common case).
+        OpenFile,
         /// Clear the data source (`clearRequested`).
-        ClearRequested,
-        /// Dismissed.
-        Dismissed,
+        Clear,
+        /// Dismissed (Esc / clicked outside / an already-active source).
+        Cancel,
     }
 
     /// The source-chooser popover view.
@@ -507,12 +525,27 @@ mod view {
                         cx.notify();
                     }
                 });
-            SourceChooserPopup {
+            let mut popup = SourceChooserPopup {
                 model,
                 input,
                 focus_handle: cx.focus_handle(),
                 _subscription: subscription,
-            }
+            };
+            popup.spawn_liveness_probe(window, cx);
+            popup
+        }
+
+        /// The CONTRACT entry point: build the chooser over the default content
+        /// (provider actions + the given `recent` saved sources) as an [`Entity`]
+        /// the editor opens anchored under the source chip and subscribes to for
+        /// [`SourceChooserEvent`]. `recent` are `(name, kind_label, active)` tuples
+        /// most-recent-first (see [`default_entries`](super::default_entries)).
+        pub fn view(
+            recent: Vec<(String, String, bool)>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Entity<Self> {
+            cx.new(|cx| SourceChooserPopup::new(default_entries(&recent), window, cx))
         }
 
         /// Read-only access to the model.
@@ -520,12 +553,113 @@ mod view {
             &self.model
         }
 
+        /// Apply liveness results to the model (`setLivenessResults`), re-rendering
+        /// so stale saved sources gain the "(exited)" styling. Public so a host
+        /// that owns the real probe (process aliveness / file existence) can push
+        /// fresh results; the default probe below marks file-backed sources by
+        /// existence.
+        pub fn set_liveness(&mut self, alive: Vec<bool>, cx: &mut Context<Self>) {
+            self.model.set_liveness(&alive);
+            cx.notify();
+        }
+
+        /// Defer a one-shot liveness probe (`SourceModel::set_liveness`): the C++
+        /// runs an async liveness check after `popup()` so stale sources get the
+        /// "(exited)" badge. We probe each saved source's `file_path` for existence
+        /// (the in-scope analogue — process aliveness is the out-of-scope live data
+        /// source). Sources without a path are treated as alive (no false stale).
+        fn spawn_liveness_probe(&mut self, window: &Window, cx: &mut Context<Self>) {
+            // Build (saved_index, file_path) pairs to probe off the entries.
+            let probes: Vec<(usize, String)> = self
+                .model
+                .entries()
+                .iter()
+                .filter(|e| e.entry_kind == SourceEntryKind::SavedSource && e.saved_index >= 0)
+                .map(|e| (e.saved_index as usize, e.file_path.clone()))
+                .collect();
+            if probes.is_empty() {
+                return;
+            }
+            let max_idx = probes.iter().map(|(i, _)| *i).max().unwrap_or(0);
+            cx.defer_in(window, move |this, _window, cx| {
+                let mut alive = vec![true; max_idx + 1];
+                for (idx, path) in &probes {
+                    // A non-empty path that does not exist on disk → stale; an empty
+                    // path (process/live source) stays alive (no file to probe).
+                    if !path.is_empty() && !std::path::Path::new(path).exists() {
+                        alive[*idx] = false;
+                    }
+                }
+                this.model.set_liveness(&alive);
+                cx.notify();
+            });
+        }
+
         fn accept_row(&mut self, row: usize, cx: &mut Context<Self>) {
             match self.model.accept(row) {
-                SourceAccept::SavedSource(i) => cx.emit(SourceChooserEvent::SourceSelected(i)),
-                SourceAccept::Provider(id) => cx.emit(SourceChooserEvent::ProviderSelected(id)),
-                SourceAccept::Clear => cx.emit(SourceChooserEvent::ClearRequested),
-                SourceAccept::None => cx.emit(SourceChooserEvent::Dismissed),
+                SourceAccept::SavedSource(i) => {
+                    cx.emit(SourceChooserEvent::Pick(SourcePick::SavedSource(i)))
+                }
+                SourceAccept::Provider(id) => {
+                    // "File" is the common file-open flow; route it as OpenFile so
+                    // the editor can open the file picker directly.
+                    if id == "file" {
+                        cx.emit(SourceChooserEvent::OpenFile);
+                    } else {
+                        cx.emit(SourceChooserEvent::Pick(SourcePick::Provider(id)));
+                    }
+                }
+                SourceAccept::Clear => cx.emit(SourceChooserEvent::Clear),
+                SourceAccept::None => cx.emit(SourceChooserEvent::Cancel),
+            }
+        }
+
+        /// Keyboard navigation (`sourcechooserpopup.cpp:603` `eventFilter`):
+        /// Up/Down move the selection (skipping section headers), Enter accepts the
+        /// selected row, Esc cancels. Down from the (focused) filter traverses into
+        /// the list; Up off the top returns focus to the filter. Returns `true`
+        /// when handled.
+        fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            match key {
+                "down" => {
+                    // Down-from-filter-into-list: if nothing is selected yet, land
+                    // on the first selectable row; else advance.
+                    if self.model.selected().is_none() {
+                        self.model.move_down();
+                        // move_down seeds the first selectable row when none set.
+                    } else {
+                        self.model.move_down();
+                    }
+                    cx.notify();
+                    true
+                }
+                "up" => {
+                    self.model.move_up();
+                    cx.notify();
+                    true
+                }
+                "enter" => {
+                    match self.model.accept_current() {
+                        SourceAccept::SavedSource(i) => {
+                            cx.emit(SourceChooserEvent::Pick(SourcePick::SavedSource(i)))
+                        }
+                        SourceAccept::Provider(id) => {
+                            if id == "file" {
+                                cx.emit(SourceChooserEvent::OpenFile);
+                            } else {
+                                cx.emit(SourceChooserEvent::Pick(SourcePick::Provider(id)));
+                            }
+                        }
+                        SourceAccept::Clear => cx.emit(SourceChooserEvent::Clear),
+                        SourceAccept::None => cx.emit(SourceChooserEvent::Cancel),
+                    }
+                    true
+                }
+                "escape" => {
+                    cx.emit(SourceChooserEvent::Cancel);
+                    true
+                }
+                _ => false,
             }
         }
     }
@@ -660,6 +794,14 @@ mod view {
                 .id("rcx-source-chooser")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxSourceChooser")
+                // Capture-phase key handling so Up/Down/Enter/Esc drive the list
+                // even when the filter input owns focus (the C++ `eventFilter`
+                // forwarding from the line-edit to the list, incl. Down-into-list).
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                    if this.handle_nav_key(ev.keystroke.key.as_str(), cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .min_w(px(360.))
                 .max_h(px(520.))
                 .p(px(tokens::space::XS))
@@ -894,5 +1036,22 @@ mod model_tests {
                 assert!(model.rows()[sel].entry.selectable());
             }
         }
+    }
+
+    #[test]
+    fn down_from_unfiltered_seeds_first_selectable_row() {
+        // Defect 3: Down from the (focused) filter into the list. With no filter
+        // there is no selection; Down must land on the first selectable row
+        // (skipping the leading section header), not stay unselected.
+        let mut model = SourceModel::new(entries());
+        assert_eq!(model.selected(), None);
+        model.move_down();
+        let sel = model.selected().expect("Down seeds a selection");
+        assert!(model.rows()[sel].entry.selectable());
+        // The first row is a "Saved" section header → selection skips past it.
+        assert_ne!(
+            model.rows()[sel].entry.entry_kind,
+            super::SourceEntryKind::SectionHeader
+        );
     }
 }
