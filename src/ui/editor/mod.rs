@@ -553,6 +553,13 @@ impl RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Grab keyboard focus for the editor surface so its key bindings fire
+        // after a click (arrow-key node navigation, Down-at-end → append a field,
+        // Ctrl+Shift+Up/Down reorder, F2/T/Delete, etc.). Without this, clicking a
+        // node selected it but left the editor unfocused, so the keyboard did
+        // nothing. A subsequent `begin_inline_edit` re-focuses the field input.
+        window.focus(&self.focus_handle, cx);
+
         // A click elsewhere commits any active edit first (§9 "click elsewhere
         // → commitInlineEdit").
         if self.editing.is_some() {
