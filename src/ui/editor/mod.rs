@@ -101,6 +101,10 @@ actions!(
         EditorHex128,
         EditorNavUp,
         EditorNavDown,
+        // Ctrl+Shift+Up/Down — reorder the active field among its siblings (the
+        // C++ `moveNodeRequested`). Distinct from plain Up/Down navigation.
+        EditorMoveUp,
+        EditorMoveDown,
         EditorNavPageUp,
         EditorNavPageDown,
         EditorNavHome,
@@ -175,6 +179,10 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("5", EditorHex128, Some("RcxEditor")),
         KeyBinding::new("up", EditorNavUp, Some("RcxEditor")),
         KeyBinding::new("down", EditorNavDown, Some("RcxEditor")),
+        // Ctrl+Shift+Up/Down reorder the field; gpui matches this more-specific
+        // chord over the bare `up`/`down` navigation bindings above.
+        KeyBinding::new("ctrl-shift-up", EditorMoveUp, Some("RcxEditor")),
+        KeyBinding::new("ctrl-shift-down", EditorMoveDown, Some("RcxEditor")),
         KeyBinding::new("pageup", EditorNavPageUp, Some("RcxEditor")),
         KeyBinding::new("pagedown", EditorNavPageDown, Some("RcxEditor")),
         KeyBinding::new("home", EditorNavHome, Some("RcxEditor")),
@@ -779,14 +787,22 @@ impl RcxEditor {
         if count <= 0 {
             return;
         }
-        // The tail offset of the struct = max(child.offset + size) over its members.
+        // The tail offset of the struct = max(child.offset + size) over its
+        // members. For container children (struct/array) `size_for_kind` is 0,
+        // so use the container-aware `struct_span` to measure past them — else
+        // the appended field would land on top of the last child.
         let tail = {
             let tree = self.controller.tree();
             tree.children_of(struct_id)
                 .iter()
                 .map(|&ci| {
                     let c = &tree.nodes[ci];
-                    c.offset + crate::core::size_for_kind(c.kind).max(0)
+                    let sz = if crate::core::is_container_kind(c.kind) {
+                        tree.struct_span(c.id)
+                    } else {
+                        crate::core::size_for_kind(c.kind).max(0)
+                    };
+                    c.offset + sz
                 })
                 .max()
                 .unwrap_or(0)
@@ -1493,22 +1509,37 @@ impl RcxEditor {
             self.after_mutation(cx);
             return;
         }
-        // Forward walk fell off the end → auto-append a field to the last data
-        // node's struct (mirrors the "+1" footer pill). Up-at-top is a no-op.
+        // Forward walk fell off the end → auto-append ONE Hex64 field to the
+        // ENCLOSING container of the last visible data row (C++
+        // `appendSingleFieldRequested` → `append_single_field`). The handler
+        // walks the last row's leaf id UP to its Struct/Array/Enum container,
+        // appends a Hex64 at the container's aligned tail (so the struct visibly
+        // grows past an array/struct-tail child, the array-end case), or appends
+        // an auto-numbered enum member, then MOVES the selection to the new node.
+        // Plain Up-at-top (dir < 0) is a silent no-op.
         if dir > 0 {
-            let last = self
+            let last_id = self
                 .controller
                 .last_result()
                 .meta
                 .iter()
                 .rev()
                 .find(|lm| lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID && !lm.is_continuation)
-                .map(|lm| (lm.node_idx, lm.node_kind));
-            if let Some((node_idx, _)) = last {
-                if node_idx >= 0 {
-                    let (parent_id, offset) = self.insert_anchor(node_idx as usize);
-                    self.controller
-                        .insert_node(parent_id, offset, NodeKind::Hex64, "");
+                .map(|lm| lm.node_id);
+            if let Some(node_id) = last_id {
+                if let Some(new_id) = self.controller.append_single_field(node_id) {
+                    self.apply_document(cx);
+                    // Scroll to the freshly-selected new field's line.
+                    if let Some(line) = self
+                        .controller
+                        .last_result()
+                        .meta
+                        .iter()
+                        .position(|lm| lm.node_id == new_id && !lm.is_continuation)
+                    {
+                        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                    }
+                } else {
                     self.apply_document(cx);
                 }
             }
@@ -1520,6 +1551,22 @@ impl RcxEditor {
     }
     fn action_nav_down(&mut self, _: &EditorNavDown, _w: &mut Window, cx: &mut Context<Self>) {
         self.navigate_node(1, 1, cx);
+    }
+
+    /// Ctrl+Shift+Up — reorder the active field one slot up among its siblings.
+    fn action_move_up(&mut self, _: &EditorMoveUp, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_l, lm)) = self.current_node() {
+            self.controller.move_node(lm.node_idx as usize, -1);
+            self.apply_document(cx);
+        }
+    }
+
+    /// Ctrl+Shift+Down — reorder the active field one slot down among its siblings.
+    fn action_move_down(&mut self, _: &EditorMoveDown, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_l, lm)) = self.current_node() {
+            self.controller.move_node(lm.node_idx as usize, 1);
+            self.apply_document(cx);
+        }
     }
     fn action_nav_page_up(&mut self, _: &EditorNavPageUp, _w: &mut Window, cx: &mut Context<Self>) {
         self.navigate_node(-1, self.page_step(), cx);
@@ -3460,6 +3507,8 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_hex128))
             .on_action(cx.listener(Self::action_nav_up))
             .on_action(cx.listener(Self::action_nav_down))
+            .on_action(cx.listener(Self::action_move_up))
+            .on_action(cx.listener(Self::action_move_down))
             .on_action(cx.listener(Self::action_nav_page_up))
             .on_action(cx.listener(Self::action_nav_page_down))
             .on_action(cx.listener(Self::action_nav_home))

@@ -1615,6 +1615,154 @@ impl RcxController {
         });
     }
 
+    /// `moveNode(nodeIdx, dir)` — reorder a field among its siblings (the C++
+    /// `moveNodeRequested` handler, `controller.cpp:792-815`, bound to
+    /// Ctrl+Shift+Up/Down in the editor).
+    ///
+    /// Faithful neighbor-swap: the field exchanges its `offset` with the
+    /// immediate neighbor in offset order (`dir` = -1 up / +1 down). The
+    /// underlying `nodes[]` array order is NOT touched and no other sibling
+    /// offsets shift — compose's sort-by-offset makes the two appear swapped on
+    /// the next refresh. Clamp at the first/last sibling (silent no-op, no
+    /// wrap). Pushed as one undoable macro ("Move node") of two `ChangeOffset`
+    /// commands so a single undo restores both.
+    pub fn move_node(&mut self, node_idx: usize, dir: i32) {
+        if node_idx >= self.doc.tree.nodes.len() {
+            return;
+        }
+        let node = self.doc.tree.nodes[node_idx].clone();
+        // Offset-sorted sibling indices (match compose's visual order;
+        // `children_of` returns child-cache order which is not necessarily
+        // offset-sorted).
+        let mut sibs = self.doc.tree.children_of(node.parent_id);
+        sibs.sort_by_key(|&i| self.doc.tree.nodes[i].offset);
+        let Some(pos) = sibs.iter().position(|&i| i == node_idx) else {
+            return;
+        };
+        let target = pos as i32 + dir;
+        if target < 0 || target as usize >= sibs.len() {
+            return; // clamp at the ends — no swap, no wrap.
+        }
+        let other_idx = sibs[target as usize];
+        let other = self.doc.tree.nodes[other_idx].clone();
+        if node.offset == other.offset {
+            return; // nothing to exchange.
+        }
+        self.begin_macro("Move node");
+        self.push_command(Command::ChangeOffset {
+            node_id: node.id,
+            old_offset: node.offset,
+            new_offset: other.offset,
+        });
+        self.push_command(Command::ChangeOffset {
+            node_id: other.id,
+            old_offset: other.offset,
+            new_offset: node.offset,
+        });
+        self.end_macro();
+    }
+
+    /// `appendSingleFieldRequested` handler (`controller.cpp:962-1020`), bound to
+    /// plain Down-walking-off-the-end in the editor. `node_id` is the LAST VISIBLE
+    /// data row's leaf id (a field id, not the struct).
+    ///
+    /// 1. PARENT RESOLUTION / walk-up: from the leaf, walk UP until the node is a
+    ///    Struct/Array/Enum container (`structId`). Returns silently if the id is
+    ///    unknown or the walk reaches a root non-container.
+    /// 2. ENUM: append one auto-numbered `Member{nextVal}` (nextVal = last value
+    ///    + 1, or 0 when empty) via `ChangeEnumMembers`.
+    /// 3. EMBEDDED-STRUCT redirect: if `childrenOf(structId)` is empty AND the
+    ///    container's `refId != 0`, append into the referenced root class instead.
+    /// 4. STRUCT/ARRAY append — HARDCODED `Hex64` at the container TAIL:
+    ///    slotOffset = max over children of (sib.offset + node_size(sib)); the new
+    ///    offset is that rounded up to `alignment_for(Hex64)` (= 8). Auto-named
+    ///    `field_%04x`, pushed as `Insert`.
+    /// 5. SELECTION MOVE: clear `sel_ids`, set it to the new node id, reset the
+    ///    anchor, `updateCommandRow` — a subsequent Down appends AFTER this field.
+    ///    Returns the new node id so the UI can re-find/scroll to its line.
+    pub fn append_single_field(&mut self, node_id: u64) -> Option<u64> {
+        let mut si = self.doc.tree.index_of_id(node_id);
+        if si < 0 {
+            return None;
+        }
+        // Walk up from the leaf to the enclosing Struct/Array/Enum container.
+        loop {
+            let n = &self.doc.tree.nodes[si as usize];
+            if matches!(n.kind, NodeKind::Struct | NodeKind::Array) || n.is_enum() {
+                break;
+            }
+            if n.parent_id == 0 {
+                return None;
+            }
+            si = self.doc.tree.index_of_id(n.parent_id);
+            if si < 0 {
+                return None;
+            }
+        }
+        let container = self.doc.tree.nodes[si as usize].clone();
+        let struct_id = container.id;
+
+        // ENUM: append one auto-numbered member (not the struct-field path).
+        if container.is_enum() {
+            let mut new_members = container.enum_members.clone();
+            let next_val = new_members.last().map(|(_, v)| v + 1).unwrap_or(0);
+            new_members.push((format!("Member{}", next_val), next_val));
+            self.push_command(Command::ChangeEnumMembers {
+                node_id: struct_id,
+                old_members: container.enum_members.clone(),
+                new_members,
+            });
+            // Keep the selection on the enum container itself.
+            self.sel_ids.clear();
+            self.sel_ids.insert(struct_id);
+            self.anchor_line = -1;
+            self.update_command_row();
+            return Some(struct_id);
+        }
+
+        // EMBEDDED-STRUCT redirect: an embedded placeholder with no children but a
+        // refId → append into the referenced root class instead.
+        let mut target_id = struct_id;
+        if self.doc.tree.children_of(struct_id).is_empty() && container.ref_id != 0 {
+            target_id = container.ref_id;
+        }
+
+        // STRUCT/ARRAY field append — HARDCODED Hex64 at the container tail.
+        let mut slot_offset = 0i32;
+        for ci in self.doc.tree.children_of(target_id) {
+            let sib = &self.doc.tree.nodes[ci];
+            let sz = self.node_size(sib);
+            let end = sib.offset + sz;
+            if end > slot_offset {
+                slot_offset = end;
+            }
+        }
+        let align = alignment_for(NodeKind::Hex64);
+        let offset = (slot_offset + align - 1) / align * align;
+
+        let mut n = Node {
+            kind: NodeKind::Hex64,
+            name: format!("field_{:04x}", offset),
+            parent_id: target_id,
+            offset,
+            ..Node::default()
+        };
+        n.id = self.doc.tree.reserve_id();
+        let new_id = n.id;
+        self.push_command(Command::Insert {
+            node: n,
+            off_adjs: Vec::new(),
+        });
+
+        // SELECTION MOVE: clear then select the new field so the next Down appends
+        // after it and the user can immediately retype its kind.
+        self.sel_ids.clear();
+        self.sel_ids.insert(new_id);
+        self.anchor_line = -1;
+        self.update_command_row();
+        Some(new_id)
+    }
+
     /// `removeNode(nodeIdx)` (`controller.cpp:2513`).
     pub fn remove_node(&mut self, node_idx: usize) {
         if node_idx >= self.doc.tree.nodes.len() {

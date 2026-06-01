@@ -887,6 +887,219 @@ fn insert_node_above_shifts_offsets() {
 }
 
 #[test]
+fn move_node_down_swaps_offsets() {
+    // build_small_tree fields (offset order): u32@0, float@4, u8@8, pad0@9,
+    // pad1@11, hex@12. Move u8 (the 3rd sibling) DOWN: it swaps offsets with
+    // pad0 (the 4th, immediate offset-neighbor below).
+    let mut c = make_ctrl();
+    let u8_idx = find_idx(&c, "field_u8");
+    let pad0_idx = find_idx(&c, "pad0");
+    let u8_off = c.tree().nodes[u8_idx].offset;
+    let pad0_off = c.tree().nodes[pad0_idx].offset;
+    assert_eq!(u8_off, 8);
+    assert_eq!(pad0_off, 9);
+
+    c.move_node(u8_idx, 1);
+    assert_eq!(c.tree().nodes[u8_idx].offset, pad0_off);
+    assert_eq!(c.tree().nodes[pad0_idx].offset, u8_off);
+
+    // One undoable macro restores both.
+    c.undo();
+    assert_eq!(c.tree().nodes[u8_idx].offset, u8_off);
+    assert_eq!(c.tree().nodes[pad0_idx].offset, pad0_off);
+}
+
+#[test]
+fn move_node_up_swaps_offsets() {
+    let mut c = make_ctrl();
+    let float_idx = find_idx(&c, "field_float");
+    let u32_idx = find_idx(&c, "field_u32");
+    let float_off = c.tree().nodes[float_idx].offset;
+    let u32_off = c.tree().nodes[u32_idx].offset;
+    assert_eq!(float_off, 4);
+    assert_eq!(u32_off, 0);
+
+    c.move_node(float_idx, -1);
+    assert_eq!(c.tree().nodes[float_idx].offset, u32_off);
+    assert_eq!(c.tree().nodes[u32_idx].offset, float_off);
+}
+
+#[test]
+fn move_node_clamps_at_first() {
+    // Up on the first sibling (u32@0) is a silent no-op.
+    let mut c = make_ctrl();
+    let u32_idx = find_idx(&c, "field_u32");
+    let offsets_before: Vec<i32> = c.tree().nodes.iter().map(|n| n.offset).collect();
+    c.move_node(u32_idx, -1);
+    let offsets_after: Vec<i32> = c.tree().nodes.iter().map(|n| n.offset).collect();
+    assert_eq!(offsets_before, offsets_after);
+}
+
+#[test]
+fn move_node_clamps_at_last() {
+    // Down on the last sibling (field_hex@12) is a silent no-op.
+    let mut c = make_ctrl();
+    let hex_idx = find_idx(&c, "field_hex");
+    let offsets_before: Vec<i32> = c.tree().nodes.iter().map(|n| n.offset).collect();
+    c.move_node(hex_idx, 1);
+    let offsets_after: Vec<i32> = c.tree().nodes.iter().map(|n| n.offset).collect();
+    assert_eq!(offsets_before, offsets_after);
+}
+
+#[test]
+fn move_node_out_of_bounds_no_op() {
+    let mut c = make_ctrl();
+    let before = c.tree().nodes.len();
+    c.move_node(9999, 1);
+    assert_eq!(c.tree().nodes.len(), before);
+}
+
+#[test]
+fn append_single_field_grows_struct_at_tail() {
+    // Down-walking-off-the-end on the last field (field_hex@12, Hex32 → end 16)
+    // appends ONE Hex64 at the struct tail, rounded up to align 8 → offset 16.
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let last_id = find_id(&c, "field_hex");
+    let before = c.tree().children_of(root_id).len();
+
+    let new_id = c.append_single_field(last_id).expect("appended");
+    let ni = c.tree().index_of_id(new_id) as usize;
+    assert_eq!(c.tree().nodes[ni].kind, NodeKind::Hex64);
+    assert_eq!(c.tree().nodes[ni].parent_id, root_id);
+    assert_eq!(c.tree().nodes[ni].offset, 16); // tail = 12 + 4, aligned to 8.
+    assert_eq!(c.tree().nodes[ni].name, "field_0010");
+    assert_eq!(c.tree().children_of(root_id).len(), before + 1);
+
+    // SELECTION moved to the new field so a subsequent Down appends after it.
+    assert!(c.selected_ids().contains(&new_id));
+
+    // Undoable.
+    c.undo();
+    assert!(c.tree().index_of_id(new_id) < 0);
+}
+
+#[test]
+fn append_single_field_walks_up_leaf_to_struct() {
+    // Passing a mid-struct leaf id (field_u8) still resolves the enclosing
+    // struct and appends at the struct tail.
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let leaf = find_id(&c, "field_u8");
+    let new_id = c.append_single_field(leaf).expect("appended");
+    let ni = c.tree().index_of_id(new_id) as usize;
+    assert_eq!(c.tree().nodes[ni].parent_id, root_id);
+    assert_eq!(c.tree().nodes[ni].offset, 16);
+}
+
+#[test]
+fn append_single_field_grows_past_array_child() {
+    // A struct whose last child is an Array[4] of Hex32 (16 bytes @ off 16).
+    // Appending must land PAST the array footprint (off 32), not overlap it.
+    let mut doc = RcxDocument::new();
+    let root = Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "S".into(),
+        name: "root".into(),
+        ..Node::default()
+    };
+    let ri = doc.tree.add_node(root);
+    let root_id = doc.tree.nodes[ri].id;
+    let f = Node {
+        kind: NodeKind::Hex64,
+        name: "f0".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    };
+    doc.tree.add_node(f);
+    let arr = Node {
+        kind: NodeKind::Array,
+        name: "arr".into(),
+        parent_id: root_id,
+        offset: 16,
+        element_kind: NodeKind::Hex32,
+        array_len: 4,
+        ..Node::default()
+    };
+    let ai = doc.tree.add_node(arr);
+    let arr_id = doc.tree.nodes[ai].id;
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+
+    // struct_span(arr) = 4 * 4 = 16 → array end = 16 + 16 = 32.
+    let new_id = c.append_single_field(arr_id).expect("appended");
+    let ni = c.tree().index_of_id(new_id) as usize;
+    assert_eq!(c.tree().nodes[ni].parent_id, arr_id); // walk-up lands ON the array.
+                                                      // Appended into the array's own tail (empty array → slot 0, aligned 0).
+    assert_eq!(c.tree().nodes[ni].offset, 0);
+
+    // And appending via a struct-level leaf grows the struct PAST the array.
+    let leaf = find_id(&c, "f0");
+    let new2 = c.append_single_field(leaf).expect("appended");
+    let n2 = c.tree().index_of_id(new2) as usize;
+    assert_eq!(c.tree().nodes[n2].parent_id, root_id);
+    assert_eq!(c.tree().nodes[n2].offset, 32); // past the array footprint.
+}
+
+#[test]
+fn append_single_field_first_field_into_empty_struct() {
+    // An empty struct: Down appends the FIRST field at offset 0.
+    let mut doc = RcxDocument::new();
+    let root = Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Empty".into(),
+        name: "root".into(),
+        ..Node::default()
+    };
+    let ri = doc.tree.add_node(root);
+    let root_id = doc.tree.nodes[ri].id;
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+
+    let new_id = c.append_single_field(root_id).expect("appended");
+    let ni = c.tree().index_of_id(new_id) as usize;
+    assert_eq!(c.tree().nodes[ni].kind, NodeKind::Hex64);
+    assert_eq!(c.tree().nodes[ni].parent_id, root_id);
+    assert_eq!(c.tree().nodes[ni].offset, 0);
+    assert_eq!(c.tree().nodes[ni].name, "field_0000");
+}
+
+#[test]
+fn append_single_field_enum_appends_member() {
+    // An enum node: Down appends an auto-numbered Member, NOT a hex field.
+    let mut doc = RcxDocument::new();
+    let mut e = Node {
+        kind: NodeKind::UInt32,
+        class_keyword: "enum".into(),
+        name: "e".into(),
+        ..Node::default()
+    };
+    e.enum_members = vec![("A".into(), 0), ("B".into(), 1)];
+    let ei = doc.tree.add_node(e);
+    let enum_id = doc.tree.nodes[ei].id;
+    let before_nodes = doc.tree.nodes.len();
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+
+    let ret = c.append_single_field(enum_id).expect("appended member");
+    assert_eq!(ret, enum_id); // selection stays on the enum container.
+                              // No new node was inserted.
+    assert_eq!(c.tree().nodes.len(), before_nodes);
+    let members = &c.tree().nodes[c.tree().index_of_id(enum_id) as usize].enum_members;
+    assert_eq!(members.len(), 3);
+    assert_eq!(members[2], ("Member2".to_string(), 2)); // nextVal = last(1) + 1.
+}
+
+#[test]
+fn append_single_field_unknown_id_no_op() {
+    let mut c = make_ctrl();
+    let before = c.tree().nodes.len();
+    assert!(c.append_single_field(999_999).is_none());
+    assert_eq!(c.tree().nodes.len(), before);
+}
+
+#[test]
 fn delete_root_struct() {
     let mut c = make_ctrl();
     let root_id = c.tree().nodes[0].id;
