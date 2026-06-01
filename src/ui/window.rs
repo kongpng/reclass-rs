@@ -47,7 +47,9 @@ use super::statusbar::{render_status_bar, StatusInfo};
 use super::tabs::{DocAreaEvent, DocumentArea};
 use super::theme_apply::ThemeRegistryGlobal;
 use super::titlebar::{self, LayoutPreset};
-use super::workspace::{WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspacePanel};
+use super::workspace::{
+    WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
+};
 use crate::theme::ThemeManager;
 
 // App-level actions. Mirrors Zed: the command palette opens on Ctrl+Shift+P / F1
@@ -504,6 +506,23 @@ impl MainWindow {
             window,
             |this, _ws, nav: &WorkspaceNav, window, cx| {
                 this.on_workspace_nav(*nav, window, cx);
+            },
+        )
+        .detach();
+
+        // ── Wire the workspace empty-area "New …" context menu (right-click the
+        // project background / an empty project; the C++ newClass()/newStruct()/
+        // newEnum()) → the same path as File ▸ New …. ──
+        cx.subscribe_in(
+            &workspace,
+            window,
+            |this, _ws, req: &WorkspaceNewType, window, cx| {
+                let cmd = match req {
+                    WorkspaceNewType::Class => "file.new_class",
+                    WorkspaceNewType::Struct => "file.new_struct",
+                    WorkspaceNewType::Enum => "file.new_enum",
+                };
+                this.run_menu_command(&cmd.to_string(), window, cx);
             },
         )
         .detach();

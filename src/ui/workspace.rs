@@ -58,9 +58,29 @@ actions!(
         WsRenameType,
         WsDuplicateType,
         WsDeleteType,
-        WsAddMember
+        WsAddMember,
+        // Empty-area (no type under the cursor) context menu — the C++
+        // `main.cpp:6561` `!clickedIndex.isValid()` branch (New Class / New Struct
+        // / New Enum), which calls `newClass()/newStruct()/newEnum()`.
+        WsNewClass,
+        WsNewStruct,
+        WsNewEnum
     ]
 );
+
+/// A request from the workspace's **empty-area** context menu to create a new
+/// top-level type (the C++ `newClass()/newStruct()/newEnum()` slots). The window
+/// resolves it exactly like the `File ▸ New …` menu (a fresh document with the
+/// chosen root kind). Emitted by [`WorkspacePanel`]; handled by the main window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkspaceNewType {
+    /// New Class — `file.new_class`.
+    Class,
+    /// New Struct — `file.new_struct`.
+    Struct,
+    /// New Enum — `file.new_enum`.
+    Enum,
+}
 
 /// The badge a workspace row shows — the C++ `S`/`E`/`F` letter badge
 /// (`WorkspaceDelegate::paint`), generalized to distinguish unions.
@@ -688,6 +708,45 @@ impl WorkspacePanel {
         _cx: &mut Context<Self>,
     ) {
     }
+
+    // ── Empty-area "New …" actions (the C++ `newClass()/newStruct()/newEnum()`) ──
+    // Each emits a [`WorkspaceNewType`] the window resolves like `File ▸ New …`.
+
+    /// "New Class" — emit the new-type request (the C++ `newClass()`).
+    fn action_new_class(&mut self, _: &WsNewClass, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(WorkspaceNewType::Class);
+    }
+
+    /// "New Struct" — emit the new-type request (the C++ `newStruct()`).
+    fn action_new_struct(&mut self, _: &WsNewStruct, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(WorkspaceNewType::Struct);
+    }
+
+    /// "New Enum" — emit the new-type request (the C++ `newEnum()`).
+    fn action_new_enum(&mut self, _: &WsNewEnum, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(WorkspaceNewType::Enum);
+    }
+}
+
+/// Build the **empty-area** right-click [`PopupMenu`] (the C++ workspace-tree
+/// `!clickedIndex.isValid()` branch, `main.cpp:6561`): New Class / New Struct /
+/// New Enum. Shown when right-clicking the panel background — the header, the
+/// filter, blank tree space, or an empty project with no types yet — so there is
+/// always a way to create the first type. Each item dispatches its workspace
+/// action (handled on the panel's tracked-focus root → emits [`WorkspaceNewType`]
+/// → the window opens a fresh document with that root kind). Zed elevated-surface
+/// look + leading kind icons, matching [`type_context_menu`].
+fn empty_area_menu(menu: PopupMenu) -> PopupMenu {
+    use gpui_component::IconName;
+    menu.menu_element_with_icon(IconName::Plus, Box::new(WsNewClass), |_w, cx| {
+        menu_row("New Class", "\u{2318}N", cx)
+    })
+    .menu_element_with_icon(IconName::Plus, Box::new(WsNewStruct), |_w, cx| {
+        menu_row("New Struct", "\u{2318}T", cx)
+    })
+    .menu_element_with_icon(IconName::Plus, Box::new(WsNewEnum), |_w, cx| {
+        menu_row("New Enum", "\u{2318}E", cx)
+    })
 }
 
 /// Build the type-row right-click [`PopupMenu`] (the C++ workspace-tree `QMenu`,
@@ -766,6 +825,7 @@ impl Panel for WorkspacePanel {
 
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl EventEmitter<WorkspaceNav> for WorkspacePanel {}
+impl EventEmitter<WorkspaceNewType> for WorkspacePanel {}
 
 impl Focusable for WorkspacePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -789,6 +849,16 @@ impl Render for WorkspacePanel {
             .on_action(cx.listener(Self::action_duplicate))
             .on_action(cx.listener(Self::action_delete))
             .on_action(cx.listener(Self::action_add_member))
+            .on_action(cx.listener(Self::action_new_class))
+            .on_action(cx.listener(Self::action_new_struct))
+            .on_action(cx.listener(Self::action_new_enum))
+            // Empty-area right-click → New Class / New Struct / New Enum (the C++
+            // `main.cpp:6561` `!clickedIndex.isValid()` branch). Attached to the
+            // panel root so right-clicking the header, the filter, or the blank
+            // tree area (incl. an empty project with no types yet) opens it; a
+            // right-click ON a type row hits that row's own `context_menu` (the
+            // inner element wins), so the two never collide.
+            .context_menu(move |menu, _window, _cx| empty_area_menu(menu))
             .size_full()
             .bg(color::panel_bg(cx))
             .text_color(color::text(cx))
