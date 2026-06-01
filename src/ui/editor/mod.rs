@@ -1178,8 +1178,14 @@ impl RcxEditor {
             col_end: span.end,
             _subscription: subscription,
         });
+        // Focus the field AFTER its element is in the render tree. Focusing a
+        // handle whose element has not yet painted is dropped at the frame boundary
+        // — the edit box appeared but never received keyboard input (ALL inline
+        // edits were un-typeable: rename, value, hex). Popups don't hit this because
+        // the dialog layer paints them immediately. Deferring focuses the field once
+        // this notify's re-render has placed the editing overlay in the tree.
         let handle = field.read(cx).field_focus_handle();
-        window.focus(&handle, cx);
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
         // Arm the caret blink with a solid caret so the field shows an immediate,
         // continuously-visible cursor the moment editing begins (BUG 2).
         field.update(cx, |f, cx| f.arm_caret(cx));
