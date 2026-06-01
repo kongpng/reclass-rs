@@ -182,6 +182,18 @@ impl EditorPalette {
         }
     }
 
+    /// An **opaque** fill for the inline-edit field band — the editor paper with
+    /// the active-line wash composited on top, so it reads as a distinct editable
+    /// surface while fully occluding the static row glyphs (the type token / the
+    /// pre-edit name) beneath it. A translucent active-line bg alone would let the
+    /// static text bleed through behind the seeded edit text, so the inline field
+    /// composites it down to a solid color.
+    pub fn active_line_fill(&self) -> Hsla {
+        // `blend` composites `other` over `self`: the opaque paper stays opaque,
+        // tinted by the translucent active-line wash.
+        self.paper.blend(self.active_line_bg)
+    }
+
     /// Heat color for a heat level (1=cold, 2=warm, 3=hot), or `None` for static.
     pub fn heat_color(&self, level: i32) -> Option<Hsla> {
         match level {

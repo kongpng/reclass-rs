@@ -44,7 +44,7 @@ use crate::ui::{design, tooltip};
 
 use element::{RowElement, RowPaint};
 use geometry::CellMetrics;
-use inline_edit::{EditCommit, EditOutcome, FieldElement, FieldInput};
+use inline_edit::{EditCommit, EditOutcome, FieldInput};
 use palette::EditorPalette;
 use selection::ByteSelection;
 
@@ -101,6 +101,13 @@ const EDITOR_LINE_HEIGHT: f32 = 1.5;
 /// against the row-text element's own left edge); the inline-edit overlay simply
 /// adds this offset alongside the address-margin offset.
 const ICON_CELLS: f32 = 2.0;
+
+/// Width (px) of the per-row left accent border (`border_l_2`). The border lives
+/// inside the row's border-box, so an `absolute`-positioned child's `left(0)` is
+/// the padding-box left — one border-width *short* of where the RowElement paints
+/// text column 0. The inline-edit overlay adds this so its seeded text lands on
+/// the resolved column instead of sliding one column left onto the type token.
+const BORDER_L_PX: f32 = 2.0;
 
 /// The key bindings for the editor surface (bound in the `RcxEditor` context).
 /// Returned so the app can register them once at startup alongside the inline
@@ -203,6 +210,10 @@ struct EditingField {
     line: usize,
     /// Char-column start of the edited span (where the overlay is positioned).
     col_start: i32,
+    /// Char-column end of the edited span — the overlay's opaque band spans
+    /// `[col_start, col_end)` so it covers exactly the edited column (and occludes
+    /// the static glyphs beneath it), item 3.
+    col_end: i32,
     _subscription: Subscription,
 }
 
@@ -622,6 +633,7 @@ impl RcxEditor {
             field: field.clone(),
             line,
             col_start: span.start,
+            col_end: span.end,
             _subscription: subscription,
         });
         let handle = field.read(cx).field_focus_handle();
@@ -989,7 +1001,7 @@ impl RcxEditor {
             .editing
             .as_ref()
             .filter(|e| e.line == idx)
-            .map(|e| (e.field.clone(), e.col_start));
+            .map(|e| (e.field.clone(), e.col_start, e.col_end));
         // The "active line" (Zed's active-line bg / reclass's highlighted current
         // row): the row currently being edited, even when it is not part of the
         // multi-selection. A selected row already carries the louder accent fill.
@@ -1214,7 +1226,7 @@ impl RcxEditor {
 
         // Inline-edit overlay positioned at the edited column — offset by the
         // address-margin width so it lands over the field, not the margin.
-        if let Some((field, col_start)) = editing_here {
+        if let Some((field, col_start, col_end)) = editing_here {
             let hex_digits = self
                 .controller
                 .last_result()
@@ -1226,19 +1238,43 @@ impl RcxEditor {
             } else {
                 0.0
             };
+            let cell = self.metrics.cell_width;
             // The overlay is positioned in the row's own coordinate space, so it
             // must clear BOTH the address margin and the kind-icon gutter (both
-            // precede the row-text element) before the per-column offset.
-            let left =
-                px((margin + ICON_CELLS + col_start.max(0) as f32) * self.metrics.cell_width);
+            // precede the row-text element) before the per-column offset. The
+            // RowElement's text column 0 sits past the 2px left accent border too
+            // (the border is inside the row's border-box, so an `absolute` child's
+            // `left(0)` is the *padding-box* left — one border-width short of the
+            // text). Add `BORDER_L_PX` so the seeded edit text lands exactly on the
+            // NAME column and does not slide one column left onto the type token
+            // (item 3: the earlier overlay covered only the address margin, not the
+            // per-target column nor the accent border).
+            let left = px(BORDER_L_PX + (margin + ICON_CELLS + col_start.max(0) as f32) * cell);
+            // The opaque band spans the edited column `[col_start, col_end)` (a
+            // generous minimum so short seeds still get a visible field box).
+            let editing_width = ((col_end - col_start).max(0) as f32).max(6.0);
+            // The inline field paints over the static row text. Give it an OPAQUE
+            // paper-colored band so the column's static glyphs (the type token, the
+            // pre-edit name) do not bleed through behind the seeded text — without
+            // this the field reads as garbled overlap ("int64_teateTime"), item 3.
             row = row.child(
                 div()
                     .absolute()
                     .top_0()
                     .left(left)
                     .h(px(self.metrics.line_height))
-                    .min_w(px(self.metrics.cell_width * 4.0))
-                    .child(FieldElement { input: field }),
+                    .w(px((editing_width + 1.0) * cell))
+                    .bg(palette.active_line_fill())
+                    // The field entity's own `Render` carries the focus/key-context
+                    // wrapper (`.track_focus` + `.key_context("RcxFieldInput")` +
+                    // every `.on_action(..)` field handler). Embedding the entity —
+                    // not the raw `FieldElement` — is what establishes the
+                    // `RcxFieldInput` key context on the focused element so keystrokes
+                    // route through `window.handle_input` and the action bindings
+                    // fire (items 1 & 2). The raw `FieldElement` had no key context,
+                    // so typing / backspace / arrows / enter / escape were all inert
+                    // and the caret never painted (its paint is gated on focus).
+                    .child(field.clone()),
             );
         }
 

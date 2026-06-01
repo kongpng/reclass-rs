@@ -480,10 +480,9 @@ impl EntityInputHandler for FieldInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        let (content, cursor) = splice_text(&self.content, range, new_text);
+        self.content = content.into();
+        self.selected_range = cursor..cursor;
         self.marked_range.take();
         // Keep the caret solid + recomputed at the new cursor offset while typing
         // (BUG 2): a keystroke must not leave the caret in a stale "off" phase.
@@ -554,6 +553,27 @@ impl EntityInputHandler for FieldInput {
         let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
+}
+
+/// Pure text-edit primitive shared by the field's keystroke handlers — splice
+/// `new_text` over `content[range]` and return `(new_content, new_cursor)` where
+/// the cursor collapses to just past the inserted text. This is the byte-exact
+/// core of [`EntityInputHandler::replace_text_in_range`] lifted out of the gpui
+/// `Window`/`Context` plumbing so the keystroke logic (insert / backspace / delete
+/// / paste) is unit-testable headlessly — the entity method delegates to it, so a
+/// test of this function is a test of what a real keypress does to the field.
+///
+/// `range` is a UTF-8 byte range clamped to char boundaries by the caller (the
+/// field always derives it from char-aligned selection offsets).
+pub fn splice_text(content: &str, range: Range<usize>, new_text: &str) -> (String, usize) {
+    let start = range.start.min(content.len());
+    let end = range.end.clamp(start, content.len());
+    let mut out = String::with_capacity(content.len() - (end - start) + new_text.len());
+    out.push_str(&content[..start]);
+    out.push_str(new_text);
+    out.push_str(&content[end..]);
+    let cursor = start + new_text.len();
+    (out, cursor)
 }
 
 /// The custom element that shapes + paints the field text + caret/selection and
@@ -804,7 +824,7 @@ mod tests {
     // Import only the items under test — NOT `super::*`, which would pull the
     // module's `gpui::*` glob into the `#[test]` hygiene expansion and explode
     // the type-recursion budget on this nightly+gpui combination.
-    use super::EditCommit;
+    use super::{splice_text, EditCommit};
     use crate::compose::EditTarget;
 
     #[test]
@@ -818,5 +838,48 @@ mod tests {
         };
         assert_eq!(c.node_idx, 3);
         assert_eq!(c.target, EditTarget::Name);
+    }
+
+    #[test]
+    fn typing_into_a_select_all_field_replaces_the_seed() {
+        // BUG 1 integration: a freshly-opened inline field seeds its text and
+        // select-all-highlights it (`selected_range = 0..len`). The first keystroke
+        // must REPLACE the whole seed (not append), then subsequent keystrokes
+        // insert at the collapsed caret. This drives the exact splice the entity's
+        // `replace_text_in_range` runs on each `a`/`b`/`c` key.
+        let seed = "CreateTime";
+        // Type 'X' with the seed fully selected → content becomes "X", caret after.
+        let (c1, cur1) = splice_text(seed, 0..seed.len(), "X");
+        assert_eq!(c1, "X");
+        assert_eq!(cur1, 1);
+        // Then 'Y' / 'Z' insert at the caret (collapsed selection cur..cur).
+        let (c2, cur2) = splice_text(&c1, cur1..cur1, "Y");
+        assert_eq!(c2, "XY");
+        assert_eq!(cur2, 2);
+        let (c3, cur3) = splice_text(&c2, cur2..cur2, "Z");
+        assert_eq!(c3, "XYZ");
+        assert_eq!(cur3, 3);
+    }
+
+    #[test]
+    fn splice_inserts_replaces_and_deletes_like_keystrokes() {
+        // Insert at the caret (typing in the middle).
+        assert_eq!(splice_text("abd", 2..2, "c"), ("abcd".to_string(), 3));
+        // Replace a selection (drag-select "bc" then type "X").
+        assert_eq!(splice_text("abcd", 1..3, "X"), ("aXd".to_string(), 2));
+        // Backspace = splice an empty string over the char before the caret.
+        assert_eq!(splice_text("abc", 2..3, ""), ("ab".to_string(), 2));
+        // Delete = splice empty over the char after the caret.
+        assert_eq!(splice_text("abc", 0..1, ""), ("bc".to_string(), 0));
+        // Append at the end.
+        assert_eq!(splice_text("ab", 2..2, "c"), ("abc".to_string(), 3));
+    }
+
+    #[test]
+    fn splice_clamps_out_of_range_to_string_bounds() {
+        // Defensive: a range past the end clamps to the string length (the field
+        // always passes char-aligned offsets, but the splice must never panic).
+        assert_eq!(splice_text("ab", 5..9, "Z"), ("abZ".to_string(), 3));
+        assert_eq!(splice_text("ab", 1..9, "Z"), ("aZ".to_string(), 2));
     }
 }

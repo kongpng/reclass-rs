@@ -246,6 +246,39 @@ mod tests {
     }
 
     #[test]
+    fn type_token_resolves_to_an_edit_target_on_pointer_and_primitive_rows() {
+        // BUG 4 regression: clicking the TYPE token on a pointer (`void*`) row or a
+        // primitive (`uint32_t`) row must resolve to an editable `EditTarget` so
+        // `begin_inline_edit` (or the type-selector popup) can fire — the QA could
+        // not confirm a type-token edit opened on a `void*` row. The type column's
+        // first glyph (just past the fold prefix) must always hit *some* target.
+        let type_col = compose::K_FOLD_COL + 1;
+
+        // Primitive: the whole type column is the generic Type target.
+        let prim = field(NodeKind::UInt32, 0);
+        let prim_text = "uint32_t      count                  0";
+        assert_eq!(
+            target_at_col(&prim, prim_text, type_col, 14, 22),
+            Some(EditTarget::Type),
+            "primitive type token must hit Type"
+        );
+
+        // Pointer: the type token resolves to a clickable target (Type or, where
+        // the pointer-target sub-span overlaps, PointerTarget — both open an edit).
+        let ptr = field(NodeKind::Pointer64, 0);
+        let ptr_text = "void*         pData                  0x0";
+        let hit = target_at_col(&ptr, ptr_text, type_col, 14, 22);
+        assert!(
+            matches!(
+                hit,
+                Some(EditTarget::Type) | Some(EditTarget::PointerTarget)
+            ),
+            "pointer type token must hit Type or PointerTarget, got {hit:?}"
+        );
+        assert!(hit.is_some(), "void* type token must be editable");
+    }
+
+    #[test]
     fn pointer_target_wins_over_type() {
         let lm = field(NodeKind::Pointer64, 0);
         // "Player*       enemy" — '*' after the type text; target span is ind..'*'.

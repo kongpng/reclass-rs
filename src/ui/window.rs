@@ -1498,17 +1498,25 @@ impl MainWindow {
             }
             // ROUTE EACH CARD DISTINCTLY (the bug: every card landed on a new
             // class). Each card now does its OWN thing — the same operation its
-            // File-menu twin runs — after dismissing the splash.
-            StartPageEvent::Card(card) => {
-                self.dismiss_start_page(cx);
-                match card {
-                    StartCard::NewClass => self.new_document(window, cx),
-                    StartCard::OpenProject => self.prompt_open(window, cx),
-                    StartCard::ImportSource => self.prompt_import(ImportKind::Source, window, cx),
-                    StartCard::ImportXml => self.prompt_import(ImportKind::Xml, window, cx),
-                    StartCard::ImportPdb => self.prompt_import(ImportKind::Pdb, window, cx),
-                }
-            }
+            // File-menu twin runs.
+            //
+            // CRITICAL: do NOT dismiss the splash here for the async file-picker
+            // cards. `prompt_open`/`prompt_import` spawn a native dialog that
+            // resolves *later*; dismissing eagerly would tear the welcome page
+            // down to the blank "Untitled" doc the instant the card is clicked,
+            // so a cancelled (or, headless, un-openable) dialog would strand the
+            // user on an empty document instead of returning to the splash. Only
+            // the SUCCESS paths dismiss: `open_project` (window.rs ~1597) and
+            // `load_doc_into_active` (~953) both call `dismiss_start_page` once a
+            // project actually loads. `NewClass` is synchronous and unconditional,
+            // so it still dismisses eagerly (inside `new_document`).
+            StartPageEvent::Card(card) => match card {
+                StartCard::NewClass => self.new_document(window, cx),
+                StartCard::OpenProject => self.prompt_open(window, cx),
+                StartCard::ImportSource => self.prompt_import(ImportKind::Source, window, cx),
+                StartCard::ImportXml => self.prompt_import(ImportKind::Xml, window, cx),
+                StartCard::ImportPdb => self.prompt_import(ImportKind::Pdb, window, cx),
+            },
             StartPageEvent::FileSelected(path) => {
                 // The C++ start-page recent-file click → `project_open(path)`
                 // (app-shell §13). Dismiss the splash + load the `.rcx` into the
