@@ -236,8 +236,9 @@ impl Element for RowElement {
                         }
                         MouseButton::Right => {
                             let pos = event.position;
+                            let rel_x = f32::from(event.position.x - left).max(0.0);
                             let _ = editor.update(cx, |this, cx| {
-                                this.dispatch_row_context_menu(line, pos, window, cx);
+                                this.dispatch_row_context_menu(line, rel_x, pos, window, cx);
                             });
                         }
                         _ => {}

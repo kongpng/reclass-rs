@@ -70,26 +70,15 @@ pub struct EditorPalette {
     pub byte_sel: Hsla,
     /// The border color for chrome accents (chevron box, source chip outline).
     pub border: Hsla,
-    /// The crisp fold disclosure triangle (`▸`/`▾`) on expandable rows.
-    ///
-    /// Round-3: the disclosure control is now a crisp **SVG** chevron painted in
-    /// the icon gutter (see `mod.rs` `render_row`), so the caret baked into the
-    /// composed row text is rendered **transparent** here — only the SVG shows,
-    /// while fold-col hit-testing (column-based) is untouched. The SVG's own tint
-    /// is [`fold_chevron_icon`](Self::fold_chevron_icon).
+    /// The crisp fold disclosure triangle (`▸`/`▾`) on expandable rows — painted
+    /// as the TEXT glyph compose bakes into the fold prefix, on the row baseline
+    /// (B1: C++ has no SVG icon gutter). A clear link/accent foreground so the fold
+    /// affordance reads as a real disclosure control.
     pub fold_chevron: Hsla,
-    /// The tint for the crisp SVG fold disclosure chevron in the icon gutter — the
-    /// clear link/accent blue so the fold affordance reads as a real control.
-    pub fold_chevron_icon: Hsla,
     /// The "active line" subtle highlight — the gentle full-row fill on the
     /// primary/cursor row (Zed's active-line background), softer than the
     /// accent-tinted selection fill so a selected row still reads as selected.
     pub active_line_bg: Hsla,
-    /// The dimmed node-kind icon drawn in the icon gutter of an expandable
-    /// container row (struct/array fold head) — a quiet muted marker that gives
-    /// every node row a type icon (reclass parity) without competing with the
-    /// crisp fold disclosure triangle.
-    pub kind_icon_dim: Hsla,
 }
 
 impl EditorPalette {
@@ -98,32 +87,43 @@ impl EditorPalette {
         let t = cx.theme();
         EditorPalette {
             text: t.foreground,
-            type_fg: t.yellow,
+            // Item 21: primitive type tokens (uint8_t/hex64/…) render BLUE (the C++
+            // lexer keyword color, `syntaxKeyword`), not yellow/gold. Named struct
+            // types are retinted teal at the span level (see `class_name`/teal).
+            type_fg: t.blue,
             fnptr_fg: t.blue,
             name_fg: t.foreground,
-            // Resolved field values (the `0x7ff60baa84c0` pointer/address column)
-            // render in the warm One Dark **number/orange** hue in the reclass
-            // screenshots (PIC1 measures ≈ `#d19a66`, the `markerCycle`/`warning`
-            // role), not green — green is reserved for comments/symbols.
-            value_fg: t.warning,
-            dim: t.muted_foreground,
+            // Item 20: field VALUE column renders the C++ green/tan number color
+            // (the lexer `Number` hue), not orange. Use the green-leaning syntax
+            // number color so resolved values read green/tan like C++.
+            value_fg: t.green,
+            // Item 29: the dim role (hex byte run + ASCII preview + braces/footer)
+            // uses the deeper C++ `textFaint`, not the brighter muted foreground.
+            dim: text_faint(t.muted_foreground),
             keyword: t.magenta,
-            class_name: t.blue,
+            // Item 23: the root class NAME on the command row is the C++
+            // `IND_CLASS_NAME = syntaxType` (teal) — identical to the named-type
+            // column color — not link-blue. Tie it to the teal type/struct color.
+            class_name: t.cyan,
             // Base address / numeric literal — the true One Dark orange `#d19a66`
             // (`warning` ← `markerCycle`), matching the command-row address in PIC1.
             number: t.warning,
-            ascii: with_alpha(t.green, 0.75),
+            // Item 29: the ASCII preview + dim hex byte run use the deeper C++
+            // `textFaint` (≈ #505050), not the brighter `muted_foreground`, so the
+            // hex/ASCII columns read as dim as C++. Build a faint tone by darkening
+            // the muted foreground toward the paper.
+            ascii: with_alpha(text_faint(t.muted_foreground), 0.9),
             comment_green: t.green_light,
             type_hint: t.muted_foreground,
             rtti_hint: t.yellow,
             enum_chip: t.link,
             tree_conn: t.muted_foreground,
-            // Soft accent-tinted selection fill (not the hard text-selection bg).
-            // The reclass active row is a clear band; Zed uses a gentle accent
-            // fill — 0.20 reads as a real "this row is selected" surface against
-            // the dark editor paper while staying soft (zed_ui_spec.md §5.4).
-            selection_bg: with_alpha(t.primary, 0.20),
-            accent: t.primary,
+            // Item 30: selection band uses the near-neutral `theme.selected` fill
+            // (the C++ `theme.selected` dark band), NOT a primary@0.20 accent wash.
+            selection_bg: t.selection,
+            // Item 30: the 2px left accent bar is the hover-span color (the C++
+            // `indHoverSpan`), not the loud primary accent.
+            accent: t.link,
             // Hover overlay: the theme `list_hover` is tuned for the dense UI
             // lists; lift it a touch so the per-row hover is visible over the
             // darker editor paper (the editor paper is `background.darker`).
@@ -132,26 +132,37 @@ impl EditorPalette {
             paper: darker(t.background, 0.06),
             gutter_bg: darker(t.background, 0.06),
             gutter_fg: with_alpha(t.muted_foreground, 0.70),
+            // Item 31: footer pills are a flat translucent box (`indCmdPill`), no
+            // border, dim pill fill. The 1px border + MD rounding are dropped at
+            // the render site; the fill stays a faint translucent foreground wash.
             pill_bg: with_alpha(t.foreground, 0.06),
-            heat_cold: t.blue_light,
-            heat_warm: t.yellow_light,
+            // Item 22: change-heat byte coloring is an amber→orange→red ramp (warm
+            // throughout), NOT blue→yellow→red. Cold is a dim warm amber/tan (lerp
+            // from the muted foreground toward a warm tan ≈ #d2aa6e), warm is a
+            // brighter orange, hot reaches red.
+            heat_cold: lerp(
+                t.muted_foreground,
+                Hsla {
+                    h: 38.0 / 360.0,
+                    s: 0.55,
+                    l: 0.62,
+                    a: 1.0,
+                },
+                0.6,
+            ),
+            heat_warm: t.warning,
             heat_hot: t.red,
             byte_sel: t.link,
             border: t.border,
-            // The baked text caret is hidden (the crisp SVG chevron in the icon
-            // gutter is the disclosure control now); fold-col hit-testing is
-            // column-based, so a transparent caret glyph changes nothing there.
-            fold_chevron: gpui::transparent_black(),
-            // The SVG disclosure chevron reads in the link/accent blue — a crisp,
-            // unmistakable fold control against the dim chrome around it.
-            fold_chevron_icon: t.link,
+            // B1 / items 2-3: the fold disclosure triangle (`▸`/`▾`) is the TEXT
+            // glyph compose bakes into the fold prefix, painted on the row baseline
+            // (C++ has no SVG icon gutter). It reads in the link/accent color so the
+            // fold affordance is a crisp, unmistakable control against the dim
+            // chrome around it (was transparent when the SVG gutter existed).
+            fold_chevron: t.link,
             // Active-line band: a barely-there foreground wash (Zed's active-line
             // bg), softer than the accent selection fill so the two are distinct.
             active_line_bg: with_alpha(t.foreground, 0.03),
-            // Container-row kind marker: a quiet muted glyph (≈40% alpha) so the
-            // gutter reads as "in use" on every node row, yet stays well behind the
-            // crisp fold disclosure triangle's accent blue.
-            kind_icon_dim: with_alpha(t.muted_foreground, 0.45),
         }
     }
 
@@ -178,7 +189,6 @@ impl EditorPalette {
             SpanRole::HeatWarm => self.heat_warm,
             SpanRole::HeatHot => self.heat_hot,
             SpanRole::FoldChevron => self.fold_chevron,
-            SpanRole::KindIconDim => self.kind_icon_dim,
         }
     }
 
@@ -217,4 +227,36 @@ fn darker(c: Hsla, amount: f32) -> Hsla {
 /// Apply an alpha to an `Hsla` (translucent tints: soft selection, dim ASCII).
 fn with_alpha(c: Hsla, a: f32) -> Hsla {
     Hsla { a, ..c }
+}
+
+/// A deeper "text faint" tone (item 29): the C++ `textFaint` (≈ #505050) is a
+/// good chunk dimmer than the muted foreground. Approximate it by pulling the
+/// muted foreground's lightness down toward the floor while desaturating a hair,
+/// so the hex byte run + ASCII preview read as faint as the C++ does. Clamped.
+fn text_faint(muted: Hsla) -> Hsla {
+    Hsla {
+        s: (muted.s * 0.85).clamp(0.0, 1.0),
+        l: (muted.l * 0.62).clamp(0.0, 1.0),
+        ..muted
+    }
+}
+
+/// Linear interpolation between two `Hsla` colors in HSL space (item 22 heat
+/// ramp). `t` is clamped to `[0,1]`; `0` → `a`, `1` → `b`. Hue is lerped on the
+/// shorter arc so an amber/tan target does not wrap the wheel.
+fn lerp(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let t = t.clamp(0.0, 1.0);
+    let mut dh = b.h - a.h;
+    if dh > 0.5 {
+        dh -= 1.0;
+    } else if dh < -0.5 {
+        dh += 1.0;
+    }
+    let h = (a.h + dh * t).rem_euclid(1.0);
+    Hsla {
+        h,
+        s: a.s + (b.s - a.s) * t,
+        l: a.l + (b.l - a.l) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
 }

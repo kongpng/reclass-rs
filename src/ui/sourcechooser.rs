@@ -318,6 +318,65 @@ impl SourceModel {
         }
     }
 
+    /// Set the selection to `row` if it is selectable (a hover / click preview).
+    /// Returns whether the selection changed.
+    pub fn select_at(&mut self, row: usize) -> bool {
+        if self
+            .rows
+            .get(row)
+            .map(|r| r.entry.selectable())
+            .unwrap_or(false)
+        {
+            self.selected = Some(row);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move selection down by `page` selectable rows (PageDown).
+    pub fn page_down(&mut self, page: usize) {
+        for _ in 0..page.max(1) {
+            let from = self.selected.unwrap_or(0);
+            match self.next_selectable(from, 1) {
+                Some(next) => self.selected = Some(next),
+                None => {
+                    if self.selected.is_none() {
+                        self.selected = self.rows.iter().position(|r| r.entry.selectable());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Move selection up by `page` selectable rows (PageUp).
+    pub fn page_up(&mut self, page: usize) {
+        for _ in 0..page.max(1) {
+            let Some(from) = self.selected else { break };
+            match self.next_selectable(from, -1) {
+                Some(prev) => self.selected = Some(prev),
+                None => break,
+            }
+        }
+    }
+
+    /// Select the first selectable row (Home).
+    pub fn move_home(&mut self) {
+        self.selected = self.rows.iter().position(|r| r.entry.selectable());
+    }
+
+    /// Select the last selectable row (End).
+    pub fn move_end(&mut self) {
+        self.selected = self
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, r)| r.entry.selectable())
+            .map(|(i, _)| i);
+    }
+
     /// Accept a row (`acceptIndex`): reject disabled/section; an **active** saved
     /// source just hides (`None`); else map to the corresponding action.
     pub fn accept(&self, row: usize) -> SourceAccept {
@@ -505,6 +564,8 @@ mod view {
         model: SourceModel,
         input: Entity<InputState>,
         focus_handle: FocusHandle,
+        /// Scrolls the list so the keyboard-selected row stays visible (item 9).
+        list_scroll: ScrollHandle,
         _subscription: Subscription,
     }
 
@@ -529,10 +590,35 @@ mod view {
                 model,
                 input,
                 focus_handle: cx.focus_handle(),
+                list_scroll: ScrollHandle::new(),
                 _subscription: subscription,
             };
             popup.spawn_liveness_probe(window, cx);
             popup
+        }
+
+        /// Scroll the selected row into view (item 9). Rows render 1:1 with model
+        /// rows, so the model index is the rendered child index.
+        fn scroll_selected_into_view(&self) {
+            if let Some(sel) = self.model.selected() {
+                self.list_scroll.scroll_to_item(sel);
+            }
+        }
+
+        /// Hover over a row moves the selection highlight to it (item 2) so
+        /// keyboard + mouse selection stay in sync.
+        fn hover_row(&mut self, row: usize, cx: &mut Context<Self>) {
+            if self.model.selected() != Some(row)
+                && self
+                    .model
+                    .rows()
+                    .get(row)
+                    .map(|r| r.entry.selectable())
+                    .unwrap_or(false)
+            {
+                self.model.select_at(row);
+                cx.notify();
+            }
         }
 
         /// The CONTRACT entry point: build the chooser over the default content
@@ -620,21 +706,43 @@ mod view {
         /// the list; Up off the top returns focus to the filter. Returns `true`
         /// when handled.
         fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            const PAGE: usize = 8;
             match key {
                 "down" => {
                     // Down-from-filter-into-list: if nothing is selected yet, land
                     // on the first selectable row; else advance.
-                    if self.model.selected().is_none() {
-                        self.model.move_down();
-                        // move_down seeds the first selectable row when none set.
-                    } else {
-                        self.model.move_down();
-                    }
+                    self.model.move_down();
+                    self.scroll_selected_into_view();
                     cx.notify();
                     true
                 }
                 "up" => {
                     self.model.move_up();
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "pagedown" => {
+                    self.model.page_down(PAGE);
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "pageup" => {
+                    self.model.page_up(PAGE);
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "home" => {
+                    self.model.move_home();
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "end" => {
+                    self.model.move_end();
+                    self.scroll_selected_into_view();
                     cx.notify();
                     true
                 }
@@ -683,9 +791,22 @@ mod view {
             let hover_bg = color::hover_overlay(cx);
             let sel_bg = color::selected_bg(cx);
             let border = color::border(cx);
-            // Show the filter only when the list is long enough to warrant it
-            // (PIC4 is a plain dropdown; a long saved-source list gets a filter).
-            let show_filter = self.model.entries().len() > 8;
+            let query = self.input.read(cx).value().to_string();
+            let filtering = !query.trim().is_empty();
+            // Footer counts (the C++ `m_statusLabel`): "N of M sources" while
+            // filtering / "No matches" on an empty result / "M sources" otherwise.
+            let total_sources = self
+                .model
+                .entries()
+                .iter()
+                .filter(|e| e.entry_kind != SourceEntryKind::SectionHeader)
+                .count();
+            let shown_sources = self
+                .model
+                .rows()
+                .iter()
+                .filter(|r| r.entry.entry_kind != SourceEntryKind::SectionHeader)
+                .count();
 
             let rows: Vec<AnyElement> = self
                 .model
@@ -741,6 +862,12 @@ mod view {
                                 .when(is_sel, |d| d.bg(sel_bg))
                                 .when(!is_sel && e.enabled, |d| d.hover(|s| s.bg(hover_bg)))
                                 .when(e.enabled, |d| d.cursor_pointer())
+                                // Hover-to-select (item 2): sync keyboard + mouse.
+                                .when(e.enabled, |d| {
+                                    d.on_mouse_move(cx.listener(move |this, _e, _w, cx| {
+                                        this.hover_row(row, cx);
+                                    }))
+                                })
                                 .when(e.enabled, |d| {
                                     d.on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.accept_row(row, cx);
@@ -826,29 +953,74 @@ mod view {
                 .rounded(px(tokens::radius::LG))
                 .shadow_md()
                 .text_size(px(tokens::font::UI_MD))
-                .when(show_filter, |this| {
-                    this.child(
-                        gpui_component::h_flex()
-                            .px(px(tokens::space::SM))
-                            .pb(px(tokens::space::XS))
-                            .gap(px(tokens::space::SM))
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(muted)
-                                    .child(icon::search().size_3()),
-                            )
-                            .child(div().flex_1().child(Input::new(&self.input).w_full())),
-                    )
-                })
+                // The fuzzy filter is ALWAYS shown now (item 14) — the C++ source
+                // chooser always offers it, not just for long lists.
                 .child(
+                    gpui_component::h_flex()
+                        .px(px(tokens::space::SM))
+                        .pb(px(tokens::space::XS))
+                        .gap(px(tokens::space::SM))
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(muted)
+                                .child(icon::search().size_3()),
+                        )
+                        .child(div().flex_1().child(Input::new(&self.input).w_full())),
+                )
+                .child(
+                    // Scrollable list (item 9): the keyboard-selected row scrolls
+                    // into view via `list_scroll.scroll_to_item`.
                     gpui_component::v_flex()
                         .id("rcx-source-chooser-list")
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.list_scroll)
                         .children(rows),
+                )
+                // Footer chrome (item 14): a "↑↓ navigate · ↵ select · Esc close"
+                // hint, the "N of M sources" / "No matches" status, and an Esc
+                // button — the C++ source-chooser footer status line.
+                .child(
+                    gpui_component::h_flex()
+                        .w_full()
+                        .mt(px(tokens::space::XS))
+                        .px(px(tokens::space::SM))
+                        .py(px(tokens::space::XS))
+                        .gap(px(tokens::space::SM))
+                        .items_center()
+                        .border_t_1()
+                        .border_color(border)
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(muted)
+                        .child(div().flex_none().child(
+                            "\u{2191}\u{2193} navigate \u{00B7} \u{21B5} select \u{00B7} Esc close",
+                        ))
+                        .child(div().flex_1())
+                        .child(div().flex_none().child(if filtering {
+                            if shown_sources == 0 {
+                                "No matches".to_string()
+                            } else {
+                                format!("{shown_sources} of {total_sources} sources")
+                            }
+                        } else {
+                            format!("{total_sources} sources")
+                        }))
+                        .child(
+                            div()
+                                .id("source-esc")
+                                .flex_none()
+                                .px(px(tokens::space::SM))
+                                .rounded(px(tokens::radius::SM))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(hover_bg).text_color(fg))
+                                .on_click(cx.listener(|_this, _e, _w, cx| {
+                                    cx.emit(SourceChooserEvent::Cancel)
+                                }))
+                                .child("Esc"),
+                        ),
                 )
         }
     }
@@ -1050,6 +1222,41 @@ mod model_tests {
             if let Some(sel) = model.selected() {
                 assert!(model.rows()[sel].entry.selectable());
             }
+        }
+    }
+
+    #[test]
+    fn select_at_skips_unselectable_rows() {
+        let mut model = SourceModel::new(entries());
+        // Row 0 is the "Saved" section header → not selectable.
+        assert!(!model.select_at(0));
+        // The notepad.exe saved row is selectable.
+        let np = model
+            .rows()
+            .iter()
+            .position(|r| r.entry.display_name == "notepad.exe")
+            .unwrap();
+        assert!(model.select_at(np));
+        assert_eq!(model.selected(), Some(np));
+    }
+
+    #[test]
+    fn page_home_end_skip_sections() {
+        let mut model = SourceModel::new(entries());
+        model.move_end();
+        let last = model.selected().unwrap();
+        assert!(model.rows()[last].entry.selectable());
+        model.move_home();
+        let first = model.selected().unwrap();
+        assert!(model.rows()[first].entry.selectable());
+        // Home lands on the first selectable row (skips the leading section).
+        assert_ne!(
+            model.rows()[first].entry.entry_kind,
+            super::SourceEntryKind::SectionHeader
+        );
+        model.page_down(8);
+        if let Some(sel) = model.selected() {
+            assert!(model.rows()[sel].entry.selectable());
         }
     }
 

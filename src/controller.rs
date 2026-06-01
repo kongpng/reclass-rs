@@ -1259,6 +1259,18 @@ impl RcxController {
             write_provider(&mut self.doc.provider, addr, bytes)
         }
     }
+
+    /// Write `bytes` at the absolute `addr` through the active provider (the
+    /// scanner result-table col-1 `onCellEdited` write path). Returns whether the
+    /// write landed. Public so the window can resolve a scanner Value-cell edit
+    /// against the live document's writable provider; mirrors the C++
+    /// `provider->writeBytes(addr, data)` the scanner uses for a result write.
+    pub fn write_memory(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        if self.read_only_override || bytes.is_empty() {
+            return false;
+        }
+        self.write_through(addr, bytes)
+    }
 }
 
 /// Write through an `Arc<dyn Provider>`. Uses `Arc::get_mut` (unique handle —
@@ -1873,6 +1885,192 @@ impl RcxController {
             node_id: node.id,
             old_state: node.collapsed,
             new_state: !node.collapsed,
+        });
+    }
+
+    /// `materializeRefChildren(nodeIdx)` (`controller.cpp:2024`) — pointer-follow /
+    /// inline materialize.
+    ///
+    /// A typed pointer / embedded-struct-ref fold head has no children of its own;
+    /// expanding it must clone the referenced struct's children inline so they
+    /// appear under this node. The editor decides between this and
+    /// [`RcxController::toggle_collapse`] from the fold head's `M_CYCLE` marker bit
+    /// (`controller.cpp:5893-5897` `handleMarginClick`): a cycle/ref head
+    /// materializes, a plain container head toggles.
+    ///
+    /// All inserts are wrapped in one undo macro ("Materialize ref children") so a
+    /// single undo removes the whole materialized subtree, and the self-referential
+    /// clone (same kind/name/refId as the parent — the one that *was* the cycle) is
+    /// auto-expanded so a single click expands it.
+    pub fn materialize_ref_children(&mut self, node_idx: usize) {
+        if node_idx >= self.doc.tree.nodes.len() {
+            return;
+        }
+
+        // Snapshot values before any mutation invalidates references.
+        let parent_id = self.doc.tree.nodes[node_idx].id;
+        let ref_id = self.doc.tree.nodes[node_idx].ref_id;
+        let parent_kind = self.doc.tree.nodes[node_idx].kind;
+        let parent_name = self.doc.tree.nodes[node_idx].name.clone();
+
+        if ref_id == 0 {
+            return;
+        }
+        if !self.doc.tree.children_of(parent_id).is_empty() {
+            return; // already materialized
+        }
+
+        let ref_children = self.doc.tree.children_of(ref_id);
+        if ref_children.is_empty() {
+            return;
+        }
+
+        // Clone children by value, reparent under this node, collapsed.
+        let mut clones: Vec<Node> = Vec::with_capacity(ref_children.len());
+        for ci in ref_children {
+            let mut copy = self.doc.tree.nodes[ci].clone();
+            copy.id = self.doc.tree.reserve_id();
+            copy.parent_id = parent_id;
+            copy.collapsed = true;
+            clones.push(copy);
+        }
+
+        let was_suppressed = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Materialize ref children");
+
+        for clone in &clones {
+            self.push_command(Command::Insert {
+                node: clone.clone(),
+                off_adjs: Vec::new(),
+            });
+        }
+
+        // Auto-expand the self-referential child (the one that was the cycle) so
+        // the user gets expand in a single click.
+        if let Some(clone) = clones
+            .iter()
+            .find(|c| c.kind == parent_kind && c.name == parent_name && c.ref_id == ref_id)
+        {
+            self.push_command(Command::Collapse {
+                node_id: clone.id,
+                old_state: true,
+                new_state: false,
+            });
+        }
+
+        self.end_macro();
+        self.suppress_refresh = was_suppressed;
+        if !self.suppress_refresh {
+            self.refresh();
+        }
+    }
+
+    /// Resolve the *root class* a command-row edit targets: the explicit
+    /// `m_viewRootId` if set, otherwise the first top-level (`parentId == 0`)
+    /// `Struct`. Mirrors the `targetId = m_viewRootId; if (targetId == 0) { ... }`
+    /// preamble shared by `convertRootKeyword` (`controller.cpp:1620`) and the
+    /// `RootClassType`/`RootClassName` inline-commit arms (`controller.cpp:1353`,
+    /// `:1377`). Returns `0` when no such struct exists.
+    pub fn root_class_target_id(&self) -> u64 {
+        if self.view_root_id != 0 {
+            return self.view_root_id;
+        }
+        for n in &self.doc.tree.nodes {
+            if n.parent_id == 0 && n.kind == NodeKind::Struct {
+                return n.id;
+            }
+        }
+        0
+    }
+
+    /// `convertRootKeyword(newKeyword)` (`controller.cpp:1620`) — the menu / keyword
+    /// double-click path that *cycles* the root class keyword (struct↔class). Only
+    /// allows class↔struct (never enum), pushes an undoable `ChangeClassKeyword`.
+    pub fn convert_root_keyword(&mut self, new_keyword: &str) {
+        let target_id = self.root_class_target_id();
+        if target_id == 0 {
+            return;
+        }
+        let idx = self.doc.tree.index_of_id(target_id);
+        if idx < 0 {
+            return;
+        }
+        let old_kw = self.doc.tree.nodes[idx as usize]
+            .resolved_class_keyword()
+            .to_string();
+        if old_kw == new_keyword {
+            return;
+        }
+        // Only allow class↔struct conversion (never enum).
+        if old_kw == "enum" || new_keyword == "enum" {
+            return;
+        }
+        self.push_command(Command::ChangeClassKeyword {
+            node_id: target_id,
+            old_keyword: old_kw,
+            new_keyword: new_keyword.to_string(),
+        });
+    }
+
+    /// `EditTarget::RootClassType` inline-commit (`controller.cpp:1353-1376`):
+    /// clicking the `struct`/`class`/`enum` keyword opens a small edit whose only
+    /// valid commits are exactly those three keywords (case-insensitive). Anything
+    /// else is rejected (no-op). On a real change pushes `ChangeClassKeyword`.
+    ///
+    /// Unlike [`RcxController::convert_root_keyword`] this DOES permit setting/leaving
+    /// `enum` — matching the C++ which guards enum only in the *cycle* path, not the
+    /// explicit-keyword commit.
+    pub fn set_root_class_keyword(&mut self, text: &str) {
+        let kw = text.trim().to_lowercase();
+        if kw != "struct" && kw != "class" && kw != "enum" {
+            return;
+        }
+        let target_id = self.root_class_target_id();
+        if target_id == 0 {
+            return;
+        }
+        let idx = self.doc.tree.index_of_id(target_id);
+        if idx < 0 {
+            return;
+        }
+        let old_kw = self.doc.tree.nodes[idx as usize]
+            .resolved_class_keyword()
+            .to_string();
+        if old_kw == kw {
+            return;
+        }
+        self.push_command(Command::ChangeClassKeyword {
+            node_id: target_id,
+            old_keyword: old_kw,
+            new_keyword: kw,
+        });
+    }
+
+    /// `EditTarget::RootClassName` inline-commit (`controller.cpp:1377-1400`):
+    /// clicking the class/struct NAME in the header renames the viewed root struct's
+    /// `structTypeName` (NOT its `name`) via an undoable `ChangeStructTypeName`.
+    /// Empty text is rejected (no-op).
+    pub fn rename_root_class(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let target_id = self.root_class_target_id();
+        if target_id == 0 {
+            return;
+        }
+        let idx = self.doc.tree.index_of_id(target_id);
+        if idx < 0 {
+            return;
+        }
+        let old_name = self.doc.tree.nodes[idx as usize].struct_type_name.clone();
+        if old_name == text {
+            return;
+        }
+        self.push_command(Command::ChangeStructTypeName {
+            node_id: target_id,
+            old_name,
+            new_name: text.to_string(),
         });
     }
 

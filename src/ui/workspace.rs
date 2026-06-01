@@ -82,6 +82,29 @@ pub enum WorkspaceNewType {
     Enum,
 }
 
+/// A mutation request from the workspace type-row right-click menu (the C++
+/// workspace-tree `QMenu` actions, `main.cpp:7221` — Rename / Duplicate / Delete
+/// / Add Member). The panel is a read-only surface (it carries only the
+/// `NodeTree`), so it raises the intent for the main window to resolve against the
+/// owning document's live controller. Carries the targeted `(doc, node_id)` and,
+/// for Rename, the new name the user typed in the inline rename prompt.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WorkspaceTypeAction {
+    /// Rename the type/field node (the C++ `renameType`). Carries the current
+    /// display name to seed the window's rename prompt.
+    Rename {
+        doc: DocId,
+        node_id: u64,
+        current: String,
+    },
+    /// Duplicate the type/field node (the C++ `duplicateType`).
+    Duplicate { doc: DocId, node_id: u64 },
+    /// Delete the type/field node (the C++ `deleteType`).
+    Delete { doc: DocId, node_id: u64 },
+    /// Append a new member field to the targeted struct (the C++ `addMember`).
+    AddMember { doc: DocId, node_id: u64 },
+}
+
 /// The badge a workspace row shows — the C++ `S`/`E`/`F` letter badge
 /// (`WorkspaceDelegate::paint`), generalized to distinguish unions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -408,6 +431,22 @@ impl WorkspaceModel {
         })
     }
 
+    /// The display name of the node `node_id` (a top-level type or a field child),
+    /// for seeding the rename prompt. `None` if no row carries that id.
+    pub fn display_name_of(&self, node_id: u64) -> Option<String> {
+        for t in self.type_entries() {
+            if t.id == node_id {
+                return Some(t.name.clone());
+            }
+            for c in &t.children {
+                if c.id == node_id {
+                    return Some(c.field_name.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Filter the type rows to those whose name (or any field child) matches the
     /// lowercased `query` (the C++ `QSortFilterProxyModel` + the proxy that hides
     /// section headers while filtering, `WorkspaceProxyModel`). An empty query
@@ -684,29 +723,56 @@ impl WorkspacePanel {
         }
     }
 
-    /// "Rename" — graceful stub (`node.rename` lives in the controller, not on
-    /// this read-only surface). Consumes the action so the menu closes.
-    fn action_rename(&mut self, _: &WsRenameType, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// "Rename" — raise a [`WorkspaceTypeAction::Rename`] for the targeted node
+    /// (the C++ `renameType` → `QInputDialog::getText`). The window owns the
+    /// dialog + the mutable controller; the panel only carries the current name so
+    /// the window can seed the rename prompt.
+    fn action_rename(&mut self, _: &WsRenameType, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav) = self.context_target {
+            let current = self.model.display_name_of(nav.node_id).unwrap_or_default();
+            cx.emit(WorkspaceTypeAction::Rename {
+                doc: nav.doc,
+                node_id: nav.node_id,
+                current,
+            });
+        }
+    }
 
-    /// "Duplicate" — graceful stub (`node.duplicate`).
+    /// "Duplicate" — raise a [`WorkspaceTypeAction::Duplicate`] (the C++
+    /// `duplicateType`).
     fn action_duplicate(
         &mut self,
         _: &WsDuplicateType,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        if let Some(nav) = self.context_target {
+            cx.emit(WorkspaceTypeAction::Duplicate {
+                doc: nav.doc,
+                node_id: nav.node_id,
+            });
+        }
     }
 
-    /// "Delete" — graceful stub (`node.delete`).
-    fn action_delete(&mut self, _: &WsDeleteType, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// "Delete" — raise a [`WorkspaceTypeAction::Delete`] (the C++ `deleteType`).
+    fn action_delete(&mut self, _: &WsDeleteType, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav) = self.context_target {
+            cx.emit(WorkspaceTypeAction::Delete {
+                doc: nav.doc,
+                node_id: nav.node_id,
+            });
+        }
+    }
 
-    /// "Add Member" — graceful stub (`node.add_member`).
-    fn action_add_member(
-        &mut self,
-        _: &WsAddMember,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    /// "Add Member" — raise a [`WorkspaceTypeAction::AddMember`] for the targeted
+    /// struct (the C++ `addMember`).
+    fn action_add_member(&mut self, _: &WsAddMember, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav) = self.context_target {
+            cx.emit(WorkspaceTypeAction::AddMember {
+                doc: nav.doc,
+                node_id: nav.node_id,
+            });
+        }
     }
 
     // ── Empty-area "New …" actions (the C++ `newClass()/newStruct()/newEnum()`) ──
@@ -826,6 +892,7 @@ impl Panel for WorkspacePanel {
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl EventEmitter<WorkspaceNav> for WorkspacePanel {}
 impl EventEmitter<WorkspaceNewType> for WorkspacePanel {}
+impl EventEmitter<WorkspaceTypeAction> for WorkspacePanel {}
 
 impl Focusable for WorkspacePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1514,6 +1581,28 @@ mod tests {
         // in offset-sorted order: health@0, stamina@8, xp@12.
         let offsets: Vec<i32> = player.children.iter().map(|c| c.offset).collect();
         assert_eq!(offsets, vec![0, 8, 12]);
+    }
+
+    #[test]
+    fn display_name_of_resolves_types_and_fields() {
+        let tree = sample_tree();
+        let d = doc_id(1);
+        let docs = vec![WorkspaceDoc {
+            doc: d,
+            tree: &tree,
+        }];
+        let m = WorkspaceModel::build(&docs, &[], &[]);
+
+        // A top-level type's display name resolves by its node id.
+        let player = m.type_entries().find(|t| t.name == "Player").unwrap();
+        assert_eq!(m.display_name_of(player.id), Some("Player".to_string()));
+
+        // A field child's name resolves by its node id.
+        let health = &player.children[0];
+        assert_eq!(m.display_name_of(health.id), Some("health".to_string()));
+
+        // An unknown id resolves to None.
+        assert_eq!(m.display_name_of(0xDEAD_BEEF), None);
     }
 
     #[test]

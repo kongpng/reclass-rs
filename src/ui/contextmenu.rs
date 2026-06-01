@@ -298,6 +298,9 @@ mod view {
     pub struct ContextMenuView {
         items: Vec<MenuItem>,
         focus_handle: FocusHandle,
+        /// The keyboard-highlighted item index (item 11): Up/Down move it over
+        /// selectable rows, Enter activates it. `None` until the first key/hover.
+        selected: Option<usize>,
     }
 
     impl ContextMenuView {
@@ -306,6 +309,7 @@ mod view {
             ContextMenuView {
                 items,
                 focus_handle: cx.focus_handle(),
+                selected: None,
             }
         }
 
@@ -314,8 +318,120 @@ mod view {
             &self.items
         }
 
+        /// The currently keyboard-highlighted item index (tests / wiring).
+        pub fn selected(&self) -> Option<usize> {
+            self.selected
+        }
+
+        /// Whether an item index is activatable (not a separator).
+        fn is_selectable(&self, i: usize) -> bool {
+            matches!(
+                self.items.get(i),
+                Some(MenuItem::Action { enabled: true, .. }) | Some(MenuItem::Check { .. })
+            )
+        }
+
+        /// The next selectable item from `from` in direction `dir` (skips
+        /// separators + disabled actions). `None` if none in that direction.
+        fn next_selectable(&self, from: i32, dir: i32) -> Option<usize> {
+            let len = self.items.len() as i32;
+            let mut i = from + dir;
+            while i >= 0 && i < len {
+                if self.is_selectable(i as usize) {
+                    return Some(i as usize);
+                }
+                i += dir;
+            }
+            None
+        }
+
+        /// The first selectable item (top-down).
+        fn first_selectable(&self) -> Option<usize> {
+            (0..self.items.len()).find(|&i| self.is_selectable(i))
+        }
+
+        /// The last selectable item.
+        fn last_selectable(&self) -> Option<usize> {
+            (0..self.items.len()).rev().find(|&i| self.is_selectable(i))
+        }
+
         fn activate(&mut self, command: CommandId, cx: &mut Context<Self>) {
             cx.emit(ContextMenuEvent::Activated(command));
+        }
+
+        /// Activate the keyboard-highlighted item, if any.
+        fn activate_selected(&mut self, cx: &mut Context<Self>) {
+            let Some(i) = self.selected else { return };
+            match self.items.get(i) {
+                Some(MenuItem::Action {
+                    command,
+                    enabled: true,
+                    ..
+                })
+                | Some(MenuItem::Check { command, .. }) => {
+                    let cmd = command.clone();
+                    self.activate(cmd, cx);
+                }
+                _ => {}
+            }
+        }
+
+        /// Keyboard handler (item 11): Up/Down highlight selectable items, Enter
+        /// activates the highlighted one, Esc dismisses. Returns `true` when
+        /// handled.
+        fn handle_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            match key {
+                "down" => {
+                    let from = self.selected.map(|s| s as i32).unwrap_or(-1);
+                    if let Some(next) = self.next_selectable(from, 1) {
+                        self.selected = Some(next);
+                    } else if self.selected.is_none() {
+                        self.selected = self.first_selectable();
+                    }
+                    cx.notify();
+                    true
+                }
+                "up" => {
+                    let from = self
+                        .selected
+                        .map(|s| s as i32)
+                        .unwrap_or(self.items.len() as i32);
+                    if let Some(prev) = self.next_selectable(from, -1) {
+                        self.selected = Some(prev);
+                    } else if self.selected.is_none() {
+                        self.selected = self.last_selectable();
+                    }
+                    cx.notify();
+                    true
+                }
+                "home" => {
+                    self.selected = self.first_selectable();
+                    cx.notify();
+                    true
+                }
+                "end" => {
+                    self.selected = self.last_selectable();
+                    cx.notify();
+                    true
+                }
+                "enter" | "space" => {
+                    self.activate_selected(cx);
+                    true
+                }
+                "escape" => {
+                    cx.emit(ContextMenuEvent::Dismissed);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Hover over an item highlights it (keeps keyboard + mouse in sync).
+        fn hover_item(&mut self, i: usize, cx: &mut Context<Self>) {
+            if self.selected != Some(i) && self.is_selectable(i) {
+                self.selected = Some(i);
+                cx.notify();
+            }
         }
     }
 
@@ -334,6 +450,8 @@ mod view {
             let disabled = color::text_disabled(cx);
             let danger = cx.theme().danger_foreground;
             let hover_bg = color::hover_overlay(cx);
+            let sel_bg = color::selected_bg(cx);
+            let selected = self.selected;
 
             let rows: Vec<AnyElement> = self
                 .items
@@ -362,12 +480,17 @@ mod view {
                         let shortcut = context_shortcut_for(command);
                         let cmd = command.clone();
                         let enabled = *enabled;
+                        let is_sel = selected == Some(i);
                         menu_row(i)
                             .text_color(row_fg)
+                            .when(is_sel, |r| r.bg(sel_bg))
                             .when(enabled, |r| {
                                 let cmd = cmd.clone();
                                 r.cursor_pointer()
-                                    .hover(|s| s.bg(hover_bg))
+                                    .when(!is_sel, |r| r.hover(|s| s.bg(hover_bg)))
+                                    .on_mouse_move(
+                                        cx.listener(move |this, _e, _w, cx| this.hover_item(i, cx)),
+                                    )
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.activate(cmd.clone(), cx)
                                     }))
@@ -386,10 +509,15 @@ mod view {
                     } => {
                         let cmd = command.clone();
                         let checked = *checked;
+                        let is_sel = selected == Some(i);
                         menu_row(i)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|s| s.bg(hover_bg))
+                            .when(is_sel, |r| r.bg(sel_bg))
+                            .when(!is_sel, |r| r.hover(|s| s.bg(hover_bg)))
+                            .on_mouse_move(
+                                cx.listener(move |this, _e, _w, cx| this.hover_item(i, cx)),
+                            )
                             .on_click(
                                 cx.listener(move |this, _e, _w, cx| this.activate(cmd.clone(), cx)),
                             )
@@ -405,6 +533,13 @@ mod view {
                 .id("rcx-context-menu")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxContextMenu")
+                // Keyboard support (item 11): Up/Down highlight, Enter activate,
+                // Esc dismiss.
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                    if this.handle_key(ev.keystroke.key.as_str(), cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .min_w(px(200.))
                 .p(px(tokens::space::XS))
                 .bg(color::elevated_bg(cx))

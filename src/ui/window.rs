@@ -49,6 +49,7 @@ use super::theme_apply::ThemeRegistryGlobal;
 use super::titlebar::{self, LayoutPreset};
 use super::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
+    WorkspaceTypeAction,
 };
 use crate::theme::{SettingsStore, ThemeManager};
 
@@ -770,6 +771,19 @@ impl MainWindow {
         )
         .detach();
 
+        // ── Wire the workspace type-row right-click mutations (the C++ workspace
+        // `QMenu`: Rename / Duplicate / Delete / Add Member). The panel is a
+        // read-only surface, so it raises the intent for the window to resolve
+        // against the owning document's live controller. ──
+        cx.subscribe_in(
+            &workspace,
+            window,
+            |this, _ws, ev: &super::workspace::WorkspaceTypeAction, window, cx| {
+                this.on_workspace_type_action(ev.clone(), window, cx);
+            },
+        )
+        .detach();
+
         // ── The in-window menu bar (the titlebar dropdown row; app-shell §7). ──
         // Its chosen-command events route to `run_menu_command` — the same
         // dispatch the command palette's `Trigger` uses.
@@ -805,14 +819,31 @@ impl MainWindow {
         )
         .detach();
 
+        // ── Wire the scanner result-cell inline edits (the C++ `onCellEdited`):
+        // the Address cell re-evaluates the expression + re-reads, the Value cell
+        // writes the typed value back through the active provider. The panel is a
+        // read-only surface (it holds only an `Arc` provider clone), so it raises
+        // the intent for the window to resolve against its mutable controller. ──
+        cx.subscribe_in(
+            &scanner,
+            window,
+            |this, sc, ev: &super::scannerpanel::ScannerEdit, window, cx| {
+                this.on_scanner_edit(sc.clone(), ev.clone(), window, cx);
+            },
+        )
+        .detach();
+
         // ── Wire the modules dock row activation (double-click → set the active
         // document's base address to the module base). ──
         cx.subscribe_in(
             &modules,
             window,
-            |this, _md, ev: &super::modulespanel::ModuleAction, window, cx| {
-                if let super::modulespanel::ModuleAction::Activate { base, .. } = ev {
+            |this, _md, ev: &super::modulespanel::ModuleAction, window, cx| match ev {
+                super::modulespanel::ModuleAction::Activate { base, .. } => {
                     this.navigate_active_editor_to_address(*base, window, cx);
+                }
+                super::modulespanel::ModuleAction::DownloadAll => {
+                    this.download_all_module_symbols(window, cx);
                 }
             },
         )
@@ -1155,19 +1186,14 @@ impl MainWindow {
                 cx,
             ),
             "view.presentation" => self.toggle_presentation(cx),
-            "view.theme_edit" => self.notify(
-                "Theme editing is available in Tools ▸ Options (Appearance).",
-                window,
-                cx,
-            ),
+            // View ▸ Edit Theme — fold into the Options dialog's Appearance page
+            // (the port's theme editing lives there); open it directly rather than
+            // pointing the user at another menu.
+            "view.theme_edit" => self.open_options_dialog(window, cx),
 
             // ── Tools ──
             "tools.rtti" => self.open_rtti_browser(window, cx),
-            "tools.type_aliases" => self.notify(
-                "Type Aliases: the alias editor dialog is not available in this port yet.",
-                window,
-                cx,
-            ),
+            "tools.type_aliases" => self.open_type_aliases_dialog(window, cx),
             "tools.mcp" => self.toggle_mcp(window, cx),
             "tools.options" => self.open_options_dialog(window, cx),
             "tools.profiler" => self.notify(
@@ -1392,30 +1418,32 @@ impl MainWindow {
                 tree.base_address_formula.clone()
             }
         };
-        let spec = super::messagebox::confirm(
-            "Add Bookmark",
-            &format!(
-                "Bookmark the current address ({default_formula})? It will be added with an \
-                 auto-generated name; rename it in the Bookmarks dock."
-            ),
-            "Add bookmark",
-            false,
-        );
+        // Free-text name entry (the C++ Edit ▸ Add Bookmark `QInputDialog::getText`
+        // collects the bookmark NAME; the formula defaults to the current base).
+        // Seed the field with the next free auto-name so a blind Enter still works,
+        // but let the user type any name — replacing the old auto-name-only confirm.
+        let default_name = self.next_bookmark_name(&editor, cx);
         let editor2 = editor.clone();
+        let formula = default_formula.clone();
         let this = cx.entity().downgrade();
-        super::messagebox::open_confirm(
-            spec,
-            move |window, app| {
-                let _ = this.update(app, |me, cx| {
-                    let name = me.next_bookmark_name(&editor2, cx);
-                    editor2.update(cx, |ed, _cx| {
-                        ed.controller_mut().add_bookmark(&name, &default_formula);
-                    });
-                    me.after_bookmark_added(&name, &default_formula, window, cx);
-                });
-            },
+        self.open_text_prompt(
+            "Add Bookmark",
+            &format!("Name (address {default_formula})"),
+            &default_name,
             window,
             cx,
+            move |name, window, app| {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let _ = this.update(app, |me, cx| {
+                    editor2.update(cx, |ed, _cx| {
+                        ed.controller_mut().add_bookmark(&name, &formula);
+                    });
+                    me.after_bookmark_added(&name, &formula, window, cx);
+                });
+            },
         );
     }
 
@@ -1533,13 +1561,143 @@ impl MainWindow {
             return;
         };
         editor.update(cx, |ed, cx| {
-            let tree = &mut ed.controller_mut().document_mut().tree;
-            tree.base_address = addr;
+            let ctrl = ed.controller_mut();
+            ctrl.document_mut().tree.base_address = addr;
+            // Reset value-history / heat on a jump (the C++ `resetChangeTracking`
+            // on navigate): the old base's per-node change heat + history no longer
+            // describes the new region, so clear it before recomposing — otherwise
+            // every field flashes "changed" against the previous address's values.
+            ctrl.reset_change_tracking();
             ed.apply_document(cx);
         });
         self.rebuild_workspace(cx);
         self.notify(format!("Jumped to 0x{addr:X}"), window, cx);
         cx.notify();
+    }
+
+    /// Resolve a scanner result-cell inline edit against the active document (the
+    /// C++ `onCellEdited`):
+    /// - **Address cell** (`EvalAddress`): re-evaluate the (re-typed) address
+    ///   expression with the live provider callbacks, re-read the value at the new
+    ///   address, and push it back into the row (`apply_address_edit`) so the row
+    ///   tracks the new location.
+    /// - **Value cell** (`WriteValue`): serialize the value-input text with the
+    ///   scanner's value type and write it back to the row's address through the
+    ///   active controller's writable provider, then refresh the row's recorded
+    ///   bytes (`apply_value_write`).
+    ///
+    /// The panel raises the intent because it holds only a read-only `Arc` provider
+    /// clone; the mutable controller lives here on the window.
+    fn on_scanner_edit(
+        &mut self,
+        scanner: Entity<super::scannerpanel::ScannerPanel>,
+        ev: super::scannerpanel::ScannerEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::scannerpanel::ScannerEdit;
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Attach a data source first.", window, cx);
+            return;
+        };
+        match ev {
+            ScannerEdit::EvalAddress { row } => {
+                // The re-typed address expression lives in the scanner's value
+                // input (the inline-edit source the panel exposes); evaluate it,
+                // re-read the value at the resolved address, and rebind the row.
+                let formula = scanner.read(cx).value_input_text(cx);
+                if formula.trim().is_empty() {
+                    return;
+                }
+                let value_type = scanner.read(cx).last_value_type();
+                let ptr_size = editor.read(cx).controller().tree().pointer_size.max(1);
+                let provider = editor.read(cx).controller().document().provider.clone();
+                let cbs = crate::addr::AddressParserCallbacks {
+                    resolve_module: Some(Box::new({
+                        let p = provider.clone();
+                        move |name: &str| {
+                            let base = p.symbol_to_address(name);
+                            (base, base != 0)
+                        }
+                    })),
+                    read_pointer: Some(Box::new({
+                        let p = provider.clone();
+                        move |addr: u64| {
+                            if ptr_size >= 8 {
+                                (p.read_u64(addr), true)
+                            } else {
+                                (p.read_u32(addr) as u64, true)
+                            }
+                        }
+                    })),
+                    resolve_identifier: Some(Box::new({
+                        let p = provider.clone();
+                        move |name: &str| {
+                            let base = p.symbol_to_address(name);
+                            (base, base != 0)
+                        }
+                    })),
+                    ..Default::default()
+                };
+                let r = crate::addr::AddressParser::evaluate(&formula, ptr_size, Some(&cbs));
+                if !r.ok {
+                    self.notify(format!("Couldn't evaluate \"{formula}\"."), window, cx);
+                    return;
+                }
+                let size = crate::scanner::value_size_for_type(value_type).max(0);
+                let new_value = if size > 0 {
+                    provider.read_bytes(r.value, size)
+                } else {
+                    Vec::new()
+                };
+                scanner.update(cx, |sp, cx| {
+                    sp.apply_address_edit(row, r.value, new_value, cx);
+                });
+            }
+            ScannerEdit::WriteValue { row, address } => {
+                let text = scanner.read(cx).value_input_text(cx);
+                if text.trim().is_empty() {
+                    self.notify(
+                        "Type a value in the scanner's Value field, then double-click \
+                         a result's Value cell to write it.",
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                let value_type = scanner.read(cx).last_value_type();
+                // Serialize the typed value to bytes via the scanner value type
+                // (the C++ writes the typed value, not the displayed bytes).
+                let bytes = match crate::scanner::serialize_value(value_type, &text) {
+                    Ok((b, _mask)) => b,
+                    Err(e) => {
+                        self.notify(format!("Invalid value: {e}"), window, cx);
+                        return;
+                    }
+                };
+                if bytes.is_empty() {
+                    return;
+                }
+                let wrote = editor.update(cx, |ed, _cx| {
+                    ed.controller_mut().write_memory(address, &bytes)
+                });
+                if wrote {
+                    let new_value = bytes.clone();
+                    scanner.update(cx, |sp, cx| {
+                        sp.apply_value_write(row, new_value, cx);
+                    });
+                    // The write changed live memory — re-read so the editor reflects
+                    // the new value.
+                    editor.update(cx, |ed, cx| ed.apply_document(cx));
+                } else {
+                    self.notify(
+                        "Write failed — the data source isn't writable (open a File source).",
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
     }
 
     // ── View: font family (the C++ exclusive Consolas / JetBrains Mono picker) ──
@@ -1593,6 +1751,52 @@ impl MainWindow {
             "MCP Server stopped."
         };
         self.notify(msg, window, cx);
+    }
+
+    /// Tools ▸ Type Aliases… — open the [`TypeAliasesDialog`] seeded from the
+    /// active document's per-kind alias map (the C++ `showTypeAliasesDialog`). On
+    /// accept, apply the edited aliases to the document and recompose so the
+    /// editor + generated code reflect the new type names.
+    fn open_type_aliases_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first.", window, cx);
+            return;
+        };
+        let current: std::collections::HashMap<crate::core::NodeKind, String> =
+            editor.read(cx).controller().document().type_aliases.clone();
+        let dlg = cx.new(|cx| TypeAliasesDialog::new(current, window, cx));
+        let editor2 = editor.clone();
+        let this = cx.entity().downgrade();
+        self.goto_sub = Some(cx.subscribe_in(
+            &dlg,
+            window,
+            move |_w, dlg, ev: &TypeAliasesEvent, window, cx| match ev {
+                TypeAliasesEvent::Accept => {
+                    let map = dlg.read(cx).collect(cx);
+                    window.close_dialog(cx);
+                    let _ = this.update(cx, |me, cx| {
+                        editor2.update(cx, |ed, cx| {
+                            ed.controller_mut().document_mut().type_aliases = map;
+                            ed.apply_document(cx);
+                        });
+                        me.sync_dirty_state(cx);
+                        me.notify("Type aliases updated", window, cx);
+                        cx.notify();
+                    });
+                }
+                TypeAliasesEvent::Cancel => window.close_dialog(cx),
+            },
+        ));
+        let focus = dlg.read(cx).focus_handle(cx);
+        let dlg_for_modal = dlg.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(460.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dlg_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     /// Tools ▸ Options — open the [`OptionsDialog`] seeded from the live window
@@ -2260,6 +2464,70 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Modules dock ▸ Download All (the C++ `download_all`): load/download PDB
+    /// symbols for every module of the active source. Enumerate the active
+    /// provider's modules; for each, prefer an already-cached or module-adjacent
+    /// PDB (the C++ `findCached`/`findLocal`, which need no network). A real
+    /// network fetch needs each module's PE debug GUID/age — only obtainable from
+    /// a live process target (out of scope on this platform; see
+    /// `provider::native`), so report what was resolvable and how many modules
+    /// were seen. With no modules (a File source enumerates none) this guides the
+    /// user to attach a live source.
+    fn download_all_module_symbols(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Attach a data source first.", window, cx);
+            return;
+        };
+        let modules = editor
+            .read(cx)
+            .controller()
+            .document()
+            .provider
+            .enumerate_modules();
+        if modules.is_empty() {
+            self.notify(
+                "No modules to download symbols for — attach a live process source \
+                 (file sources expose no loaded modules).",
+                window,
+                cx,
+            );
+            return;
+        }
+        let downloader = crate::rtti::downloader::SymbolDownloader::new();
+        let mut resolved = 0usize;
+        for m in &modules {
+            // Without PE debug info we can't form a download request; but if a PDB
+            // is already cached or sits next to the module we can count it as
+            // resolvable (the C++ short-circuits on findCached/findLocal first).
+            let pdb_name = if m.name.to_ascii_lowercase().ends_with(".pdb") {
+                m.name.clone()
+            } else {
+                // Best-effort: <module-stem>.pdb beside the module image.
+                let stem = std::path::Path::new(&m.name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&m.name);
+                format!("{stem}.pdb")
+            };
+            if crate::rtti::downloader::SymbolDownloader::find_local(&m.full_path, &pdb_name)
+                .is_some()
+            {
+                resolved += 1;
+                continue;
+            }
+            let _ = &downloader; // (network fetch needs live PE debug GUID/age)
+        }
+        self.notify(
+            format!(
+                "Download All: {resolved}/{} module symbols resolved from cache/local. \
+                 Network PDB fetch needs a live process target.",
+                modules.len()
+            ),
+            window,
+            cx,
+        );
+    }
+
     /// Load an already-built document into the active editor tab and sync the
     /// tab title + source (shared by import; mirrors the tail of
     /// [`open_project`](Self::open_project)).
@@ -2699,6 +2967,13 @@ impl MainWindow {
         self.menubar.update(cx, |mb, cx| {
             mb.set_command_checked("view.presentation", on, cx);
         });
+        // Slow the read cadence while presenting (the C++ presentation mode backs
+        // off the refresh/MCP tick so the demo doesn't churn): in presentation the
+        // controllers use a calm refresh interval; restoring leaves them at the
+        // persisted interval. Mirror the blur-throttle path the window already owns.
+        self.set_controllers_window_state(!on, true, cx);
+        // The render reads `self.presentation` to fade the chrome (titlebar +
+        // status bar); request a repaint so the fade applies immediately.
         cx.notify();
     }
 
@@ -2966,6 +3241,164 @@ impl MainWindow {
             t.view_root = Some(nav.node_id);
         }
         cx.notify();
+    }
+
+    /// The editor entity owning document `doc`, if it is open in a tab.
+    fn editor_for_doc(&self, doc: DocId, cx: &App) -> Option<Entity<super::editor::RcxEditor>> {
+        self.document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .find(|t| t.id == doc)
+            .map(|t| t.editor.clone())
+    }
+
+    /// Resolve a workspace type-row mutation (the C++ workspace `QMenu`:
+    /// Rename / Duplicate / Delete / Add Member) against the owning document's
+    /// live controller. The targeted node is addressed by `(doc, node_id)`; map
+    /// the id to its tree index and drive the matching controller command, then
+    /// recompose the editor, rebuild the workspace tree, and sync dirty state.
+    fn on_workspace_type_action(
+        &mut self,
+        action: WorkspaceTypeAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            WorkspaceTypeAction::Rename {
+                doc,
+                node_id,
+                current,
+            } => {
+                // The C++ `renameType` opens `QInputDialog::getText`; collect the
+                // new name in a free-text prompt, then apply on accept.
+                let Some(editor) = self.editor_for_doc(doc, cx) else {
+                    return;
+                };
+                let this = cx.entity().downgrade();
+                self.open_text_prompt(
+                    "Rename Type",
+                    "New name",
+                    &current,
+                    window,
+                    cx,
+                    move |name, window, app| {
+                        let name = name.trim().to_string();
+                        if name.is_empty() {
+                            return;
+                        }
+                        let _ = this.update(app, |me, cx| {
+                            editor.update(cx, |ed, cx| {
+                                let idx = ed.controller().tree().index_of_id(node_id);
+                                if idx >= 0 {
+                                    ed.controller_mut().rename_node(idx as usize, &name);
+                                    ed.apply_document(cx);
+                                }
+                            });
+                            me.rebuild_workspace(cx);
+                            me.sync_dirty_state(cx);
+                            me.notify(format!("Renamed to {name}"), window, cx);
+                            cx.notify();
+                        });
+                    },
+                );
+            }
+            WorkspaceTypeAction::Duplicate { doc, node_id } => {
+                let Some(editor) = self.editor_for_doc(doc, cx) else {
+                    return;
+                };
+                editor.update(cx, |ed, cx| {
+                    let idx = ed.controller().tree().index_of_id(node_id);
+                    if idx >= 0 {
+                        ed.controller_mut().duplicate_node(idx as usize);
+                        ed.apply_document(cx);
+                    }
+                });
+                self.rebuild_workspace(cx);
+                self.sync_dirty_state(cx);
+                self.notify("Duplicated type", window, cx);
+                cx.notify();
+            }
+            WorkspaceTypeAction::Delete { doc, node_id } => {
+                // Confirm before a destructive delete (the C++ asks before
+                // deleting a top-level type).
+                let Some(editor) = self.editor_for_doc(doc, cx) else {
+                    return;
+                };
+                let name = editor.read(cx).controller().tree().index_of_id(node_id);
+                if name < 0 {
+                    return;
+                }
+                let spec = super::messagebox::confirm(
+                    "Delete Type",
+                    "Delete this type and its members? This can be undone.",
+                    "Delete",
+                    true,
+                );
+                let this = cx.entity().downgrade();
+                super::messagebox::open_confirm(
+                    spec,
+                    move |window, app| {
+                        let _ = this.update(app, |me, cx| {
+                            editor.update(cx, |ed, cx| {
+                                let idx = ed.controller().tree().index_of_id(node_id);
+                                if idx < 0 {
+                                    return;
+                                }
+                                let node = ed.controller().tree().nodes[idx as usize].clone();
+                                // A top-level struct uses `deleteRootStruct` (it
+                                // also rebinds refs + the view root); a member field
+                                // uses `removeNode`.
+                                if node.parent_id == 0 && node.kind == crate::core::NodeKind::Struct
+                                {
+                                    ed.controller_mut().delete_root_struct(node_id);
+                                } else {
+                                    ed.controller_mut().remove_node(idx as usize);
+                                }
+                                ed.apply_document(cx);
+                            });
+                            me.rebuild_workspace(cx);
+                            me.sync_dirty_state(cx);
+                            me.notify("Deleted type", window, cx);
+                            cx.notify();
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+            WorkspaceTypeAction::AddMember { doc, node_id } => {
+                let Some(editor) = self.editor_for_doc(doc, cx) else {
+                    return;
+                };
+                editor.update(cx, |ed, cx| {
+                    let idx = ed.controller().tree().index_of_id(node_id);
+                    if idx < 0 {
+                        return;
+                    }
+                    let node = ed.controller().tree().nodes[idx as usize].clone();
+                    // Append a new member at the end of the struct. For a struct row
+                    // the members are its children; for a field row, add a sibling
+                    // into the field's parent.
+                    let parent_id = if node.kind == crate::core::NodeKind::Struct {
+                        node.id
+                    } else {
+                        node.parent_id
+                    };
+                    ed.controller_mut().insert_node(
+                        parent_id,
+                        -1,
+                        crate::core::NodeKind::Hex64,
+                        "new_member",
+                    );
+                    ed.apply_document(cx);
+                });
+                self.rebuild_workspace(cx);
+                self.sync_dirty_state(cx);
+                self.notify("Added member", window, cx);
+                cx.notify();
+            }
+        }
     }
 
     // ── Workspace model rebuild (app-shell §10 `rebuildWorkspaceModel`) ──
@@ -3309,6 +3742,433 @@ impl MainWindow {
         self.state.set_theme_name(&applied.name);
         super::theme_apply::apply_theme(&applied, window, cx);
     }
+
+    /// Open a modal free-text input prompt (the C++ `QInputDialog::getText`):
+    /// title + field label + a seeded value. On accept (Enter / OK) the trimmed
+    /// text is delivered to `on_accept`; Cancel / Esc dismisses with no callback.
+    /// Used by the bookmark-name and type-rename flows (replacing the previous
+    /// auto-name confirm boxes).
+    fn open_text_prompt<F>(
+        &mut self,
+        title: &str,
+        label: &str,
+        default: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_accept: F,
+    ) where
+        F: Fn(String, &mut Window, &mut App) + 'static,
+    {
+        let title = title.to_string();
+        let label = label.to_string();
+        let default = default.to_string();
+        let prompt = cx.new(|cx| {
+            TextPromptDialog::new(title.clone(), label.clone(), default.clone(), window, cx)
+        });
+        let on_accept = Rc::new(on_accept);
+        self.goto_sub = Some(cx.subscribe_in(
+            &prompt,
+            window,
+            move |_this, _p, ev: &TextPromptEvent, window, cx| match ev {
+                TextPromptEvent::Accept(text) => {
+                    let text = text.clone();
+                    window.close_dialog(cx);
+                    (on_accept)(text, window, cx);
+                }
+                TextPromptEvent::Cancel => window.close_dialog(cx),
+            },
+        ));
+        let focus = prompt.read(cx).focus_handle(cx);
+        let prompt_for_modal = prompt.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(420.))
+                .margin_top(px(140.))
+                .close_button(false)
+                .child(prompt_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+}
+
+/// The outcome of the [`TextPromptDialog`] (the C++ `QInputDialog` accept/reject).
+#[derive(Clone, Debug)]
+enum TextPromptEvent {
+    /// OK / Enter on a non-empty value — the trimmed text.
+    Accept(String),
+    /// Cancel / Esc.
+    Cancel,
+}
+
+/// A minimal modal free-text input dialog — the port's `QInputDialog::getText`.
+/// A single input seeded with a default (all-selected), an OK button (disabled
+/// while the trimmed text is empty), and Cancel. Enter confirms; Esc cancels.
+struct TextPromptDialog {
+    title: String,
+    label: String,
+    input: Entity<gpui_component::input::InputState>,
+    focus_handle: FocusHandle,
+    _sub: Subscription,
+}
+
+impl TextPromptDialog {
+    fn new(
+        title: String,
+        label: String,
+        default: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        use gpui_component::input::{InputEvent, InputState};
+        let input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx);
+            s.set_value(default.clone(), window, cx);
+            s
+        });
+        // Re-render on change so the OK enabled-state tracks the field.
+        let sub = cx.subscribe_in(&input, window, |_this, _i, ev: &InputEvent, _w, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        TextPromptDialog {
+            title,
+            label,
+            input,
+            focus_handle: cx.focus_handle(),
+            _sub: sub,
+        }
+    }
+
+    fn value(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
+    fn confirm(&mut self, cx: &mut Context<Self>) {
+        let text = self.value(cx).trim().to_string();
+        if !text.is_empty() {
+            cx.emit(TextPromptEvent::Accept(text));
+        }
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        cx.emit(TextPromptEvent::Cancel);
+    }
+}
+
+impl Focusable for TextPromptDialog {
+    /// Delegate the dialog focus to the INPUT so `window.focus(focus_handle)`
+    /// lands keystrokes in the field (the command-palette pattern) — without this
+    /// the dialog card holds focus and typing does nothing (the same dead-input
+    /// failure mode the cross-cutting note flags for inline edits).
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.read(cx).focus_handle(cx)
+    }
+}
+
+impl EventEmitter<TextPromptEvent> for TextPromptDialog {}
+
+impl Render for TextPromptDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use super::dialogs::modal;
+        use gpui_component::button::{Button, ButtonVariants as _};
+        use gpui_component::input::Input;
+        use gpui_component::Disableable as _;
+
+        let can_ok = !self.value(cx).trim().is_empty();
+        let card_w = modal::clamp_width(420., window);
+
+        let body = modal::body(cx)
+            .child(modal::field_label(self.label.clone(), cx))
+            .child(Input::new(&self.input).w_full());
+
+        let footer = modal::footer(cx)
+            .child(
+                Button::new("prompt-cancel")
+                    .label("Cancel")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.cancel(cx))),
+            )
+            .child(
+                Button::new("prompt-ok")
+                    .primary()
+                    .label("OK")
+                    .when(!can_ok, |b| b.disabled(true))
+                    .on_click(cx.listener(|this, _e, _w, cx| this.confirm(cx))),
+            );
+
+        modal::card(cx)
+            .id("rcx-text-prompt")
+            .track_focus(&self.focus_handle)
+            .key_context("RcxTextPrompt")
+            // Capture-phase Enter/Esc so the dialog confirms/cancels even while the
+            // input owns focus (the C++ dialog's default-button / reject wiring).
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "enter" => {
+                        this.confirm(cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        this.cancel(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .w(card_w)
+            .child(
+                modal::header(self.title.clone(), cx).child(modal::close_button(
+                    "prompt-close",
+                    cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                    cx,
+                )),
+            )
+            .child(body)
+            .child(footer)
+    }
+}
+
+/// The outcome of the [`TypeAliasesDialog`].
+#[derive(Clone, Debug)]
+enum TypeAliasesEvent {
+    /// OK — commit the edited alias map.
+    Accept,
+    /// Cancel / Esc.
+    Cancel,
+}
+
+/// The Tools ▸ Type Aliases editor (the C++ `showTypeAliasesDialog`): a row per
+/// aliasable [`NodeKind`] (the primitives + pointers + strings; the C++ skips
+/// Vec/Mat/Struct/Array), each with the canonical type name on the left and an
+/// editable alias field on the right. Two preset buttons fill the column with the
+/// stdint (C99) or Windows (basetsd.h) names; Clear empties them.
+struct TypeAliasesDialog {
+    /// (kind, canonical-name, alias-input) per aliasable kind, in `K_KIND_META`
+    /// order.
+    rows: Vec<(
+        crate::core::NodeKind,
+        &'static str,
+        Entity<gpui_component::input::InputState>,
+    )>,
+    focus_handle: FocusHandle,
+}
+
+impl TypeAliasesDialog {
+    fn aliasable(kind: crate::core::NodeKind) -> bool {
+        use crate::core::NodeKind::*;
+        !matches!(kind, Vec2 | Vec3 | Vec4 | Mat4x4 | Struct | Array)
+    }
+
+    /// The Windows (basetsd.h) preset alias for a kind, if any (the C++
+    /// `kWindowsPreset`).
+    fn windows_alias(kind: crate::core::NodeKind) -> Option<&'static str> {
+        use crate::core::NodeKind::*;
+        Some(match kind {
+            Int8 => "CHAR",
+            Int16 => "SHORT",
+            Int32 => "LONG",
+            Int64 => "LONGLONG",
+            UInt8 => "UCHAR",
+            UInt16 => "USHORT",
+            UInt32 => "ULONG",
+            UInt64 => "ULONGLONG",
+            Float => "FLOAT",
+            Double => "DOUBLE",
+            Bool => "BOOLEAN",
+            Pointer32 => "ULONG",
+            Pointer64 => "ULONG_PTR",
+            _ => return None,
+        })
+    }
+
+    fn new(
+        current: std::collections::HashMap<crate::core::NodeKind, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        use gpui_component::input::InputState;
+        let mut rows = Vec::new();
+        for meta in crate::core::K_KIND_META.iter() {
+            if !Self::aliasable(meta.kind) {
+                continue;
+            }
+            let seed = current.get(&meta.kind).cloned().unwrap_or_default();
+            let input = cx.new(|cx| {
+                let mut s = InputState::new(window, cx).placeholder(meta.type_name);
+                if !seed.is_empty() {
+                    s.set_value(seed, window, cx);
+                }
+                s
+            });
+            rows.push((meta.kind, meta.type_name, input));
+        }
+        TypeAliasesDialog {
+            rows,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Collect the edited alias map (empty fields are dropped — no alias).
+    fn collect(&self, cx: &App) -> std::collections::HashMap<crate::core::NodeKind, String> {
+        let mut map = std::collections::HashMap::new();
+        for (kind, _name, input) in &self.rows {
+            let v = input.read(cx).value().to_string();
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                map.insert(*kind, v);
+            }
+        }
+        map
+    }
+
+    /// Fill every field with the stdint (C99) preset — the canonical type name
+    /// per kind (the C++ `kStdintPreset`).
+    fn apply_stdint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (_kind, name, input) in &self.rows {
+            let name = name.to_string();
+            input.update(cx, |s, cx| s.set_value(name, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Fill the Windows-mapped fields with their basetsd.h names; clear the rest.
+    fn apply_windows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (kind, _name, input) in &self.rows {
+            let v = Self::windows_alias(*kind).unwrap_or("").to_string();
+            input.update(cx, |s, cx| s.set_value(v, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Empty every field (no aliases).
+    fn apply_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (_kind, _name, input) in &self.rows {
+            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        }
+        cx.notify();
+    }
+
+    fn confirm(&mut self, cx: &mut Context<Self>) {
+        cx.emit(TypeAliasesEvent::Accept);
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        cx.emit(TypeAliasesEvent::Cancel);
+    }
+}
+
+impl Focusable for TypeAliasesDialog {
+    /// Focus the first alias input so the dialog opens ready to type (the
+    /// command-palette delegate pattern); fall back to the card handle if there
+    /// are no rows.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.rows
+            .first()
+            .map(|(_, _, input)| input.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
+    }
+}
+
+impl EventEmitter<TypeAliasesEvent> for TypeAliasesDialog {}
+
+impl Render for TypeAliasesDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use super::design::tokens;
+        use super::dialogs::modal;
+        use gpui_component::button::{Button, ButtonVariants as _};
+        use gpui_component::input::Input;
+        use gpui_component::Sizable as _;
+
+        let card_w = modal::clamp_width(460., window);
+        let card_max_h = modal::clamp_height(560., 100., window);
+        let mono = SharedString::from(tokens::font::mono_family());
+
+        let rows: Vec<AnyElement> = self
+            .rows
+            .iter()
+            .map(|(_kind, name, input)| {
+                gpui_component::h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(tokens::space::MD))
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .flex_none()
+                            .font_family(mono.clone())
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(SharedString::from(*name)),
+                    )
+                    .child(Input::new(input).w_full().font_family(mono.clone()))
+                    .into_any_element()
+            })
+            .collect();
+
+        let presets = gpui_component::h_flex()
+            .gap(px(tokens::space::SM))
+            .child(
+                Button::new("alias-stdint")
+                    .small()
+                    .label("stdint (C99)")
+                    .on_click(cx.listener(|this, _e, window, cx| this.apply_stdint(window, cx))),
+            )
+            .child(
+                Button::new("alias-windows")
+                    .small()
+                    .label("Windows (basetsd.h)")
+                    .on_click(cx.listener(|this, _e, window, cx| this.apply_windows(window, cx))),
+            )
+            .child(
+                Button::new("alias-clear")
+                    .small()
+                    .label("Clear")
+                    .on_click(cx.listener(|this, _e, window, cx| this.apply_clear(window, cx))),
+            );
+
+        let body = modal::body(cx).child(presets).child(
+            gpui_component::v_flex()
+                .id("rcx-alias-rows")
+                .w_full()
+                .max_h(px(360.))
+                .overflow_y_scroll()
+                .gap(px(tokens::space::XS))
+                .children(rows),
+        );
+
+        let footer = modal::footer(cx)
+            .child(
+                Button::new("alias-cancel")
+                    .label("Cancel")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.cancel(cx))),
+            )
+            .child(
+                Button::new("alias-ok")
+                    .primary()
+                    .label("OK")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.confirm(cx))),
+            );
+
+        modal::card(cx)
+            .id("rcx-type-aliases")
+            .track_focus(&self.focus_handle)
+            .key_context("RcxTypeAliases")
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                if ev.keystroke.key.as_str() == "escape" {
+                    this.cancel(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .w(card_w)
+            .max_h(card_max_h)
+            .child(modal::header("Type Aliases", cx).child(modal::close_button(
+                "alias-close",
+                cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                cx,
+            )))
+            .child(body)
+            .child(footer)
+    }
 }
 
 impl Render for MainWindow {
@@ -3361,6 +4221,13 @@ impl Render for MainWindow {
         let source = self.state.active_source();
         let status_bar = render_status_bar(&status_info, &source, cx);
 
+        // Presentation Mode (View ▸ Presentation Mode): fade the surrounding chrome
+        // (titlebar + status bar) so the editor surface reads as the focus, like the
+        // C++ `setPresentationMode`. The editor content itself is untouched (full
+        // opacity); only the chrome strips dim.
+        let presentation = self.presentation;
+        let chrome_opacity = if presentation { 0.45 } else { 1.0 };
+
         div()
             .id("reclass-main-window")
             .key_context("RcxWindow")
@@ -3392,7 +4259,8 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_quick_bookmark))
             .on_action(cx.listener(Self::on_shortcuts))
             // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
-            .child(titlebar)
+            // Dimmed in Presentation Mode (chrome fade).
+            .child(div().opacity(chrome_opacity).child(titlebar))
             // ── Row 2: the content column — the docking workspace + the
             // start-page overlay. `flex_1 min_h_0` makes it take all the space
             // *between* the titlebar and the status bar; `overflow_hidden` clips
@@ -3411,7 +4279,8 @@ impl Render for MainWindow {
             )
             // ── Row 3: the bottom status bar (app-shell §11) — a thin chrome strip
             // pinned to the very bottom, never shrunk by the flex content above.
-            .child(status_bar)
+            // Dimmed in Presentation Mode (chrome fade).
+            .child(div().flex_none().opacity(chrome_opacity).child(status_bar))
             // Overlay layers.
             .children(sheet_layer)
             .children(dialog_layer)

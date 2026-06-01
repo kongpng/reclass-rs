@@ -212,6 +212,18 @@ impl ProcessPickerModel {
     }
 }
 
+/// The index of the row that should be pre-selected within a displayed
+/// (already-filtered, in display order) row list — the first attachable row, or
+/// the first row when none is attachable, or `None` for an empty list. Mirrors
+/// the C++ `selectPreferredProcess` (which falls back to the table's default top
+/// selection so Attach/Enter always act on *some* row).
+pub fn preferred_row_index(rows: &[ProcessRow]) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some(rows.iter().position(ProcessRow::is_attachable).unwrap_or(0))
+}
+
 impl ProcessRow {
     /// Sort rank: attachable rows (0) before stub rows (1).
     fn availability_rank(&self) -> u8 {
@@ -229,6 +241,7 @@ pub use view::{ProcessPickEvent, ProcessPicker};
 
 #[cfg(feature = "ui")]
 mod view {
+    use crate::ui::contextmenu::process_row_menu;
     use crate::ui::design::{color, tokens};
     use crate::ui::dialogs::modal;
     use gpui::prelude::FluentBuilder as _;
@@ -241,6 +254,14 @@ mod view {
     use gpui_component::Sizable as _;
 
     use super::{ProcessPickerModel, ProcessRow, SourceAvailability};
+
+    /// An open row context menu: the right-clicked row index + the window-space
+    /// anchor point (the C++ `customContextMenuRequested` position).
+    #[derive(Clone, Copy)]
+    struct RowMenu {
+        row_ix: usize,
+        pos: Point<Pixels>,
+    }
 
     /// The picker's outcome (the C++ `accept`/`reject`).
     #[derive(Clone, Debug)]
@@ -360,6 +381,12 @@ mod view {
         model: ProcessPickerModel,
         filter: Entity<InputState>,
         table: Entity<TableState<ProcessDelegate>>,
+        /// The open right-click menu (row + anchor), if any.
+        row_menu: Option<RowMenu>,
+        /// The last cursor position seen on a right mouse-down over the table, used
+        /// to anchor the row menu (`TableEvent::RightClickedRow` carries only the
+        /// row index).
+        last_right_click: Point<Pixels>,
         focus_handle: FocusHandle,
         _subs: Vec<Subscription>,
     }
@@ -378,22 +405,40 @@ mod view {
                     this.refresh_table(cx);
                 }
             }));
-            subs.push(cx.subscribe(&table, |this, table, ev: &TableEvent, cx| {
-                if let TableEvent::DoubleClickedRow(row_ix) = ev {
-                    let row = table.read(cx).delegate().rows.get(*row_ix).cloned();
-                    if let Some(row) = row {
-                        this.attach_row(&row, cx);
+            subs.push(
+                cx.subscribe(&table, |this, table, ev: &TableEvent, cx| match ev {
+                    // Double-click attaches (the C++ `cellDoubleClicked` → `accept`).
+                    TableEvent::DoubleClickedRow(row_ix) => {
+                        let row = table.read(cx).delegate().rows.get(*row_ix).cloned();
+                        if let Some(row) = row {
+                            this.attach_row(&row, cx);
+                        }
                     }
-                }
-            }));
+                    // Right-click opens the row copy menu (the C++
+                    // `customContextMenuRequested`). `None` (empty area) closes it.
+                    TableEvent::RightClickedRow(row_ix) => {
+                        this.row_menu = row_ix.map(|row_ix| RowMenu {
+                            row_ix,
+                            pos: this.last_right_click,
+                        });
+                        cx.notify();
+                    }
+                    _ => {}
+                }),
+            );
 
             let mut this = ProcessPicker {
                 model,
                 filter,
                 table,
+                row_menu: None,
+                last_right_click: Point::default(),
                 focus_handle: cx.focus_handle(),
                 _subs: subs,
             };
+            // refresh_table also pre-selects the preferred (first attachable) row
+            // and scrolls it into view, so Attach / Enter work immediately (the
+            // C++ `selectPreferredProcess` + `scrollToItem`).
             this.refresh_table(cx);
             this
         }
@@ -413,7 +458,8 @@ mod view {
             self.filter.read(cx).value().to_string()
         }
 
-        /// Push the filtered rows into the table delegate.
+        /// Push the filtered rows into the table delegate, then re-select the
+        /// preferred row (the row set changed, so any prior selection is stale).
         fn refresh_table(&mut self, cx: &mut Context<Self>) {
             let query = self.filter_text(cx);
             let rows: Vec<ProcessRow> = self.model.filtered(&query).into_iter().cloned().collect();
@@ -421,7 +467,22 @@ mod view {
                 state.delegate_mut().rows = rows;
                 cx.notify();
             });
+            self.row_menu = None;
+            self.select_preferred(cx);
             cx.notify();
+        }
+
+        /// Select the preferred (first attachable, else first) row in the current
+        /// table and scroll it into view (the C++ `selectPreferredProcess` +
+        /// `scrollToItem`), so Attach / Enter act on a real row immediately.
+        fn select_preferred(&mut self, cx: &mut Context<Self>) {
+            let ix = super::preferred_row_index(&self.table.read(cx).delegate().rows);
+            if let Some(ix) = ix {
+                self.table.update(cx, |state, cx| {
+                    state.set_selected_row(ix, cx);
+                    state.scroll_to_row(ix, cx);
+                });
+            }
         }
 
         /// Attach to a row if it is attachable (the C++ `onProcessSelected`).
@@ -450,6 +511,118 @@ mod view {
         /// Cancel the picker (Esc / Cancel button).
         fn cancel(&mut self, cx: &mut Context<Self>) {
             cx.emit(ProcessPickEvent::Cancel);
+        }
+
+        /// Run a row-menu command (`process.copy_pid` / `_name` / `_path`): write
+        /// the corresponding field of the menu's row to the system clipboard, then
+        /// close the menu. Mirrors the C++ `QApplication::clipboard()->setText(...)`
+        /// dispatch in `customContextMenuRequested`.
+        fn run_row_command(&mut self, command: &str, cx: &mut Context<Self>) {
+            if let Some(menu) = self.row_menu {
+                let row = self
+                    .table
+                    .read(cx)
+                    .delegate()
+                    .rows
+                    .get(menu.row_ix)
+                    .cloned();
+                if let Some(row) = row {
+                    let text = match command {
+                        "process.copy_pid" => row.pid.to_string(),
+                        "process.copy_name" => row.name.clone(),
+                        "process.copy_path" => row.path.clone(),
+                        _ => String::new(),
+                    };
+                    if !text.is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                }
+            }
+            self.row_menu = None;
+            cx.notify();
+        }
+
+        /// Capture-phase key handling: Enter attaches the selected row, Escape
+        /// cancels (or, if a row menu is open, closes it). Returns `true` when
+        /// handled.
+        fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            match key {
+                "enter" => {
+                    self.attach_selected(cx);
+                    true
+                }
+                "escape" => {
+                    if self.row_menu.take().is_some() {
+                        cx.notify();
+                    } else {
+                        self.cancel(cx);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Render the open right-click row menu as a deferred, anchored elevated
+        /// surface (the C++ `QMenu` at the cursor): Copy PID / Copy Name / Copy
+        /// Path, with "Copy PID" disabled for synthetic (PID-less) rows.
+        fn render_row_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+            let menu = self.row_menu?;
+            let has_pid = self
+                .table
+                .read(cx)
+                .delegate()
+                .rows
+                .get(menu.row_ix)
+                .map(|r| r.pid != 0)
+                .unwrap_or(false);
+            let items = process_row_menu(has_pid);
+            let mut surface = crate::ui::design::elevated_surface(cx)
+                .min_w(px(180.))
+                .p(px(tokens::space::XS))
+                .text_size(px(tokens::font::UI_MD));
+            for (i, item) in items.into_iter().enumerate() {
+                if let crate::ui::contextmenu::MenuItem::Action {
+                    label,
+                    command,
+                    enabled,
+                } = item
+                {
+                    let fg = if enabled {
+                        color::text(cx)
+                    } else {
+                        color::text_disabled(cx)
+                    };
+                    let hover = color::hover_overlay(cx);
+                    let row = gpui_component::h_flex()
+                        .id(("process-menu-row", i))
+                        .w_full()
+                        .h(px(24.))
+                        .px(px(tokens::space::SM))
+                        .items_center()
+                        .rounded(px(tokens::radius::MD))
+                        .text_color(fg)
+                        .child(label)
+                        .when(enabled, |r| {
+                            r.cursor_pointer()
+                                .hover(|s| s.bg(hover))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.run_row_command(&command, cx);
+                                }))
+                        });
+                    surface = surface.child(row);
+                }
+            }
+            Some(
+                deferred(
+                    anchored()
+                        .position(menu.pos)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(surface),
+                )
+                .with_priority(2)
+                .into_any_element(),
+            )
         }
     }
 
@@ -486,6 +659,15 @@ mod view {
                         .border_1()
                         .border_color(color::border(cx))
                         .overflow_hidden()
+                        // Record the cursor position on a right mouse-down so the
+                        // row menu (opened by the table's `RightClickedRow` event,
+                        // which carries only the row index) anchors at the click.
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, e: &MouseDownEvent, _w, _cx| {
+                                this.last_right_click = e.position;
+                            }),
+                        )
                         .child(DataTable::new(&self.table).bordered(false).small()),
                 )
                 .child(
@@ -508,10 +690,19 @@ mod view {
                         .on_click(cx.listener(|this, _e, _w, cx| this.attach_selected(cx))),
                 );
 
+            let row_menu = self.render_row_menu(cx);
+
             modal::card(cx)
                 .id("rcx-process-picker")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxProcessPicker")
+                // Capture-phase key handling so Enter attaches / Escape cancels even
+                // while the filter input owns focus (the C++ dialog accept/reject).
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                    if this.handle_nav_key(ev.keystroke.key.as_str(), cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .w(card_w)
                 .h(card_h)
                 .child(
@@ -523,13 +714,14 @@ mod view {
                 )
                 .child(body)
                 .child(footer)
+                .children(row_menu)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessPickerModel, ProcessRow, SourceAvailability};
+    use super::{preferred_row_index, ProcessPickerModel, ProcessRow, SourceAvailability};
     use crate::provider::ProviderRegistry;
 
     fn available(pid: u32, name: &str) -> ProcessRow {
@@ -642,5 +834,41 @@ mod tests {
         let reg = ProviderRegistry::new();
         let m = ProcessPickerModel::from_registry(&reg);
         assert!(m.preferred().is_none());
+    }
+
+    #[test]
+    fn preferred_row_index_picks_first_attachable() {
+        let rows = vec![
+            ProcessRow {
+                availability: SourceAvailability::Stub,
+                ..available(0, "stub")
+            },
+            available(10, "real"),
+            available(20, "real2"),
+        ];
+        // The first attachable row is index 1 (index 0 is a stub).
+        assert_eq!(preferred_row_index(&rows), Some(1));
+    }
+
+    #[test]
+    fn preferred_row_index_falls_back_to_first_row() {
+        // No attachable row → fall back to the first row so Attach/Enter still
+        // act on something (the C++ default top selection).
+        let rows = vec![
+            ProcessRow {
+                availability: SourceAvailability::Stub,
+                ..available(0, "a")
+            },
+            ProcessRow {
+                availability: SourceAvailability::Stub,
+                ..available(0, "b")
+            },
+        ];
+        assert_eq!(preferred_row_index(&rows), Some(0));
+    }
+
+    #[test]
+    fn preferred_row_index_none_for_empty() {
+        assert_eq!(preferred_row_index(&[]), None);
     }
 }

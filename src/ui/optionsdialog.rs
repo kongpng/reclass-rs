@@ -194,6 +194,27 @@ pub fn filter_visible(query: &str) -> Vec<OptionsPage> {
         .collect()
 }
 
+/// Step the nav-tree selection to the next/previous **visible** page (the C++
+/// `QTreeWidget` Up/Down across the filtered tree). `pages` is the currently
+/// visible page list ([`filter_visible`]); `current` is the selected page;
+/// `delta` is +1 (Down) or -1 (Up). Returns the page to select next, clamped to
+/// the ends (no wraparound, matching the tree's keyboard navigation). Returns
+/// `None` when there is nothing to move to (empty list, or the current page is
+/// not visible).
+pub fn step_visible_page(
+    pages: &[OptionsPage],
+    current: OptionsPage,
+    delta: isize,
+) -> Option<OptionsPage> {
+    if pages.is_empty() {
+        return None;
+    }
+    let cur = pages.iter().position(|p| *p == current)?;
+    let last = pages.len() - 1;
+    let next = (cur as isize + delta).clamp(0, last as isize) as usize;
+    Some(pages[next])
+}
+
 /// Whether a page matches the (already-lowercased, trimmed) query — label OR any
 /// keyword contains it.
 fn page_matches(page: OptionsPage, q_lower: &str) -> bool {
@@ -213,8 +234,8 @@ pub use view::{OptionsDialog, OptionsEvent};
 #[cfg(feature = "ui")]
 mod view {
     use super::{
-        filter_visible, font_choice_index, parse_refresh_ms, OptionsPage, OptionsResult,
-        FONT_CHOICES, REFRESH_DESC,
+        filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
+        OptionsResult, FONT_CHOICES, REFRESH_DESC,
     };
     use crate::ui::design::{color, section_label, tokens, zed_list_row};
     use crate::ui::dialogs::modal;
@@ -354,6 +375,67 @@ mod view {
 
         fn cancel(&mut self, cx: &mut Context<Self>) {
             cx.emit(OptionsEvent::Cancel);
+        }
+
+        /// Whether a text input (search or refresh) currently holds focus — used to
+        /// guard Enter so it does not fire OK while the user is typing in a field.
+        fn an_input_focused(&self, window: &Window, cx: &App) -> bool {
+            self.search.read(cx).focus_handle(cx).is_focused(window)
+                || self.refresh.read(cx).focus_handle(cx).is_focused(window)
+        }
+
+        /// Move the nav-tree selection to the next/previous visible page (Up/Down).
+        fn step_page(&mut self, delta: isize, cx: &mut Context<Self>) {
+            let visible = filter_visible(&self.query);
+            if let Some(next) = step_visible_page(&visible, self.page, delta) {
+                self.select_page(next, cx);
+            }
+        }
+
+        /// Capture-phase key handling (the C++ `ThemedDialog` accept/reject + the
+        /// `Ctrl+E` search shortcut + the nav-tree Up/Down): Escape cancels; Enter
+        /// confirms (OK) unless a dropdown is open or a text input owns focus (so
+        /// typing/picking isn't hijacked); Ctrl+E focuses the search box; Up/Down
+        /// walk the visible pages. Returns `true` when handled.
+        fn handle_nav_key(
+            &mut self,
+            key: &str,
+            modifiers: &Modifiers,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> bool {
+            // Ctrl+E focuses the search box (the placeholder's advertised shortcut).
+            if key == "e" && modifiers.control {
+                let search = self.search.clone();
+                window.focus(&search.read(cx).focus_handle(cx), cx);
+                cx.notify();
+                return true;
+            }
+            match key {
+                "escape" => {
+                    self.cancel(cx);
+                    true
+                }
+                "enter" => {
+                    // Don't fire OK while a dropdown is open or an input is focused
+                    // (Enter there picks/commits the control, not the dialog).
+                    if self.theme_open || self.font_open || self.an_input_focused(window, cx) {
+                        false
+                    } else {
+                        self.confirm(cx);
+                        true
+                    }
+                }
+                "down" => {
+                    self.step_page(1, cx);
+                    true
+                }
+                "up" => {
+                    self.step_page(-1, cx);
+                    true
+                }
+                _ => false,
+            }
         }
 
         /// Pick a theme (the C++ `m_themeCombo->setCurrentIndex`).
@@ -676,6 +758,19 @@ mod view {
                 .id("rcx-options-dialog")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxOptions")
+                // Capture-phase key handling so Escape/Enter/Ctrl+E/Up-Down reach
+                // the dialog even while the search/refresh input owns focus (the C++
+                // ThemedDialog accept/reject + Ctrl+E + nav-tree navigation).
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if this.handle_nav_key(
+                        ev.keystroke.key.as_str(),
+                        &ev.keystroke.modifiers,
+                        window,
+                        cx,
+                    ) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .w(card_w)
                 .h(card_h)
                 .child(modal::header("Options", cx).child(modal::close_button(
@@ -743,8 +838,8 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_visible, font_choice_index, parse_refresh_ms, OptionsPage, OptionsResult,
-        FONT_CHOICES, REFRESH_MAX, REFRESH_MIN,
+        filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
+        OptionsResult, FONT_CHOICES, REFRESH_MAX, REFRESH_MIN,
     };
 
     #[test]
@@ -837,6 +932,48 @@ mod tests {
         // Empty / non-numeric → the minimum (defensive, like an empty spinbox).
         assert_eq!(parse_refresh_ms(""), REFRESH_MIN);
         assert_eq!(parse_refresh_ms("abc"), REFRESH_MIN);
+    }
+
+    #[test]
+    fn step_visible_page_walks_and_clamps() {
+        let all = OptionsPage::ALL.to_vec();
+        // Down from General → AI Features → Generator, clamps at the end.
+        assert_eq!(
+            step_visible_page(&all, OptionsPage::General, 1),
+            Some(OptionsPage::AiFeatures)
+        );
+        assert_eq!(
+            step_visible_page(&all, OptionsPage::AiFeatures, 1),
+            Some(OptionsPage::Generator)
+        );
+        assert_eq!(
+            step_visible_page(&all, OptionsPage::Generator, 1),
+            Some(OptionsPage::Generator)
+        );
+        // Up clamps at the start.
+        assert_eq!(
+            step_visible_page(&all, OptionsPage::Generator, -1),
+            Some(OptionsPage::AiFeatures)
+        );
+        assert_eq!(
+            step_visible_page(&all, OptionsPage::General, -1),
+            Some(OptionsPage::General)
+        );
+    }
+
+    #[test]
+    fn step_visible_page_respects_filtered_list() {
+        // With only AI + Generator visible, Up from Generator lands on AI Features
+        // (General is hidden, so it is skipped).
+        let visible = vec![OptionsPage::AiFeatures, OptionsPage::Generator];
+        assert_eq!(
+            step_visible_page(&visible, OptionsPage::Generator, -1),
+            Some(OptionsPage::AiFeatures)
+        );
+        // A current page that is not visible → no move.
+        assert_eq!(step_visible_page(&visible, OptionsPage::General, 1), None);
+        // Empty list → no move.
+        assert_eq!(step_visible_page(&[], OptionsPage::General, 1), None);
     }
 
     #[test]

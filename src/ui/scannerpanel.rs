@@ -720,6 +720,89 @@ pub fn serialize_results_json(
     )
 }
 
+/// Parse a scanner results JSON document (the inverse of
+/// [`serialize_results_json`]; the C++ `loadResultsFrom`). Returns the recovered
+/// [`ScanResult`] list. Tolerant hand-rolled scan over the `results` array (the
+/// format is a flat list of `{address, value, module?}` objects with hex
+/// fields), so loading a file the port itself wrote round-trips. Unknown / extra
+/// keys are ignored; a malformed entry is skipped. Pure + unit-tested.
+pub fn deserialize_results_json(json: &str) -> Vec<ScanResult> {
+    fn unhex(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            let hi = (bytes[i] as char).to_digit(16);
+            let lo = (bytes[i + 1] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+                _ => break,
+            }
+            i += 2;
+        }
+        out
+    }
+    // Extract the value of a `"key":"..."` string field within the slice `obj`.
+    fn str_field(obj: &str, key: &str) -> Option<String> {
+        let pat = format!("\"{key}\"");
+        let kpos = obj.find(&pat)?;
+        let after = &obj[kpos + pat.len()..];
+        let colon = after.find(':')?;
+        let rest = after[colon + 1..].trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+
+    // Isolate the `results:[ ... ]` array body, then split on top-level `}`.
+    let Some(arr_start) = json
+        .find("\"results\"")
+        .and_then(|p| json[p..].find('[').map(|b| p + b + 1))
+    else {
+        return Vec::new();
+    };
+    let arr = &json[arr_start..];
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut obj_start: Option<usize> = None;
+    for (i, ch) in arr.char_indices() {
+        match ch {
+            ']' if depth == 0 => break,
+            '{' => {
+                if depth == 0 {
+                    obj_start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = obj_start.take() {
+                        let obj = &arr[start..=i];
+                        if let Some(addr_hex) = str_field(obj, "address") {
+                            let address =
+                                u64::from_str_radix(addr_hex.trim_start_matches("0x"), 16)
+                                    .unwrap_or(0);
+                            let value = str_field(obj, "value")
+                                .map(|v| unhex(&v))
+                                .unwrap_or_default();
+                            let module = str_field(obj, "module").unwrap_or_default();
+                            out.push(ScanResult {
+                                address,
+                                region_module: module,
+                                scan_value: value,
+                                previous_value: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
@@ -1701,6 +1784,71 @@ mod view {
             serialize_results_json(self.form.mode(), self.form.value_type, &rows)
         }
 
+        /// "Save…" footer button — write the current results to a file the user
+        /// picks (the C++ `saveResultsTo`). Serializes to the scanner JSON shape
+        /// and writes it asynchronously after the native save dialog returns.
+        fn save_results_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.results.is_empty() {
+                return;
+            }
+            let json = self.results_json();
+            let dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            let rx = cx.prompt_for_new_path(&dir, Some("scan_results.json"));
+            cx.spawn_in(window, async move |this, cx| {
+                let Some(path) = rx.await.ok().and_then(|r| r.ok()).flatten() else {
+                    return;
+                };
+                let wrote = std::fs::write(&path, json).is_ok();
+                let _ = this.update(cx, |this, cx| {
+                    this.status = if wrote {
+                        format!("Saved results to {}", path.display())
+                    } else {
+                        "Failed to write results file".to_string()
+                    };
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        /// "Load…" footer button — read a previously-saved results file the user
+        /// picks (the C++ `loadResultsFrom`): parse the scanner JSON and replace
+        /// the result list via [`load_results`](Self::load_results).
+        fn load_results_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let rx = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Load scan results".into()),
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let Some(path) = rx
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+                    .and_then(|v| v.into_iter().next())
+                else {
+                    return;
+                };
+                let json = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.status = "Failed to read results file".to_string();
+                            cx.notify();
+                        });
+                        return;
+                    }
+                };
+                let results = super::deserialize_results_json(&json);
+                let _ = this.update(cx, |this, cx| {
+                    this.load_results(results, cx);
+                });
+            })
+            .detach();
+        }
+
         /// The scan-type dropdown label (PIC3/PIC6: "Signature" vs "Value").
         fn mode_label(&self) -> &'static str {
             match self.form.mode() {
@@ -2261,30 +2409,61 @@ mod view {
                         .border_color(color::border(cx))
                         .child(DataTable::new(&self.table).bordered(false).small()),
                 )
-                // ── Footer: Go to Address + Copy Address ──
+                // ── Footer: Save/Load (left) + Go to Address + Copy Address (right) ──
                 .child(
                     gpui_component::h_flex()
                         .w_full()
                         .px(px(tokens::space::LG))
                         .py(px(tokens::space::MD))
                         .gap(px(tokens::space::MD))
-                        .justify_end()
+                        .justify_between()
+                        .items_center()
                         .border_t_1()
                         .border_color(color::border(cx))
                         .bg(color::panel_bg(cx))
+                        // Save / Load results to a file (the C++ saveResultsTo /
+                        // loadResultsFrom). Save is enabled only with results.
                         .child(
-                            Button::new("scanner-goto")
-                                .small()
-                                .label("Go to Address")
-                                .disabled(!has_selection)
-                                .on_click(cx.listener(|this, _e, _w, cx| this.go_to_selected(cx))),
+                            gpui_component::h_flex()
+                                .gap(px(tokens::space::SM))
+                                .child(
+                                    Button::new("scanner-save")
+                                        .small()
+                                        .label("Save…")
+                                        .disabled(!has_results)
+                                        .on_click(cx.listener(|this, _e, window, cx| {
+                                            this.save_results_dialog(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("scanner-load").small().label("Load…").on_click(
+                                        cx.listener(|this, _e, window, cx| {
+                                            this.load_results_dialog(window, cx)
+                                        }),
+                                    ),
+                                ),
                         )
                         .child(
-                            Button::new("scanner-copy")
-                                .small()
-                                .label("Copy Address")
-                                .disabled(!has_selection)
-                                .on_click(cx.listener(|this, _e, _w, cx| this.copy_selected(cx))),
+                            gpui_component::h_flex()
+                                .gap(px(tokens::space::MD))
+                                .child(
+                                    Button::new("scanner-goto")
+                                        .small()
+                                        .label("Go to Address")
+                                        .disabled(!has_selection)
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| this.go_to_selected(cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("scanner-copy")
+                                        .small()
+                                        .label("Copy Address")
+                                        .disabled(!has_selection)
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| this.copy_selected(cx)),
+                                        ),
+                                ),
                         ),
                 )
         }
@@ -2294,10 +2473,10 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_delta, filter_rows, format_value, previous_delta_text, rescan_status,
-        serialize_results_json, split_address_dim, stage_breadcrumb, truncation_banner,
-        value_type_entries, CondEntry, ScanMode, ScanRow, ScannerForm, FAST_SCAN_ALIGNMENTS,
-        MAX_DISPLAY_ROWS,
+        compute_delta, deserialize_results_json, filter_rows, format_value, previous_delta_text,
+        rescan_status, serialize_results_json, split_address_dim, stage_breadcrumb,
+        truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow, ScannerForm,
+        FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
     use crate::scanner::{ScanCondition, ScanResult, ValueType};
 
@@ -2387,6 +2566,34 @@ mod tests {
         let sig = serialize_results_json(ScanMode::Signature, ValueType::Int32, &[]);
         assert!(sig.contains("\"scanMode\":0"));
         assert!(sig.contains("\"count\":0"));
+    }
+
+    #[test]
+    fn deserialize_results_json_round_trips() {
+        let rows = vec![
+            (0x401000u64, vec![0x39, 0x05, 0x00, 0x00], String::new()),
+            (0x7ff0u64, vec![0xFFu8], "game.exe".to_string()),
+        ];
+        let json = serialize_results_json(ScanMode::Value, ValueType::Int32, &rows);
+        let parsed = deserialize_results_json(&json);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].address, 0x401000);
+        assert_eq!(parsed[0].scan_value, vec![0x39, 0x05, 0x00, 0x00]);
+        assert_eq!(parsed[0].region_module, "");
+        assert_eq!(parsed[1].address, 0x7ff0);
+        assert_eq!(parsed[1].scan_value, vec![0xFF]);
+        assert_eq!(parsed[1].region_module, "game.exe");
+    }
+
+    #[test]
+    fn deserialize_results_json_empty_and_malformed() {
+        // No results array → empty.
+        assert!(deserialize_results_json("{}").is_empty());
+        // Empty results list.
+        let empty = serialize_results_json(ScanMode::Value, ValueType::Int32, &[]);
+        assert!(deserialize_results_json(&empty).is_empty());
+        // Garbage → empty, no panic.
+        assert!(deserialize_results_json("not json at all").is_empty());
     }
 
     // ── Field-visibility reducer (onConditionChanged) ──

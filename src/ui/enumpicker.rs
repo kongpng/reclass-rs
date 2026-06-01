@@ -170,6 +170,39 @@ impl EnumPickerModel {
         }
     }
 
+    /// Move selection down by `page` rows (PageDown), clamped to the last row.
+    pub fn page_down(&mut self, page: usize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() - 1;
+        let from = self.selected.unwrap_or(0);
+        self.selected = Some((from + page.max(1)).min(last));
+    }
+
+    /// Move selection up by `page` rows (PageUp), clamped to the first row.
+    pub fn page_up(&mut self, page: usize) {
+        if let Some(r) = self.selected {
+            self.selected = Some(r.saturating_sub(page.max(1)));
+        } else if !self.rows.is_empty() {
+            self.selected = Some(0);
+        }
+    }
+
+    /// Select the first row (Home).
+    pub fn move_home(&mut self) {
+        if !self.rows.is_empty() {
+            self.selected = Some(0);
+        }
+    }
+
+    /// Select the last row (End).
+    pub fn move_end(&mut self) {
+        if !self.rows.is_empty() {
+            self.selected = Some(self.rows.len() - 1);
+        }
+    }
+
     /// Select + return the value of a clicked row (`acceptRow`).
     pub fn select_row(&mut self, row: usize) -> Option<i64> {
         if row < self.rows.len() {
@@ -249,6 +282,8 @@ mod view {
         model: EnumPickerModel,
         input: Entity<InputState>,
         focus_handle: FocusHandle,
+        /// Scrolls the list so the keyboard-selected member stays visible (item 9).
+        list_scroll: ScrollHandle,
         _subscription: Subscription,
     }
 
@@ -277,6 +312,7 @@ mod view {
                 model,
                 input,
                 focus_handle: cx.focus_handle(),
+                list_scroll: ScrollHandle::new(),
                 _subscription: subscription,
             }
         }
@@ -286,9 +322,26 @@ mod view {
             &self.model
         }
 
+        /// Scroll the selected member into view (item 9). Rows render 1:1 with
+        /// model rows, so the model index is the rendered child index.
+        fn scroll_selected_into_view(&self) {
+            if let Some(sel) = self.model.selected() {
+                self.list_scroll.scroll_to_item(sel);
+            }
+        }
+
         fn accept_row(&mut self, row: usize, cx: &mut Context<Self>) {
             if let Some(value) = self.model.select_row(row) {
                 cx.emit(EnumPickerEvent::Chosen(value));
+            }
+        }
+
+        /// Hover over a member moves the selection highlight to it (item 2) so
+        /// keyboard + mouse selection stay in sync.
+        fn hover_row(&mut self, row: usize, cx: &mut Context<Self>) {
+            if self.model.selected() != Some(row) {
+                self.model.select_row(row);
+                cx.notify();
             }
         }
 
@@ -296,14 +349,41 @@ mod view {
         /// selected member (clamped), Enter chooses it, Esc dismisses. Returns
         /// `true` when handled so the caller stops propagation.
         fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            const PAGE: usize = 10;
             match key {
                 "down" => {
                     self.model.move_down();
+                    self.scroll_selected_into_view();
                     cx.notify();
                     true
                 }
                 "up" => {
                     self.model.move_up();
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "pagedown" => {
+                    self.model.page_down(PAGE);
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "pageup" => {
+                    self.model.page_up(PAGE);
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "home" => {
+                    self.model.move_home();
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "end" => {
+                    self.model.move_end();
+                    self.scroll_selected_into_view();
                     cx.notify();
                     true
                 }
@@ -371,6 +451,10 @@ mod view {
                         .when(is_sel, |d| d.bg(sel_bg))
                         .when(!is_sel, |d| d.hover(|s| s.bg(hover_bg)))
                         .cursor_pointer()
+                        // Hover-to-select (item 2): keep keyboard + mouse in sync.
+                        .on_mouse_move(cx.listener(move |this, _e, _window, cx| {
+                            this.hover_row(row, cx);
+                        }))
                         .on_click(cx.listener(move |this, _e, _window, cx| {
                             this.accept_row(row, cx);
                         }))
@@ -451,12 +535,15 @@ mod view {
                     )
                 })
                 .child(
+                    // Scrollable member list (item 9): the keyboard-selected
+                    // member scrolls into view via `list_scroll.scroll_to_item`.
                     gpui_component::v_flex()
                         .id("rcx-enum-picker-list")
                         .p(px(tokens::space::XS))
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.list_scroll)
                         .children(rows),
                 )
         }
@@ -539,6 +626,25 @@ mod tests {
         for _ in 0..10 {
             model.move_down();
         }
+        assert_eq!(model.selected(), Some(model.row_count() - 1));
+    }
+
+    #[test]
+    fn page_home_end_navigation() {
+        let many: Vec<Member> = (0..20).map(|i| Member::new(&format!("M{i}"), i)).collect();
+        let mut model = EnumPickerModel::new(many, 0);
+        // Current value 0 → first row.
+        assert_eq!(model.selected(), Some(0));
+        model.page_down(10);
+        assert_eq!(model.selected(), Some(10));
+        model.page_down(10);
+        // Clamps to the last row.
+        assert_eq!(model.selected(), Some(model.row_count() - 1));
+        model.page_up(5);
+        assert_eq!(model.selected(), Some(model.row_count() - 1 - 5));
+        model.move_home();
+        assert_eq!(model.selected(), Some(0));
+        model.move_end();
         assert_eq!(model.selected(), Some(model.row_count() - 1));
     }
 

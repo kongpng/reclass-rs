@@ -289,6 +289,14 @@ mod view {
         pinned: bool,
         offset_input: Entity<InputState>,
         focus_handle: FocusHandle,
+        /// The size button currently hovered — drives the byte-preview / info
+        /// line so hovering 8/16/32/64/128 previews that conversion (item 4).
+        /// `None` falls back to the current kind.
+        hovered_size: Option<NodeKind>,
+        /// The keyboard-focused hit index into [`Self::hit_order`] (item 5): arrows
+        /// / Tab advance it, Enter/Space activate the focused chip. `None` = no
+        /// keyboard focus yet (mouse mode).
+        focused_hit: Option<usize>,
     }
 
     impl HexToolbarPopup {
@@ -300,6 +308,8 @@ mod view {
                 pinned: false,
                 offset_input,
                 focus_handle: cx.focus_handle(),
+                hovered_size: None,
+                focused_hit: None,
             }
         }
 
@@ -320,6 +330,128 @@ mod view {
             if !self.pinned {
                 cx.emit(HexToolbarEvent::Dismissed);
             }
+        }
+
+        /// The keyboard-focusable hit order (the C++ `m_hits` of ENABLED hits, in
+        /// paint order): the doable size buttons, the pin toggle, then the pinned
+        /// panel's suggestion / insert / join / fill-go hits (item 5). Recomputed
+        /// each keypress so it tracks the current pinned/selection state.
+        fn hit_order(&self) -> Vec<super::HitAction> {
+            use super::HitAction;
+            let mut hits: Vec<HitAction> = Vec::new();
+            for &kind in HEX_SIZES.iter() {
+                if self.ctx.can_do(kind) {
+                    hits.push(HitAction::Size(kind));
+                }
+            }
+            hits.push(HitAction::Pin);
+            if self.pinned {
+                if self.ctx.has_ptr {
+                    hits.push(HitAction::Suggest);
+                }
+                if self.ctx.has_float {
+                    hits.push(HitAction::Suggest);
+                }
+                if self.ctx.has_string {
+                    hits.push(HitAction::Suggest);
+                }
+                hits.push(HitAction::InsertAbove);
+                hits.push(HitAction::InsertBelow);
+                if self.ctx.multi_select_join_kind().is_some() {
+                    hits.push(HitAction::JoinSelected);
+                }
+                hits.push(HitAction::FillGo);
+            }
+            hits
+        }
+
+        /// Activate a hit (the C++ `mousePressEvent` dispatch reused by the
+        /// keyboard handler).
+        fn activate_hit(&mut self, hit: super::HitAction, cx: &mut Context<Self>) {
+            use super::HitAction;
+            match hit {
+                HitAction::Size(kind) => self.pick_size(kind, cx),
+                HitAction::Pin => self.toggle_pin(cx),
+                HitAction::Suggest => {
+                    // Activate the first detected suggestion (ptr > float > string).
+                    let kind = if self.ctx.has_ptr {
+                        Some(NodeKind::Pointer64)
+                    } else if self.ctx.has_float {
+                        Some(NodeKind::Float)
+                    } else if self.ctx.has_string {
+                        Some(NodeKind::UTF8)
+                    } else {
+                        None
+                    };
+                    if let Some(k) = kind {
+                        self.pick_suggestion(k, cx);
+                    }
+                }
+                HitAction::InsertAbove => cx.emit(HexToolbarEvent::InsertAbove(self.ctx.node_id)),
+                HitAction::InsertBelow => cx.emit(HexToolbarEvent::InsertBelow(self.ctx.node_id)),
+                HitAction::JoinSelected => cx.emit(HexToolbarEvent::JoinSelected),
+                HitAction::FillGo => self.fill_go(cx),
+            }
+        }
+
+        /// Keyboard handler (the C++ `keyPressEvent`, item 5): Tab / Right / Down
+        /// advance the focused hit, Backtab / Left / Up retreat it, Enter / Space
+        /// activate it, Esc dismisses (or unpins when pinned). Returns `true` when
+        /// handled.
+        fn handle_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+            match key {
+                "escape" => {
+                    if self.pinned {
+                        self.toggle_pin(cx);
+                    } else {
+                        cx.emit(HexToolbarEvent::Dismissed);
+                    }
+                    true
+                }
+                "tab" if shift => {
+                    self.advance_hit(-1, cx);
+                    true
+                }
+                "tab" | "right" | "down" => {
+                    self.advance_hit(1, cx);
+                    true
+                }
+                "left" | "up" => {
+                    self.advance_hit(-1, cx);
+                    true
+                }
+                "enter" | "space" => {
+                    let hits = self.hit_order();
+                    if let Some(idx) = self.focused_hit {
+                        if let Some(&hit) = hits.get(idx) {
+                            self.activate_hit(hit, cx);
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Advance the keyboard-focused hit by `dir` (wrapping), seeding from 0 on
+        /// the first move (mirrors the C++ `advanceHover`).
+        fn advance_hit(&mut self, dir: i32, cx: &mut Context<Self>) {
+            let len = self.hit_order().len();
+            if len == 0 {
+                return;
+            }
+            let next = match self.focused_hit {
+                None => {
+                    if dir >= 0 {
+                        0
+                    } else {
+                        len - 1
+                    }
+                }
+                Some(cur) => (((cur as i32 + dir) % len as i32 + len as i32) % len as i32) as usize,
+            };
+            self.focused_hit = Some(next);
+            cx.notify();
         }
 
         fn toggle_pin(&mut self, cx: &mut Context<Self>) {
@@ -369,6 +501,7 @@ mod view {
             let sel_bg = color::selected_bg(cx);
             let border = color::border(cx);
 
+            let hit_order = self.hit_order();
             // Size button row — a segmented chip group (Zed toggle row): each size
             // is a small chip, the current kind soft-accent-filled, undoable sizes
             // dimmed + non-interactive.
@@ -378,6 +511,9 @@ mod view {
                 .map(|(&kind, label)| {
                     let is_current = kind == self.ctx.current_kind;
                     let can_do = self.ctx.can_do(kind);
+                    // Keyboard focus ring when this size is the focused hit (item 5).
+                    let is_kb_focused = self.focused_hit.and_then(|i| hit_order.get(i))
+                        == Some(&super::HitAction::Size(kind));
                     let chip_fg = if is_current {
                         accent
                     } else if can_do {
@@ -398,8 +534,22 @@ mod view {
                         .when(is_current, |d| {
                             d.bg(sel_bg).font_weight(FontWeight::SEMIBOLD)
                         })
+                        .when(is_kb_focused, |d| d.border_1().border_color(accent))
+                        .when(!is_kb_focused, |d| {
+                            d.border_1().border_color(gpui::transparent_black())
+                        })
                         .when(can_do && !is_current, |d| {
                             d.cursor_pointer().hover(|s| s.bg(hover_bg))
+                        })
+                        // Hover sets the previewed size (item 4): the byte-preview
+                        // and info line below recompute for the hovered kind.
+                        .when(can_do, |d| {
+                            d.on_mouse_move(cx.listener(move |this, _e, _w, cx| {
+                                if this.hovered_size != Some(kind) {
+                                    this.hovered_size = Some(kind);
+                                    cx.notify();
+                                }
+                            }))
                         })
                         .when(can_do, |d| {
                             d.on_click(cx.listener(move |this, _e, _w, cx| {
@@ -411,9 +561,11 @@ mod view {
                 })
                 .collect();
 
-            // The hovered-size preview/info (default to the current kind).
-            let preview = self.ctx.preview_for_kind(self.ctx.current_kind);
-            let info = self.ctx.info_for_kind(self.ctx.current_kind);
+            // The byte-preview / info line tracks the HOVERED size button (item 4),
+            // falling back to the current kind when nothing is hovered.
+            let preview_kind = self.hovered_size.unwrap_or(self.ctx.current_kind);
+            let preview = self.ctx.preview_for_kind(preview_kind);
+            let info = self.ctx.info_for_kind(preview_kind);
 
             // Smart-suggestion rows (`hextoolbarpopup.cpp:312` — the pinned panel's
             // ptr/float/string detections). Each is a small bordered chip painted in
@@ -478,6 +630,14 @@ mod view {
                 .id("rcx-hex-toolbar")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxHexToolbar")
+                // Keyboard support (item 5): Tab/arrows move the focused chip,
+                // Enter/Space activate it, Esc dismisses / unpins.
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                    if this.handle_key(ev.keystroke.key.as_str(), ev.keystroke.modifiers.shift, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
                 .flex()
                 .flex_col()
                 .min_w(px(280.))
@@ -568,6 +728,38 @@ mod view {
                                         })),
                                 ),
                         )
+                        // Multi-select join (item 3): when >1 contiguous power-of-
+                        // two hex bytes are selected, render a "join N → kindX" chip
+                        // emitting JoinSelected (the C++ HA_JoinSel row). Hidden
+                        // otherwise so the action is reachable from the pinned panel.
+                        .when_some(self.ctx.multi_select_join_kind(), |this, join_kind| {
+                            let join_focused = self.focused_hit.and_then(|i| hit_order.get(i))
+                                == Some(&super::HitAction::JoinSelected);
+                            let label = format!(
+                                "join {} \u{2192} {}",
+                                self.ctx.multi_select_count,
+                                super::type_name_for(join_kind)
+                            );
+                            this.child(
+                                gpui_component::h_flex()
+                                    .id("hex-join-selected")
+                                    .h(px(22.))
+                                    .px(px(tokens::space::MD))
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(tokens::radius::MD))
+                                    .border_1()
+                                    .border_color(if join_focused { accent } else { border })
+                                    .text_size(px(tokens::font::UI_SM))
+                                    .text_color(fg)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(hover_bg))
+                                    .on_click(cx.listener(|_this, _e, _w, cx| {
+                                        cx.emit(HexToolbarEvent::JoinSelected);
+                                    }))
+                                    .child(label),
+                            )
+                        })
                         .child(
                             gpui_component::h_flex()
                                 .gap(px(tokens::space::XS))

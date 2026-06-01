@@ -209,6 +209,17 @@ impl FieldInput {
         self.hex_overwrite.is_some()
     }
 
+    /// Item 7: re-seed the content with the ASCII preview `seed` (one printable
+    /// char per byte) and switch into [`HexOverwrite::Ascii`] mode. Used by the
+    /// "Edit ASCII" context-menu entry, which opens a plain Value edit (whose seed
+    /// is the hex string) then converts it to the ASCII overwrite editor.
+    pub fn set_ascii_overwrite(&mut self, seed: &str, byte_count: usize) {
+        self.content = seed.to_string().into();
+        self.hex_overwrite = Some(HexOverwrite::Ascii { byte_count });
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+    }
+
     /// Advance/clamp helper: the next caret offset moving right by one, skipping a
     /// space separator in hex mode, clamped to the last data position.
     fn ow_next(&self, off: usize) -> usize {

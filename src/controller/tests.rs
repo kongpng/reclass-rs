@@ -2259,3 +2259,198 @@ fn viewport_diag_nonvacuous() {
         panic!("2nd tick returned None — viewport test would be vacuous");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Root-class command-row helpers + materialize-ref-children (INTERACTION parity)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn root_class_target_resolves_view_root_then_first_struct() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    // No view root set → first top-level Struct.
+    assert_eq!(c.view_root_id(), 0);
+    assert_eq!(c.root_class_target_id(), root_id);
+    // Explicit view root wins.
+    c.set_suppress_refresh(true);
+    c.set_view_root_id(root_id);
+    assert_eq!(c.root_class_target_id(), root_id);
+}
+
+#[test]
+fn rename_root_class_writes_struct_type_name_undoable() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let old = c.tree().nodes[0].struct_type_name.clone();
+    assert_eq!(old, "TestStruct");
+
+    // Empty text is rejected (no-op).
+    c.rename_root_class("");
+    assert_eq!(c.tree().nodes[0].struct_type_name, "TestStruct");
+
+    c.rename_root_class("Player");
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].struct_type_name, "Player");
+    // It renames structTypeName, NOT the node `name`.
+    assert_eq!(c.tree().nodes[ri].name, "root");
+
+    c.undo();
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].struct_type_name, "TestStruct");
+
+    // No-op when unchanged: stack count stays put.
+    let before = c.undo_stack().count();
+    c.rename_root_class("TestStruct");
+    assert_eq!(c.undo_stack().count(), before);
+}
+
+#[test]
+fn set_root_class_keyword_accepts_only_valid_keywords() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    assert_eq!(c.tree().nodes[0].resolved_class_keyword(), "struct");
+
+    // Garbage is rejected (no-op, no undo entry).
+    let before = c.undo_stack().count();
+    c.set_root_class_keyword("notakeyword");
+    assert_eq!(c.undo_stack().count(), before);
+    assert_eq!(c.tree().nodes[0].resolved_class_keyword(), "struct");
+
+    // Case-insensitive "Class".
+    c.set_root_class_keyword("Class");
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].resolved_class_keyword(), "class");
+
+    // Unlike convert_root_keyword, the explicit commit DOES allow enum.
+    c.set_root_class_keyword("enum");
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].resolved_class_keyword(), "enum");
+
+    c.undo();
+    c.undo();
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].resolved_class_keyword(), "struct");
+}
+
+#[test]
+fn convert_root_keyword_cycles_struct_class_but_never_enum() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+
+    c.convert_root_keyword("class");
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].resolved_class_keyword(), "class");
+
+    // enum is forbidden in the cycle path (no-op).
+    let before = c.undo_stack().count();
+    c.convert_root_keyword("enum");
+    assert_eq!(c.undo_stack().count(), before);
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].resolved_class_keyword(), "class");
+
+    // Same keyword is a no-op.
+    c.convert_root_keyword("class");
+    assert_eq!(c.undo_stack().count(), before);
+
+    c.convert_root_keyword("struct");
+    let ri = c.tree().index_of_id(root_id) as usize;
+    assert_eq!(c.tree().nodes[ri].resolved_class_keyword(), "struct");
+}
+
+#[test]
+fn materialize_ref_children_clones_referenced_struct_inline() {
+    // Build: a definition struct `Inner` with two fields, and a host struct that
+    // embeds a `Struct` node referencing `Inner` (refId set, no own children).
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let host = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Host".into(),
+        name: "host".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let host_id = doc.tree.nodes[host].id;
+
+    let inner = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Inner".into(),
+        name: "inner_def".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let inner_id = doc.tree.nodes[inner].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "a".into(),
+        parent_id: inner_id,
+        offset: 0,
+        ..Node::default()
+    });
+    doc.tree.add_node(Node {
+        kind: NodeKind::Float,
+        name: "b".into(),
+        parent_id: inner_id,
+        offset: 4,
+        ..Node::default()
+    });
+
+    // Embedded ref node under the host: Struct + refId=inner, NO children.
+    let embed = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "embedded".into(),
+        parent_id: host_id,
+        offset: 0,
+        ref_id: inner_id,
+        collapsed: true,
+        ..Node::default()
+    });
+    let embed_id = doc.tree.nodes[embed].id;
+
+    doc.provider = Arc::new(BufferProvider::new(vec![0u8; 64], ""));
+    let mut c = RcxController::new(doc);
+    c.set_suppress_refresh(true);
+
+    let embed_idx = c.tree().index_of_id(embed_id) as usize;
+    assert!(c.tree().children_of(embed_id).is_empty());
+
+    c.materialize_ref_children(embed_idx);
+
+    // The embed now has two inline clones (a, b) parented under it, distinct ids.
+    let kids = c.tree().children_of(embed_id);
+    assert_eq!(kids.len(), 2, "two children materialized inline");
+    let names: Vec<String> = kids
+        .iter()
+        .map(|&i| c.tree().nodes[i].name.clone())
+        .collect();
+    assert!(names.contains(&"a".to_string()));
+    assert!(names.contains(&"b".to_string()));
+    for &i in &kids {
+        assert_eq!(c.tree().nodes[i].parent_id, embed_id);
+        assert_ne!(c.tree().nodes[i].id, inner_id);
+    }
+    // The original definition struct is untouched.
+    assert_eq!(c.tree().children_of(inner_id).len(), 2);
+
+    // Second call is a no-op (already materialized).
+    let count_before = c.tree().nodes.len();
+    c.materialize_ref_children(c.tree().index_of_id(embed_id) as usize);
+    assert_eq!(c.tree().nodes.len(), count_before);
+
+    // Single undo removes the whole materialized subtree (one macro).
+    c.undo();
+    assert!(c.tree().children_of(embed_id).is_empty());
+}
+
+#[test]
+fn materialize_ref_children_noop_without_ref() {
+    let mut c = make_ctrl();
+    // root has no refId → no-op.
+    let before = c.tree().nodes.len();
+    c.materialize_ref_children(0);
+    assert_eq!(c.tree().nodes.len(), before);
+}

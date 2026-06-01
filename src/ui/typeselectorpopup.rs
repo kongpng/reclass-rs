@@ -426,6 +426,10 @@ pub struct TypeModel {
     /// The last filter applied — kept so a sort/category change can re-run the
     /// filter without the host re-pushing the query text.
     last_filter: String,
+    /// Recently-picked type names (most-recent-first), surfaced in a "Recent"
+    /// section at the top of the group view (`m_recentNames`,
+    /// `typeselectorpopup.cpp:1716`).
+    recent_names: Vec<String>,
 }
 
 impl TypeModel {
@@ -440,9 +444,25 @@ impl TypeModel {
             sort_mode: SortMode::default(),
             sort_dir: 1,
             last_filter: String::new(),
+            recent_names: Vec::new(),
         };
         m.apply_filter("");
         m
+    }
+
+    /// Set the recently-picked type names (`setRecentNames`/`m_recentNames`):
+    /// these surface in a "Recent" section at the top of the group-bucketed view
+    /// (the C++ lists them first so common picks are one chord away). Re-runs the
+    /// last filter so the section appears immediately.
+    pub fn set_recent_names(&mut self, names: Vec<String>) {
+        self.recent_names = names;
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
+    }
+
+    /// The recently-picked type names.
+    pub fn recent_names(&self) -> &[String] {
+        &self.recent_names
     }
 
     /// The current list sort mode.
@@ -593,6 +613,33 @@ impl TypeModel {
     /// Build the empty-filter bucketed view: per-group sections in fixed order.
     fn build_bucketed(&mut self) {
         let mut rows: Vec<TypeRow> = Vec::new();
+        // Recent section (`m_recentNames`, `typeselectorpopup.cpp:1716`): entries
+        // whose display name matches a recent pick, listed first. Items still
+        // appear in their normal group section below.
+        if !self.recent_names.is_empty() {
+            let mut recents: Vec<TypeEntry> = Vec::new();
+            for nm in &self.recent_names {
+                if let Some(e) = self
+                    .entries
+                    .iter()
+                    .find(|e| &e.display_name == nm && e.selectable())
+                {
+                    recents.push(e.clone());
+                }
+            }
+            if !recents.is_empty() {
+                rows.push(TypeRow {
+                    entry: TypeEntry::section("Recent"),
+                    match_positions: Vec::new(),
+                });
+                for e in recents {
+                    rows.push(TypeRow {
+                        entry: e,
+                        match_positions: Vec::new(),
+                    });
+                }
+            }
+        }
         for group in KindGroup::ALL {
             let mut group_entries: Vec<TypeEntry> = self
                 .entries
@@ -699,6 +746,68 @@ impl TypeModel {
         }
     }
 
+    /// Move the selection down by `page` selectable rows (PageDown), landing on
+    /// the last selectable row if fewer remain (`Key_PageDown`).
+    pub fn page_down(&mut self, page: usize) {
+        let page = page.max(1);
+        for _ in 0..page {
+            let from = self.selected.unwrap_or(0);
+            match self.next_selectable(from, 1) {
+                Some(next) => self.selected = Some(next),
+                None => {
+                    if self.selected.is_none() {
+                        self.selected = self.first_selectable_row();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Move the selection up by `page` selectable rows (PageUp), landing on the
+    /// first selectable row if fewer remain (`Key_PageUp`).
+    pub fn page_up(&mut self, page: usize) {
+        let page = page.max(1);
+        for _ in 0..page {
+            let Some(from) = self.selected else { break };
+            match self.next_selectable(from, -1) {
+                Some(prev) => self.selected = Some(prev),
+                None => break,
+            }
+        }
+    }
+
+    /// Select the first selectable row (Home).
+    pub fn move_home(&mut self) {
+        self.selected = self.first_selectable_row();
+    }
+
+    /// Select the last selectable row (End).
+    pub fn move_end(&mut self) {
+        self.selected = self
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, r)| r.entry.selectable())
+            .map(|(i, _)| i);
+    }
+
+    /// Pre-select the row matching a primitive `kind` (`setTypes` current-entry
+    /// pre-select, `typeselectorpopup.cpp:1273`): scan for a primitive row of that
+    /// kind and select it. Returns the selected row index, if found.
+    pub fn select_kind(&mut self, kind: NodeKind) -> Option<usize> {
+        let found = self.rows.iter().position(|r| {
+            r.entry.selectable()
+                && r.entry.entry_kind == EntryKind::Primitive
+                && r.entry.primitive_kind == kind
+        });
+        if let Some(i) = found {
+            self.selected = Some(i);
+        }
+        found
+    }
+
     /// Select a specific row if it is selectable (a click; `acceptIndex`).
     pub fn select_row(&mut self, row: usize) -> bool {
         if self
@@ -799,7 +908,12 @@ mod view {
     /// modifier via its existing pointer/array ops.
     #[derive(Clone, Debug)]
     pub enum TypeSelectorEvent {
-        /// A type was chosen: its base kind + the optional modifier.
+        /// A type was chosen: its base kind + the optional modifier. The
+        /// `create_new` flag marks the "+ New" case (item 15) — a brand-new
+        /// struct/class type rather than the existing `Struct` primitive — so the
+        /// editor's apply path can create a fresh composite. Carried on the
+        /// existing `Chosen` variant (not a new variant) to keep the editor's
+        /// exhaustive match stable; the editor reads `create_new` to branch.
         Chosen {
             kind: NodeKind,
             modifier: Option<Modifier>,
@@ -818,8 +932,23 @@ mod view {
         /// the list to those groups.
         active_groups: std::collections::BTreeSet<&'static str>,
         input: Entity<InputState>,
+        /// The array-element count input (the `[]` modifier's `n` box,
+        /// `m_arrayCountEdit`); shown only when the array modifier is active.
+        array_count_input: Entity<InputState>,
         focus_handle: FocusHandle,
+        /// Scrolls the list so the keyboard-selected row stays visible (B2 / item
+        /// 1 / item 9). A plain `ScrollHandle` on the scrollable list container;
+        /// the rows are variable-height (section headers vs entries) so a uniform
+        /// list does not fit — `scroll_to_item` over the rendered children does.
+        list_scroll: ScrollHandle,
+        /// The byte size of the node's current type — drives the size diff in the
+        /// footer (`m_currentNodeSize`).
+        current_node_size: i32,
+        /// The pointer byte size — the resulting size when a pointer modifier is
+        /// active (`m_pointerSize`).
+        pointer_size: i32,
         _subscription: Subscription,
+        _count_subscription: Subscription,
     }
 
     impl TypeSelectorPopup {
@@ -853,25 +982,106 @@ mod view {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Self {
-            let model = TypeModel::new(entries);
+            let mut model = TypeModel::new(entries);
+            // Pre-select the node's current type so the picker opens highlighting
+            // the existing kind (B7 / item 7) rather than the default first row.
+            model.select_kind(current);
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Filter types..  (Ctrl+F)"));
+            let array_count_input = cx.new(|cx| InputState::new(window, cx).placeholder("n"));
             let subscription =
                 cx.subscribe_in(&input, window, |this, _i, ev: &InputEvent, _window, cx| {
                     if matches!(ev, InputEvent::Change) {
                         let q = this.input.read(cx).value().to_string();
                         this.model.apply_filter(&q);
+                        // Re-pin the current type when the filter clears.
+                        if q.trim().is_empty() {
+                            this.model.select_kind(this.current);
+                        }
+                        this.scroll_selected_into_view();
                         cx.notify();
                     }
                 });
+            // The array count box feeds Modifier::Array(n) live so the footer
+            // size-diff preview tracks the typed count (item 8).
+            let count_subscription = cx.subscribe_in(
+                &array_count_input,
+                window,
+                |this, _i, ev: &InputEvent, _window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        this.sync_array_count(cx);
+                        cx.notify();
+                    }
+                },
+            );
             TypeSelectorPopup {
                 model,
                 current,
                 active_groups: std::collections::BTreeSet::new(),
                 input,
+                array_count_input,
                 focus_handle: cx.focus_handle(),
+                list_scroll: ScrollHandle::new(),
+                current_node_size: crate::core::kind::size_for_kind(current),
+                pointer_size: 8,
                 _subscription: subscription,
+                _count_subscription: count_subscription,
             }
+        }
+
+        /// Read the array-count input and, if the array modifier is active, push
+        /// the parsed count into the model (`Modifier::Array(n)`). Empty / invalid
+        /// → count 1 (the C++ defaults the count box to "1").
+        fn sync_array_count(&mut self, cx: &mut Context<Self>) {
+            if !matches!(self.model.modifier(), Modifier::Array(_)) {
+                return;
+            }
+            let n = self.array_count_value(cx);
+            self.model.set_modifier(Modifier::Array(n));
+        }
+
+        /// The current array-count value parsed from the count box (≥1).
+        fn array_count_value(&self, cx: &App) -> i32 {
+            self.array_count_input
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(1)
+        }
+
+        /// Scroll the currently-selected model row into view (B2 / item 1 / item
+        /// 9). The list renders a subset of model rows (filtered by the category
+        /// chips), so the selected MODEL row index is mapped to its RENDERED child
+        /// index before scrolling.
+        fn scroll_selected_into_view(&self) {
+            let Some(sel) = self.model.selected() else {
+                return;
+            };
+            if let Some(child_ix) = self.rendered_index_of(sel) {
+                self.list_scroll.scroll_to_item(child_ix);
+            }
+        }
+
+        /// Map a model row index to the index of the corresponding rendered child
+        /// (the list skips category-filtered rows), or `None` if it is not
+        /// rendered.
+        fn rendered_index_of(&self, model_row: usize) -> Option<usize> {
+            let mut child = 0usize;
+            for (row, r) in self.model.rows().iter().enumerate() {
+                let visible =
+                    r.entry.entry_kind == EntryKind::Section || self.group_visible(r.entry.group);
+                if !visible {
+                    continue;
+                }
+                if row == model_row {
+                    return Some(child);
+                }
+                child += 1;
+            }
+            None
         }
 
         /// Read-only access to the model.
@@ -896,23 +1106,29 @@ mod view {
             cx.notify();
         }
 
-        /// The explicit "none" sentinel key inserted by [`select_no_groups`] — its
-        /// presence in `active_groups` hides *every* group (the C++ "none" chip).
-        const NONE_SENTINEL: &'static str = "\u{0}none";
+        /// Set the node's current type size + pointer size for the footer size
+        /// diff (`setCurrentNodeSize`/`setPointerSize`).
+        pub fn set_sizes(&mut self, current_node_size: i32, pointer_size: i32) {
+            self.current_node_size = current_node_size;
+            self.pointer_size = pointer_size;
+        }
+
+        /// Set the recently-picked type names (item 16) — forwarded to the model.
+        pub fn set_recent_names(&mut self, names: Vec<String>, cx: &mut Context<Self>) {
+            self.model.set_recent_names(names);
+            // Re-pin the current type after the rows rebuild.
+            self.model.select_kind(self.current);
+            cx.notify();
+        }
 
         /// Whether an entry's group passes the active category-chip filter.
         ///
         /// - empty set → all visible (the "all" state);
-        /// - the `none` sentinel present → nothing visible (the "none" chip);
         /// - groups WITHOUT a category chip (Vec/Str/Ctr/Common) are always
         ///   visible (the C++ `catAllowed`: only chip-bearing groups can be
         ///   filtered out);
         /// - otherwise a chip-bearing group is visible iff its key is active.
         fn group_visible(&self, group: KindGroup) -> bool {
-            // "none" sentinel → hide everything.
-            if self.active_groups.contains(Self::NONE_SENTINEL) {
-                return false;
-            }
             // No active chips → show all.
             if self.active_groups.is_empty() {
                 return true;
@@ -924,10 +1140,8 @@ mod view {
             self.active_groups.contains(group.key())
         }
 
-        /// Toggle a category chip (Hex/Int/Float/Ptr). Clears the "none" sentinel
-        /// first so toggling a chip out of the "none" state actually re-shows it.
+        /// Toggle a category chip (Hex/Int/Float/Ptr).
         fn toggle_group(&mut self, group: KindGroup, cx: &mut Context<Self>) {
-            self.active_groups.remove(Self::NONE_SENTINEL);
             let key = group.key();
             if self.active_groups.contains(key) {
                 self.active_groups.remove(key);
@@ -943,12 +1157,12 @@ mod view {
             cx.notify();
         }
 
-        /// "none" — restrict to a single empty bucket (nothing shown). We model
-        /// this by enabling no chips but flagging the explicit-none state via a
-        /// sentinel: an active set containing only an unused key hides every group.
+        /// "none" — the C++ `noneBtn` keeps AT LEAST ONE group checked (the first
+        /// chip stays on, the rest go off), so the list never goes fully empty.
+        /// We restrict to the first chip-bearing group (Hex).
         fn select_no_groups(&mut self, cx: &mut Context<Self>) {
             self.active_groups.clear();
-            self.active_groups.insert(Self::NONE_SENTINEL);
+            self.active_groups.insert(KindGroup::Hex.key());
             cx.notify();
         }
 
@@ -975,6 +1189,25 @@ mod view {
             }
         }
 
+        /// A single click on a row only PREVIEWS the selection (item 6): it sets
+        /// the selection so a modifier (`*` / `**` / `[]`) can be adjusted before
+        /// confirming with OK / Enter / double-click. The C++ list selects on
+        /// single click and accepts only on double-click / Enter / OK.
+        fn select_row_preview(&mut self, row: usize, cx: &mut Context<Self>) {
+            if self.model.select_row(row) {
+                self.scroll_selected_into_view();
+                cx.notify();
+            }
+        }
+
+        /// Hover over a row moves the selection highlight to it (item 2) so
+        /// keyboard + mouse selection stay in sync (native-menu behavior).
+        fn hover_row(&mut self, row: usize, cx: &mut Context<Self>) {
+            if self.model.selected() != Some(row) && self.model.select_row(row) {
+                cx.notify();
+            }
+        }
+
         /// The "+ New" footer button (`createNewTypeRequested`,
         /// `typeselectorpopup.cpp:924`): create a brand-new struct/class and apply
         /// it to the node, carrying the active `*`/`**`/`[]` modifier. Emitted as a
@@ -987,6 +1220,12 @@ mod view {
                 Modifier::None => None,
                 m => Some(m),
             };
+            // "+ New" (item 15): emit a Struct-kinded Chosen carrying the active
+            // modifier. NOTE: a fully distinct "create brand-new type" signal
+            // (vs picking the existing Struct primitive) needs an editor-side
+            // branch; a new enum variant would break the editor's exhaustive
+            // `TypeSelectorEvent` match (another owner's file), so this keeps the
+            // working Struct-apply path. See report notes.
             cx.emit(TypeSelectorEvent::Chosen {
                 kind: NodeKind::Struct,
                 modifier,
@@ -1010,21 +1249,55 @@ mod view {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> bool {
-            // Ctrl+F focuses the filter from anywhere.
+            // Ctrl+F focuses the filter from anywhere AND selects all its text so
+            // typing replaces the query (item 12; the C++ `selectAll()` on focus).
             if key == "f" && modifiers.control {
-                let input = self.input.clone();
-                window.focus(&input.read(cx).focus_handle(cx), cx);
+                self.input.update(cx, |input, cx| input.focus(window, cx));
+                // Route the input's own SelectAll (ctrl-a) so the existing text is
+                // selected — `InputState::select_all` is not public, so dispatch
+                // the keystroke to the now-focused input.
+                if let Ok(ks) = Keystroke::parse("ctrl-a") {
+                    window.dispatch_keystroke(ks, cx);
+                }
                 cx.notify();
                 return true;
             }
+            // One visible page ≈ the 520px max popup minus chrome over a 26px row.
+            const PAGE: usize = 10;
             match key {
                 "down" => {
                     self.model.move_down();
+                    self.scroll_selected_into_view();
                     cx.notify();
                     true
                 }
                 "up" => {
                     self.model.move_up();
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "pagedown" => {
+                    self.model.page_down(PAGE);
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "pageup" => {
+                    self.model.page_up(PAGE);
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "home" => {
+                    self.model.move_home();
+                    self.scroll_selected_into_view();
+                    cx.notify();
+                    true
+                }
+                "end" => {
+                    self.model.move_end();
+                    self.scroll_selected_into_view();
                     cx.notify();
                     true
                 }
@@ -1042,8 +1315,13 @@ mod view {
     }
 
     impl Focusable for TypeSelectorPopup {
-        fn focus_handle(&self, _cx: &App) -> FocusHandle {
-            self.focus_handle.clone()
+        /// Return the FILTER INPUT's focus handle so the editor's
+        /// `window.focus(popup.focus_handle)` lands on the input — opening the
+        /// picker and immediately typing filters (B2 fix 1). The capture-phase key
+        /// handler on the popup surface still receives Up/Down/Enter/Esc because it
+        /// is an ancestor of the focused input.
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.input.read(cx).focus_handle(cx)
         }
     }
 
@@ -1155,9 +1433,22 @@ mod view {
                             })
                             .when(!is_sel && r.entry.enabled, |d| d.hover(|s| s.bg(hover_bg)))
                             .when(r.entry.enabled, |d| d.cursor_pointer())
+                            // Hover-to-select (item 2): keep keyboard + mouse
+                            // selection in sync so Enter confirms the hovered row.
                             .when(r.entry.enabled, |d| {
-                                d.on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.accept_row(row, cx);
+                                d.on_mouse_move(cx.listener(move |this, _e, _w, cx| {
+                                    this.hover_row(row, cx);
+                                }))
+                            })
+                            // Single click = PREVIEW (select only); double click =
+                            // confirm (item 6) so a modifier can be adjusted first.
+                            .when(r.entry.enabled, |d| {
+                                d.on_click(cx.listener(move |this, e: &ClickEvent, _w, cx| {
+                                    if e.click_count() >= 2 {
+                                        this.accept_row(row, cx);
+                                    } else {
+                                        this.select_row_preview(row, cx);
+                                    }
                                 }))
                             })
                             // Leading colored kind chip (the SVG glyph for the group).
@@ -1277,12 +1568,18 @@ mod view {
                 .child(self.render_category_tabs(&theme, cx))
                 .child(self.render_column_header(cx))
                 .child(
+                    // A SCROLLABLE list (B2 fix 2 / item 9): the keyboard-selected
+                    // row scrolls into view via `list_scroll.scroll_to_item` over
+                    // the rendered children. Rows are variable-height (section
+                    // headers vs entries) so a `ScrollHandle` + `overflow_y_scroll`
+                    // fits where a uniform list would not.
                     gpui_component::v_flex()
                         .id("rcx-type-selector-list")
                         .p(px(tokens::space::XS))
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.list_scroll)
                         .children(rows),
                 )
                 .child(self.render_footer(cx))
@@ -1299,13 +1596,27 @@ mod view {
             let hover_bg = color::hover_overlay(cx);
             let sel_bg = color::selected_bg(cx);
 
-            // Live per-group counts over the catalogue.
-            let count_of = |g: KindGroup| -> usize {
+            let filtering = !self.input.read(cx).value().trim().is_empty();
+            // Per-group TOTAL count over the catalogue.
+            let total_of = |g: KindGroup| -> usize {
                 self.model
                     .entries()
                     .iter()
                     .filter(|e| e.group == g && e.selectable())
                     .count()
+            };
+            // Per-group VISIBLE count: when filtering, only the rows that survived
+            // the fuzzy filter (the C++ shows "visible / total"); else the total.
+            let visible_of = |g: KindGroup| -> usize {
+                if filtering {
+                    self.model
+                        .rows()
+                        .iter()
+                        .filter(|r| r.entry.selectable() && r.entry.group == g)
+                        .count()
+                } else {
+                    total_of(g)
+                }
             };
             let total = self
                 .model
@@ -1314,7 +1625,16 @@ mod view {
                 .filter(|e| e.selectable())
                 .count();
 
-            let chip = |group: KindGroup, count: usize, color: Hsla, on: bool| -> AnyElement {
+            // The chip label shows "Group (visible/total)" while filtering, else
+            // "Group (total)" — matching the C++ CategoryChip count semantics.
+            let chip = |group: KindGroup, color: Hsla, on: bool| -> AnyElement {
+                let vis = visible_of(group);
+                let tot = total_of(group);
+                let count_label = if filtering && vis != tot {
+                    format!("{} ({vis}/{tot})", group.key())
+                } else {
+                    format!("{} ({tot})", group.key())
+                };
                 gpui_component::h_flex()
                     .id(SharedString::from(format!("cat-{}", group.key())))
                     .h(px(20.))
@@ -1331,7 +1651,7 @@ mod view {
                         div()
                             .text_size(px(tokens::font::UI_XS))
                             .text_color(if on { fg } else { muted })
-                            .child(format!("{} ({count})", group.key())),
+                            .child(count_label),
                     )
                     .into_any_element()
             };
@@ -1365,7 +1685,10 @@ mod view {
             };
 
             let all_active = self.active_groups.is_empty();
-            let none_active = self.active_groups.contains(Self::NONE_SENTINEL);
+            // "none" = exactly the first chip-bearing group (Hex) is active — the
+            // C++ keeps one group on (it never goes fully empty).
+            let none_active =
+                self.active_groups.len() == 1 && self.active_groups.contains(KindGroup::Hex.key());
 
             gpui_component::h_flex()
                 .w_full()
@@ -1378,25 +1701,21 @@ mod view {
                 .border_color(color::border(cx))
                 .child(chip(
                     KindGroup::Hex,
-                    count_of(KindGroup::Hex),
                     group_color(KindGroup::Hex),
                     on(KindGroup::Hex),
                 ))
                 .child(chip(
                     KindGroup::Int,
-                    count_of(KindGroup::Int),
                     group_color(KindGroup::Int),
                     on(KindGroup::Int),
                 ))
                 .child(chip(
                     KindGroup::Float,
-                    count_of(KindGroup::Float),
                     group_color(KindGroup::Float),
                     on(KindGroup::Float),
                 ))
                 .child(chip(
                     KindGroup::Ptr,
-                    count_of(KindGroup::Ptr),
                     group_color(KindGroup::Ptr),
                     on(KindGroup::Ptr),
                 ))
@@ -1417,7 +1736,17 @@ mod view {
                     div()
                         .text_size(px(tokens::font::UI_XS))
                         .text_color(muted)
-                        .child(format!("{total} types")),
+                        .child(if filtering {
+                            let shown = self
+                                .model
+                                .rows()
+                                .iter()
+                                .filter(|r| r.entry.selectable())
+                                .count();
+                            format!("{shown} of {total}")
+                        } else {
+                            format!("{total} types")
+                        }),
                 )
         }
 
@@ -1527,13 +1856,21 @@ mod view {
             let border = color::border(cx);
             let active = self.model.modifier();
 
-            // The current selection summary "<curtype> · <size>".
+            // The current selection summary "<full> · <resulting-size> (±diff)"
+            // — computes the size AFTER the active modifier (ptr → pointer size,
+            // array → base*n) and a diff vs the node's current size (item 13).
             let summary = self
                 .model
                 .selected_entry()
                 .map(|e| {
-                    let size = if e.size_bytes > 0 {
-                        format!("{}B", e.size_bytes)
+                    let base = e.size_bytes;
+                    let result = match self.model.modifier() {
+                        Modifier::Pointer | Modifier::PointerPointer => self.pointer_size,
+                        Modifier::Array(n) if base > 0 => base * n.max(1),
+                        _ => base,
+                    };
+                    let size = if result > 0 {
+                        format!("{result}B")
                     } else {
                         "dyn".to_string()
                     };
@@ -1541,7 +1878,14 @@ mod view {
                         .model
                         .full_text()
                         .unwrap_or_else(|| e.display_name.clone());
-                    format!("{full} · {size}")
+                    let mut s = format!("{full} · {size}");
+                    if result > 0 && self.current_node_size > 0 && result != self.current_node_size
+                    {
+                        let diff = result - self.current_node_size;
+                        let sign = if diff > 0 { "+" } else { "" };
+                        s.push_str(&format!(" ({sign}{diff})"));
+                    }
+                    s
                 })
                 .unwrap_or_else(|| "—".to_string());
 
@@ -1572,10 +1916,6 @@ mod view {
                     .into_any_element()
             };
             let array_on = matches!(active, Modifier::Array(_));
-            let array_modifier = match active {
-                Modifier::Array(n) => Modifier::Array(n),
-                _ => Modifier::Array(1),
-            };
             let modifiers_allowed = self.model.mode().allows_modifiers();
 
             gpui_component::v_flex()
@@ -1601,6 +1941,40 @@ mod view {
                         .gap(px(tokens::space::XS))
                         .items_center()
                         .when(modifiers_allowed, |d| {
+                            // The `[]` chip: toggling it on seeds the count box to
+                            // "1" and focuses it; the box feeds Modifier::Array(n).
+                            let array_chip = gpui_component::h_flex()
+                                .id("mod-array")
+                                .h(px(24.))
+                                .min_w(px(30.))
+                                .px(px(tokens::space::MD))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(tokens::radius::MD))
+                                .text_size(px(tokens::font::UI_SM))
+                                .text_color(if array_on { accent } else { fg })
+                                .when(array_on, |d| d.bg(sel_bg).font_weight(FontWeight::SEMIBOLD))
+                                .when(!array_on, |d| d.cursor_pointer().hover(|s| s.bg(hover_bg)))
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    if matches!(this.model.modifier(), Modifier::Array(_)) {
+                                        this.model.set_modifier(Modifier::None);
+                                    } else {
+                                        // Toggling `[]` on seeds the count box to "1"
+                                        // (the C++ defaults the count to 1) + focuses
+                                        // it so the user can type a new count.
+                                        if this.array_count_input.read(cx).value().trim().is_empty()
+                                        {
+                                            this.array_count_input
+                                                .update(cx, |i, cx| i.set_value("1", window, cx));
+                                        }
+                                        let n = this.array_count_value(cx);
+                                        this.model.set_modifier(Modifier::Array(n));
+                                        this.array_count_input
+                                            .update(cx, |i, cx| i.focus(window, cx));
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("[]");
                             d.child(chip(
                                 "mod-ptr",
                                 "*",
@@ -1613,12 +1987,16 @@ mod view {
                                 active == Modifier::PointerPointer,
                                 Modifier::PointerPointer,
                             ))
-                            .child(chip(
-                                "mod-array",
-                                "[]",
-                                array_on,
-                                array_modifier,
-                            ))
+                            .child(array_chip)
+                            // The array element COUNT box (item 8) — visible only
+                            // when the array modifier is active; feeds Array(n).
+                            .when(array_on, |d| {
+                                d.child(
+                                    div()
+                                        .w(px(52.))
+                                        .child(Input::new(&self.array_count_input).w_full()),
+                                )
+                            })
                         })
                         .child(
                             Button::new("type-new")
@@ -1918,6 +2296,84 @@ mod tests {
         let mut sorted = sizes.clone();
         sorted.sort();
         assert_eq!(sizes, sorted);
+    }
+
+    // ── page/home/end navigation (item 10) ──
+
+    #[test]
+    fn page_down_and_up_move_multiple_selectable_rows() {
+        let mut model = TypeModel::new(sample_entries());
+        let first = model.selected().unwrap();
+        model.page_down(3);
+        let after = model.selected().unwrap();
+        assert!(after > first, "page_down advances past the first row");
+        assert!(model.rows()[after].entry.selectable());
+        // PageUp returns toward the top.
+        model.page_up(3);
+        assert!(model.rows()[model.selected().unwrap()].entry.selectable());
+    }
+
+    #[test]
+    fn home_and_end_select_first_and_last_selectable() {
+        let mut model = TypeModel::new(sample_entries());
+        model.move_end();
+        let last = model.selected().unwrap();
+        assert!(model.rows()[last].entry.selectable());
+        // End lands on the last selectable row (no later selectable row exists).
+        assert!(model.rows()[last + 1..]
+            .iter()
+            .all(|r| !r.entry.selectable()));
+        model.move_home();
+        let first = model.selected().unwrap();
+        assert!(model.rows()[first].entry.selectable());
+        // Home lands on the first selectable row (no earlier selectable row).
+        assert!(model.rows()[..first].iter().all(|r| !r.entry.selectable()));
+    }
+
+    // ── current-kind pre-select (B7 / item 7) ──
+
+    #[test]
+    fn select_kind_preselects_matching_primitive() {
+        let mut model = TypeModel::new(sample_entries());
+        let row = model.select_kind(NodeKind::Float).unwrap();
+        assert_eq!(model.selected(), Some(row));
+        let e = model.selected_entry().unwrap();
+        assert_eq!(e.primitive_kind, NodeKind::Float);
+        // A kind not present yields None and leaves the selection unchanged.
+        let before = model.selected();
+        assert_eq!(model.select_kind(NodeKind::Mat4x4), None);
+        assert_eq!(model.selected(), before);
+    }
+
+    // ── recent names (item 16) ──
+
+    #[test]
+    fn recent_names_surface_a_recent_section_first() {
+        let mut model = TypeModel::new(sample_entries());
+        model.set_recent_names(vec!["float".to_string(), "int32_t".to_string()]);
+        // The first section header is "Recent".
+        let first_section = model
+            .rows()
+            .iter()
+            .find(|r| r.entry.entry_kind == EntryKind::Section)
+            .unwrap();
+        assert_eq!(first_section.entry.display_name, "Recent");
+        // The recent entries follow it (before any other group section).
+        let recent_pos = model
+            .rows()
+            .iter()
+            .position(|r| r.entry.display_name == "Recent")
+            .unwrap();
+        assert_eq!(model.rows()[recent_pos + 1].entry.display_name, "float");
+    }
+
+    #[test]
+    fn recent_names_empty_has_no_recent_section() {
+        let model = TypeModel::new(sample_entries());
+        assert!(model
+            .rows()
+            .iter()
+            .all(|r| r.entry.display_name != "Recent"));
     }
 
     #[test]

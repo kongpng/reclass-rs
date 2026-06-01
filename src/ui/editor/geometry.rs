@@ -190,72 +190,6 @@ pub enum SpanRole {
     /// so the fold affordance reads as a real disclosure control (the task's "crisp
     /// disclosure triangle for expandable nodes" + the reclass/Zed outline look).
     FoldChevron,
-    /// A *dimmed* node-kind icon — the kind glyph drawn in the icon gutter of an
-    /// expandable container row (struct/array fold head). Quieter than the leaf
-    /// kind glyphs so it never competes with the crisp fold disclosure triangle,
-    /// while still giving every node row a type marker for reclass parity.
-    KindIconDim,
-}
-
-/// A small node-kind glyph prefixing a row's icon gutter — the Zed-outline-style
-/// kind marker the editor draws to the left of EVERY node row (struct / pointer /
-/// array / hex / fnptr / value), like the reclass project tree's per-node type
-/// icons (PIC2) and a Zed outline. On expandable container rows it is drawn in a
-/// quieter (dimmed) role so it never competes with the crisp fold disclosure
-/// triangle, which remains the *interactive* fold affordance.
-///
-/// Backed by single monospace glyphs (no SVG assets are bundled, cookbook §"Icon"),
-/// chosen to read at the 13px editor size: `◆` struct, `→` pointer, `ƒ` fnptr,
-/// `▦` array, `#` hex, `•` plain value. The `role` drives its color via the
-/// palette so a theme switch retints it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct KindGlyph {
-    pub glyph: char,
-    pub role: SpanRole,
-}
-
-/// The kind glyph for a node row, or `None` for rows that carry no node icon
-/// (command row, footer, continuation/member sub-rows, synthetic `node_id == 0`).
-///
-/// Every *real* node row gets a type marker for reclass/Zed-outline parity —
-/// including expandable container rows (struct/array fold heads), which the
-/// earlier build left blank so the gutter looked unused when the default-opened
-/// struct happened to be all-pointer members. Container rows render the glyph in
-/// the quiet [`SpanRole::KindIconDim`] role so it sits *behind* the crisp fold
-/// disclosure triangle (the real fold affordance) instead of duelling with it.
-/// Pure, tested.
-pub fn kind_glyph(lm: &LineMeta) -> Option<KindGlyph> {
-    use crate::core::NodeKind::*;
-    // Chrome / structural / sub-rows carry no kind icon.
-    if matches!(lm.line_kind, LineKind::CommandRow | LineKind::Footer)
-        || lm.is_continuation
-        || lm.is_member_line
-        || lm.node_id == 0
-    {
-        return None;
-    }
-    // Expandable container rows (struct/array fold heads): still carry a kind
-    // marker, but drawn dim so it complements — not competes with — the crisp fold
-    // disclosure triangle painted in the row text.
-    if lm.fold_head {
-        let glyph = match lm.node_kind {
-            Array => '\u{25A6}', // ▦ — an array
-            _ => '\u{25C6}',     // ◆ — a struct/class (the usual container)
-        };
-        return Some(KindGlyph {
-            glyph,
-            role: SpanRole::KindIconDim,
-        });
-    }
-    let (glyph, role) = match lm.node_kind {
-        Struct => ('\u{25C6}', SpanRole::Type), // ◆ — a struct/class
-        Array => ('\u{25A6}', SpanRole::Type),  // ▦ — an array
-        Pointer32 | Pointer64 => ('\u{2192}', SpanRole::Keyword), // → — a pointer
-        FuncPtr32 | FuncPtr64 => ('\u{0192}', SpanRole::FnPtr), // ƒ — a function ptr
-        Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => ('#', SpanRole::Dim), // # — raw hex
-        _ => ('\u{2022}', SpanRole::Value),     // • — a plain value field
-    };
-    Some(KindGlyph { glyph, role })
 }
 
 /// Whether a node kind renders its type token as a function-pointer (One Dark
@@ -361,12 +295,18 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
         _ => {
             let is_hex = is_hex_preview(lm.node_kind);
             if !lm.is_member_line && !lm.is_continuation {
-                // Type token, colored by node kind: function pointers blue,
-                // pointers magenta-ish (keyword), value/struct types yellow.
+                // Type token, colored by node kind (item 21): function pointers
+                // blue, pointers magenta-ish (keyword), NAMED struct/class types
+                // teal (the C++ `syntaxType`, same teal as the root class name),
+                // primitive value types blue (the C++ `syntaxKeyword`). The
+                // `ClassName` role carries the teal so named composite type tokens
+                // read identically to the command-row class name.
                 let type_role = if is_fnptr_kind(lm.node_kind) {
                     SpanRole::FnPtr
                 } else if is_pointer_kind(lm.node_kind) {
                     SpanRole::Keyword
+                } else if matches!(lm.node_kind, crate::core::NodeKind::Struct) {
+                    SpanRole::ClassName
                 } else {
                     SpanRole::Type
                 };
@@ -1172,114 +1112,6 @@ mod tests {
     fn margin_empty_when_no_digits() {
         assert_eq!(fmt_margin_text(0x40, 0, 0, false, true), "");
         assert_eq!(fmt_margin_text(0x40, 0, -1, false, false), "");
-    }
-
-    /// A leaf field row with a real (non-zero) node id, so `kind_glyph` treats it
-    /// as a true node row rather than a synthetic one.
-    fn node_field_line(depth: i32, kind: NodeKind) -> LineMeta {
-        LineMeta {
-            node_id: 42,
-            ..field_line(depth, kind)
-        }
-    }
-
-    #[test]
-    fn kind_glyph_distinguishes_node_types() {
-        // Leaf rows get a per-kind glyph; container/fold rows and chrome get none.
-        let ptr = node_field_line(1, NodeKind::Pointer64);
-        assert_eq!(
-            kind_glyph(&ptr),
-            Some(KindGlyph {
-                glyph: '\u{2192}',
-                role: SpanRole::Keyword
-            })
-        );
-        let fnptr = node_field_line(1, NodeKind::FuncPtr64);
-        assert_eq!(kind_glyph(&fnptr).unwrap().role, SpanRole::FnPtr);
-        let hex = node_field_line(1, NodeKind::Hex64);
-        assert_eq!(kind_glyph(&hex).unwrap().glyph, '#');
-        let val = node_field_line(1, NodeKind::Int32);
-        assert_eq!(kind_glyph(&val).unwrap().glyph, '\u{2022}');
-        let arr = node_field_line(1, NodeKind::Array);
-        assert_eq!(kind_glyph(&arr).unwrap().glyph, '\u{25A6}');
-    }
-
-    #[test]
-    fn kind_glyph_paints_for_scalar_leaf_rows() {
-        // The QA verification: scalar/leaf rows (int/float/bool/double) DO render a
-        // kind glyph — the `•` value marker — in the loud Value role (not dim, not
-        // suppressed). This is what makes the icon gutter visibly in use when a
-        // struct has scalar members (vs. the all-pointer default-opened struct).
-        for kind in [
-            NodeKind::Int32,
-            NodeKind::Int64,
-            NodeKind::UInt8,
-            NodeKind::Float,
-            NodeKind::Double,
-            NodeKind::Bool,
-        ] {
-            let kg = kind_glyph(&node_field_line(1, kind))
-                .unwrap_or_else(|| panic!("scalar kind {kind:?} must paint a glyph"));
-            assert_eq!(
-                kg.glyph, '\u{2022}',
-                "scalar kind {kind:?} uses the • marker"
-            );
-            assert_eq!(
-                kg.role,
-                SpanRole::Value,
-                "scalar glyph is the loud Value role"
-            );
-        }
-    }
-
-    #[test]
-    fn kind_glyph_dim_marker_on_expandable_container_rows() {
-        // Stronger reclass parity (PIC2's per-node tree icons): expandable container
-        // rows (struct/array fold heads) STILL carry a kind marker, drawn in the
-        // quiet `KindIconDim` role so the icon gutter is never empty — but quieter
-        // than leaf glyphs so it complements the crisp fold disclosure triangle.
-        let mut s_head = field_line(0, NodeKind::Struct);
-        s_head.line_kind = LineKind::Header;
-        s_head.fold_head = true;
-        s_head.node_id = 7;
-        assert_eq!(
-            kind_glyph(&s_head),
-            Some(KindGlyph {
-                glyph: '\u{25C6}',
-                role: SpanRole::KindIconDim,
-            }),
-            "struct fold head paints a dim ◆ marker"
-        );
-        let mut a_head = field_line(0, NodeKind::Array);
-        a_head.line_kind = LineKind::Header;
-        a_head.fold_head = true;
-        a_head.node_id = 8;
-        let kg = kind_glyph(&a_head).expect("array fold head paints a marker");
-        assert_eq!(kg.glyph, '\u{25A6}', "array fold head uses the ▦ marker");
-        assert_eq!(kg.role, SpanRole::KindIconDim, "container marker is dim");
-    }
-
-    #[test]
-    fn kind_glyph_none_for_chrome_fold_and_sub_rows() {
-        // Command row / footer: no node icon.
-        let cmd = LineMeta {
-            line_kind: LineKind::CommandRow,
-            node_id: crate::core::linemeta::K_COMMAND_ROW_ID,
-            ..LineMeta::default()
-        };
-        assert_eq!(kind_glyph(&cmd), None);
-        let footer = LineMeta {
-            line_kind: LineKind::Footer,
-            ..LineMeta::default()
-        };
-        assert_eq!(kind_glyph(&footer), None);
-        // Continuation / member / synthetic (node_id 0) rows: none.
-        let mut cont = field_line(1, NodeKind::Int32);
-        cont.is_continuation = true;
-        cont.node_id = 5;
-        assert_eq!(kind_glyph(&cont), None);
-        let synthetic = field_line(1, NodeKind::Int32); // node_id defaults to 0
-        assert_eq!(kind_glyph(&synthetic), None);
     }
 
     #[test]

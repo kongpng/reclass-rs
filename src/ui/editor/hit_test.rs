@@ -53,9 +53,12 @@ pub fn target_at_col(
         if span_contains(compose::command_row_root_name_span(text), col) {
             return Some(EditTarget::RootClassName);
         }
-        if span_contains(compose::command_row_root_type_span(text), col) {
-            return Some(EditTarget::RootClassType);
-        }
+        // B4 / item 1: the root struct/class/enum KEYWORD is NOT left-click
+        // editable. C++ `hitTestTarget` returns only `RootClassName` for the name
+        // span; the keyword resolves to `None` (left-click does nothing) and is
+        // converted via the RIGHT-click "Convert to Struct/Class" menu instead.
+        // Returning `RootClassType` here opened a highlighted text box that
+        // committed to nothing (a dead box) — and the same on double-click. Drop it.
         return None;
     }
 
@@ -245,12 +248,35 @@ mod tests {
         );
     }
 
-    // The kind-icon gutter width (cells) the row reserves before the text. Mirrors
-    // `super::super::ICON_CELLS` (kept in sync; the inline-edit overlay-left math
-    // is `ICON_CELLS*cell + col_start*cell`, with NO border/margin term, because
-    // the overlay lives inside the text-region wrapper whose origin == the painted
-    // text origin).
-    const ICON_CELLS: f32 = 2.0;
+    #[test]
+    fn command_row_keyword_resolves_to_no_target() {
+        // B4 / item 1 regression: the root struct/class/enum KEYWORD is NOT
+        // left-click editable — clicking it must resolve to `None` (C++
+        // `hitTestTarget` returns only `RootClassName` for the name span; the
+        // keyword is converted via the RIGHT-click menu). Returning a target here is
+        // what opened the dead, un-typeable edit box.
+        let lm = LineMeta {
+            line_kind: LineKind::CommandRow,
+            ..LineMeta::default()
+        };
+        let text = "[\u{25B8}] file \u{25BE} 0x1000 struct Foo {";
+        let ty = compose::command_row_root_type_span(text);
+        assert!(ty.valid, "keyword span resolves");
+        // The first column of the keyword span resolves to NO edit target.
+        assert_eq!(target_at_col(&lm, text, ty.start, 14, 22), None);
+        // And a mid-keyword column likewise.
+        assert_eq!(
+            target_at_col(&lm, text, (ty.start + ty.end) / 2, 14, 22),
+            None
+        );
+    }
+
+    // B1/items 2-3: the kind-icon gutter is REMOVED — C++ has no icon column. The
+    // inline-edit overlay-left is now just `col_start*cell` (no gutter/border/margin
+    // term) because the overlay lives inside the text-region wrapper whose origin ==
+    // the painted text origin. Kept as `0.0` so the overlay-left assertions below
+    // read as the no-gutter math `0 + col*cell`.
+    const ICON_CELLS: f32 = 0.0;
 
     #[test]
     fn command_row_name_click_seeds_name_and_lands_overlay_on_the_name() {

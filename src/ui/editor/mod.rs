@@ -34,7 +34,7 @@ pub mod tab_cycle;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{ActiveTheme, Icon, IconName, WindowExt as _};
+use gpui_component::{ActiveTheme, IconName, WindowExt as _};
 
 use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
@@ -77,6 +77,10 @@ actions!(
         EditorInsertBelow,
         EditorInsertAbove,
         EditorConvertPtr,
+        // Item 6 / B4: command-row keyword right-click → convert the root class
+        // keyword struct↔class (the C++ `keywordConvertRequested`).
+        EditorConvertRootToStruct,
+        EditorConvertRootToClass,
         EditorToggleBigEndian,
         EditorDuplicate,
         EditorDelete,
@@ -142,6 +146,28 @@ actions!(
         EditorPasteNodes,
         // Ctrl+Shift+C — copy the current node's address (`0x{addr:X}`) as text.
         EditorCopyAddress,
+        // Item 27: offset/address-margin right-click → checkable Relative (+0x) /
+        // Absolute address mode.
+        EditorOffsetsRelative,
+        EditorOffsetsAbsolute,
+        // Item 9: the Convert submenu quick-converts (per-size int/uint/float,
+        // ptr/fnptr, Split to hexN, Convert to Hex). Each sets the target kind on
+        // the context-target node via `change_node_kind` (or `split_hex_node`).
+        EditorConvUInt,
+        EditorConvInt,
+        EditorConvFloat,
+        EditorConvPtr64,
+        EditorConvFnPtr64,
+        EditorConvHex,
+        EditorConvSplitHex,
+        // Item 7: open the in-place hex byte / ASCII overwrite editor on the
+        // context-target hex node's value.
+        EditorEditBytesHex,
+        EditorEditBytesAscii,
+        // Item 17: Copy submenu — address / offset / line / all-as-text.
+        EditorCopyOffset,
+        EditorCopyLine,
+        EditorCopyAllText,
     ]
 );
 
@@ -151,18 +177,13 @@ actions!(
 /// the first measurement.
 const DEFAULT_CELL_RATIO: f32 = 0.6;
 
-/// Editor line-height multiple (× font size). The shared token is 1.4; the grid
-/// reads more comfortably (and matches the reclass screenshots' generous leading)
-/// at 1.5, so the editor surface uses a slightly looser leading than dense UI
-/// lists. Both the painted rows and the hit-test metrics derive from this.
-const EDITOR_LINE_HEIGHT: f32 = 1.5;
-
-/// Width (in monospace cells) of the node-kind icon gutter rendered between the
-/// address margin and the row text. It sits OUTSIDE the composed text columns, so
-/// it never disturbs hit-testing/fold/inline-edit column math (those resolve
-/// against the row-text element's own left edge); the inline-edit overlay simply
-/// adds this offset alongside the address-margin offset.
-const ICON_CELLS: f32 = 2.0;
+/// Editor line-height multiple (× font size). Item 24: the local `1.5` const that
+/// shadowed the canonical token is deleted; the editor now uses the single
+/// canonical [`design::tokens::font::EDITOR_LINE_HEIGHT`] (~1.4) so the grid's
+/// leading matches the C++ (12px cap + small extraAscent/Descent) instead of the
+/// looser 1.5 it read at. Both the painted rows and the hit-test metrics derive
+/// from this one source.
+const EDITOR_LINE_HEIGHT: f32 = design::tokens::font::EDITOR_LINE_HEIGHT;
 
 /// The key bindings for the editor surface (bound in the `RcxEditor` context).
 /// Returned so the app can register them once at startup alongside the inline
@@ -290,6 +311,13 @@ pub struct RcxEditor {
     /// selection. `None` clears on mouse-up / the next non-drag interaction.
     drag_anchor_line: Option<usize>,
     drag_on_byte_grid: bool,
+    /// The text-local X (px) the drag press landed on, and whether the ~8px drag
+    /// threshold has been crossed yet (item 28). A button-held move within the
+    /// dead-zone does NOT start extending the node/byte selection; only once the
+    /// pointer travels past `DRAG_DEAD_ZONE_PX` from the anchor does drag-select
+    /// begin (then `drag_started` latches so the rest of the drag extends freely).
+    drag_anchor_x: f32,
+    drag_started: bool,
     /// The node-clipboard payload (the `rcx-clipboard/v1` blob written by
     /// EditorCopy/Cut). gpui's clipboard is text-only here, so the serialized blob
     /// also lands on the system clipboard; this field is the in-process fast path
@@ -421,6 +449,8 @@ impl RcxEditor {
             caret_line: None,
             drag_anchor_line: None,
             drag_on_byte_grid: false,
+            drag_anchor_x: 0.0,
+            drag_started: false,
             node_clipboard: None,
             _refresh_task: Self::spawn_refresh_loop(cx),
             last_tab_target: None,
@@ -759,6 +789,10 @@ impl RcxEditor {
         let on_byte_grid = self.byte_addr_for_hit(&lm, &text, hit.col).is_some();
         self.drag_anchor_line = Some(line);
         self.drag_on_byte_grid = on_byte_grid;
+        // Item 28: record the press X + reset the drag-threshold latch; a held move
+        // must travel past the dead-zone before drag-select begins.
+        self.drag_anchor_x = rel_x;
+        self.drag_started = false;
 
         // Fold-prefix click → toggle collapse via the controller.
         if hit.in_fold_col {
@@ -1369,12 +1403,13 @@ impl RcxEditor {
                 }
             }
             EditTarget::RootClassName => {
-                let root_id = self.controller.view_root_id();
-                let idx = self.controller.tree().index_of_id(root_id);
-                if idx >= 0 {
-                    self.controller
-                        .rename_node(idx as usize, commit.text.trim());
-                }
+                // B3 / item 4: rename the viewed root struct's `struct_type_name`
+                // (NOT its `name`) — the command-row display reads `struct_type_name`
+                // first (see `build_command_row`), so renaming `name` left the
+                // displayed name unchanged. `rename_root_class` mirrors the C++
+                // `EditTarget::RootClassName` commit (`ChangeStructTypeName`), so the
+                // recomposed command row reflects the new name.
+                self.controller.rename_root_class(commit.text.trim());
             }
             _ => {}
         }
@@ -2697,42 +2732,35 @@ impl RcxEditor {
                             }
                         }),
                     )
+                    // Item 27: right-click the offset margin → a small checkable
+                    // Relative Offsets (+0x) / Absolute Addresses menu (the C++
+                    // margin-0 right-click), in addition to the left double-click.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_offset_mode_menu(e.position, window, cx);
+                        }),
+                    )
                     .child(SharedString::from(margin_text)),
             );
         }
 
-        // Node-kind icon gutter — a small Zed-outline-style kind glyph (struct ◆ /
-        // pointer → / array ▦ / fnptr ƒ / hex # / value •) prefixing each node row,
-        // distinguishing node types at a glance like the reclass project tree
-        // (PIC2's per-node icons) + Zed outline. Leaf rows paint a loud kind-tinted
-        // glyph; expandable container rows paint the SAME marker in the quiet
-        // `KindIconDim` role so the gutter is never empty, while their crisp fold
-        // disclosure triangle (painted in the row text) stays the interactive fold
-        // affordance. Reserved on EVERY row (a fixed `ICON_CELLS` width) so the row
-        // text starts at the same column whether or not a glyph is present — the
-        // icon lives OUTSIDE the composed text columns, so hit-testing/fold math is
-        // untouched.
+        // No node-kind icon gutter (B1 / items 2-3): C++ Reclass has NO icon column
+        // and NO per-row SVG type glyph. The fold disclosure arrow (`▸`/`▾`) is a
+        // TEXT glyph the compose layer bakes into the fold-prefix (column 1 of the
+        // K_FOLD_COL=3 region), painted in the crisp `FoldChevron` role on the row's
+        // own baseline (see `palette.fold_chevron`); leaf rows show only the dim
+        // tree connector or a blank prefix. Removing the invented `ICON_CELLS=2`
+        // gutter shifts the whole type/name/value/offset grid left to match C++ and
+        // text-baselines the chevron at the fold prefix instead of SVG-centering it.
         //
-        // Round-3: the round-2 text-glyph markers (◆ ▦ → # • ƒ) + the fold caret
-        // are now crisp SVGs (design::icon_* / `IconName`, registered by the
-        // Assets stage). Fold-head rows paint the disclosure chevron here
-        // (`ChevronRight` collapsed / `ChevronDown` expanded) — the row text's own
-        // baked caret is rendered transparent via `palette.fold_chevron` so only
-        // this SVG shows, while fold-col hit-testing (column-based) is untouched.
-        // Leaf node rows paint their per-kind icon. The icon size is clamped to the
-        // gutter cell box so the column math is unchanged.
-        // The icon gutter + the row-text element + every absolute overlay (the
-        // inline-edit field and the command-row hover strips) now live inside ONE
-        // `relative` wrapper (`text_region`) that begins right after the address
-        // margin. This makes overlay positioning provably aligned with the painted
-        // text WITHOUT guessing the row's border/margin geometry: inside the
-        // wrapper the gutter is the first flex child (width `ICON_CELLS*cell`), the
-        // text follows it, and an absolute overlay's `left(0)` is the wrapper's own
-        // origin — so an overlay at `left = ICON_CELLS*cell + col*cell` lands on the
-        // exact same pixel as painted text column `col`. (The earlier "row-space"
-        // math added a hand-rolled border + margin width and flip-flopped by ±2
-        // cells across passes — items 1/2: the inline-edit box landed on the type
-        // keyword / one column off instead of over the clicked token.)
+        // The row-text element + every absolute overlay (the inline-edit field and
+        // the command-row hover strips) live inside ONE `relative` wrapper
+        // (`text_region`) that begins right after the address margin. The wrapper's
+        // absolute origin coincides with the painted text origin, so an overlay at
+        // `left = col*cell` lands on the exact same pixel as painted text column
+        // `col` — no icon-gutter term to add.
         let cell = self.metrics.cell_width;
         let mut text_region = div()
             .relative()
@@ -2740,39 +2768,6 @@ impl RcxEditor {
             .h(px(self.metrics.line_height))
             .flex()
             .flex_row();
-        {
-            let icon_px = (self.metrics.line_height * 0.62).clamp(10.0, 18.0);
-            let mut gutter = div()
-                .flex_shrink_0()
-                .w(px(ICON_CELLS * self.metrics.cell_width))
-                .h(px(self.metrics.line_height))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_center();
-            if lm.fold_head {
-                // The crisp disclosure chevron (the real fold affordance).
-                let name = if lm.fold_collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                };
-                gutter = gutter.child(
-                    Icon::new(name)
-                        .size(px(icon_px))
-                        .text_color(palette.fold_chevron_icon),
-                );
-            } else if let Some(kg) = geometry::kind_glyph(&lm) {
-                // The per-kind SVG marker, tinted by the glyph's semantic role so a
-                // theme switch retints it (same role→color mapping as before).
-                gutter = gutter.child(
-                    Icon::new(kind_icon_name(lm.node_kind))
-                        .size(px(icon_px))
-                        .text_color(palette.role_color(kg.role)),
-                );
-            }
-            text_region = text_region.child(gutter);
-        }
 
         // The text element (static) — always painted as the base layer; it owns
         // the hitbox + row-local click routing back into the view.
@@ -2800,12 +2795,11 @@ impl RcxEditor {
             let addr = crate::compose::command_row_addr_span(&text);
             if addr.valid && addr.end > addr.start {
                 // The hover strip lives INSIDE `text_region` (after the address
-                // margin), so its `left` only clears the kind-icon gutter + the
-                // per-column offset — NO margin/border term. The wrapper's absolute
-                // origin == the text origin, so this lands exactly on the painted
-                // address span (the same alignment the inline-edit field uses).
-                let icon_gutter = ICON_CELLS * cell;
-                let left = px(icon_gutter + addr.start.max(0) as f32 * cell);
+                // margin), so its `left` is just the per-column offset — NO
+                // margin/border/gutter term. The wrapper's absolute origin == the
+                // text origin, so this lands exactly on the painted address span
+                // (the same alignment the inline-edit field uses).
+                let left = px(addr.start.max(0) as f32 * cell);
                 let width = px(((addr.end - addr.start).max(1) as f32) * cell);
                 let base_address = self.controller.last_result().layout.base_address;
                 let module: SharedString = self.controller.document().provider.name().into();
@@ -2853,11 +2847,10 @@ impl RcxEditor {
             // Source-chip + chevron hover affordances (item 5): a pointing-hand
             // cursor + a one-line tooltip ('Data Source' / 'Switch View') over each
             // interactive command-row chip. Transparent hover hitboxes living INSIDE
-            // `text_region` (after the address margin), so their `left` only clears
-            // the kind-icon gutter + the per-column offset — the same alignment the
-            // inline-edit field uses. Each forwards its click back to the normal row
-            // routing so the source/type-selector popup still opens (items 1/2/5).
-            let icon_gutter = ICON_CELLS * cell;
+            // `text_region` (after the address margin), so their `left` is just the
+            // per-column offset — the same alignment the inline-edit field uses. Each
+            // forwards its click back to the normal row routing so the source/type-
+            // selector popup still opens (items 1/2/5).
             for (hover_id, span, tip) in [
                 (
                     "rcx-src-hover",
@@ -2871,7 +2864,7 @@ impl RcxEditor {
                 ),
             ] {
                 if span.valid && span.end > span.start {
-                    let left = px(icon_gutter + span.start.max(0) as f32 * cell);
+                    let left = px(span.start.max(0) as f32 * cell);
                     let width = px(((span.end - span.start).max(1) as f32) * cell);
                     let tip: SharedString = tip.into();
                     // The hover hitbox occludes the row-text element, so forward its
@@ -2907,16 +2900,14 @@ impl RcxEditor {
         //
         // The field lives inside `text_region`, whose absolute origin coincides
         // with the painted text origin (the wrapper sits after the address margin;
-        // its first flex child is the kind-icon gutter, then the row text). So the
-        // overlay only needs to clear the kind-icon gutter (`ICON_CELLS*cell`) and
-        // add the per-column offset — there is NO border/margin term to guess. This
-        // makes the box land directly over the clicked token (e.g. the root class
-        // NAME on the command row), not after the `{` and not on the `struct`
-        // keyword (items 1/2): painted text column `c` and overlay-left
-        // `ICON_CELLS*cell + c*cell` are the same pixel by construction.
+        // its first/only flex child is the row text). So the overlay-left is just
+        // the per-column offset — there is NO border/margin/gutter term to guess.
+        // This makes the box land directly over the clicked token (e.g. the root
+        // class NAME on the command row), not after the `{` and not on the `struct`
+        // keyword (items 1/2): painted text column `c` and overlay-left `c*cell` are
+        // the same pixel by construction.
         if let Some((field, col_start, col_end)) = editing_here {
-            let icon_gutter = ICON_CELLS * cell;
-            let left = px(icon_gutter + col_start.max(0) as f32 * cell);
+            let left = px(col_start.max(0) as f32 * cell);
             // The opaque band spans the edited column `[col_start, col_end)` (a
             // generous minimum so short seeds still get a visible field box).
             let editing_width = ((col_end - col_start).max(0) as f32).max(6.0);
@@ -3020,6 +3011,20 @@ impl RcxEditor {
         // A drag never fires while an inline edit owns the surface.
         if self.editing.is_some() {
             return;
+        }
+        // Item 28: drag dead-zone. Until the pointer has traveled past ~8px from
+        // the press anchor (same row), or the drag has already crossed onto another
+        // row, treat the move as a not-yet-drag and do nothing — a small jitter
+        // while clicking must not begin extending the node/byte selection. Once the
+        // threshold is crossed the `drag_started` latch stays set for the rest of
+        // the gesture so subsequent moves extend freely.
+        const DRAG_DEAD_ZONE_PX: f32 = 8.0;
+        if !self.drag_started {
+            let crossed_row = self.drag_anchor_line.map(|a| a != line).unwrap_or(false);
+            if !crossed_row && (rel_x - self.drag_anchor_x).abs() < DRAG_DEAD_ZONE_PX {
+                return;
+            }
+            self.drag_started = true;
         }
         // Mode 1 — the drag started on the hex byte grid: extend the armed byte
         // selection to the byte under the cursor (the original behavior).
@@ -3378,6 +3383,7 @@ impl RcxEditor {
     pub(crate) fn dispatch_row_context_menu(
         &mut self,
         line: usize,
+        rel_x: f32,
         pos: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3388,6 +3394,28 @@ impl RcxEditor {
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
+        // Item 6 / B4: right-click on the command-row root struct/class KEYWORD
+        // opens a "Convert to Struct" / "Convert to Class" menu (the C++ intended
+        // replacement for the removed left-click keyword edit). enum has no
+        // conversion. The keyword span is resolved from the composed command-row
+        // text; `rel_x` is text-local (the RowElement's origin == text origin).
+        if lm.line_kind == LineKind::CommandRow && lm.node_id == K_COMMAND_ROW_ID {
+            let text = self.line_text_owned(line);
+            let col = self.metrics.col_containing_x(rel_x);
+            let rts = crate::compose::command_row_root_type_span(&text);
+            if rts.valid && col >= rts.start && col < rts.end {
+                let kw = text
+                    .get(
+                        geometry::utf16_to_byte(&text, rts.start)
+                            ..geometry::utf16_to_byte(&text, rts.end),
+                    )
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                self.open_root_convert_menu(&kw, pos, window, cx);
+            }
+            return;
+        }
         // Only real node rows get the node menu (command/footer/synthetic rows
         // have their own affordances and no node ops).
         if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
@@ -3436,6 +3464,13 @@ impl RcxEditor {
         let alt_name = crate::core::kind_to_string(alt_kind_for(target.kind));
         let cycle_label = format!("\u{2190} {cur_name}  \u{2194}  {alt_name} \u{2192}");
         let is_container = crate::core::is_container_kind(target.kind);
+        // Item 7/9: hex-node-only menu entries (Edit Bytes / Split to hexN) + the
+        // node's live big-endian state for the checkable toggle (item 13).
+        let is_hex_ctx = is_hex_preview(target.kind);
+        let big_endian = {
+            let idx = self.controller.tree().index_of_id(target.node_id);
+            idx >= 0 && self.controller.tree().nodes[idx as usize].big_endian
+        };
 
         let editor_focus = self.focus_handle.clone();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
@@ -3461,18 +3496,74 @@ impl RcxEditor {
                 .menu_with_icon("Rename", IconName::SquareTerminal, Box::new(EditorRename))
                 .menu_with_icon("Change Type", IconName::Frame, Box::new(EditorChangeType))
                 .separator()
+                // Item 15: the C++ Insert submenu offers Insert 4 Above (Hex32,
+                // Shift+Ins) / Insert 8 Above (Hex64, Ins) — the keyboard already
+                // maps Insert/Shift+Insert to those — plus Insert Below.
                 .submenu("Insert", mw, mcx, |sub, _w, _cx| {
-                    sub.menu_with_icon("Insert Below", IconName::Plus, Box::new(EditorInsertBelow))
-                        .menu_with_icon("Insert Above", IconName::Plus, Box::new(EditorInsertAbove))
-                })
-                .submenu("Convert", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon(
-                        "To Pointer (New Class)",
-                        IconName::ArrowRight,
-                        Box::new(EditorConvertPtr),
+                        "Insert 8 Above (Hex64)",
+                        IconName::Plus,
+                        Box::new(EditorInsertHex64),
+                    )
+                    .menu_with_icon(
+                        "Insert 4 Above (Hex32)",
+                        IconName::Plus,
+                        Box::new(EditorInsertHex32),
+                    )
+                    .separator()
+                    .menu_with_icon("Insert Below", IconName::Plus, Box::new(EditorInsertBelow))
+                    .menu_with_icon(
+                        "Insert Above",
+                        IconName::Plus,
+                        Box::new(EditorInsertAbove),
                     )
                 })
-                .menu_with_check("Big endian", false, Box::new(EditorToggleBigEndian))
+                // Item 9: the C++ quick-convert set — per-size int/uint/float,
+                // ptr/fnptr, Split to hexN, Convert to Hex, plus the New-Class ptr.
+                .submenu("Convert", mw, mcx, move |sub, _w, _cx| {
+                    let mut sub = sub
+                        .menu_with_icon(
+                            "To Pointer (New Class)",
+                            IconName::ArrowRight,
+                            Box::new(EditorConvertPtr),
+                        )
+                        .separator()
+                        .menu_with_icon("uint", IconName::Frame, Box::new(EditorConvUInt))
+                        .menu_with_icon("int", IconName::Frame, Box::new(EditorConvInt))
+                        .menu_with_icon("float", IconName::Frame, Box::new(EditorConvFloat))
+                        .separator()
+                        .menu_with_icon("ptr", IconName::ArrowRight, Box::new(EditorConvPtr64))
+                        .menu_with_icon(
+                            "fnptr",
+                            IconName::SquareTerminal,
+                            Box::new(EditorConvFnPtr64),
+                        )
+                        .separator()
+                        .menu_with_icon("Convert to Hex", IconName::Frame, Box::new(EditorConvHex));
+                    if is_hex_ctx {
+                        sub = sub.menu_with_icon(
+                            "Split to hexN + hexN",
+                            IconName::Frame,
+                            Box::new(EditorConvSplitHex),
+                        );
+                    }
+                    sub
+                })
+                .menu_with_check("Big endian", big_endian, Box::new(EditorToggleBigEndian))
+                .when(is_hex_ctx, |menu| {
+                    // Item 7: in-place hex / ASCII overwrite editor entry points,
+                    // shown for hex nodes (the value is a fixed-length byte string).
+                    menu.menu_with_icon(
+                        "Edit Bytes (Hex)",
+                        IconName::SquareTerminal,
+                        Box::new(EditorEditBytesHex),
+                    )
+                    .menu_with_icon(
+                        "Edit ASCII",
+                        IconName::SquareTerminal,
+                        Box::new(EditorEditBytesAscii),
+                    )
+                })
                 .submenu("Static", mw, mcx, |sub, _w, _cx| {
                     // Static-address submenu (graceful stub — no logic op yet).
                     sub.label("(no static address)")
@@ -3489,9 +3580,17 @@ impl RcxEditor {
                         !is_container,
                     )
                 })
+                // Item 17: the Copy submenu — Copy Address / Offset / Line / All as
+                // Text (was a dead "(copy)" label).
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
-                    // Copy variants beyond C-struct are graceful stubs.
-                    sub.label("(copy)")
+                    sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
+                        .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
+                        .menu_with_icon("Copy Line", IconName::Copy, Box::new(EditorCopyLine))
+                        .menu_with_icon(
+                            "Copy All as Text",
+                            IconName::Copy,
+                            Box::new(EditorCopyAllText),
+                        )
                 })
                 .submenu("Tracking", mw, mcx, |sub, _w, _cx| sub.label("(tracking)"))
                 .menu_with_icon(
@@ -3501,6 +3600,20 @@ impl RcxEditor {
                 )
         });
 
+        self.show_context_menu_at(menu, pos, window, cx);
+    }
+
+    /// Mount a built [`PopupMenu`](gpui_component::menu::PopupMenu) at `pos`: wire
+    /// its dismiss subscription, record it, and keep editor focus so dispatched
+    /// actions land in the `RcxEditor` key context. Shared by the node menu and the
+    /// command-row root-keyword convert menu (item 6).
+    fn show_context_menu_at(
+        &mut self,
+        menu: Entity<gpui_component::menu::PopupMenu>,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Dismiss (click-away / Esc on the menu) closes + clears state.
         self._context_menu_sub =
             Some(cx.subscribe(&menu, |this, _menu, _ev: &DismissEvent, cx| {
@@ -3695,9 +3808,332 @@ impl RcxEditor {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Graceful stub: no controller op for endianness in this stage; close
-        // cleanly (the item renders + closes, the C++ contract for un-wired items).
+        // Item 13: flip the node's endianness via the undoable `ToggleBigEndian`
+        // command (was a no-op stub). Resolve the node by id so the command is
+        // index-shift safe, read its current `big_endian`, and push the flip.
         self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            let idx = self.controller.tree().index_of_id(t.node_id);
+            if idx >= 0 {
+                let old_val = self.controller.tree().nodes[idx as usize].big_endian;
+                self.controller
+                    .push_command(crate::core::Command::ToggleBigEndian {
+                        node_id: t.node_id,
+                        old_val,
+                        new_val: !old_val,
+                    });
+                self.after_mutation(cx);
+            }
+        }
+    }
+
+    /// Item 27: open the checkable Relative/Absolute offset-mode menu at `pos`.
+    fn open_offset_mode_menu(
+        &mut self,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focus = self.focus_handle.clone();
+        let relative = self.relative_offsets;
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, _mw, _mcx| {
+            menu.min_w(px(220.0))
+                .action_context(editor_focus.clone())
+                .menu_with_check(
+                    "Relative Offsets (+0x)",
+                    relative,
+                    Box::new(EditorOffsetsRelative),
+                )
+                .menu_with_check(
+                    "Absolute Addresses",
+                    !relative,
+                    Box::new(EditorOffsetsAbsolute),
+                )
+        });
+        self.show_context_menu_at(menu, pos, window, cx);
+    }
+
+    /// Item 27: switch the offset margin to relative `+0x` mode.
+    fn action_offsets_relative(
+        &mut self,
+        _: &EditorOffsetsRelative,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if !self.relative_offsets {
+            self.relative_offsets = true;
+            cx.notify();
+        }
+    }
+
+    /// Item 27: switch the offset margin to absolute-address mode.
+    fn action_offsets_absolute(
+        &mut self,
+        _: &EditorOffsetsAbsolute,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if self.relative_offsets {
+            self.relative_offsets = false;
+            cx.notify();
+        }
+    }
+
+    /// Item 6 / B4: convert the root class keyword to `struct` (the C++
+    /// `keywordConvertRequested("struct")`). Dispatched from the command-row
+    /// right-click "Convert to Struct" menu item.
+    fn action_convert_root_to_struct(
+        &mut self,
+        _: &EditorConvertRootToStruct,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        self.controller.convert_root_keyword("struct");
+        self.after_mutation(cx);
+    }
+
+    /// Item 6 / B4: convert the root class keyword to `class` (the C++
+    /// `keywordConvertRequested("class")`).
+    fn action_convert_root_to_class(
+        &mut self,
+        _: &EditorConvertRootToClass,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        self.controller.convert_root_keyword("class");
+        self.after_mutation(cx);
+    }
+
+    // ── Item 9: Convert submenu quick-converts ──
+
+    /// Change the context-target node's kind, mapping the requested family to the
+    /// variant of the SAME byte size as the node (so a uint32 → "float" lands on the
+    /// 4-byte float, a uint64 → "int" lands on int64, etc.). Falls back to the
+    /// 4-byte member of the family when the node's size has no member.
+    fn convert_target_family(&mut self, family: SizeFamily, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            let size = crate::core::size_for_kind(t.kind).max(0);
+            let kind = family.kind_for_size(size);
+            self.controller.change_node_kind(t.node_idx, kind);
+            self.after_mutation(cx);
+        }
+    }
+
+    fn action_conv_uint(&mut self, _: &EditorConvUInt, _w: &mut Window, cx: &mut Context<Self>) {
+        self.convert_target_family(SizeFamily::UInt, cx);
+    }
+    fn action_conv_int(&mut self, _: &EditorConvInt, _w: &mut Window, cx: &mut Context<Self>) {
+        self.convert_target_family(SizeFamily::Int, cx);
+    }
+    fn action_conv_float(&mut self, _: &EditorConvFloat, _w: &mut Window, cx: &mut Context<Self>) {
+        self.convert_target_family(SizeFamily::Float, cx);
+    }
+    fn action_conv_ptr64(&mut self, _: &EditorConvPtr64, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller
+                .change_node_kind(t.node_idx, NodeKind::Pointer64);
+            self.after_mutation(cx);
+        }
+    }
+    fn action_conv_fnptr64(
+        &mut self,
+        _: &EditorConvFnPtr64,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller
+                .change_node_kind(t.node_idx, NodeKind::FuncPtr64);
+            self.after_mutation(cx);
+        }
+    }
+    fn action_conv_hex(&mut self, _: &EditorConvHex, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            // Convert to the hex equivalent of the node's current byte size.
+            let kind = hex_kind_for_size(crate::core::size_for_kind(t.kind).max(1));
+            self.controller.change_node_kind(t.node_idx, kind);
+            self.after_mutation(cx);
+        }
+    }
+    fn action_conv_split_hex(
+        &mut self,
+        _: &EditorConvSplitHex,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.controller.split_hex_node(t.node_id);
+            self.apply_document(cx);
+        }
+    }
+
+    // ── Item 7: in-place hex / ASCII overwrite editor entry points ──
+
+    fn action_edit_bytes_hex(
+        &mut self,
+        _: &EditorEditBytesHex,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            // begin_inline_edit detects a hex Value and arms HexOverwrite::Hex.
+            self.begin_inline_edit(t.line, EditTarget::Value, window, cx);
+        }
+    }
+    fn action_edit_bytes_ascii(
+        &mut self,
+        _: &EditorEditBytesAscii,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            self.begin_ascii_overwrite_edit(t.line, t.node_idx as i32, window, cx);
+        }
+    }
+
+    // ── Item 17: Copy submenu ──
+
+    fn action_copy_offset(
+        &mut self,
+        _: &EditorCopyOffset,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            if let Some(lm) = self.line_meta(t.line).cloned() {
+                let base = self.controller.last_result().layout.base_address;
+                let off = lm.offset_addr.saturating_sub(base);
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{:X}", off)));
+            }
+        }
+    }
+    fn action_copy_line(&mut self, _: &EditorCopyLine, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.action_target() {
+            let text = self.line_text_owned(t.line);
+            cx.write_to_clipboard(ClipboardItem::new_string(text.trim_end().to_string()));
+        }
+    }
+    fn action_copy_all_text(
+        &mut self,
+        _: &EditorCopyAllText,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        // Compose every line's text into one block (the C++ "Copy All as Text").
+        let result = self.controller.last_result();
+        let mut out = String::new();
+        for i in 0..result.meta.len() {
+            out.push_str(self.line_text_owned(i).trim_end());
+            out.push('\n');
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(out));
+    }
+
+    /// Item 7: open the ASCII overwrite editor on the hex node at `(line,
+    /// node_idx)`. Seeds the field with the node's ASCII preview (one printable
+    /// char per byte) and arms [`HexOverwrite::Ascii`].
+    fn begin_ascii_overwrite_edit(
+        &mut self,
+        line: usize,
+        node_idx: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if node_idx < 0 {
+            return;
+        }
+        let Some(lm) = self.line_meta(line).cloned() else {
+            return;
+        };
+        if !is_hex_preview(lm.node_kind) {
+            return;
+        }
+        let byte_count = if lm.line_byte_count > 0 {
+            lm.line_byte_count as usize
+        } else {
+            crate::core::size_for_kind(lm.node_kind).max(0) as usize
+        };
+        if byte_count == 0 {
+            return;
+        }
+        // Read the live bytes for the ASCII seed.
+        let (addr, _ok) = self.controller.tree().absolute_address(node_idx);
+        let data = self
+            .controller
+            .document()
+            .provider
+            .read_bytes(addr, byte_count as i32);
+        let seed: String = (0..byte_count)
+            .map(|i| {
+                let b = data.get(i).copied().unwrap_or(0);
+                if (0x20..=0x7E).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        // The value span resolves the overlay column; reuse begin_inline_edit's
+        // span resolution by opening a plain Value edit then re-seeding + switching
+        // to ASCII overwrite mode.
+        self.begin_inline_edit(line, EditTarget::Value, window, cx);
+        if let Some(editing) = self.editing.as_ref() {
+            let field = editing.field.clone();
+            field.update(cx, |f, _cx| {
+                f.set_ascii_overwrite(&seed, byte_count);
+            });
+            cx.notify();
+        }
+    }
+
+    /// Item 6 / B4: build + show the root-keyword conversion menu at `pos`. The
+    /// menu offers exactly the C++ option set: a `struct` root offers "Convert to
+    /// Class"; a `class` root offers "Convert to Struct"; an `enum` root offers
+    /// nothing (no menu shown).
+    fn open_root_convert_menu(
+        &mut self,
+        keyword: &str,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focus = self.focus_handle.clone();
+        let kw = keyword.to_string();
+        // enum: no conversion options — do not open a menu.
+        if kw != "struct" && kw != "class" {
+            return;
+        }
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, _mw, _mcx| {
+            let menu = menu.min_w(px(200.0)).action_context(editor_focus.clone());
+            if kw == "class" {
+                menu.menu_with_icon(
+                    "Convert to Struct",
+                    IconName::Frame,
+                    Box::new(EditorConvertRootToStruct),
+                )
+            } else {
+                menu.menu_with_icon(
+                    "Convert to Class",
+                    IconName::Frame,
+                    Box::new(EditorConvertRootToClass),
+                )
+            }
+        });
+        self.show_context_menu_at(menu, pos, window, cx);
     }
 
     fn action_duplicate(&mut self, _: &EditorDuplicate, _w: &mut Window, cx: &mut Context<Self>) {
@@ -4249,9 +4685,24 @@ impl RcxEditor {
                         this.apply_document(cx);
                     }
                 }
-                HexToolbarEvent::JoinSelected
-                | HexToolbarEvent::FillToOffset(_, _)
-                | HexToolbarEvent::Dismissed => {
+                HexToolbarEvent::JoinSelected => {
+                    // Item 10: actually JOIN the contiguous hex run starting at the
+                    // toolbar's anchor node (was a close-only no-op). Sum the
+                    // anchor's size plus its consecutive same-parent hex siblings,
+                    // pick the largest hex kind that fits the total, and join. The
+                    // anchor is `node_id` captured when the toolbar opened.
+                    window.close_dialog(cx);
+                    this._hex_toolbar_sub = None;
+                    this.join_hex_run(node_id, cx);
+                }
+                HexToolbarEvent::FillToOffset(id, offset) => {
+                    // Item 11: actually FILL the gap from the node's end up to the
+                    // typed offset with padding hex nodes (was a close-only no-op).
+                    window.close_dialog(cx);
+                    this._hex_toolbar_sub = None;
+                    this.fill_to_offset(*id, *offset, cx);
+                }
+                HexToolbarEvent::Dismissed => {
                     window.close_dialog(cx);
                     this._hex_toolbar_sub = None;
                     cx.notify();
@@ -4266,9 +4717,89 @@ impl RcxEditor {
                 .close_button(false)
                 .child(popup_for_modal.clone())
         });
-        let _ = node_id;
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Item 10: join the contiguous hex run starting at `anchor_id`. Sums the
+    /// anchor's byte size plus its consecutive same-parent hex siblings (the run the
+    /// toolbar's "join selected" affordance acts on), picks the largest hex
+    /// [`NodeKind`] whose size fits the accumulated total, and routes to the
+    /// controller `join_hex_nodes`. A single hex node (no following hex sibling) is a
+    /// no-op (nothing to join).
+    fn join_hex_run(&mut self, anchor_id: u64, cx: &mut Context<Self>) {
+        let tree = self.controller.tree();
+        let ni = tree.index_of_id(anchor_id);
+        if ni < 0 {
+            return;
+        }
+        let anchor = &tree.nodes[ni as usize];
+        if !is_hex_preview(anchor.kind) {
+            return;
+        }
+        let parent_id = anchor.parent_id;
+        let mut total = crate::core::size_for_kind(anchor.kind).max(0);
+        let mut next_off = anchor.offset + total;
+        // Walk consecutive same-parent hex siblings by offset.
+        loop {
+            let found = tree.nodes.iter().enumerate().find(|(_, s)| {
+                s.parent_id == parent_id
+                    && s.offset == next_off
+                    && crate::core::kind::is_hex_node(s.kind)
+            });
+            let Some((_, s)) = found else { break };
+            let sz = crate::core::size_for_kind(s.kind).max(0);
+            if sz <= 0 {
+                break;
+            }
+            total += sz;
+            next_off += sz;
+        }
+        // Largest hex kind that fits the accumulated run.
+        let target = hex_kind_for_size(total);
+        let target_sz = crate::core::size_for_kind(target);
+        if target_sz <= crate::core::size_for_kind(self.controller.tree().nodes[ni as usize].kind) {
+            return; // nothing larger to join into
+        }
+        self.controller.join_hex_nodes(anchor_id, target);
+        self.apply_document(cx);
+    }
+
+    /// Item 11: fill the gap from the hex node's end offset up to `target_offset`
+    /// with padding hex nodes. Resolves the node, computes `cur_end = offset + size`,
+    /// then inserts `Hex64`/`Hex8` fields (hex64 chunks then an 8-byte tail split as
+    /// needed) into the parent at increasing offsets until the gap is covered. A
+    /// non-positive gap is a no-op.
+    fn fill_to_offset(&mut self, node_id: u64, target_offset: u64, cx: &mut Context<Self>) {
+        let (parent_id, mut cur) = {
+            let tree = self.controller.tree();
+            let idx = tree.index_of_id(node_id);
+            if idx < 0 {
+                return;
+            }
+            let n = &tree.nodes[idx as usize];
+            let size = crate::core::size_for_kind(n.kind).max(0) as u64;
+            (n.parent_id, n.offset as u64 + size)
+        };
+        if target_offset <= cur || parent_id == 0 {
+            return;
+        }
+        // Insert padding hex nodes covering [cur, target_offset). Prefer 8-byte
+        // Hex64 chunks; the remainder is filled with Hex8 single bytes. Guard the
+        // loop count so a pathological gap can't spin forever.
+        let mut guard = 0;
+        while cur < target_offset && guard < 4096 {
+            let remaining = target_offset - cur;
+            let (kind, step) = if remaining >= 8 {
+                (NodeKind::Hex64, 8u64)
+            } else {
+                (NodeKind::Hex8, 1u64)
+            };
+            self.controller.insert_node(parent_id, cur as i32, kind, "");
+            cur += step;
+            guard += 1;
+        }
+        self.apply_document(cx);
     }
 
     /// Apply a hex-toolbar size choice (item 9): a smaller target splits the node,
@@ -4338,21 +4869,102 @@ fn minimap_row_for(lm: &LineMeta, palette: &EditorPalette) -> minimap::MinimapRo
     }
 }
 
-/// The "alternate" kind for the quick type-cycler (`← cur ↔ alt →`) and the
-/// forward `T`-less cycle: steps to the next kind in the [`NodeKind`] table,
-/// wrapping. This is the in-place type stepper the C++ menu's `← type ↔ type →`
-/// row drives (a quick toggle between adjacent primitive types).
-fn alt_kind_for(kind: NodeKind) -> NodeKind {
-    let i = kind as u8 as usize;
-    let n = crate::core::K_KIND_META.len();
-    crate::core::K_KIND_META[(i + 1) % n].kind
+/// A scalar type family for the Convert submenu (item 9): the requested int /
+/// uint / float, resolved to the variant matching the node's current byte size.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SizeFamily {
+    Int,
+    UInt,
+    Float,
 }
 
-/// The previous kind in the table (the `←` half of the cycler), wrapping.
+impl SizeFamily {
+    /// The family member of `size` bytes; falls back to the 4-byte member when the
+    /// size has no member (e.g. float has no 1-byte variant).
+    fn kind_for_size(self, size: i32) -> NodeKind {
+        use NodeKind::*;
+        match self {
+            SizeFamily::Int => match size {
+                1 => Int8,
+                2 => Int16,
+                4 => Int32,
+                8 => Int64,
+                16 => Int128,
+                _ => Int32,
+            },
+            SizeFamily::UInt => match size {
+                1 => UInt8,
+                2 => UInt16,
+                4 => UInt32,
+                8 => UInt64,
+                16 => UInt128,
+                _ => UInt32,
+            },
+            SizeFamily::Float => match size {
+                2 => Float16,
+                4 => Float,
+                8 => Double,
+                _ => Float,
+            },
+        }
+    }
+}
+
+/// The largest hex [`NodeKind`] whose byte size is `<= bytes` (item 10 join). Hex
+/// kinds are 1/2/4/8/16 bytes (Hex8/16/32/64/128); a run total maps to the biggest
+/// hex that fits so a join collapses the run into the widest hex cell.
+fn hex_kind_for_size(bytes: i32) -> NodeKind {
+    match bytes {
+        b if b >= 16 => NodeKind::Hex128,
+        b if b >= 8 => NodeKind::Hex64,
+        b if b >= 4 => NodeKind::Hex32,
+        b if b >= 2 => NodeKind::Hex16,
+        _ => NodeKind::Hex8,
+    }
+}
+
+/// The ordered list of kinds that share `kind`'s byte size (item 16): the
+/// same-size variant ring the quick type-cycler steps through. Only primitive,
+/// fixed-size scalar/pointer kinds participate — containers (Struct/Array) and
+/// dynamic-size kinds (size 0) are excluded so the cycler never lands on a
+/// container or a string/dynamic type of a different footprint. Table order is
+/// preserved so the ring is stable.
+fn same_size_variants(kind: NodeKind) -> Vec<NodeKind> {
+    let size = crate::core::size_for_kind(kind);
+    if size <= 0 {
+        return vec![kind];
+    }
+    let ring: Vec<NodeKind> = crate::core::K_KIND_META
+        .iter()
+        .map(|m| m.kind)
+        .filter(|&k| {
+            !matches!(k, NodeKind::Struct | NodeKind::Array)
+                && crate::core::size_for_kind(k) == size
+        })
+        .collect();
+    if ring.is_empty() {
+        vec![kind]
+    } else {
+        ring
+    }
+}
+
+/// The "alternate" kind for the quick type-cycler (`← cur ↔ alt →`) and the
+/// forward `T`-less cycle (item 16): steps to the NEXT same-byte-size variant,
+/// wrapping. Cycling between equal-footprint primitives (e.g. int32_t → uint32_t →
+/// float → hex32 …) never lands on a different size / container / string — the C++
+/// in-place stepper keeps the node's byte layout fixed.
+fn alt_kind_for(kind: NodeKind) -> NodeKind {
+    let ring = same_size_variants(kind);
+    let pos = ring.iter().position(|&k| k == kind).unwrap_or(0);
+    ring[(pos + 1) % ring.len()]
+}
+
+/// The previous same-size variant (the `←` half of the cycler), wrapping (item 16).
 fn prev_kind_for(kind: NodeKind) -> NodeKind {
-    let i = kind as u8 as usize;
-    let n = crate::core::K_KIND_META.len();
-    crate::core::K_KIND_META[(i + n - 1) % n].kind
+    let ring = same_size_variants(kind);
+    let pos = ring.iter().position(|&k| k == kind).unwrap_or(0);
+    ring[(pos + ring.len() - 1) % ring.len()]
 }
 
 /// Parse a typed base-address string into `(numeric_base, formula)` for the
@@ -4398,22 +5010,6 @@ fn parse_pure_number(t: &str) -> Option<u64> {
         return u64::from_str_radix(t, 16).ok();
     }
     None
-}
-
-/// The SVG icon ([`IconName`]) for a node-kind gutter marker — the crisp
-/// replacement for the round-2 text glyphs (`geometry::kind_glyph`'s ◆ ▦ → # • ƒ).
-/// Driven by node kind so struct/array/pointer/fnptr/hex/value each read at a
-/// glance, matching the reclass per-node tree icons (PIC2) + a Zed outline.
-fn kind_icon_name(kind: NodeKind) -> IconName {
-    use NodeKind::*;
-    match kind {
-        Struct => IconName::Frame,
-        Array => IconName::LayoutDashboard,
-        Pointer32 | Pointer64 => IconName::ArrowRight,
-        FuncPtr32 | FuncPtr64 => IconName::SquareTerminal,
-        Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => IconName::MemoryStick,
-        _ => IconName::Dash,
-    }
 }
 
 impl Focusable for RcxEditor {
@@ -4499,6 +5095,22 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_insert_below))
             .on_action(cx.listener(Self::action_insert_above))
             .on_action(cx.listener(Self::action_convert_ptr))
+            .on_action(cx.listener(Self::action_convert_root_to_struct))
+            .on_action(cx.listener(Self::action_convert_root_to_class))
+            .on_action(cx.listener(Self::action_offsets_relative))
+            .on_action(cx.listener(Self::action_offsets_absolute))
+            .on_action(cx.listener(Self::action_conv_uint))
+            .on_action(cx.listener(Self::action_conv_int))
+            .on_action(cx.listener(Self::action_conv_float))
+            .on_action(cx.listener(Self::action_conv_ptr64))
+            .on_action(cx.listener(Self::action_conv_fnptr64))
+            .on_action(cx.listener(Self::action_conv_hex))
+            .on_action(cx.listener(Self::action_conv_split_hex))
+            .on_action(cx.listener(Self::action_edit_bytes_hex))
+            .on_action(cx.listener(Self::action_edit_bytes_ascii))
+            .on_action(cx.listener(Self::action_copy_offset))
+            .on_action(cx.listener(Self::action_copy_line))
+            .on_action(cx.listener(Self::action_copy_all_text))
             .on_action(cx.listener(Self::action_toggle_big_endian))
             .on_action(cx.listener(Self::action_duplicate))
             .on_action(cx.listener(Self::action_delete))
@@ -4940,6 +5552,49 @@ mod tests {
             parse_base_address("ntdll!Sym", fallback),
             (fallback, "ntdll!Sym".to_string())
         );
+    }
+
+    #[test]
+    fn type_cycle_stays_within_the_same_byte_size() {
+        // Item 16: the quick type-cycler (`← cur ↔ alt →`, Left/Right) steps to a
+        // same-byte-size variant, never a different size / container / string. From
+        // any fixed-size primitive, both alt (next) and prev land on a kind of the
+        // SAME byte size, and the ring closes (cycling len times returns home).
+        use super::{alt_kind_for, prev_kind_for, same_size_variants};
+        use crate::core::{size_for_kind, NodeKind};
+        for &k in &[
+            NodeKind::Int8,
+            NodeKind::Int32,
+            NodeKind::UInt32,
+            NodeKind::Float,
+            NodeKind::Int64,
+            NodeKind::Pointer64,
+        ] {
+            let size = size_for_kind(k);
+            let next = alt_kind_for(k);
+            let prev = prev_kind_for(k);
+            assert_eq!(
+                size_for_kind(next),
+                size,
+                "alt of {k:?} must keep the byte size"
+            );
+            assert_eq!(
+                size_for_kind(prev),
+                size,
+                "prev of {k:?} must keep the byte size"
+            );
+            assert!(
+                !matches!(next, NodeKind::Struct | NodeKind::Array),
+                "cycle never lands on a container"
+            );
+            // Cycling forward `ring.len()` times returns to the start.
+            let ring = same_size_variants(k);
+            let mut cur = k;
+            for _ in 0..ring.len() {
+                cur = alt_kind_for(cur);
+            }
+            assert_eq!(cur, k, "forward cycle of {k:?} closes the ring");
+        }
     }
 
     #[test]

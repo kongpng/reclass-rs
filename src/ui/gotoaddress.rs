@@ -99,6 +99,31 @@ pub fn push_recent(store: &mut dyn SettingsStore, entry: &str) {
     store_recent(store, &next);
 }
 
+/// Step the recent-list selection within a list of `len` entries, mirroring the
+/// C++ `QListWidget` keyboard navigation the dialog routes Up/Down into
+/// (`gotoaddressdialog.h:152` `keyPressEvent` Down-into-list, then the list's own
+/// Up/Down). `current` is the current selected row (`None` = no selection yet, as
+/// when focus first moves into the list); `delta` is +1 (Down) or -1 (Up).
+///
+/// Rules (matching `QListWidget::setCurrentRow` clamping, not wrapping):
+/// - empty list → `None`;
+/// - no current + Down → row 0 (focus lands on the first row, the C++
+///   `setCurrentRow(0)` on Down-into-list); no current + Up → last row;
+/// - otherwise clamp `current + delta` to `0..len` (no wraparound, like Qt).
+pub fn step_recent_selection(current: Option<usize>, delta: isize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    match current {
+        None => Some(if delta < 0 { last } else { 0 }),
+        Some(cur) => {
+            let next = (cur as isize + delta).clamp(0, last as isize);
+            Some(next as usize)
+        }
+    }
+}
+
 /// The status line the live validator shows under the input (`onTextChanged`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum GotoStatus {
@@ -266,9 +291,17 @@ mod view {
         input: Entity<InputState>,
         state: GotoState,
         recent: Vec<String>,
+        /// The keyboard-highlighted recent row (the C++ `m_recentList`
+        /// `currentRow`); `None` until focus moves into the list (Down from the
+        /// input) or a row is hovered.
+        recent_selected: Option<usize>,
+        /// Set while [`pick_recent`](Self::pick_recent) programmatically writes the
+        /// input so the resulting `Change` event does not clear the recent
+        /// highlight (only genuine user typing clears it).
+        suppress_recent_clear: bool,
         ptr_size: i32,
         focus_handle: FocusHandle,
-        _subscription: Subscription,
+        _subscriptions: Vec<Subscription>,
     }
 
     impl GotoAddressDialog {
@@ -280,23 +313,37 @@ mod view {
             cx: &mut Context<Self>,
         ) -> Self {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("0x..."));
-            // Re-evaluate on every keystroke (the C++ `textChanged` connection).
+            // Re-evaluate on every keystroke (the C++ `textChanged` connection),
+            // and run Go on Enter when the formula resolves (the C++
+            // `m_input` `returnPressed` → `accept()` connection).
             let subscription = cx.subscribe_in(
                 &input,
                 window,
-                |this, _input, ev: &InputEvent, _window, cx| {
-                    if matches!(ev, InputEvent::Change) {
+                |this, _input, ev: &InputEvent, _window, cx| match ev {
+                    InputEvent::Change => {
+                        // Genuine user typing detaches from the recent list (the
+                        // highlight no longer reflects the input); a programmatic
+                        // recent-pick suppresses this so the highlight persists.
+                        if this.suppress_recent_clear {
+                            this.suppress_recent_clear = false;
+                        } else {
+                            this.recent_selected = None;
+                        }
                         this.on_text_changed(cx);
                     }
+                    InputEvent::PressEnter { .. } => this.confirm(cx),
+                    _ => {}
                 },
             );
             GotoAddressDialog {
                 input,
                 state: GotoState::new(),
                 recent,
+                recent_selected: None,
+                suppress_recent_clear: false,
                 ptr_size,
                 focus_handle: cx.focus_handle(),
-                _subscription: subscription,
+                _subscriptions: vec![subscription],
             }
         }
 
@@ -332,11 +379,92 @@ mod view {
             cx.emit(GotoEvent::Cancel);
         }
 
-        /// Pick a recent entry into the input (`currentTextChanged`).
+        /// Copy a recent entry into the input and re-evaluate
+        /// (`m_recentList currentTextChanged` → `m_input->setText(text)`). Does not
+        /// commit — the C++ only fills the input on a selection change.
         fn pick_recent(&mut self, entry: String, window: &mut Window, cx: &mut Context<Self>) {
+            // The set_value below emits a `Change`; mark it as programmatic so the
+            // subscription does not clear the recent highlight.
+            self.suppress_recent_clear = true;
             self.input
                 .update(cx, |s, cx| s.set_value(entry, window, cx));
             self.on_text_changed(cx);
+        }
+
+        /// Select recent row `ix` (clamped), copy its text into the input, and
+        /// re-evaluate — the C++ `setCurrentRow` + `currentTextChanged` pair.
+        fn select_recent(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+            if let Some(entry) = self.recent.get(ix).cloned() {
+                self.recent_selected = Some(ix);
+                self.pick_recent(entry, window, cx);
+                cx.notify();
+            }
+        }
+
+        /// Activate the highlighted recent entry — the C++ `itemActivated`
+        /// (Enter / double-click): fill the input from the item then `accept()` if
+        /// the formula resolves. With no highlighted row this is a plain confirm.
+        fn confirm_recent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if let Some(ix) = self.recent_selected {
+                if let Some(entry) = self.recent.get(ix).cloned() {
+                    self.pick_recent(entry, window, cx);
+                }
+            }
+            self.confirm(cx);
+        }
+
+        /// Capture-phase key handling (the C++ `keyPressEvent` override + the
+        /// recent-list's own navigation): Escape cancels; Down from the input moves
+        /// focus into the recent list (selecting row 0); Up/Down then walk the
+        /// recents (clamped); Enter activates the highlighted recent (or Go). Returns
+        /// `true` when handled so the caller stops propagation.
+        fn handle_nav_key(
+            &mut self,
+            key: &str,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> bool {
+            match key {
+                "escape" => {
+                    self.cancel(cx);
+                    true
+                }
+                "down" => {
+                    if self.recent.is_empty() {
+                        return false;
+                    }
+                    let next =
+                        super::step_recent_selection(self.recent_selected, 1, self.recent.len());
+                    if let Some(ix) = next {
+                        self.select_recent(ix, window, cx);
+                    }
+                    true
+                }
+                "up" => {
+                    // Up only navigates once focus is in the recent list; before
+                    // that it stays in the input (the C++ list owns Up).
+                    if self.recent.is_empty() || self.recent_selected.is_none() {
+                        return false;
+                    }
+                    let next =
+                        super::step_recent_selection(self.recent_selected, -1, self.recent.len());
+                    if let Some(ix) = next {
+                        self.select_recent(ix, window, cx);
+                    }
+                    true
+                }
+                "enter" => {
+                    // Enter on a highlighted recent activates it; otherwise the
+                    // input's own returnPressed handles Go (let it through).
+                    if self.recent_selected.is_some() {
+                        self.confirm_recent(window, cx);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
         }
 
         /// The "Base Address" help legend (PIC5): a titled card listing the
@@ -415,23 +543,35 @@ mod view {
                 GotoStatus::Error(e) => (e, cx.theme().danger),
             };
 
-            // The recent entries as compact Zed list-rows (mono, selectable).
+            // The recent entries as compact Zed list-rows (mono, selectable). The
+            // keyboard-highlighted row gets the selected fill; hovering selects a
+            // row (mouse + keyboard stay in sync), and a click selects-then-confirms
+            // (the C++ `itemActivated`).
+            let recent_selected = self.recent_selected;
             let recent_rows: Vec<AnyElement> = self
                 .recent
                 .iter()
-                .map(|entry| {
+                .enumerate()
+                .map(|(ix, entry)| {
                     let entry = entry.clone();
-                    let pick = entry.clone();
+                    let selected = recent_selected == Some(ix);
                     crate::ui::design::zed_list_row(
-                        SharedString::from(format!("goto-recent-{entry}")),
-                        false,
+                        SharedString::from(format!("goto-recent-{ix}-{entry}")),
+                        selected,
                         cx,
                     )
                     .font_family(mono.clone())
                     .text_size(px(tokens::font::UI_SM))
                     .cursor_pointer()
+                    .on_mouse_move(cx.listener(move |this, _e, _window, cx| {
+                        if this.recent_selected != Some(ix) {
+                            this.recent_selected = Some(ix);
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.pick_recent(pick.clone(), window, cx);
+                        this.select_recent(ix, window, cx);
+                        this.confirm_recent(window, cx);
                     }))
                     .child(entry)
                     .into_any_element()
@@ -484,6 +624,14 @@ mod view {
                 .id("rcx-goto-address")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxGotoAddress")
+                // Capture-phase key handling so Escape/Down-into-recents/Up-Down/
+                // Enter reach the dialog even while the input owns focus (the C++
+                // `keyPressEvent` override + the recent-list navigation).
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if this.handle_nav_key(ev.keystroke.key.as_str(), window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .w(card_w)
                 .max_h(card_max_h)
                 .child(
@@ -502,8 +650,8 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_recent, load_recent, push_recent, push_recent_list, GotoState, GotoStatus,
-        MAX_RECENT, RECENT_KEY,
+        clear_recent, load_recent, push_recent, push_recent_list, step_recent_selection, GotoState,
+        GotoStatus, MAX_RECENT, RECENT_KEY,
     };
     use crate::addr::AddressParserCallbacks;
     use crate::theme::manager::MemSettings;
@@ -624,5 +772,36 @@ mod tests {
         let mut s = GotoState::new();
         s.evaluate("  0xAB  ", 8, None::<&AddressParserCallbacks<'_>>);
         assert_eq!(s.formula(), "0xAB");
+    }
+
+    // ── recent-list keyboard navigation (the C++ keyPressEvent Down-into-list +
+    //    QListWidget Up/Down clamping) ──
+
+    #[test]
+    fn step_recent_selection_empty_is_none() {
+        assert_eq!(step_recent_selection(None, 1, 0), None);
+        assert_eq!(step_recent_selection(Some(0), -1, 0), None);
+    }
+
+    #[test]
+    fn step_recent_selection_down_from_input_lands_on_first() {
+        // Down with no current row → row 0 (focus moves into the list).
+        assert_eq!(step_recent_selection(None, 1, 3), Some(0));
+    }
+
+    #[test]
+    fn step_recent_selection_up_from_input_lands_on_last() {
+        assert_eq!(step_recent_selection(None, -1, 3), Some(2));
+    }
+
+    #[test]
+    fn step_recent_selection_clamps_without_wrapping() {
+        // Down past the end stays on the last row (Qt setCurrentRow clamps).
+        assert_eq!(step_recent_selection(Some(2), 1, 3), Some(2));
+        // Up past the start stays on the first row.
+        assert_eq!(step_recent_selection(Some(0), -1, 3), Some(0));
+        // Mid-list moves normally.
+        assert_eq!(step_recent_selection(Some(1), 1, 3), Some(2));
+        assert_eq!(step_recent_selection(Some(1), -1, 3), Some(0));
     }
 }
