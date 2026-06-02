@@ -151,11 +151,17 @@ declarative path only (the default, and what we document).
 
 ## 4. ReClass.NET plugin compatibility (goal 3)
 
-The C++ version ships this as a *plugin* (`plugins/RcNetPluginCompatLayer/`),
-registered as the `reclass.netcompatlayer` provider. We mirror that: a **first-party
-"ReClass.NET compat" plugin** in our own system — no special core machinery.
+The C++ version ships this AS a plugin (`plugins/RcNetPluginCompatLayer/`) that the
+user points at a `.dll` via a file dialog. **We do it better: a CORE host subsystem,
+not a plugin.** The user just **drops a ReClass.NET plugin `.dll` (plus any sidecar,
+e.g. memflow's `memflow.toml`) into the `plugins/` folder**; the host's folder scan
+**auto-detects** and bridges it — no compat *plugin*, no file dialog. Detection per
+DLL: our abi_stable root module → our-format loader; exports the ReClass.NET
+CoreFunctions → native compat; is a .NET assembly (PE CLR header) → managed compat.
 
-It bridges ReClass.NET's documented native **CoreFunctions** ABI (8 functions, the
+The canonical target is a **native** plugin like **memflow-reclass-plugin** (a Rust
+cdylib exporting the CoreFunctions over memflow connectors — KVM/QEMU/PCILeech). The
+core loader bridges ReClass.NET's native **CoreFunctions** ABI (8 functions, the
 memory-backend subset — no debug/breakpoint) into our `Provider`:
 
 ```
@@ -198,11 +204,20 @@ region enumeration in the port.
 Scope (matches C++): **memory backends only.** Managed UI/node-type ReClass.NET
 plugins are *not* bridged — they target ReClass.NET's managed model + WinForms.
 
-Discovery (matches C++): **interactive, not a folder scan** — `select_target`
-pops a file dialog to pick a ReClass.NET `*.dll`, validates/loads it (PE CLR-header
-check decides native vs managed), then shows the bridged process list. The compat
-plugin registers under our `reclass.netcompatlayer` identifier (icon `plug.svg`).
-Target string format: `"<dllpath>|<pid>:<name>"`.
+Discovery (better than C++): a **folder scan** of `plugins/` (not C++'s file dialog).
+Each `.dll`/`.so` is sniffed (exports / PE CLR header) and routed to our loader,
+native compat, or managed compat; sidecar files (e.g. `memflow.toml`) live beside the
+DLL. A bridged ReClass.NET source registers under `reclass.netcompatlayer` (icon
+`plug.svg`) and is attached through the normal Source picker; its `select_target`
+shows the plugin's process list.
+
+**Scope (decided): native (cross-platform) + managed-MEMORY (Windows CLR) backends.**
+Managed node-type / UI plugins (e.g. **FrostbitePlugin** — a `WeakPtr` node type +
+Frostbite name reader) are **not supported**: they bind to ReClass.NET's managed
+rendering + node model, which our Rust/GPUI app can't run. The scan detects a managed
+assembly that implements `ICoreProcessFunctions` → bridge it; one that doesn't (a
+node/UI plugin) → log "ReClass.NET node-type plugin unsupported" and skip. (Note: even
+C++ can't load these — its compat only bridges the memory CoreFunctions.)
 
 Managed path specifics (from the reference): host **.NET Framework v4.0.30319** via
 `mscoree`/COM and call the C# bridge entry `RcNetBridge.Bridge.Initialize("<hexptr>|
