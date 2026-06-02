@@ -129,6 +129,12 @@ actions!(
         // Collapse-all / expand-all (item 19).
         EditorCollapseAll,
         EditorExpandAll,
+        // Shift+Left / Shift+Right — collapse / expand the current foldable node
+        // (a nested class/struct instance, a pointer-to-class, an array of
+        // structs). Plain Left/Right stay type-cycle (C++ parity), so the fold
+        // keys take the Shift chord to avoid clobbering it.
+        EditorCollapseNode,
+        EditorExpandNode,
         // Shift+Up/Down — extend the node multi-selection (range-select, the C++
         // `nodeClicked(.., ShiftModifier)` keyboard path). Distinct from plain
         // Up/Down (which REPLACE the selection) and Ctrl+Shift+Up/Down (reorder).
@@ -283,6 +289,13 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         // Left/Right cycle same-size type variants (item 18).
         KeyBinding::new("left", EditorCycleLeft, Some("RcxEditor")),
         KeyBinding::new("right", EditorCycleRight, Some("RcxEditor")),
+        // Shift+Left / Shift+Right collapse / expand the current foldable node
+        // (nested class/struct instance, pointer-to-class, array of structs).
+        // The inline-edit field binds shift-left/right in its deeper
+        // `RcxFieldInput` context (text selection), so it shadows these while
+        // editing — same pattern as up/down. Plain Left/Right stay type-cycle.
+        KeyBinding::new("shift-left", EditorCollapseNode, Some("RcxEditor")),
+        KeyBinding::new("shift-right", EditorExpandNode, Some("RcxEditor")),
         // F12 Go To Definition (item 20).
         KeyBinding::new("f12", EditorGoToDefinition, Some("RcxEditor")),
         // Collapse-all / expand-all (item 19).
@@ -3382,6 +3395,65 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.cycle_same_size(1, cx);
+    }
+
+    /// Shift+Left → collapse / Shift+Right → expand the current foldable node
+    /// (a nested class/struct instance, a pointer-to-class, an array of structs —
+    /// any row that shows a fold chevron). Plain Left/Right stay type-cycle, so
+    /// the fold keys take the Shift chord.
+    fn action_collapse_node(
+        &mut self,
+        _: &EditorCollapseNode,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fold_current(false, cx);
+    }
+    fn action_expand_node(
+        &mut self,
+        _: &EditorExpandNode,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fold_current(true, cx);
+    }
+
+    /// Collapse (`expand=false`) or expand (`expand=true`) the current node if it
+    /// is a fold head, and only when that changes its state (so Shift+Left on an
+    /// already-collapsed node, or Shift+Right on an expanded one, is a no-op).
+    /// Mirrors the chevron-click path (`on_row_mouse_down`): ref/pointer/cycle
+    /// heads materialize their referenced children on expand so they become real
+    /// navigable rows; plain containers toggle. The nav anchor is seeded on the
+    /// head so a following Down descends into the children.
+    fn fold_current(&mut self, expand: bool, cx: &mut Context<Self>) {
+        let Some((line, lm)) = self.current_node() else {
+            return;
+        };
+        if lm.node_idx < 0 || !lm.fold_head {
+            return; // leaf / non-expandable row
+        }
+        let node_idx = lm.node_idx as usize;
+        let node_id = lm.node_id;
+        let is_collapsed = self
+            .controller
+            .tree()
+            .nodes
+            .get(node_idx)
+            .map(|n| n.collapsed)
+            .unwrap_or(true);
+        // Already in the requested state → nothing to do.
+        if expand != is_collapsed {
+            return;
+        }
+        if expand && (lm.marker_mask & (1u32 << crate::core::linemeta::M_CYCLE)) != 0 {
+            self.controller.materialize_ref_children(node_idx);
+        } else {
+            self.controller.toggle_collapse(node_idx);
+        }
+        self.controller
+            .handle_node_click(line as i64, node_id, CtrlMods::NONE);
+        self.caret_line = Some(line);
+        self.after_mutation(cx);
     }
 
     /// `cycleSameSizeTypeRequested` (controller.cpp:709). Item 3: apply the cycle
@@ -7949,6 +8021,8 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_go_to_definition))
             .on_action(cx.listener(Self::action_collapse_all))
             .on_action(cx.listener(Self::action_expand_all))
+            .on_action(cx.listener(Self::action_collapse_node))
+            .on_action(cx.listener(Self::action_expand_node))
             // Shift-extending navigation (items 2/3) + Ctrl+A (5) + node
             // clipboard (4) + copy-address (10).
             .on_action(cx.listener(Self::action_select_up))
