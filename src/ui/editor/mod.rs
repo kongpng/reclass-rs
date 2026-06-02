@@ -1477,7 +1477,18 @@ impl RcxEditor {
         };
         let text = self.line_text_owned(line);
         let (type_w, name_w) = geometry::effective_widths(&lm);
-        let span = geometry::resolved_span_for(&lm, &text, target, type_w, name_w);
+        // Hex VALUE editing is a fixed-length per-byte overwrite over the byte grid
+        // (armed as `hex_overwrite_mode` below). `resolved_span_for` deliberately
+        // returns an invalid span for a hex Value (it is not a plain inline edit),
+        // so resolve the byte-grid value span directly here — otherwise the early
+        // `!span.valid` return meant "Edit Bytes (Hex)", "Edit ASCII", and Enter on
+        // a hex node all silently did nothing.
+        let span =
+            if target == EditTarget::Value && lm.node_idx >= 0 && is_hex_preview(lm.node_kind) {
+                crate::compose::value_span_for(&lm, type_w, name_w)
+            } else {
+                geometry::resolved_span_for(&lm, &text, target, type_w, name_w)
+            };
         if !span.valid || span.end <= span.start {
             return;
         }
@@ -1597,17 +1608,21 @@ impl RcxEditor {
         // field and `cx.notify()`-ing here re-prepaints the row on every keystroke,
         // cursor move, and blink tick, so the caret stays solid while typing and
         // is recomputed at the live cursor offset (BUG 2).
-        let subscription = cx.observe(&field, |this: &mut RcxEditor, field, cx| {
-            let outcome = field.update(cx, |f, _| f.take_outcome());
-            if let Some(outcome) = outcome {
-                this.resolve_edit_outcome(outcome, cx);
-            } else {
-                // Item 71/72/68/73: while still editing, re-validate the live text
-                // and refresh the expression-result popup on every change.
-                this.update_edit_validation(cx);
-            }
-            cx.notify();
-        });
+        // `observe_in` (not `observe`) so the callback receives a `Window`: when the
+        // field commits/cancels (Enter/Esc) it is dropped, orphaning keyboard focus,
+        // so we must return focus to the editor surface — which needs a window.
+        let subscription =
+            cx.observe_in(&field, window, |this: &mut RcxEditor, field, window, cx| {
+                let outcome = field.update(cx, |f, _| f.take_outcome());
+                if let Some(outcome) = outcome {
+                    this.resolve_edit_outcome(outcome, window, cx);
+                } else {
+                    // Item 71/72/68/73: while still editing, re-validate the live text
+                    // and refresh the expression-result popup on every change.
+                    this.update_edit_validation(cx);
+                }
+                cx.notify();
+            });
 
         self.last_tab_target = Some(target);
         self.editing = Some(EditingField {
@@ -1774,7 +1789,12 @@ impl RcxEditor {
 
     /// Apply a committed/cancelled inline edit (the `inlineEditCommitted`/
     /// `inlineEditCancelled` round-trip, editor-surface.md §11).
-    fn resolve_edit_outcome(&mut self, outcome: EditOutcome, cx: &mut Context<Self>) {
+    fn resolve_edit_outcome(
+        &mut self,
+        outcome: EditOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match outcome {
             EditOutcome::Commit(commit) => {
                 // Item 5: capture the ASCII-overwrite flag before clearing the edit
@@ -1788,11 +1808,17 @@ impl RcxEditor {
                 self.edit_validation = None;
                 self.expr_result = None;
                 self.apply_commit(&commit, ascii, cx);
+                // Return keyboard focus to the editor surface. The committed field
+                // entity is now dropped, so without this the focus is orphaned and
+                // the next keystroke (e.g. Enter to re-edit) is swallowed until the
+                // user clicks back into the editor.
+                window.focus(&self.focus_handle, cx);
             }
             EditOutcome::Cancel => {
                 self.editing = None;
                 self.edit_validation = None;
                 self.expr_result = None;
+                window.focus(&self.focus_handle, cx);
                 cx.notify();
             }
             EditOutcome::Continue => {}
