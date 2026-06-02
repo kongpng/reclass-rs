@@ -2495,3 +2495,49 @@ fn rtti_hint_on_typed_pointer_header() {
     );
     assert_eq!(c.rtti_vtable_addr, vtable_va);
 }
+
+#[test]
+fn pointer_to_class_fold_footer_has_add_bytes_pills() {
+    // A typed pointer-to-class fold footer carries the same add-bytes pills as a
+    // struct footer (`+1 +10h +100h +1000h Trim Top`) so the user can grow the
+    // pointed-to class definition from the expansion. (A void pointer with no
+    // ref_id keeps a plain `}` — covered by the other pointer tests.)
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let mi = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Main".into(),
+        ..Node::default()
+    });
+    let main_id = tree.nodes[mi].id;
+    let ti = tree.add_node(Node {
+        offset: 200,
+        collapsed: false,
+        kind: NodeKind::Struct,
+        name: "VTable".into(),
+        ..Node::default()
+    });
+    let tmpl_id = tree.nodes[ti].id;
+    tree.add_node(child(tmpl_id, NodeKind::UInt64, 0, "fn_one"));
+    tree.add_node(Node {
+        ref_id: tmpl_id,
+        collapsed: false,
+        ..child(main_id, NodeKind::Pointer64, 0, "ptr")
+    });
+
+    let mut data = vec![0u8; 256];
+    data[0..8].copy_from_slice(&100u64.to_le_bytes()); // ptr -> 100 (readable)
+    let prov = BufferProvider::new(data, "");
+    let r = compose_default(&tree, &prov);
+
+    let fi = r
+        .meta
+        .iter()
+        .position(|lm| lm.line_kind == LineKind::Footer && lm.node_kind == NodeKind::Pointer64)
+        .expect("pointer-fold footer present");
+    let text = lines(&r)[fi].clone();
+    assert!(
+        text.contains("+1 +10h +100h +1000h Trim Top"),
+        "pointer-to-class footer should carry add-bytes pills, got: {text:?}"
+    );
+}

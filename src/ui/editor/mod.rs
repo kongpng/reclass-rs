@@ -1222,6 +1222,26 @@ impl RcxEditor {
     /// its op ran. `Top` scrolls to the top; `+10h/+100h/+1000h` append that many
     /// bytes (as `Hex64` fields) to the footer's struct. `Trim`/`+10` need
     /// controller ops not exposed here; they hit-test but no-op gracefully.
+    /// The struct id whose tail a footer's add/trim pills should grow. Normally
+    /// the footer's own node, but a typed pointer-to-class fold and an embedded
+    /// struct instance (a `Struct` with a `ref_id` and no own children) both grow
+    /// the REFERENCED class definition — so the appended bytes land in the shared
+    /// class, not on the pointer/instance node (which would orphan the ref view).
+    fn footer_grow_target(&self, lm: &LineMeta) -> u64 {
+        let tree = self.controller.tree();
+        let idx = tree.index_of_id(lm.node_id);
+        if idx < 0 {
+            return lm.node_id;
+        }
+        let n = &tree.nodes[idx as usize];
+        let is_ptr = matches!(n.kind, NodeKind::Pointer32 | NodeKind::Pointer64);
+        let is_embedded_ref = n.kind == NodeKind::Struct && tree.children_of(n.id).is_empty();
+        if n.ref_id != 0 && (is_ptr || is_embedded_ref) {
+            return n.ref_id;
+        }
+        lm.node_id
+    }
+
     fn on_footer_click(
         &mut self,
         lm: &LineMeta,
@@ -1253,6 +1273,11 @@ impl RcxEditor {
         let Some(tok) = hit_tok else {
             return false;
         };
+        // The struct whose tail the add/trim pills grow. For a typed pointer-to-
+        // class fold or an embedded struct instance (a struct with a refId and no
+        // own children), the bytes belong to the REFERENCED class definition, not
+        // the pointer/instance node itself — so resolve through `ref_id`.
+        let grow_id = self.footer_grow_target(lm);
         match tok {
             "Top" => {
                 self.scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -1265,7 +1290,7 @@ impl RcxEditor {
                     "+100h" => 0x100,
                     _ => 0x1000,
                 };
-                self.append_bytes_to_struct(lm.node_id, bytes, cx);
+                self.append_bytes_to_struct(grow_id, bytes, cx);
                 true
             }
             // `+1` single-add pill (the C++ `appendSingleFieldRequested`,
@@ -1274,8 +1299,8 @@ impl RcxEditor {
             // member when the footer's container is an enum. `append_single_field`
             // walks up to the enclosing Struct/Array/Enum and does exactly this.
             "+1" => {
-                if lm.node_id != 0 && lm.node_id != K_COMMAND_ROW_ID {
-                    self.controller.append_single_field(lm.node_id);
+                if grow_id != 0 && grow_id != K_COMMAND_ROW_ID {
+                    self.controller.append_single_field(grow_id);
                     self.apply_document(cx);
                 }
                 true
@@ -1289,7 +1314,7 @@ impl RcxEditor {
             // `Trim` pill (the C++ `trimHexRequested`, controller.cpp:1047):
             // drop trailing hex padding fields from the struct.
             "Trim" => {
-                self.trim_trailing_padding(lm.node_id, cx);
+                self.trim_trailing_padding(grow_id, cx);
                 true
             }
             _ => true,

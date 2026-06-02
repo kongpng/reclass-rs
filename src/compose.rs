@@ -2591,7 +2591,11 @@ fn compose_node(
 
             state.current_ptr_base = saved_ptr_base;
 
-            // Footer for pointer fold.
+            // Footer for pointer fold. A typed pointer to a class shows the same
+            // add-bytes pills as a struct footer (`+1 +10h +100h +1000h Trim Top`)
+            // so the user can grow the pointed-to class definition from here — the
+            // editor's footer-click resolves `node.ref_id` as the grow target. A
+            // void/untyped pointer (no ref_id) keeps the plain closing brace.
             {
                 let mut lm = LineMeta {
                     node_idx,
@@ -2604,8 +2608,13 @@ fn compose_node(
                     ..Default::default()
                 };
                 lm.offset_text.clear();
-                let mut t = U16Str::from_str(&render::indent(depth));
-                t.push_str("}");
+                let t = if node.ref_id != 0 {
+                    render::fmt_struct_footer(&node, depth, tree.struct_span(node.ref_id))
+                } else {
+                    let mut t = U16Str::from_str(&render::indent(depth));
+                    t.push_str("}");
+                    t
+                };
                 state.emit_line(&t, &mut lm);
             }
         }
