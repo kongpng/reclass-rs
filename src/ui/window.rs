@@ -1513,7 +1513,12 @@ impl MainWindow {
     /// the (possibly stub) provider rows; a chosen row reports the selection.
     fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use super::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
-        let model = ProcessPickerModel::from_registry(&crate::provider::ProviderRegistry::new());
+        // Build the picker's available-source rows from the real plugin registry
+        // (the in-tree File/Buffer/Snapshot/Null providers registered through the
+        // contract) instead of a throwaway empty registry — so the picker reads the
+        // same source list the rest of the app does (design §6 Phase 1 / §7.A [fix]).
+        let manager = crate::plugin::PluginManager::with_builtins();
+        let model = ProcessPickerModel::from_registry(manager.registry());
         // Remember which process the user last attached to (the C++
         // `lastAttachedProcess` QSettings key; processpicker.cpp:386). The picker
         // *reads* this to pre-select the matching row in `selectPreferredProcess` —
@@ -5448,48 +5453,34 @@ impl Render for TypeAliasesDialog {
 /// Read-only metadata: name, version, type, author, and a one-line description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PluginInfo {
-    name: &'static str,
-    version: &'static str,
-    kind: &'static str,
-    author: &'static str,
-    description: &'static str,
+    name: String,
+    version: String,
+    kind: String,
+    author: String,
+    description: String,
 }
 
-/// The built-in provider "plugins" this port ships (the in-scope analogue of the
-/// C++ loaded `IPlugin`s — native DLL/SO loading is out of scope, so these are
-/// the compiled-in provider backends the registry can hand out). Pure;
-/// unit-tested via [`builtin_plugins`] in the test module.
+/// The built-in provider "plugins" this port ships, **derived from the real
+/// [`PluginManager`](crate::plugin::PluginManager)** (design §6 Phase 1: the
+/// Manage Plugins dialog reads the live plugin set, not a second hand-kept table).
+/// Each in-tree plugin's [`PluginManifest`](crate::plugin::PluginManifest) becomes
+/// a read-only dialog row; the "<name> Provider" label preserves the C++ dialog's
+/// display text. Native DLL/SO loading is out of scope (the dialog notes it).
 fn builtin_plugins() -> Vec<PluginInfo> {
-    vec![
-        PluginInfo {
-            name: "File Provider",
-            version: env!("CARGO_PKG_VERSION"),
-            kind: "Provider",
-            author: "Reclass (Rust port)",
-            description: "Reads a project's data from a binary file on disk.",
-        },
-        PluginInfo {
-            name: "Buffer Provider",
-            version: env!("CARGO_PKG_VERSION"),
-            kind: "Provider",
-            author: "Reclass (Rust port)",
-            description: "Reads from an in-memory byte buffer (imports / tests).",
-        },
-        PluginInfo {
-            name: "Snapshot Provider",
-            version: env!("CARGO_PKG_VERSION"),
-            kind: "Provider",
-            author: "Reclass (Rust port)",
-            description: "Reads from a captured memory snapshot.",
-        },
-        PluginInfo {
-            name: "Null Provider",
-            version: env!("CARGO_PKG_VERSION"),
-            kind: "Provider",
-            author: "Reclass (Rust port)",
-            description: "The detached source — every read returns zero.",
-        },
-    ]
+    crate::plugin::PluginManager::with_builtins()
+        .plugins()
+        .iter()
+        .map(|p| {
+            let m = p.manifest();
+            PluginInfo {
+                name: format!("{} Provider", m.name),
+                version: m.version.clone(),
+                kind: "Provider".to_string(),
+                author: m.author.clone(),
+                description: m.description.clone(),
+            }
+        })
+        .collect()
 }
 
 /// The Plugins manager's outcome — Close (the only action in the read-only port).
@@ -5569,7 +5560,7 @@ impl Render for PluginManagerDialog {
                                     .bg(color::selected_bg(cx))
                                     .text_color(color::text_muted(cx))
                                     .text_size(px(tokens::font::UI_SM))
-                                    .child(p.kind),
+                                    .child(p.kind.clone()),
                             ),
                     )
                     .child(
@@ -6353,7 +6344,7 @@ mod tests {
         // Every shipped provider backend is listed as a read-only "Provider".
         assert!(!plugins.is_empty());
         assert!(plugins.iter().all(|p| p.kind == "Provider"));
-        let names: Vec<&str> = plugins.iter().map(|p| p.name).collect();
+        let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"File Provider"));
         assert!(names.contains(&"Null Provider"));
         // Each row carries the fields the C++ dialog shows.

@@ -33,6 +33,7 @@ pub mod controller;
 pub mod core;
 pub mod format;
 pub mod generator;
+pub mod plugin;
 pub mod provider;
 pub mod scanner;
 pub mod theme;

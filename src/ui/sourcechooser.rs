@@ -415,50 +415,95 @@ impl SourceModel {
     }
 }
 
-/// The built-in provider actions shown at the top of the chooser (PIC4): the
-/// memory-source plugins, each labeled with its plugin filename hint. These map
-/// 1:1 onto the C++ provider registry entries; the trailing recent/saved sources
-/// + the "Clear All" action are appended by [`default_entries`].
+/// The kind label for a provider, keyed off its identifier (the C++ `kindLabelFor`,
+/// `sourcechooserpopup.h:19-42`). Centralized so both source surfaces agree
+/// (design §7.A [fix] — the C++ had two divergent tables). Falls back to "Source".
+pub fn kind_label_for(identifier: &str) -> &'static str {
+    match identifier {
+        "file" => "File",
+        "buffer" => "Buffer",
+        "snapshot" => "Snapshot",
+        "null" => "Null",
+        "kernelmemory" => "Kernel",
+        "processmemory" => "Process",
+        "remoteprocessmemory" => "Remote",
+        "windbgmemory" => "WinDbg",
+        "reclass.netcompatlayer" | "rcnetcompat" => "Compat",
+        _ => "Source",
+    }
+}
+
+/// Build the provider-action entries from a [`ProviderRegistry`](crate::provider::ProviderRegistry)
+/// — the SINGLE shared model both source-picker surfaces consume (design §7.A
+/// [fix]: the C++ had two icon/label tables that already diverged). Each enabled
+/// registry provider becomes a [`SourceEntry::provider`] row, labeled via
+/// [`kind_label_for`] and carrying its `dll_file_name` hint; the trailing
+/// recent/saved sources + "Clear All" are appended by [`default_entries`].
+pub fn provider_entries_from_registry(
+    registry: &crate::provider::ProviderRegistry,
+) -> Vec<SourceEntry> {
+    registry
+        .enabled_providers()
+        .map(|p| {
+            let mut e =
+                SourceEntry::provider(&p.identifier, &p.name, kind_label_for(&p.identifier));
+            e.dll_file_name = p.dll_file_name.clone();
+            e
+        })
+        .collect()
+}
+
+/// The default source families the picker shows when no live registry is threaded
+/// through (the visible memory-source plugin list, PIC4). Built by seeding a
+/// registry with the canonical descriptors and rendering it through the shared
+/// [`provider_entries_from_registry`] path, so the menu and the inline popup share
+/// one code path even before the host wires its real `PluginManager` registry in
+/// (design §7.A [fix]). The native source families are out-of-scope stubs in this
+/// port but still listed (with their dll hint) for parity with the C++ menu.
 pub fn provider_entries() -> Vec<SourceEntry> {
-    let mk = |id: &str, name: &str, kind: &str, dll: &str| {
-        let mut e = SourceEntry::provider(id, name, kind);
-        e.dll_file_name = dll.to_string();
-        e
+    let mut reg = crate::provider::ProviderRegistry::new();
+    // "File" has no plugin dll hint in the screenshot.
+    reg.register_builtin("File", "file");
+    let mk = |reg: &mut crate::provider::ProviderRegistry, name: &str, id: &str, dll: &str| {
+        reg.register_provider(crate::provider::ProviderInfo {
+            name: name.to_string(),
+            identifier: id.to_string(),
+            is_builtin: false,
+            dll_file_name: dll.to_string(),
+            enabled: true,
+        });
     };
-    vec![
-        // "File" has no plugin dll hint in the screenshot.
-        SourceEntry::provider("file", "File", "File"),
-        mk(
-            "kernelmemory",
-            "Kernel Memory",
-            "Kernel",
-            "libKernelMemoryPlugin.dll",
-        ),
-        mk(
-            "processmemory",
-            "Process Memory",
-            "Process",
-            "libProcessMemoryPlugin.dll",
-        ),
-        mk(
-            "rcnetcompat",
-            "ReClass.NET Compat Layer",
-            "Compat",
-            "libRcNetCompatPlugin.dll",
-        ),
-        mk(
-            "remoteprocessmemory",
-            "Remote Process Memory",
-            "Remote",
-            "libRemoteProcessMemoryPlugin.dll",
-        ),
-        mk(
-            "windbgmemory",
-            "WinDbg Memory",
-            "WinDbg",
-            "libWinDbgMemoryPlugin.dll",
-        ),
-    ]
+    mk(
+        &mut reg,
+        "Kernel Memory",
+        "kernelmemory",
+        "libKernelMemoryPlugin.dll",
+    );
+    mk(
+        &mut reg,
+        "Process Memory",
+        "processmemory",
+        "libProcessMemoryPlugin.dll",
+    );
+    mk(
+        &mut reg,
+        "ReClass.NET Compat Layer",
+        "rcnetcompat",
+        "libRcNetCompatPlugin.dll",
+    );
+    mk(
+        &mut reg,
+        "Remote Process Memory",
+        "remoteprocessmemory",
+        "libRemoteProcessMemoryPlugin.dll",
+    );
+    mk(
+        &mut reg,
+        "WinDbg Memory",
+        "windbgmemory",
+        "libWinDbgMemoryPlugin.dll",
+    );
+    provider_entries_from_registry(&reg)
 }
 
 /// The full default chooser content (PIC4): the provider list, a separator, the
@@ -1028,7 +1073,45 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_entries, provider_entries, SourceEntryKind};
+    use super::{
+        default_entries, kind_label_for, provider_entries, provider_entries_from_registry,
+        SourceEntryKind,
+    };
+
+    #[test]
+    fn provider_entries_from_registry_is_the_shared_model() {
+        // The in-tree PluginManager registry → the same SourceEntry shape both
+        // surfaces consume (design §7.A [fix] — one shared list).
+        let mgr = crate::plugin::PluginManager::with_builtins();
+        let entries = provider_entries_from_registry(mgr.registry());
+        let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(names, vec!["File", "Buffer", "Snapshot", "Null"]);
+        // All are provider actions with a kind label and the derived identifier.
+        assert!(entries
+            .iter()
+            .all(|e| e.entry_kind == SourceEntryKind::ProviderAction));
+        let file = entries.iter().find(|e| e.display_name == "File").unwrap();
+        assert_eq!(file.provider_identifier, "file");
+        assert_eq!(file.kind_label, "File");
+    }
+
+    #[test]
+    fn provider_entries_from_registry_skips_disabled() {
+        let mut mgr = crate::plugin::PluginManager::with_builtins();
+        mgr.registry_mut().set_enabled("buffer", false);
+        let entries = provider_entries_from_registry(mgr.registry());
+        let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(names, vec!["File", "Snapshot", "Null"]);
+    }
+
+    #[test]
+    fn kind_label_for_is_centralized_and_consistent() {
+        // The single label table both surfaces share (design §7.A [fix]).
+        assert_eq!(kind_label_for("processmemory"), "Process");
+        assert_eq!(kind_label_for("reclass.netcompatlayer"), "Compat");
+        assert_eq!(kind_label_for("kernelmemory"), "Kernel");
+        assert_eq!(kind_label_for("unknownthing"), "Source");
+    }
 
     #[test]
     fn provider_entries_match_pic4_list() {

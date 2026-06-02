@@ -152,8 +152,7 @@ impl ProcessPickerModel {
     /// which is the in-scope analogue of "things you can attach to".
     pub fn from_registry(registry: &ProviderRegistry) -> ProcessPickerModel {
         let mut rows: Vec<ProcessRow> = registry
-            .providers()
-            .iter()
+            .enabled_providers()
             .map(|p| ProcessRow {
                 pid: 0,
                 name: p.name.clone(),
