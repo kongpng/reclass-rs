@@ -413,10 +413,17 @@ growth, all [future].)*
 
 - **`abi_stable` vs `stabby`** for our native ABI. Recommend `abi_stable` (mature).
 - **C header for our-format plugins**: ship it (C/C++/Zig authors) or Rust-only? Default Rust-only.
-- **Managed-C# CLR hosting**: mirror C++ exactly (.NET Framework via `mscoree` COM +
-  port `RcNetBridge.cs`, Windows-only) — confirmed by "what the C++ supports". Open:
-  do we *also* try .NET 5+ via `netcorehost` for plugins that target modern .NET, or
-  strictly match ReClass.NET's .NET Framework target?
+- **Managed CLR hosting — the "is there a crate?" question (DECIDED):** yes, two
+  exist for different runtimes. `netcorehost` is the turnkey, cross-platform crate but
+  hosts **modern .NET (Core/5+/8)**, which **cannot load existing ReClass.NET (.NET
+  Framework 4.x) plugin assemblies** — wrong tool for the compat goal. Existing
+  ReClass.NET managed plugins need **.NET Framework** hosting, for which we use the
+  official **`windows` crate** CLR-hosting COM bindings (`CLRCreateInstance`/
+  `ICLRMetaHost`/`ICLRRuntimeHost`) — a maintained binding, **not** C++'s hand-rolled
+  vtables — plus the ported `RcNetBridge.cs`. Windows-only (Framework is). Decision:
+  **`windows`-crate Framework hosting**; keep `netcorehost` as a `[future]` option
+  only for plugins built against modern .NET. (Confirmed scope: managed *memory*
+  backends only.)
 - **`Provider` across the ABI**: `RBox<dyn Provider_TO>` (sabi trait object, so
   plugin `read()` is a direct native call on the hot path). Recommend yes.
 
