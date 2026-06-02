@@ -45,29 +45,42 @@ const VERIFY_HARNESS = `On-screen verify. Rebuild the ui binary: \`cd ${OUT} && 
 
 let halted = false
 
+// A single subagent occasionally finishes without emitting StructuredOutput, which
+// would otherwise throw and abort the WHOLE run (it killed the prior launch at the
+// P5 design step). Wrap every agent call so that hiccup degrades to null+log and the
+// workflow continues — the per-phase commit-or-revert + the final git assessment keep
+// correctness. The integrate step still does the real git work even if its structured
+// summary is lost; we reconcile from `git log` afterward.
+const safe = async (prompt, opts) => {
+  try { return await agent(prompt, opts) } catch (e) {
+    log(`[soft-fail] ${(opts && opts.label) || '?'}: ${String(e).slice(0, 120)} — continuing.`)
+    return null
+  }
+}
+
 async function runPhase(p) {
   phase(p.title)
   if (halted) { log(`SKIP ${p.title} — a foundational phase reverted; cannot proceed.`); return { skipped: true } }
 
-  const plan = await agent(
+  const plan = await safe(
     `DESIGN STEP for plugin-system ${p.title}.\n${COMMON}\n\nGoal of this phase:\n${p.goal}\n\nRead the design doc section + the verified C++ reference + the EXISTING Rust code you'll touch, and produce a concrete, ordered implementation plan: exact files to create/edit, the key trait/struct signatures, how it wires into existing code WITHOUT breaking current behavior, feature-gating, new deps, and risks. Keep increments small + compiling.`,
     { label: `design:${p.key}`, phase: p.title, schema: PLAN_SCHEMA })
 
-  const impl = await agent(
+  const impl = await safe(
     `IMPLEMENT plugin-system ${p.title} on the real working tree (${OUT}).\n${COMMON}\n\nPlan to execute:\n${JSON.stringify((plan && plan.steps) || []).slice(0, 4000)}\nSummary: ${plan ? plan.summary : ''}\n\n${p.impl}\n\nWrite real, compiling Rust + tests. Prefer a working, tested vertical slice over breadth. Verify your own files compile (\`cd ${OUT} && ${LP} cargo build 2>&1|grep -E '^error|Finished'|tail -5\` and, if you added a feature, also build with it). Do NOT commit. Return what you changed + whether it compiles + any deferred items.`,
     { label: `impl:${p.key}`, phase: p.title, schema: IMPL_SCHEMA })
 
-  const integ = await agent(
+  const integ = await safe(
     `INTEGRATE plugin-system ${p.title}. Make the WHOLE project green and commit, or revert.\n${PARITY}\n\nContext (impl notes): ${impl ? (impl.notes || '').slice(0, 600) : ''}; compiles=${impl && impl.compiles}; deferred=${impl ? JSON.stringify(impl.deferred || []) : '[]'}.\nFix any build/test breakage from this phase (seams with existing code, feature gating, fmt). The new plugin code is additive — if a small part can't be made to work, prefer trimming it to a compiling+tested subset over reverting the whole phase; only full-revert if the phase fundamentally can't integrate. Commit message: "feat(plugin): ${p.title} — <what landed>".`,
     { label: `integrate:${p.key}`, phase: p.title, schema: INTEG_SCHEMA })
 
-  const review = await agent(
+  const review = await safe(
     `ADVERSARIAL SELF-REVIEW of plugin-system ${p.title} (READ-ONLY). Spec: ${DESIGN}; C++ truth: ${REF}. Inspect the phase's commit (\`cd ${OUT} && git show --stat HEAD\` + read the changed files) and check: (1) PARITY preserved — existing behavior/tests untouched, default build unaffected by new feature-gated deps; (2) the new code MATCHES the design + the verified C++ behavior (signatures, the ProviderRegistry wiring, the contract shape, the [fix] items for this phase); (3) real correctness issues, stubs that silently no-op, or places that diverge from the C++ reference. Be skeptical. Return parity_ok, matches_design, a concrete issues list, and an assessment.`,
     { label: `review:${p.key}`, phase: p.title, schema: REVIEW_SCHEMA })
 
   let verify = null
   if (p.uiVerify) {
-    verify = await agent(
+    verify = await safe(
       `VISUAL VERIFY of plugin-system ${p.title}.\n${VERIFY_HARNESS}\n\nCheck: ${p.uiVerify}\nAlso confirm the existing app still looks/works right (parity). Return works + shots + detail.`,
       { label: `verify:${p.key}`, phase: p.title, schema: VERIFY_SCHEMA })
   }
@@ -107,17 +120,17 @@ const PHASES = [
     impl: `Implement manifest parsing (plugin.toml), settings persistence of enabled state, the upgraded dialog (src/ui/window.rs), safe-unload, and multiple plugin dirs. Tests for manifest parse + enable/disable persistence + safe-unload bookkeeping.` },
 ]
 
-// RESUME: P1–P3 already landed + committed in a prior run that crashed mid-P4
-// (HEAD = e81f423). Re-running them would collide with the committed code, so this
-// run continues from P4 on the existing tree; P1–P3 stay as their committed state.
+// RESUME: P1–P4 already landed + committed (HEAD = 0f14306). The prior run aborted on
+// a flaky StructuredOutput hiccup at the P5 design step (now caught by `safe()`).
+// Re-running committed phases would collide, so continue from P5 on the existing tree.
 const results = []
-for (const p of PHASES.filter((x) => ['p4', 'p5', 'p6'].includes(x.key))) {
+for (const p of PHASES.filter((x) => ['p5', 'p6'].includes(x.key))) {
   results.push({ key: p.key, title: p.title, r: await runPhase(p) })
 }
 
 // ── Final gate + honest report ──────────────────────────────────────────────
 phase('Final')
-const final = await agent(
+const final = await safe(
   `FINAL GATE + report for the plugin-system implementation (${OUT}).\n${PARITY}\n\n` +
   `Phase outcomes: ${JSON.stringify(results.map(x => ({ phase: x.title, r: x.r && { committed: x.r.integ && x.r.integ.committed, reverted: x.r.integ && x.r.integ.reverted, green: x.r.integ && x.r.integ.green, skipped: x.r.skipped, review: x.r.review && { parity: x.r.review.parity_ok, design: x.r.review.matches_design } } })))}\n\n` +
   `DO: confirm the FULL parity gate is green at HEAD; \`cargo fmt\`; if anything uncommitted, commit "chore(plugin): final integration". Capture 2-3 screenshots of working plugin UI if P2/P6 landed (use the scale rule). \`./scripts/ui.sh stop\`.\n` +
