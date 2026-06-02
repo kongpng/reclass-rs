@@ -75,6 +75,20 @@ pub trait PluginHost {
     /// already-mounted panel refreshes without a UI event having driven it.
     /// Default no-op; the Phase-2 host re-asks the plugin for the view's tree.
     fn request_rerender(&mut self, _view: &str) {}
+
+    /// Detach every open document whose data source is the provider `identifier`,
+    /// returning how many were detached (design §7.A [fix] — **safe unload**).
+    ///
+    /// The C++ unloads a plugin's backing library while a document may still hold
+    /// that provider — a dangling-pointer crash it only *warns* about
+    /// (cpp_reference §2, §10.3). The Phase-6
+    /// [`PluginManager::safe_unload`](crate::plugin::manager::PluginManager::safe_unload)
+    /// calls this **first** so no document outlives the provider it points at.
+    /// Default no-op returning `0` so no existing host implementor breaks; the
+    /// real host detaches the affected tabs.
+    fn detach_documents_using(&mut self, _identifier: &str) -> usize {
+        0
+    }
 }
 
 /// An always-compiled in-memory [`PluginHost`] capturing side effects, for tests
@@ -91,6 +105,7 @@ pub struct MockPluginHost {
     data_source: Option<(String, String)>,
     closed_dialogs: Vec<String>,
     rerender_requests: Vec<String>,
+    detached: Vec<String>,
 }
 
 impl MockPluginHost {
@@ -137,6 +152,13 @@ impl MockPluginHost {
     /// The view ids passed to `request_rerender`, in order.
     pub fn rerender_requests(&self) -> &[String] {
         &self.rerender_requests
+    }
+
+    /// The provider identifiers passed to `detach_documents_using`, in order —
+    /// so a `safe_unload` / conformance test can assert the detach happened
+    /// **before** the plugin was dropped (design §7.A [fix] safe-unload).
+    pub fn detached(&self) -> &[String] {
+        &self.detached
     }
 }
 
@@ -193,6 +215,14 @@ impl PluginHost for MockPluginHost {
 
     fn request_rerender(&mut self, view: &str) {
         self.rerender_requests.push(view.to_string());
+    }
+
+    fn detach_documents_using(&mut self, identifier: &str) -> usize {
+        // Record the call so a safe-unload test can assert the host was asked to
+        // detach the provider's documents first. The mock pretends one document
+        // referenced it (a nonzero count exercises the manager's bookkeeping).
+        self.detached.push(identifier.to_string());
+        1
     }
 }
 
@@ -265,6 +295,30 @@ mod tests {
         dyn_host.request_rerender("v");
         assert_eq!(host.closed_dialogs(), ["d"]);
         assert_eq!(host.rerender_requests(), ["v"]);
+    }
+
+    #[test]
+    fn mock_records_detach_calls() {
+        let mut host = MockPluginHost::new();
+        // The mock pretends one document referenced each provider.
+        assert_eq!(host.detach_documents_using("remoteprocessmemory"), 1);
+        assert_eq!(host.detach_documents_using("file"), 1);
+        assert_eq!(host.detached(), ["remoteprocessmemory", "file"]);
+    }
+
+    #[test]
+    fn fresh_mock_records_no_detach() {
+        let host = MockPluginHost::new();
+        assert!(host.detached().is_empty());
+    }
+
+    #[test]
+    fn detach_callable_via_trait_object() {
+        let mut host = MockPluginHost::new();
+        let dyn_host: &mut dyn PluginHost = &mut host;
+        let n = dyn_host.detach_documents_using("processmemory");
+        assert_eq!(n, 1);
+        assert_eq!(host.detached(), ["processmemory"]);
     }
 
     #[test]

@@ -111,6 +111,12 @@ scanner-parallel = ["dep:rayon"]
 # core model + serde (.rcx) — always on.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Plugin `plugin.toml` manifest parsing (design §5, §6 Phase 6). Pure-Rust and
+# already a transitive dep (the version pinned in Cargo.lock), so promoting it to
+# a direct ALWAYS-ON edge leaves the light default build effectively unaffected;
+# it is NOT gated behind the `plugins` feature because manifest parsing is host
+# bookkeeping that has no `abi_stable`/`libloading` ties.
+toml = "0.8"
 ahash = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 bytemuck = { version = "1", features = ["derive"] }

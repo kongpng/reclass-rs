@@ -77,8 +77,11 @@ pub use contract::{
 };
 pub use demo::DemoPlugin;
 pub use host::{MockPluginHost, PluginHost};
-pub use manager::PluginManager;
-pub use manifest::{derive_identifier, LoadType, Permission, PluginKind, PluginManifest};
+pub use manager::{MemPluginPersistence, PluginManager, PluginPersistence, PluginRow};
+pub use manifest::{
+    derive_identifier, detected_label, LoadType, ManifestError, Permission, PluginKind,
+    PluginManifest,
+};
 pub use provider_spec::{ProviderSpec, SharedProvider};
 pub use view::{TreeNode, UiEvent, ViewTree};
 

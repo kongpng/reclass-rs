@@ -5449,36 +5449,52 @@ impl Render for TypeAliasesDialog {
 // PluginManagerDialog — the read-only Plugins manager (the C++ showPluginsDialog)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// One row in the Plugins manager (the C++ `IPlugin` descriptor; main.cpp:8845).
-/// Read-only metadata: name, version, type, author, and a one-line description.
+/// One row in the Plugins manager (the C++ `IPlugin` descriptor; main.cpp:8845),
+/// upgraded to the Phase-6 disclosure model (design §6 Phase 6): beyond the C++
+/// name·version·type·author·description it carries the auto-detected **kind
+/// label** (design §4), the **enabled** state (design §7.A [fix] — C++ had none),
+/// and the declared **permissions** (design §5/§6 disclosure).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PluginInfo {
     name: String,
     version: String,
+    /// The detected-kind label (`builtin` / `native` / `reclassnet-native` /
+    /// `reclassnet-managed` / `process`).
     kind: String,
     author: String,
     description: String,
+    enabled: bool,
+    /// The human-readable permission tokens (e.g. `read_memory`), for disclosure.
+    permissions: Vec<String>,
 }
 
-/// The built-in provider "plugins" this port ships, **derived from the real
-/// [`PluginManager`](crate::plugin::PluginManager)** (design §6 Phase 1: the
-/// Manage Plugins dialog reads the live plugin set, not a second hand-kept table).
-/// Each in-tree plugin's [`PluginManifest`](crate::plugin::PluginManifest) becomes
-/// a read-only dialog row; the "<name> Provider" label preserves the C++ dialog's
-/// display text. Native DLL/SO loading is out of scope (the dialog notes it).
+/// The plugin rows the Manage Plugins dialog shows, **derived from the real
+/// [`PluginManager`](crate::plugin::PluginManager)** via
+/// [`plugins_view`](crate::plugin::PluginManager::plugins_view) (design §6 Phase 6:
+/// the dialog renders the live plugin set — built-in, native, or auto-detected
+/// ReClass.NET — not a second hand-kept table). The C++ `"<name> Provider"`
+/// display text is preserved for the built-in providers. Native DLL/SO loading
+/// stays out of the default build (the dialog notes it).
 fn builtin_plugins() -> Vec<PluginInfo> {
     crate::plugin::PluginManager::with_builtins()
-        .plugins()
-        .iter()
-        .map(|p| {
-            let m = p.manifest();
-            PluginInfo {
-                name: format!("{} Provider", m.name),
-                version: m.version.clone(),
-                kind: "Provider".to_string(),
-                author: m.author.clone(),
-                description: m.description.clone(),
-            }
+        .plugins_view()
+        .into_iter()
+        .map(|r| PluginInfo {
+            name: if r.is_builtin {
+                format!("{} Provider", r.name)
+            } else {
+                r.name
+            },
+            version: r.version,
+            kind: r.detected_label.to_string(),
+            author: r.author,
+            description: r.description,
+            enabled: r.enabled,
+            permissions: r
+                .permissions
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect(),
         })
         .collect()
 }
@@ -5561,6 +5577,21 @@ impl Render for PluginManagerDialog {
                                     .text_color(color::text_muted(cx))
                                     .text_size(px(tokens::font::UI_SM))
                                     .child(p.kind.clone()),
+                            )
+                            // Enabled/disabled chip (design §7.A [fix] — C++ had
+                            // no enable state to show).
+                            .child(
+                                div()
+                                    .px(px(tokens::space::XS))
+                                    .rounded(px(tokens::radius::SM))
+                                    .bg(color::selected_bg(cx))
+                                    .text_color(if p.enabled {
+                                        color::accent(cx)
+                                    } else {
+                                        color::text_disabled(cx)
+                                    })
+                                    .text_size(px(tokens::font::UI_SM))
+                                    .child(if p.enabled { "enabled" } else { "disabled" }),
                             ),
                     )
                     .child(
@@ -5574,6 +5605,18 @@ impl Render for PluginManagerDialog {
                             .text_color(color::text_muted(cx))
                             .text_size(px(tokens::font::UI_SM))
                             .child(format!("Author: {}", p.author)),
+                    )
+                    // Declared-permission disclosure (design §5/§6 — native plugins
+                    // disclose capabilities; built-ins typically have none).
+                    .child(
+                        div()
+                            .text_color(color::text_muted(cx))
+                            .text_size(px(tokens::font::UI_SM))
+                            .child(if p.permissions.is_empty() {
+                                "Permissions: none".to_string()
+                            } else {
+                                format!("Permissions: {}", p.permissions.join(", "))
+                            }),
                     )
                     .into_any_element()
             })
@@ -6341,9 +6384,13 @@ mod tests {
     #[test]
     fn builtin_plugins_lists_the_provider_backends() {
         let plugins = builtin_plugins();
-        // Every shipped provider backend is listed as a read-only "Provider".
+        // Every shipped provider backend is an in-tree built-in (the Phase-6
+        // detected-kind label, design §4/§6).
         assert!(!plugins.is_empty());
-        assert!(plugins.iter().all(|p| p.kind == "Provider"));
+        assert!(plugins.iter().all(|p| p.kind == "builtin"));
+        // The built-ins auto-load (LoadType::Auto) → all shown enabled (design
+        // §7.A [fix] enabled-state disclosure).
+        assert!(plugins.iter().all(|p| p.enabled));
         let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"File Provider"));
         assert!(names.contains(&"Null Provider"));
