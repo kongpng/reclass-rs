@@ -42,7 +42,19 @@ use crate::plugin::reclassnet::{RECLASSNET_IDENTIFIER, RECLASSNET_NAME};
 ///
 /// The fn pointers are `Copy`, so the table is trivially clonable into the
 /// provider + the plugin's factory closures.
+///
+/// **`#[repr(C)]` is load-bearing for the Phase-5 managed path.** The C# bridge
+/// populates a leaked instance of this table **by raw byte offset** —
+/// `Marshal.WriteIntPtr(table, index * IntPtr.Size, ptr)` for `index` 0..8 in the
+/// [`CORE_FUNCTION_NAMES`] order (reference §8). `#[repr(C)]` guarantees the 8
+/// `Option<Fn*>` fields are laid out as 8 consecutive pointer-sized slots in
+/// **declaration order**, so slot `i` is field `i`. (`Option<fn>` is itself a
+/// nullable pointer via the null-pointer optimization — null ⇒ `None` ⇒ an absent
+/// optional export, exactly the bridge's zero-fill semantics.) Without `#[repr(C)]`
+/// Rust could reorder the fields and the bridge would write pointers into the wrong
+/// slots. A `#[cfg(test)]` test pins the size + offsets.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct RcNetFunctions {
     pub enumerate_processes: Option<FnEnumerateProcesses>,
     pub open_remote_process: Option<FnOpenRemoteProcess>,
@@ -60,6 +72,24 @@ unsafe impl Send for RcNetFunctions {}
 unsafe impl Sync for RcNetFunctions {}
 
 impl RcNetFunctions {
+    /// An all-`None` table (the C++ `memset(outFunctions, 0, sizeof(RcNetFunctions))`,
+    /// reference §8). Used by the managed path: the bridge **populates** this zeroed
+    /// table in place (it writes raw fn pointers into the leaked table's slots),
+    /// after which [`validate_required`](RcNetFunctions::validate_required) checks
+    /// the 4 required were filled — the same validation the native `resolve` runs.
+    pub fn empty() -> RcNetFunctions {
+        RcNetFunctions {
+            enumerate_processes: None,
+            open_remote_process: None,
+            is_process_valid: None,
+            close_remote_process: None,
+            read_remote_memory: None,
+            write_remote_memory: None,
+            enumerate_sections_and_modules: None,
+            control_remote_process: None,
+        }
+    }
+
     /// Resolve all 8 CoreFunctions from `lib` by their [`CORE_FUNCTION_NAMES`] and
     /// validate the **4 required** exports (the C++ `loadNativeDll`, reference §8;
     /// design §7.A [fix] — a missing required export is a surfaced error string,
@@ -188,13 +218,51 @@ extern "C" fn process_callback(data: *mut EnumerateProcessData) {
 
 // ── The bridged plugin ────────────────────────────────────────────────────────
 
-/// A loaded ReClass.NET native plugin presented as a host [`Plugin`] (the C++
-/// `RcNetCompatPlugin`, reference §8). Owns the `libloading::Library` (kept alive
-/// for the process — C++ never unloads) and the resolved table; contributes one
-/// provider under [`RECLASSNET_IDENTIFIER`].
-struct RcNetPlugin {
+/// What keeps the [`RcNetFunctions`] table's fn pointers valid for the process
+/// lifetime. The two compat sub-paths differ only here:
+///
+/// - **Native** (Phase 4): the `libloading::Library` the exports live in, held in
+///   an `Arc` (C++ never `dlclose`s — reference §8).
+/// - **Managed** (Phase 5, Windows): the C# thunks live in the hosted CLR, which is
+///   a process-static `clr_host::ClrHost`, and the table itself is leaked
+///   (`Box::leak`) — there is no AppDomain unload (the C++ gotcha 9). So the managed
+///   path has nothing per-plugin to keep alive: [`KeepAlive::Leaked`].
+///
+/// Either way the captured value outlives the factory closures (stored in the
+/// manager alongside the plugin), so every provider the closures build sees a valid
+/// table — the same ownership model as the C++ (provider holds the table by value,
+/// plugin owns the backing).
+///
+/// The contents are **RAII holders**, not data we read: `Library(Arc)` exists so its
+/// `Drop` (eventually) unmaps the library; `Leaked` holds nothing. `Leaked` is
+/// constructed only by the `#[cfg(windows)]` managed path, so on Linux the compiler
+/// sees it unconstructed — hence the scoped `allow(dead_code)`.
+#[allow(dead_code)]
+pub(crate) enum KeepAlive {
+    /// A loaded native library kept mapped for the process (Phase 4).
+    Library(Arc<Library>),
+    /// Nothing per-plugin — the table + CLR host are process-static / leaked
+    /// (Phase 5 managed).
+    Leaked,
+}
+
+// `KeepAlive::Library` holds an `Arc<Library>` (Send+Sync); `Leaked` holds nothing.
+unsafe impl Send for KeepAlive {}
+unsafe impl Sync for KeepAlive {}
+
+/// A bridged ReClass.NET plugin presented as a host [`Plugin`] (the C++
+/// `RcNetCompatPlugin`, reference §8). Holds the resolved/populated [`RcNetFunctions`]
+/// table + a [`KeepAlive`] that backs it (a loaded library for the native path,
+/// nothing for the managed path); contributes one provider under
+/// [`RECLASSNET_IDENTIFIER`]. **Shared by both the native (Phase 4) and managed
+/// (Phase 5) paths** — they differ only in how the table is populated.
+pub(crate) struct RcNetPlugin {
     manifest: PluginManifest,
-    lib: Arc<Library>,
+    /// RAII holder for whatever backs the table (a mapped library, or nothing for
+    /// the leaked managed table). Never read — it exists purely to own that backing
+    /// for the plugin's lifetime (its `Drop` is the point), so `allow(dead_code)`.
+    #[allow(dead_code)]
+    keep_alive: KeepAlive,
     fns: RcNetFunctions,
 }
 
@@ -204,21 +272,17 @@ impl Plugin for RcNetPlugin {
     }
 
     fn contributions(&self) -> Vec<Contribution> {
-        // Clone the `Arc` + the (Copy) table into the factory closures so they
-        // keep the library mapped for as long as the closures live (the closures
-        // are stored in the manager alongside this plugin). The provider built by
-        // `create_provider` relies on this plugin staying registered (C++ parity).
+        // The (Copy) table is captured into the factory closures; the closures are
+        // stored in the manager alongside this plugin, whose `keep_alive` keeps the
+        // table's fn pointers valid (C++ parity). The provider built by
+        // `create_provider` relies on this plugin staying registered.
         let fns_create = self.fns;
-        let _lib_create = Arc::clone(&self.lib);
         let fns_enum = self.fns;
 
         let spec = ProviderSpec::new(
             // `canHandle`: the C++ `target.contains('|')` (reference §8).
             |target: &str| target.contains('|'),
             move |target: &str| -> Result<SharedProvider, String> {
-                // Capture the `Arc` so the library outlives the closure (and thus
-                // every provider it makes); the table's fn pointers stay valid.
-                let _keep_alive = &_lib_create;
                 let parsed = ParsedTarget::parse(target)?;
                 let provider = RcNetProvider::open(
                     fns_create,
@@ -251,7 +315,28 @@ impl Plugin for RcNetPlugin {
     }
 }
 
-// `RcNetPlugin` holds an `Arc<Library>` (Send+Sync) and an `RcNetFunctions`
+/// Build the shared bridged [`RcNetPlugin`] from a populated [`RcNetFunctions`]
+/// table, its `manifest`, and the [`KeepAlive`] backing it (a loaded library for
+/// the native path, [`KeepAlive::Leaked`] for the managed path). The single place
+/// both compat sub-paths construct the host [`Plugin`] (so the
+/// `canHandle`/`create_provider`/`enumerate` wiring + the
+/// [`RECLASSNET_IDENTIFIER`] invariant can't drift between them). The caller is
+/// expected to have already validated the 4 required exports
+/// ([`RcNetFunctions::validate_required`]).
+pub(crate) fn make_rcnet_plugin(
+    manifest: PluginManifest,
+    fns: RcNetFunctions,
+    keep_alive: KeepAlive,
+) -> Box<dyn Plugin> {
+    debug_assert_eq!(manifest.identifier(), RECLASSNET_IDENTIFIER);
+    Box::new(RcNetPlugin {
+        manifest,
+        keep_alive,
+        fns,
+    })
+}
+
+// `RcNetPlugin` holds a `KeepAlive` (Send+Sync) and an `RcNetFunctions`
 // (declared Send+Sync above); the contract requires `Plugin: Send + Sync`.
 
 /// A parsed `"dllpath|pid:name"` target (the C++ `createProvider` parse, reference
@@ -347,19 +432,54 @@ pub fn load_reclassnet_native(path: &Path) -> Result<Box<dyn Plugin>, String> {
         ],
         dll_file_name,
     };
-    debug_assert_eq!(manifest.identifier(), RECLASSNET_IDENTIFIER);
 
-    Ok(Box::new(RcNetPlugin {
+    // The library is kept mapped for the process (C++ never unloads); the shared
+    // builder wires the provider contribution + asserts the identifier invariant.
+    Ok(make_rcnet_plugin(
         manifest,
-        lib: Arc::new(lib),
         fns,
-    }))
+        KeepAlive::Library(Arc::new(lib)),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugin::reclassnet::ffi::{ProcessAccess, RcPointer};
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// **The managed-path ABI guard.** `#[repr(C)]` must lay `RcNetFunctions` out as
+    /// 8 consecutive pointer-sized slots in declaration order so the C# bridge's
+    /// `Marshal.WriteIntPtr(table, index * IntPtr.Size, …)` (reference §8) writes
+    /// each fn pointer into the matching field. We assert the size (8 pointers), the
+    /// pointer alignment, and that the first three fields sit at offsets 0, 1·ptr,
+    /// 2·ptr (declaration order == [`CORE_FUNCTION_NAMES`] order).
+    #[test]
+    fn rcnet_functions_is_eight_consecutive_pointer_slots() {
+        let ptr = size_of::<*const ()>();
+        // `Option<fn>` is pointer-sized (null-pointer optimization), so 8 of them.
+        assert_eq!(size_of::<RcNetFunctions>(), 8 * ptr);
+        assert_eq!(align_of::<RcNetFunctions>(), align_of::<*const ()>());
+        // Declaration order matches the bridge's slot indices 0,1,2,…
+        assert_eq!(offset_of!(RcNetFunctions, enumerate_processes), 0);
+        assert_eq!(offset_of!(RcNetFunctions, open_remote_process), ptr);
+        assert_eq!(offset_of!(RcNetFunctions, is_process_valid), 2 * ptr);
+        assert_eq!(offset_of!(RcNetFunctions, control_remote_process), 7 * ptr);
+    }
+
+    /// `empty()` is the all-`None` table the managed bridge populates in place; it
+    /// fails `validate_required` (nothing written yet) and is byte-zero (so a
+    /// leaked instance starts as the C++ `memset(…, 0, …)` zero-fill).
+    #[test]
+    fn empty_table_is_all_none_and_not_yet_valid() {
+        let t = RcNetFunctions::empty();
+        assert!(t.enumerate_processes.is_none());
+        assert!(t.read_remote_memory.is_none());
+        assert!(!t.has_required());
+        // All 8 slots are null bytes.
+        let bytes: [u8; size_of::<RcNetFunctions>()] = unsafe { std::mem::transmute(t) };
+        assert!(bytes.iter().all(|&b| b == 0), "empty() must be zero-filled");
+    }
 
     // A minimal in-test table: only the 4 required exports, plus a process
     // enumerator. (The provider-mapping logic itself is tested in `provider.rs`;

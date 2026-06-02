@@ -183,14 +183,21 @@ Two sub-paths, matching C++:
 - **Native ReClass.NET plugins** (DLLs exporting the 8 functions): load with
   **`libloading`**, resolve the exports into a `RcNetFunctions`-style fn table, wrap
   as a `Provider`. **Cross-platform** (Linux/macOS ReClass.NET native plugins exist).
-- **Managed C# ReClass.NET plugins**: **host the .NET Framework CLR + a C# bridge**,
-  exactly like C++'s `ClrHost`. ReClass.NET targets **.NET Framework 4.x (Windows)**,
-  so this path is **Windows-only**: host via `mscoree`/`ICLRMetaHost ->
-  ICLRRuntimeHost::ExecuteInDefaultAppDomain` (called from Rust through the `windows`
-  crate / direct COM), loading a C# bridge assembly that marshals the managed
-  plugin's `ICoreProcessFunctions` into the same 8 native function pointers → same
-  `Provider` wrapper. We can **port the existing `RcNetBridge.cs`** verbatim (it's a
-  pure C# bridge, runtime-agnostic to who hosts it).
+- **Managed C# ReClass.NET plugins** *(in progress — `#[cfg(windows)]` scaffold)*:
+  **host the .NET Framework CLR + a C# bridge**, exactly like C++'s `ClrHost`.
+  ReClass.NET targets **.NET Framework 4.x (Windows)**, so this path is
+  **Windows-only**: host via `mscoree`/`ICLRMetaHost -> ICLRRuntimeHost::
+  ExecuteInDefaultAppDomain` (called from Rust through the `windows` crate
+  `Win32_System_ClrHosting` feature — `CLRCreateInstance(CLSID_CLRMetaHost) ->
+  GetRuntime("v4.0.30319") -> GetInterface(CLSID_CLRRuntimeHost) -> Start()`), loading
+  a C# bridge assembly that marshals the managed plugin's `ICoreProcessFunctions` into
+  the same 8 native function pointers → **the same Phase-4 `RcNetProvider` verbatim**.
+  We **port the existing `RcNetBridge.cs`** verbatim (it's a pure C# bridge,
+  runtime-agnostic to who hosts it). The `windows` crate exports `CLSID_CLRMetaHost`
+  but **not** `CLSID_CLRRuntimeHost`, so the host **defines that GUID locally** (the
+  C++ likewise redeclares it). The managed dep is target-gated
+  (`[target.'cfg(windows)'.dependencies]`, optional, pulled only by `plugins`), so the
+  Linux build is byte-for-byte unaffected.
 
 Required vs optional (match C++): **required** = `ReadRemoteMemory`,
 `OpenRemoteProcess`, `CloseRemoteProcess`, `EnumerateProcesses`; the other 4 are
@@ -270,10 +277,19 @@ ReClass.NET native DLLs, resolve the 8 CoreFunctions (mind `__stdcall`), callbac
 based enumeration → Vecs, wrap as a `Provider`. Register under `reclass.netcompatlayer`.
 *Deliverable: a real ReClass.NET native plugin loads and reads memory, cross-platform.*
 
-**Phase 5 — ReClass.NET managed-C# compat (goal 3b, Windows-only).** Add the CLR
-host (mscoree COM via the `windows` crate) + port `RcNetBridge.cs`; managed plugin's
-`ICoreProcessFunctions` → the same `Provider`. *Deliverable: a real C# ReClass.NET
-memory-backend plugin loads on Windows.*
+**Phase 5 — ReClass.NET managed-C# compat (goal 3b, Windows-only).** *(In progress —
+landed as a `#[cfg(windows)]` scaffold.)* Add the CLR host (mscoree COM via the
+`windows` crate `Win32_System_ClrHosting`) + port `RcNetBridge.cs`; managed plugin's
+`ICoreProcessFunctions` → the same `Provider`. The managed path **reuses the Phase-4
+`RcNetProvider` verbatim** (same 8-function table, same `Provider` mapping, same
+`reclass.netcompatlayer` identifier) — the only new behavior is *populating* the table
+from a hosted CLR instead of `libloading`-resolved exports. **[fix]** The `windows`
+crate omits `CLSID_CLRRuntimeHost` (it exports only `CLSID_CLRMetaHost`), so the host
+defines that GUID locally — matching the C++ which likewise redeclares it. Because the
+COM dance + a real `.NET FW4` CLR cannot run on the Linux build host, P5 lands as a
+clean `#[cfg(windows)]` scaffold (compiles on Windows; a `#[cfg(not(windows))]` Err
+stub on Linux) plus the vendored, platform-agnostic `RcNetBridge.cs`. *Deliverable: a
+real C# ReClass.NET memory-backend plugin loads on Windows.*
 
 **Phase 6 — Management + permissions polish.** Manifest parsing, permission
 disclosure, auto/manual, reload, per-plugin enable persistence.
@@ -418,12 +434,20 @@ growth, all [future].)*
   hosts **modern .NET (Core/5+/8)**, which **cannot load existing ReClass.NET (.NET
   Framework 4.x) plugin assemblies** — wrong tool for the compat goal. Existing
   ReClass.NET managed plugins need **.NET Framework** hosting, for which we use the
-  official **`windows` crate** CLR-hosting COM bindings (`CLRCreateInstance`/
-  `ICLRMetaHost`/`ICLRRuntimeHost`) — a maintained binding, **not** C++'s hand-rolled
-  vtables — plus the ported `RcNetBridge.cs`. Windows-only (Framework is). Decision:
-  **`windows`-crate Framework hosting**; keep `netcorehost` as a `[future]` option
-  only for plugins built against modern .NET. (Confirmed scope: managed *memory*
-  backends only.)
+  official **`windows` crate** CLR-hosting COM bindings (the
+  `Win32_System_ClrHosting` feature: `CLRCreateInstance`/`CLSID_CLRMetaHost`/
+  `ICLRMetaHost`/`ICLRRuntimeInfo`/`ICLRRuntimeHost`) — a maintained binding, **not**
+  C++'s hand-rolled vtables — plus the ported `RcNetBridge.cs`. Windows-only
+  (Framework is). Decision: **`windows`-crate Framework hosting**; keep `netcorehost`
+  as a `[future]` option only for plugins built against modern .NET. **Scope (decided):
+  managed *MEMORY* backends only.** A managed assembly that loads but exposes no
+  `ICoreProcessFunctions` (a node-type / UI plugin like **FrostbitePlugin**) makes the
+  C# bridge return **code 2**, which the loader maps to a **logged "ReClass.NET
+  node-type plugin unsupported" skip** — we never attempt to bridge node types / UI.
+  **[fix]** The `windows` crate exports `CLSID_CLRMetaHost` but **omits**
+  `CLSID_CLRRuntimeHost`; the CLR host defines that GUID
+  (`90F1A06E-7712-4762-86B5-7A5EBA6BDB02`) locally, exactly as the C++ `ClrHost.cpp`
+  redeclares it.
 - **`Provider` across the ABI**: `RBox<dyn Provider_TO>` (sabi trait object, so
   plugin `read()` is a direct native call on the hot path). Recommend yes.
 

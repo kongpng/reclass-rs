@@ -27,8 +27,12 @@
 //!    if the 4 required resolve → route to the
 //!    [`reclassnet`](crate::plugin::reclassnet) native bridge.
 //! 3. Else, if the library is a **managed .NET assembly** (PE CLR data-directory
-//!    index 14 non-zero) → recorded as a Phase-5 "managed compat not yet
-//!    supported" skip (not bridged in P4).
+//!    index 14 non-zero) → route to the
+//!    [`reclassnet`](crate::plugin::reclassnet) **managed** loader (P5): on Windows
+//!    it hosts the .NET FW4 CLR + the C# bridge; a node-type / UI plugin is detected
+//!    there and surfaced as the logged "node-type plugin unsupported" skip; on
+//!    non-Windows it is the Windows-only stub. A managed outcome is a
+//!    [`LoadError::RcNetManaged`] skip.
 //! 4. Else → recorded as an unrecognized library.
 //!
 //! Gated behind the `plugins` cargo feature.
@@ -37,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use crate::plugin::contract::Plugin;
 use crate::plugin::loader::{load_native_plugin, LoadError};
-use crate::plugin::reclassnet::{load_reclassnet_native, RcNetFunctions};
+use crate::plugin::reclassnet::{load_reclassnet_managed, load_reclassnet_native, RcNetFunctions};
 
 /// The shared-library extension for the current platform (the C++ platform filter,
 /// cpp_reference §2).
@@ -122,8 +126,9 @@ pub enum RcNetClass {
     /// Exports the 8 ReClass.NET CoreFunctions (the 4 required resolve) → the
     /// [`reclassnet`](crate::plugin::reclassnet) native bridge.
     ReclassNetNative,
-    /// A managed .NET assembly (PE CLR data-directory non-zero) — a Phase-5
-    /// "managed compat not yet supported" skip (not bridged in P4).
+    /// A managed .NET assembly (PE CLR data-directory non-zero) → the
+    /// [`reclassnet`](crate::plugin::reclassnet) **managed** loader (Phase 5,
+    /// Windows-bridged / Linux-stubbed).
     ManagedAssembly,
     /// Matched no known plugin format.
     Unrecognized,
@@ -261,11 +266,15 @@ pub fn load_one(path: &Path) -> Result<Box<dyn Plugin>, LoadError> {
     match sniff(path) {
         RcNetClass::OurFormat => load_native_plugin(path),
         RcNetClass::ReclassNetNative => load_reclassnet_native(path).map_err(LoadError::RcNet),
-        RcNetClass::ManagedAssembly => Err(LoadError::Unrecognized(format!(
-            "'{}' is a managed (.NET) ReClass.NET plugin — managed compat is Phase 5 \
-             (Windows CLR host) and not yet supported; skipping",
-            path.display()
-        ))),
+        // Phase 5: route to the managed (.NET) CLR-host loader. On Windows it hosts
+        // the .NET FW4 CLR + the C# bridge; a node-type / UI plugin (no
+        // ICoreProcessFunctions) is detected there and surfaced as the logged
+        // "node-type plugin unsupported" skip (design §8). On non-Windows the
+        // loader is a stub returning the Windows-only message. Either way a managed
+        // outcome is a `RcNetManaged` skip, not a crash.
+        RcNetClass::ManagedAssembly => {
+            load_reclassnet_managed(path).map_err(LoadError::RcNetManaged)
+        }
         RcNetClass::Unrecognized => Err(LoadError::Unrecognized(format!(
             "'{}' is neither an abi_stable Reclass plugin nor a ReClass.NET native \
              plugin (the 8 CoreFunctions)",
@@ -423,29 +432,29 @@ mod tests {
     }
 
     #[test]
-    fn load_one_routes_a_synthetic_managed_assembly_to_phase5_skip() {
+    fn load_one_routes_a_synthetic_managed_assembly_to_the_managed_loader() {
         // A file that parses as a managed PE assembly → ManagedAssembly class →
-        // a Phase-5 skip error (not bridged in P4). We write a synthetic PE with a
-        // .dll extension so it's a candidate; `sniff` will fail the abi_stable +
-        // CoreFunctions probes (it isn't a real loadable lib) and reach the PE
-        // parse, which sees the CLR directory.
+        // the Phase-5 managed loader. We write a synthetic PE with a .dll extension;
+        // `sniff` will fail the abi_stable + CoreFunctions probes (it isn't a real
+        // loadable lib) and reach the PE parse, which sees the CLR directory.
         let dir = std::env::temp_dir().join(format!("rcx-managed-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        // Use a .dll name regardless of host so it's a candidate on this platform's
-        // filter only if the platform is windows; otherwise just test sniff/load_one
-        // directly on the path (extension filtering is `scan_dir`'s job, not
-        // `sniff`'s).
         let managed = dir.join("managed_plugin.dll");
         std::fs::write(&managed, synth_pe(true, 0x2000, 0x48)).unwrap();
 
         assert_eq!(sniff(&managed), RcNetClass::ManagedAssembly);
+        // The managed route returns a `RcNetManaged` outcome (never `Ok` here, and
+        // never `Unrecognized`): on non-Windows it is the Windows-only stub; on
+        // Windows it fails fast (no RcNetBridge.dll beside this synthetic file, or
+        // no .NET FW4). Either way it is a benign managed skip, not a crash.
         match load_one(&managed) {
-            Ok(_) => panic!("a managed assembly must not load in P4"),
-            Err(LoadError::Unrecognized(msg)) => {
-                assert!(msg.contains("managed"), "got: {msg}");
-                assert!(msg.contains("Phase 5"), "got: {msg}");
+            Ok(_) => panic!("this synthetic managed assembly must not load"),
+            Err(LoadError::RcNetManaged(msg)) => {
+                assert!(!msg.is_empty(), "managed skip must carry a reason");
+                #[cfg(not(windows))]
+                assert!(msg.contains("Windows-only"), "got: {msg}");
             }
-            Err(other) => panic!("expected the Phase-5 skip, got: {other}"),
+            Err(other) => panic!("expected a RcNetManaged skip, got: {other}"),
         }
 
         let _ = std::fs::remove_dir_all(&dir);

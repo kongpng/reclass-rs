@@ -90,7 +90,15 @@ native-plugins = ["dep:libloading"]
 # plugin agree on). OFF by default → default app builds pull NONE of these and are
 # byte-for-byte unaffected. `native-plugins` is a SEPARATE, untouched feature (the
 # out-of-scope live-OS-source loader seam); the two do not overlap.
-plugins = ["dep:abi_stable", "dep:libloading", "dep:reclass-plugin-abi"]
+#
+# Phase 5 also lists `dep:windows` here for the Windows-only ReClass.NET managed
+# CLR host. The `windows` dep is target-gated below
+# ([target.'cfg(windows)'.dependencies]) AND optional, so on non-Windows it is
+# simply absent — the feature stays satisfiable and the Linux default build pulls
+# nothing new (the whole `windows` crate is `#![cfg(windows)]`, so even if resolved
+# it compiles to nothing off-Windows). Default app builds remain byte-for-byte
+# unaffected (the `plugins` feature is itself off by default).
+plugins = ["dep:abi_stable", "dep:libloading", "dep:reclass-plugin-abi", "dep:windows"]
 
 # Optional parallel scanner (rayon). Off by default: the scanner falls back to
 # a serial scan so `--no-default-features` stays lean. (ARCHITECTURE.md §3.)
@@ -144,6 +152,27 @@ libloading = { version = "0.9", optional = true }
 abi_stable = { version = "0.11", optional = true }
 # The shared FFI contract crate (the single definition host + plugin agree on).
 reclass-plugin-abi = { path = "crates/reclass-plugin-abi", optional = true }
+
+# ── plugins (Phase 5 ReClass.NET managed CLR host) — Windows-only, off by default ──
+# The official `windows` crate CLR-hosting COM bindings host the .NET Framework 4.x
+# CLR for the managed ReClass.NET compat path (design §4 managed path, §6 Phase 5,
+# §8 decision). Target-gated to Windows AND optional AND pulled ONLY by `plugins`,
+# so the Linux default build (and even `--features plugins` on Linux) pulls nothing
+# from this; the whole crate is `#![cfg(windows)]` regardless. The three features
+# carry exactly the API the CLR host uses (verified against windows 0.62):
+#   Win32_System_ClrHosting → CLRCreateInstance, CLSID_CLRMetaHost, ICLRMetaHost,
+#                             ICLRRuntimeInfo, ICLRRuntimeHost (Start/
+#                             ExecuteInDefaultAppDomain)
+#   Win32_System_Com        → COM scaffolding the ClrHosting types build on
+#   Win32_Foundation        → HRESULT / BOOL / handle primitives
+# 0.62 is already resolved transitively in Cargo.lock, so this only promotes it to a
+# direct Windows-only edge (minimal lockfile delta).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_ClrHosting",
+] }
 
 # ── UI (gpui) — unpinned git, SAME source form as gpui-component (§7). ──
 # Do NOT add `rev=` to gpui/gpui_platform; reproducibility = committed Cargo.lock.

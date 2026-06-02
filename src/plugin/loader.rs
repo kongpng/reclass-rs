@@ -45,11 +45,19 @@ pub enum LoadError {
     /// surfaced reason from
     /// [`load_reclassnet_native`](crate::plugin::reclassnet::load_reclassnet_native).
     RcNet(String),
+    /// A ReClass.NET **managed (.NET)** compat load did not produce a provider
+    /// (design §6 Phase 5). Carries the surfaced reason from
+    /// [`load_reclassnet_managed`](crate::plugin::reclassnet::load_reclassnet_managed):
+    /// a node-type / UI plugin skip ("ReClass.NET node-type plugin unsupported" —
+    /// the decided memory-backends-only scope, design §8), a missing
+    /// `RcNetBridge.dll`, a CLR-unavailable / FW4-missing message, or — on
+    /// non-Windows — the Windows-only stub. A benign skip the host surfaces, not a
+    /// crash.
+    RcNetManaged(String),
     /// A library matched no known plugin format: it is neither our `abi_stable`
     /// root-module plugin nor a ReClass.NET native plugin (the 8 CoreFunctions).
     /// Recorded by the discovery sniffer so the host can surface "not a plugin"
-    /// with the underlying reason (design §4 discovery, §7.A [fix]). The string is
-    /// a short classification note (e.g. the managed-assembly Phase-5 skip).
+    /// with the underlying reason (design §4 discovery, §7.A [fix]).
     Unrecognized(String),
 }
 
@@ -58,6 +66,7 @@ impl std::fmt::Display for LoadError {
         match self {
             LoadError::Abi(e) => write!(f, "native plugin load failed: {e}"),
             LoadError::RcNet(e) => write!(f, "ReClass.NET native compat load failed: {e}"),
+            LoadError::RcNetManaged(e) => write!(f, "ReClass.NET managed compat skipped: {e}"),
             LoadError::Unrecognized(e) => write!(f, "not a recognized plugin: {e}"),
         }
     }
