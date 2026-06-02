@@ -2366,6 +2366,9 @@ fn tree_with_hex64_fields(base: u64, n: i32) -> NodeTree {
     tree
 }
 
+// RTTI chips require the `symbols` feature (the walker is a no-op without it),
+// so these RTTI tests only run when that feature is enabled.
+#[cfg(feature = "symbols")]
 #[test]
 fn rtti_hint_attaches_when_value_points_at_vtable() {
     let mut data = build_address_space_with_rtti();
@@ -2420,6 +2423,7 @@ fn rtti_no_hint_when_value_outside_any_module() {
     }
 }
 
+#[cfg(feature = "symbols")]
 #[test]
 fn rtti_modules_enumerated_few_times_not_per_line() {
     // 32 fields all pointing at the same vtable. Without caching,
@@ -2453,6 +2457,7 @@ fn rtti_modules_enumerated_few_times_not_per_line() {
     );
 }
 
+#[cfg(feature = "symbols")]
 #[test]
 fn rtti_hint_on_typed_pointer_header() {
     // A typed Pointer64 whose stored value is the vtable address itself routes
@@ -2617,6 +2622,7 @@ fn chip_order_enum_then_comment_on_one_line() {
 }
 
 // ── Comment chip ordered BEFORE RTTI on a Pointer64 (enum->comment->typeHint->RTTI) ──
+#[cfg(feature = "symbols")]
 #[test]
 fn chip_order_comment_before_rtti() {
     let mut data = build_address_space_with_rtti();
