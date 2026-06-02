@@ -16,9 +16,13 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::plugin::builtins;
-use crate::plugin::contract::{Contribution, Plugin};
+use crate::plugin::contract::{CommandResult, Contribution, DialogResult, Plugin};
+use crate::plugin::host::PluginHost;
 use crate::plugin::provider_spec::{ProviderSpec, SharedProvider};
+use crate::plugin::view::{UiEvent, ViewTree};
 use crate::provider::{ProviderInfo, ProviderRegistry};
 
 /// Owns the loaded plugins + the provider registry they populate (the C++
@@ -31,6 +35,12 @@ pub struct PluginManager {
     /// `ProviderSpec` to create a provider at attach time). Built during
     /// registration; the C++ re-finds the plugin by recomputed identifier.
     provider_index: HashMap<String, usize>,
+    /// command id → owning plugin index (design §6 Phase 2 routing — so a
+    /// dispatched `Command` reaches the plugin that contributed it).
+    command_index: HashMap<String, usize>,
+    /// view id (`Panel`/`Dialog`/`StatusItem`) → owning plugin index, so a
+    /// routed [`UiEvent`]/[`DialogResult`] reaches the contributing plugin.
+    view_index: HashMap<String, usize>,
 }
 
 impl PluginManager {
@@ -51,6 +61,18 @@ impl PluginManager {
         mgr
     }
 
+    /// As [`with_builtins`](PluginManager::with_builtins) but also loads the
+    /// in-tree [`DemoPlugin`](crate::plugin::demo::DemoPlugin) — the Phase-2
+    /// deliverable that contributes a `Command`, a `Panel`, and a `Dialog` for
+    /// the declarative-UI host to render (design §6 Phase 2). Kept separate so
+    /// [`with_builtins`](PluginManager::with_builtins) stays exactly the
+    /// four-provider Phase-1 set (the parity tests rely on that).
+    pub fn with_builtins_and_demo() -> Self {
+        let mut mgr = PluginManager::with_builtins();
+        mgr.add_plugin(crate::plugin::demo::DemoPlugin::boxed());
+        mgr
+    }
+
     /// Register a plugin and fan its contributions out (cpp_reference §2
     /// auto-register). Provider contributions are added to the registry under the
     /// plugin's derived identifier; the index records the slot so the spec can be
@@ -65,11 +87,20 @@ impl PluginManager {
         let idx = self.plugins.len();
         let mut has_provider = false;
         for contribution in plugin.contributions() {
-            if let Contribution::Provider(_) = contribution {
-                has_provider = true;
+            match &contribution {
+                Contribution::Provider(_) => has_provider = true,
+                // UI-kind contributions: index them so the Phase-2 declarative
+                // host can route a dispatched command / UI event / dialog result
+                // back to the contributing plugin (design §6 Phase 2).
+                Contribution::Command { id, .. } => {
+                    self.command_index.insert(id.clone(), idx);
+                }
+                Contribution::Panel { id, .. }
+                | Contribution::Dialog { id, .. }
+                | Contribution::StatusItem { id, .. } => {
+                    self.view_index.insert(id.clone(), idx);
+                }
             }
-            // UI-kind contributions are wired by the Phase-2 declarative host;
-            // Phase 1 only fans out provider contributions.
         }
 
         if has_provider {
@@ -139,6 +170,92 @@ impl PluginManager {
             .ok_or_else(|| format!("no provider registered as '{identifier}'"))?;
         spec.create_provider(target)
     }
+
+    // ── Phase-2 declarative-host routing (design §6 Phase 2, §7.B [+]) ──
+    //
+    // Each entry point is wrapped in `catch_unwind` so a panicking plugin
+    // surfaces as "not handled" instead of taking down the host (design §7.B
+    // "Wrap every plugin entry point in `catch_unwind`"). The `&mut` borrows are
+    // not unwind-safe by default, but a plugin panic here only abandons that one
+    // call — the manager keeps the plugin and stays usable — so `AssertUnwindSafe`
+    // is sound for our use (we don't read poisoned plugin state afterwards).
+
+    /// Dispatch a contributed `Command` to its owning plugin (design §3). Routes
+    /// by the command id recorded at registration; returns the plugin's
+    /// [`CommandResult`] (the default not-handled result if no plugin owns `id`
+    /// or the handler panicked). Panic-guarded (design §7.B [+]).
+    pub fn handle_command(
+        &mut self,
+        id: &str,
+        args: Value,
+        host: &mut dyn PluginHost,
+    ) -> CommandResult {
+        let Some(&idx) = self.command_index.get(id) else {
+            return CommandResult::default();
+        };
+        let plugin = &mut self.plugins[idx];
+        guard(CommandResult::default(), || {
+            plugin.handle_command(id, args, host)
+        })
+    }
+
+    /// Route a [`UiEvent`] from a contributed `Panel`/`Dialog`/`StatusItem` to
+    /// its owning plugin (design §3 Elm loop). Returns the fresh [`ViewTree`] to
+    /// re-render that view, or `None` (unowned view, no re-render, or a panic).
+    /// Panic-guarded (design §7.B [+]).
+    pub fn handle_ui_event(
+        &mut self,
+        view: &str,
+        ev: UiEvent,
+        host: &mut dyn PluginHost,
+    ) -> Option<ViewTree> {
+        let &idx = self.view_index.get(view)?;
+        let plugin = &mut self.plugins[idx];
+        guard(None, || plugin.handle_ui_event(view, ev, host))
+    }
+
+    /// Report a contributed `Dialog`'s outcome to its owning plugin (the
+    /// generalized C++ `selectTarget` return, design §3). Panic-guarded.
+    pub fn handle_dialog_closed(
+        &mut self,
+        view: &str,
+        result: DialogResult,
+        host: &mut dyn PluginHost,
+    ) -> CommandResult {
+        let Some(&idx) = self.view_index.get(view) else {
+            return CommandResult::default();
+        };
+        let plugin = &mut self.plugins[idx];
+        guard(CommandResult::default(), || {
+            plugin.handle_dialog_closed(view, result, host)
+        })
+    }
+
+    /// Re-ask the plugin that owns `view` for that view's current `ViewTree`
+    /// (the [`PluginHost::request_rerender`](crate::plugin::host::PluginHost::request_rerender)
+    /// resolution: the host calls this to pull the fresh tree out of the plugin's
+    /// `contributions()`). Panic-guarded; `None` if unowned / not a view / panic.
+    pub fn view_tree(&self, view: &str) -> Option<ViewTree> {
+        let &idx = self.view_index.get(view)?;
+        let plugin = self.plugins[idx].as_ref();
+        guard(None, || {
+            plugin.contributions().into_iter().find_map(|c| match c {
+                Contribution::Panel { id, initial, .. } if id == view => Some(initial),
+                Contribution::Dialog { id, initial, .. } if id == view => Some(initial),
+                Contribution::StatusItem { id, initial } if id == view => Some(initial),
+                _ => None,
+            })
+        })
+    }
+}
+
+/// Run a plugin entry point with a panic guard (design §7.B [+] — a plugin panic
+/// must not crash the host). Returns `fallback` if the closure panics. The
+/// closure borrows `&mut` plugin/host, which aren't `UnwindSafe`; we assert it
+/// because a panic here abandons only this one call (we don't subsequently read
+/// the plugin's now-possibly-inconsistent state).
+fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -209,5 +326,138 @@ mod tests {
             .map(|p| p.identifier.as_str())
             .collect();
         assert_eq!(enabled, ["file", "buffer", "snapshot"]);
+    }
+
+    // ── Phase-2 routing ──
+
+    use crate::plugin::demo;
+    use crate::plugin::host::MockPluginHost;
+
+    #[test]
+    fn with_builtins_unchanged_with_demo_added_separately() {
+        // Parity: with_builtins is still exactly the four-provider set.
+        let plain = PluginManager::with_builtins();
+        assert_eq!(plain.registry().enabled_providers().count(), 4);
+        assert!(plain.find_plugin("plugindemo").is_none());
+
+        // The demo constructor adds the demo plugin (one more plugin, but it
+        // contributes no provider, so the registry is still the four built-ins).
+        let demo_mgr = PluginManager::with_builtins_and_demo();
+        assert_eq!(demo_mgr.registry().enabled_providers().count(), 4);
+        assert_eq!(demo_mgr.plugins().len(), 5);
+    }
+
+    #[test]
+    fn routes_command_to_owning_plugin() {
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+        let res = mgr.handle_command(demo::CMD_PING, serde_json::Value::Null, &mut host);
+        assert!(res.handled);
+        assert_eq!(host.toasts(), ["Plugin Demo: pong"]);
+    }
+
+    #[test]
+    fn unknown_command_is_not_handled() {
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+        let res = mgr.handle_command("nope.nothing", serde_json::Value::Null, &mut host);
+        assert!(!res.handled);
+    }
+
+    #[test]
+    fn routes_ui_event_and_returns_fresh_tree() {
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+        // Attach button on the demo dialog: sets the data source + closes it.
+        let tree = mgr.handle_ui_event(
+            demo::DIALOG_ID,
+            crate::plugin::view::UiEvent::Clicked(demo::BTN_ATTACH.to_string()),
+            &mut host,
+        );
+        assert!(tree.is_some());
+        assert_eq!(host.closed_dialogs(), [demo::DIALOG_ID]);
+        assert!(host.data_source().is_some());
+    }
+
+    #[test]
+    fn ui_event_for_unowned_view_is_none() {
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+        assert_eq!(
+            mgr.handle_ui_event(
+                "no.such.view",
+                crate::plugin::view::UiEvent::Clicked("x".to_string()),
+                &mut host
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn view_tree_pulls_current_panel_tree() {
+        let mgr = PluginManager::with_builtins_and_demo();
+        let tree = mgr.view_tree(demo::PANEL_ID).expect("panel tree");
+        assert!(matches!(tree, crate::plugin::view::ViewTree::Column(_)));
+        assert!(mgr.view_tree("no.such.view").is_none());
+    }
+
+    #[test]
+    fn routes_dialog_closed_to_plugin() {
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+        let res = mgr.handle_dialog_closed(
+            demo::DIALOG_ID,
+            crate::plugin::contract::DialogResult::Submitted {
+                values: vec![(demo::FIELD_TARGET.to_string(), "7:x.exe".to_string())],
+            },
+            &mut host,
+        );
+        assert!(res.handled);
+        assert_eq!(
+            host.data_source(),
+            Some(&(demo::DEMO_IDENTIFIER.to_string(), "7:x.exe".to_string()))
+        );
+    }
+
+    #[test]
+    fn panicking_plugin_is_contained() {
+        // A plugin whose command handler panics must not crash the host: the
+        // guard returns the not-handled fallback (design §7.B [+]).
+        struct PanicPlugin {
+            manifest: crate::plugin::manifest::PluginManifest,
+        }
+        impl crate::plugin::contract::Plugin for PanicPlugin {
+            fn manifest(&self) -> &crate::plugin::manifest::PluginManifest {
+                &self.manifest
+            }
+            fn contributions(&self) -> Vec<Contribution> {
+                vec![Contribution::Command {
+                    id: "boom.go".to_string(),
+                    title: "Boom".to_string(),
+                    slot: crate::plugin::contract::CommandSlot::Menu,
+                }]
+            }
+            fn handle_command(
+                &mut self,
+                _id: &str,
+                _args: serde_json::Value,
+                _host: &mut dyn PluginHost,
+            ) -> CommandResult {
+                panic!("plugin blew up");
+            }
+        }
+
+        let mut mgr = PluginManager::new();
+        mgr.add_plugin(Box::new(PanicPlugin {
+            manifest: crate::plugin::manifest::PluginManifest::builtin("Boom", "panics", vec![]),
+        }));
+        let mut host = MockPluginHost::new();
+        // Silence the default panic hook's backtrace noise during this test.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let res = mgr.handle_command("boom.go", serde_json::Value::Null, &mut host);
+        std::panic::set_hook(prev);
+        // Contained: not handled, host still alive.
+        assert!(!res.handled);
     }
 }

@@ -60,6 +60,21 @@ pub trait PluginHost {
     fn set_data_source(&mut self, _identifier: &str, _target: &str) -> bool {
         false
     }
+
+    /// Close a contributed `Dialog` by id (design §3 — the inverse of
+    /// [`open_dialog`](PluginHost::open_dialog)). A plugin's
+    /// [`handle_ui_event`](crate::plugin::contract::Plugin::handle_ui_event)
+    /// calls this when its dialog's Attach/OK/Cancel finishes the interaction.
+    /// Default no-op so existing host implementors don't break; the Phase-2
+    /// declarative host wires it to dismiss the modal.
+    fn close_dialog(&mut self, _id: &str) {}
+
+    /// Ask the host to re-render the contributed view `view` (a `Panel`/`Dialog`/
+    /// `StatusItem` id) by pulling a fresh `ViewTree` from the plugin (design §3
+    /// Elm loop). A command handler that mutated panel state calls this so the
+    /// already-mounted panel refreshes without a UI event having driven it.
+    /// Default no-op; the Phase-2 host re-asks the plugin for the view's tree.
+    fn request_rerender(&mut self, _view: &str) {}
 }
 
 /// An always-compiled in-memory [`PluginHost`] capturing side effects, for tests
@@ -74,6 +89,8 @@ pub struct MockPluginHost {
     settings: BTreeMap<String, String>,
     added_nodes: Vec<(String, String)>,
     data_source: Option<(String, String)>,
+    closed_dialogs: Vec<String>,
+    rerender_requests: Vec<String>,
 }
 
 impl MockPluginHost {
@@ -110,6 +127,16 @@ impl MockPluginHost {
     /// The last `(identifier, target)` passed to `set_data_source`, if any.
     pub fn data_source(&self) -> Option<&(String, String)> {
         self.data_source.as_ref()
+    }
+
+    /// The dialog ids passed to `close_dialog`, in order.
+    pub fn closed_dialogs(&self) -> &[String] {
+        &self.closed_dialogs
+    }
+
+    /// The view ids passed to `request_rerender`, in order.
+    pub fn rerender_requests(&self) -> &[String] {
+        &self.rerender_requests
     }
 }
 
@@ -159,6 +186,14 @@ impl PluginHost for MockPluginHost {
         self.data_source = Some((identifier.to_string(), target.to_string()));
         true
     }
+
+    fn close_dialog(&mut self, id: &str) {
+        self.closed_dialogs.push(id.to_string());
+    }
+
+    fn request_rerender(&mut self, view: &str) {
+        self.rerender_requests.push(view.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +239,32 @@ mod tests {
             host.data_source(),
             Some(&("processmemory".to_string(), "1234:notepad.exe".to_string()))
         );
+    }
+
+    #[test]
+    fn records_close_dialog_and_rerender() {
+        let mut host = MockPluginHost::new();
+        // Default no-ops are overridden in the mock to record for the conformance
+        // suite (the real host wires them to the modal/dock in Phase 2).
+        host.close_dialog("demo.target");
+        host.request_rerender("demo.panel");
+        host.request_rerender("demo.panel");
+        assert_eq!(host.closed_dialogs(), ["demo.target"]);
+        assert_eq!(host.rerender_requests(), ["demo.panel", "demo.panel"]);
+        // Untouched on a fresh mock.
+        let fresh = MockPluginHost::new();
+        assert!(fresh.closed_dialogs().is_empty());
+        assert!(fresh.rerender_requests().is_empty());
+    }
+
+    #[test]
+    fn close_and_rerender_via_trait_object() {
+        let mut host = MockPluginHost::new();
+        let dyn_host: &mut dyn PluginHost = &mut host;
+        dyn_host.close_dialog("d");
+        dyn_host.request_rerender("v");
+        assert_eq!(host.closed_dialogs(), ["d"]);
+        assert_eq!(host.rerender_requests(), ["v"]);
     }
 
     #[test]

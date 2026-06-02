@@ -61,6 +61,16 @@ mcp = ["dep:interprocess"]
 # default: stubs only, so the package builds on Linux without them.
 native-plugins = ["dep:libloading"]
 
+# Phase-3 seam for the stable-ABI native plugin boundary (design §2/§6 Phase 3).
+# Currently EMPTY and carries NO dependencies: it exists only so later phases can
+# gate the `abi_stable`/`libloading` stable-ABI wrapping of the plugin contract
+# behind it without re-touching this file. Phase 2 adds no heavy deps — the
+# declarative `ViewTree` renderer (Phase 2 deliverable) lives entirely behind the
+# existing `ui` feature (`src/ui/pluginview.rs` / `pluginpanel.rs` /
+# `plugindialog.rs`), and the plugin contract itself stays plain-Rust/dep-free.
+# Default builds are unaffected (empty feature). Leave `native-plugins` untouched.
+plugins = []
+
 # Optional parallel scanner (rayon). Off by default: the scanner falls back to
 # a serial scan so `--no-default-features` stays lean. (ARCHITECTURE.md §3.)
 scanner-parallel = ["dep:rayon"]

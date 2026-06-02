@@ -68,6 +68,55 @@ pub trait Plugin: Send + Sync {
     ) -> Option<ViewTree> {
         None
     }
+
+    /// A contributed `Dialog` (the generalized C++ `selectTarget`, design §3)
+    /// closed — report its outcome back to the plugin. `view` is the dialog id;
+    /// `result` is [`DialogResult::Submitted`] (with the collected field values)
+    /// or [`DialogResult::Cancelled`]. Default no-op so no existing impl breaks —
+    /// only plugins that own a `Dialog` need react (e.g. set the data source on a
+    /// submitted target picker).
+    fn handle_dialog_closed(
+        &mut self,
+        _view: &str,
+        _result: DialogResult,
+        _host: &mut dyn PluginHost,
+    ) -> CommandResult {
+        CommandResult::default()
+    }
+}
+
+/// The outcome a contributed `Dialog` reports back via
+/// [`Plugin::handle_dialog_closed`] (design §3 — the generalized C++
+/// `selectTarget`, which returned the chosen target string or nothing). A
+/// submitted dialog carries the `(field_id, value)` pairs the host collected
+/// from the dialog's inputs/selections; a cancelled dialog carries nothing (the
+/// C++ `selectTarget` returning an empty string / `reject`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DialogResult {
+    /// The dialog was confirmed; `values` are the `(field_id, value)` pairs the
+    /// host gathered from its inputs/dropdowns/selected rows.
+    Submitted { values: Vec<(String, String)> },
+    /// The dialog was dismissed (Esc / Cancel / `×`).
+    Cancelled,
+}
+
+impl DialogResult {
+    /// Whether this is a [`DialogResult::Submitted`].
+    pub fn is_submitted(&self) -> bool {
+        matches!(self, DialogResult::Submitted { .. })
+    }
+
+    /// The value submitted for `id`, if this is a `Submitted` result that carries
+    /// it (a small convenience so a plugin can pull a field without matching).
+    pub fn get(&self, id: &str) -> Option<&str> {
+        match self {
+            DialogResult::Submitted { values } => values
+                .iter()
+                .find(|(k, _)| k == id)
+                .map(|(_, v)| v.as_str()),
+            DialogResult::Cancelled => None,
+        }
+    }
 }
 
 /// What a plugin contributes to the host (design §2). `Provider` is the Phase 1
@@ -117,6 +166,35 @@ impl Contribution {
     /// Whether this contribution is a [`Contribution::Provider`].
     pub fn is_provider(&self) -> bool {
         matches!(self, Contribution::Provider(_))
+    }
+
+    /// Whether this contribution is a host-rendered **view** — a `Panel`,
+    /// `Dialog`, or `StatusItem` (design §3), i.e. something the Phase-2
+    /// declarative renderer mounts and routes [`UiEvent`]s for. A `Command`
+    /// surfaces in a menu/palette (no `ViewTree` of its own) and a `Provider`
+    /// has no UI, so neither is a view.
+    pub fn is_view(&self) -> bool {
+        matches!(
+            self,
+            Contribution::Panel { .. }
+                | Contribution::Dialog { .. }
+                | Contribution::StatusItem { .. }
+        )
+    }
+}
+
+impl Contribution {
+    /// The ids of the renderable **views** in a contribution list — every
+    /// `Panel`/`Dialog`/`StatusItem` id, in order (design §3). The Phase-2
+    /// declarative renderer enumerates these to know which views to mount and
+    /// which ids a routed [`UiEvent`]/[`DialogResult`] can target. `Command`s and
+    /// `Provider`s are excluded ([`is_view`](Contribution::is_view)).
+    pub fn view_ids(contributions: &[Contribution]) -> Vec<&str> {
+        contributions
+            .iter()
+            .filter(|c| c.is_view())
+            .filter_map(|c| c.id())
+            .collect()
     }
 }
 
@@ -296,5 +374,79 @@ mod tests {
         };
         assert_eq!(dialog.id(), Some("pick"));
         assert!(!dialog.is_provider());
+        assert!(dialog.is_view());
+    }
+
+    #[test]
+    fn view_ids_enumerates_panels_dialogs_statusitems_only() {
+        let contributions = vec![
+            Contribution::Command {
+                id: "demo.ping".to_string(),
+                title: "Ping".to_string(),
+                slot: CommandSlot::Menu,
+            },
+            Contribution::Panel {
+                id: "demo.panel".to_string(),
+                title: "Panel".to_string(),
+                dock: DockSide::Right,
+                initial: ViewTree::Separator,
+            },
+            Contribution::Dialog {
+                id: "demo.target".to_string(),
+                title: "Target".to_string(),
+                initial: ViewTree::Separator,
+            },
+            Contribution::StatusItem {
+                id: "demo.status".to_string(),
+                initial: ViewTree::Label("ok".to_string()),
+            },
+        ];
+        // Commands are excluded; the three view kinds enumerate in order.
+        assert_eq!(
+            Contribution::view_ids(&contributions),
+            ["demo.panel", "demo.target", "demo.status"]
+        );
+        // is_view agrees per-variant.
+        assert!(!contributions[0].is_view());
+        assert!(contributions[1].is_view());
+        assert!(contributions[2].is_view());
+        assert!(contributions[3].is_view());
+    }
+
+    #[test]
+    fn dialog_result_helpers() {
+        let submitted = DialogResult::Submitted {
+            values: vec![
+                ("target".to_string(), "1234:notepad.exe".to_string()),
+                ("live".to_string(), "true".to_string()),
+            ],
+        };
+        assert!(submitted.is_submitted());
+        assert_eq!(submitted.get("target"), Some("1234:notepad.exe"));
+        assert_eq!(submitted.get("missing"), None);
+
+        let cancelled = DialogResult::Cancelled;
+        assert!(!cancelled.is_submitted());
+        assert_eq!(cancelled.get("target"), None);
+    }
+
+    #[test]
+    fn handle_dialog_closed_defaults_to_unhandled() {
+        // The new default method is callable on a trait object and, for a plugin
+        // that doesn't override it, returns the not-handled default (no break).
+        let mut p: Box<dyn Plugin> = Box::new(DummyPlugin {
+            manifest: PluginManifest::builtin("Demo", "demo", vec![Permission::AddUi]),
+        });
+        let mut host = MockPluginHost::new();
+        let res = p.handle_dialog_closed(
+            "demo.target",
+            DialogResult::Submitted {
+                values: vec![("target".to_string(), "x".to_string())],
+            },
+            &mut host,
+        );
+        assert!(!res.handled);
+        let res = p.handle_dialog_closed("demo.target", DialogResult::Cancelled, &mut host);
+        assert!(!res.handled);
     }
 }
