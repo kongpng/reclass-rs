@@ -1281,45 +1281,44 @@ fn compose_leaf(
                 }
             }
 
-            // 3. RTTI auto-detect — Hex64/Pointer64 whose value lands inside a
-            //    known module is a vtable candidate. The module-range scan
-            //    rejects ~99% of values cheaply; surviving candidates run
-            //    `walk_rtti` once and the result is cached for the rest of this
-            //    compose pass (`rtti_for_vtable`). Independent of `type_hints`
-            //    and `show_comments` — RTTI is "real signal" worth showing on
-            //    its own (`compose.cpp:462-484`, `test_rtti_hint.cpp:312`).
-            //    The null-pointer CTA chip (port-specific) is gated on
-            //    `show_rtti`; the PDB symbol annotation now rides in the value
-            //    text via `read_value` (`format.cpp:425`), so no Symbol chip.
-            if (node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64)
-                && prov.is_readable(abs_addr, 8)
-            {
-                let candidate = prov.read_u64(abs_addr);
-                if candidate == 0
-                    && state.show_rtti
-                    && (node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32)
-                {
+            // 2b. Comment chip. Mirrors `composeLeaf` (`compose.cpp:401-438`)
+            //    order: the comment annotation is appended to the line text
+            //    immediately AFTER the enum member name and BEFORE the type-hint
+            //    and RTTI annotations. Chip order on the line therefore is
+            //    enum -> comment -> typeHint -> RTTI, which fixes the trailing
+            //    text order and every chip's start/end col.
+            if state.show_comments {
+                let mut comment_text = String::new();
+                if !node.comment.is_empty() {
+                    comment_text = node.comment.clone();
+                } else if let Some(lookup) = state.symbol_lookup.as_ref() {
+                    let sym = lookup(abs_addr);
+                    if !sym.is_empty() {
+                        comment_text = sym;
+                    }
+                }
+                if !comment_text.is_empty() {
+                    // Prefix the chip text with the literal "// " lead-in to
+                    // match the authoritative C++ displayed string: `compose.cpp:436`
+                    // appends `"  // " + commentText` to the line text, so the
+                    // row literally shows `  // IHDR …`. `push_chip` prepends the
+                    // `"  "` separator (after trimming value-column padding), so a
+                    // chip text of `"// IHDR"` reproduces `"  // IHDR"` byte-for-byte.
+                    // The `// ` is added here (not via a fill closure) so the
+                    // start_col/end_col span and `sanitize_chip` (collapses embedded
+                    // \r\n\t to keep the chip on one row) cover the prefixed string.
+                    let chip_text = format!("// {comment_text}");
                     push_chip(
                         &mut line_text,
                         &mut lm,
-                        ChipKind::Rtti,
-                        "(Name class\u{2026})",
-                        |c| {
-                            c.rtti_vtable_addr = 0;
-                        },
+                        ChipKind::Comment,
+                        &chip_text,
+                        |_| {},
                     );
-                } else if candidate != 0 && candidate != u64::MAX {
-                    let info = rtti_for_vtable(state, prov, candidate);
-                    if info.ok && !info.demangled_name.is_empty() {
-                        let hint = format!("{{RTTI: {}}}", info.demangled_name);
-                        push_chip(&mut line_text, &mut lm, ChipKind::Rtti, &hint, |c| {
-                            c.rtti_vtable_addr = candidate;
-                        });
-                    }
                 }
             }
 
-            // 3b. TypeHint — type-inference annotation on hex preview nodes.
+            // 3. TypeHint — type-inference annotation on hex preview nodes.
             // Gated on `state.type_hints` (`compose.cpp:441`); with the flag off
             // the green chip is suppressed (`test_rtti_hint.cpp:313`).
             if state.type_hints && is_hex_node(node.kind) {
@@ -1364,35 +1363,43 @@ fn compose_leaf(
                 }
             }
 
-            // 4. Comment chip.
-            if state.show_comments {
-                let mut comment_text = String::new();
-                if !node.comment.is_empty() {
-                    comment_text = node.comment.clone();
-                } else if let Some(lookup) = state.symbol_lookup.as_ref() {
-                    let sym = lookup(abs_addr);
-                    if !sym.is_empty() {
-                        comment_text = sym;
-                    }
-                }
-                if !comment_text.is_empty() {
-                    // Prefix the chip text with the literal "// " lead-in to
-                    // match the authoritative C++ displayed string: `compose.cpp:436`
-                    // appends `"  // " + commentText` to the line text, so the
-                    // row literally shows `  // IHDR …`. `push_chip` prepends the
-                    // `"  "` separator (after trimming value-column padding), so a
-                    // chip text of `"// IHDR"` reproduces `"  // IHDR"` byte-for-byte.
-                    // The `// ` is added here (not via a fill closure) so the
-                    // start_col/end_col span and `sanitize_chip` (collapses embedded
-                    // \r\n\t to keep the chip on one row) cover the prefixed string.
-                    let chip_text = format!("// {comment_text}");
+            // 4. RTTI auto-detect — Hex64/Pointer64 whose value lands inside a
+            //    known module is a vtable candidate. The module-range scan
+            //    rejects ~99% of values cheaply; surviving candidates run
+            //    `walk_rtti` once and the result is cached for the rest of this
+            //    compose pass (`rtti_for_vtable`). Independent of `type_hints`
+            //    and `show_comments` — RTTI is "real signal" worth showing on
+            //    its own (`compose.cpp:462-484`, `test_rtti_hint.cpp:312`).
+            //    Appended LAST (after enum/comment/typeHint), matching C++
+            //    `composeLeaf` order. The null-pointer CTA chip (port-specific)
+            //    is gated on `show_rtti`; the PDB symbol annotation now rides in
+            //    the value text via `read_value` (`format.cpp:425`), so no
+            //    Symbol chip.
+            if (node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64)
+                && prov.is_readable(abs_addr, 8)
+            {
+                let candidate = prov.read_u64(abs_addr);
+                if candidate == 0
+                    && state.show_rtti
+                    && (node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32)
+                {
                     push_chip(
                         &mut line_text,
                         &mut lm,
-                        ChipKind::Comment,
-                        &chip_text,
-                        |_| {},
+                        ChipKind::Rtti,
+                        "(Name class\u{2026})",
+                        |c| {
+                            c.rtti_vtable_addr = 0;
+                        },
                     );
+                } else if candidate != 0 && candidate != u64::MAX {
+                    let info = rtti_for_vtable(state, prov, candidate);
+                    if info.ok && !info.demangled_name.is_empty() {
+                        let hint = format!("{{RTTI: {}}}", info.demangled_name);
+                        push_chip(&mut line_text, &mut lm, ChipKind::Rtti, &hint, |c| {
+                            c.rtti_vtable_addr = candidate;
+                        });
+                    }
                 }
             }
         }
@@ -1599,9 +1606,15 @@ fn compose_parent(
             for (name, _) in &node.enum_members {
                 max_name_len = max_name_len.max(u16_len(name));
             }
-            // Display order sorted by value (stable).
-            let mut order: Vec<usize> = (0..node.enum_members.len()).collect();
-            order.sort_by(|&a, &b| node.enum_members[a].1.cmp(&node.enum_members[b].1));
+            // Display order sorted by value. C++ uses `std::sort` (introsort,
+            // unstable: `compose.cpp:629`), so route through the libstdc++-faithful
+            // introsort helper keyed on `enum_members[idx].value` to reproduce the
+            // exact tie order on equal values (Vec::sort_by is stable and would
+            // diverge).
+            let mut order: Vec<i32> = (0..node.enum_members.len() as i32).collect();
+            let enum_values: Vec<i64> = node.enum_members.iter().map(|(_, v)| *v).collect();
+            std_sort_by_abs(&mut order, &enum_values);
+            let order: Vec<usize> = order.into_iter().map(|x| x as usize).collect();
 
             for (oi, &mi) in order.iter().enumerate() {
                 state.set_tree_sibling(child_depth, oi < order.len() - 1);
@@ -2454,21 +2467,11 @@ fn compose_node(
                 }
             }
 
-            // Comment chip on typed-pointer header. Prefixed with the literal
-            // "// " lead-in to match the C++ displayed-string convention
-            // (`compose.cpp:436`: `"  // " + commentText`) so the row shows
-            // `  // comment`, consistent with the leaf-field comment chip.
-            // (`sanitize_chip` is applied inside `push_chip`.)
-            if state.show_comments && !node.comment.is_empty() {
-                let chip_text = format!("// {}", node.comment);
-                push_chip(
-                    &mut ptr_text,
-                    &mut lm,
-                    ChipKind::Comment,
-                    &chip_text,
-                    |_| {},
-                );
-            }
+            // NOTE: C++ `composeNode` (`compose.cpp:1213-1257`) attaches ONLY the
+            // RTTI hint to a typed-pointer header — never a comment chip. A comment
+            // on a pointer-to-class node is therefore invisible in the original, so
+            // we deliberately do NOT push a Comment chip here (the leaf-field path
+            // is the only place a node comment becomes a visible chip).
 
             if state.brace_wrap && !effective_collapsed && ptr_text.ends_with_unit(LBRACE) {
                 ptr_text.chop();
@@ -3840,7 +3843,17 @@ mod render {
             NodeKind::Float => fmt_float(r_f32(addr)),
             NodeKind::Double => fmt_double(r_f64(addr)),
             NodeKind::Bool => fmt_bool(prov.read_u8(addr)),
-            NodeKind::Pointer32 => fmt_pointer32(prov.read_u32(addr)),
+            NodeKind::Pointer32 => {
+                let val = prov.read_u32(addr);
+                let mut s = fmt_pointer32(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:425-426`).
+                let sym = prov.get_symbol(u64::from(val));
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
+            }
             NodeKind::Pointer64 => {
                 let val = prov.read_u64(addr);
                 if node.ptr_depth > 0
@@ -3864,14 +3877,47 @@ mod render {
                             ..Node::default()
                         };
                         let deref_val = read_value(&tmp, prov, target, 0);
+                        // Arrow to deref target value + symbol on the pointer's
+                        // own value (`format.cpp:443-449`).
+                        let sym = prov.get_symbol(val);
+                        if !sym.is_empty() {
+                            return format!("-> {deref_val}  // {sym}");
+                        }
                         return format!("-> {deref_val}");
                     }
                     return fmt_pointer64(val);
                 }
-                fmt_pointer64(val)
+                let mut s = fmt_pointer64(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:457-458`).
+                let sym = prov.get_symbol(val);
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
             }
-            NodeKind::FuncPtr32 => fmt_pointer32(prov.read_u32(addr)),
-            NodeKind::FuncPtr64 => fmt_pointer64(prov.read_u64(addr)),
+            NodeKind::FuncPtr32 => {
+                let val = prov.read_u32(addr);
+                let mut s = fmt_pointer32(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:465-466`).
+                let sym = prov.get_symbol(u64::from(val));
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
+            }
+            NodeKind::FuncPtr64 => {
+                let val = prov.read_u64(addr);
+                let mut s = fmt_pointer64(val);
+                // `// <module>!<symbol>` suffix (`format.cpp:473-474`).
+                let sym = prov.get_symbol(val);
+                if !sym.is_empty() {
+                    s.push_str("  // ");
+                    s.push_str(&sym);
+                }
+                s
+            }
             NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => {
                 let count = size_for_kind(node.kind) / 4;
                 let mut parts: Vec<String> = Vec::new();

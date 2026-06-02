@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::core::{Node, NodeKind, NodeTree, ValueHistory};
+use crate::core::{Node, NodeKind, NodeTree, OffsetAdj, ValueHistory};
 use crate::provider::{BufferProvider, MemoryRegion, Provider, RegionType};
 
 // ── Shared fixtures (port of buildSmallTree + makeSmallBuffer) ──
@@ -1802,8 +1802,13 @@ fn space_rapid_cycle_no_corruption() {
 // ── Coverage-note parity tests (PORTING §12.4) ──
 
 #[test]
-fn change_kind_keeps_history() {
-    // Value history is intentionally KEPT across ChangeKind (no off_adjs).
+fn change_kind_clears_changed_node_history() {
+    // C++ `applyCommand` ChangeKind arm (`controller.cpp:2150-2155`) clears the
+    // changed node's OWN value history: the node's value FORMAT changed, so the
+    // prior kind's recorded string is stale. Keeping it would make the next
+    // refresh record the new format as a "change" and flash false change-heat.
+    // (This previously asserted the OPPOSITE — that history survived — which
+    // encoded a bug vs the C++; the test is flipped here to pin the correction.)
     let mut c = make_ctrl();
     let id = find_id(&c, "field_u32");
     let idx = c.tree().index_of_id(id) as usize;
@@ -1820,9 +1825,155 @@ fn change_kind_keeps_history() {
     });
     let _ = idx;
     assert!(
-        c.value_history().contains_key(&id),
-        "history must survive ChangeKind"
+        !c.value_history().contains_key(&id),
+        "changed node's history must be cleared on ChangeKind"
     );
+}
+
+#[test]
+fn change_kind_clears_changed_node_history_with_off_adjs() {
+    // Same correction as above, on the resize path: a ChangeKind that shifts
+    // siblings (non-empty off_adjs) must still clear the CHANGED node's own
+    // history (`controller.cpp:2154`), not only the shifted neighbours.
+    let mut c = make_ctrl();
+    let root_id = find_id(&c, "root");
+    let u8_id = find_id(&c, "field_u8");
+    let neighbor_id = find_id(&c, "pad0"); // sits just after field_u8 (+9)
+    c.value_history_mut().entry(u8_id).or_default().record("1");
+    c.value_history_mut()
+        .entry(neighbor_id)
+        .or_default()
+        .record("9");
+    assert!(c.value_history().contains_key(&u8_id));
+    let _ = root_id;
+    // UInt8 (1 byte) → UInt32 (4 bytes): grows by 3, shifting pad0/pad1/field_hex.
+    let off_adjs = vec![OffsetAdj {
+        node_id: neighbor_id,
+        old_offset: 9,
+        new_offset: 12,
+    }];
+    c.push_command(Command::ChangeKind {
+        node_id: u8_id,
+        old_kind: NodeKind::UInt8,
+        new_kind: NodeKind::UInt32,
+        off_adjs,
+    });
+    assert!(
+        !c.value_history().contains_key(&u8_id),
+        "changed node's own history cleared even with off_adjs"
+    );
+    assert!(
+        !c.value_history().contains_key(&neighbor_id),
+        "shifted neighbour history cleared too"
+    );
+}
+
+#[test]
+fn create_new_class_struct_uses_class_keyword_and_underscore_names() {
+    // Editor New Class (`controller.cpp:3390-3423`): first new class is
+    // `NewClass` (classKeyword="class"), and subsequent collisions are
+    // `NewClass_2`, `NewClass_3`, … (underscore, counter from 2) — matching
+    // `convert_to_typed_pointer`, NOT the old `NewClass1`/empty-keyword form.
+    let mut c = make_ctrl();
+    let (id1, name1) = c.create_new_class_struct();
+    assert_eq!(name1, "NewClass");
+    let n1 = c.tree().nodes[c.tree().index_of_id(id1) as usize].clone();
+    assert_eq!(n1.struct_type_name, "NewClass");
+    assert_eq!(
+        n1.class_keyword, "class",
+        "root materializes as `class`, not bare struct"
+    );
+    assert_eq!(c.tree().children_of(id1).len(), 8, "8 default Hex64 fields");
+    assert!(
+        c.tree()
+            .children_of(id1)
+            .iter()
+            .all(|&ci| c.tree().nodes[ci].kind == NodeKind::Hex64),
+        "default fields are Hex64"
+    );
+
+    // Second creation collides with `NewClass` → `NewClass_2` (underscore, 2).
+    let (_id2, name2) = c.create_new_class_struct();
+    assert_eq!(name2, "NewClass_2");
+    // Third → `NewClass_3`.
+    let (_id3, name3) = c.create_new_class_struct();
+    assert_eq!(name3, "NewClass_3");
+}
+
+#[test]
+fn convert_to_hex_removes_node_and_inserts_largest_first_pads() {
+    // C++ single-node "Convert to &Hex" (`controller.cpp:3713-3753`): REMOVE the
+    // node and re-fill its byte range with largest-first hex pads named
+    // `pad_<offset>` (2-wide zero-padded lowercase hex), NOT a single same-size
+    // change_node_kind that keeps the original id/name.
+    let mut c = make_ctrl();
+
+    // Make `field_float` a 12-byte Vec3 at +4 so the convert spans 2 pads.
+    let vec3_id = find_id(&c, "field_float");
+    let vi = c.tree().index_of_id(vec3_id) as usize;
+    c.tree_mut().nodes[vi].kind = NodeKind::Vec3;
+    let parent_id = c.tree().nodes[vi].parent_id;
+    assert_eq!(c.tree().nodes[vi].byte_size(), 12);
+
+    c.convert_to_hex(vec3_id);
+
+    // The original node is gone.
+    assert!(
+        c.tree().index_of_id(vec3_id) < 0,
+        "original node removed (identity NOT preserved)"
+    );
+
+    // Largest-first pads cover +4..+16: Hex64 @ +4 (pad_04) + Hex32 @ +12 (pad_0c).
+    // (Look up by the generated pad name — the offset +12 also hosts the
+    // pre-existing `field_hex`, so an offset-only search would be ambiguous.)
+    let pad0 = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| n.parent_id == parent_id && n.name == "pad_04")
+        .expect("pad_04 at +4")
+        .clone();
+    assert_eq!(pad0.kind, NodeKind::Hex64);
+    assert_eq!(pad0.offset, 4);
+    let pad1 = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| n.parent_id == parent_id && n.name == "pad_0c")
+        .expect("pad_0c at +12")
+        .clone();
+    assert_eq!(pad1.kind, NodeKind::Hex32);
+    assert_eq!(pad1.offset, 12);
+
+    // One undo macro reverts the whole decomposition.
+    c.undo();
+    let restored_idx = c.tree().index_of_id(vec3_id);
+    assert!(restored_idx >= 0, "undo restores the original node");
+    assert_eq!(c.tree().nodes[restored_idx as usize].kind, NodeKind::Vec3);
+    assert!(
+        !c.tree()
+            .nodes
+            .iter()
+            .any(|n| n.parent_id == parent_id && (n.name == "pad_04" || n.name == "pad_0c")),
+        "pads removed after undo"
+    );
+}
+
+#[test]
+fn convert_to_hex_noop_on_hex_and_container_and_empty() {
+    // Already-hex / container / zero-size nodes are not converted (C++ menu only
+    // offers this for non-hex non-container primitives; the op guards the same).
+    let mut c = make_ctrl();
+    let hex_id = find_id(&c, "field_hex"); // Hex32
+    let before = c.tree().nodes.len();
+    c.convert_to_hex(hex_id);
+    assert!(c.tree().index_of_id(hex_id) >= 0, "hex node untouched");
+    assert_eq!(c.tree().nodes.len(), before, "no nodes added/removed");
+
+    let root_id = find_id(&c, "root"); // Struct container
+    c.convert_to_hex(root_id);
+    assert!(c.tree().index_of_id(root_id) >= 0, "container untouched");
+    assert_eq!(c.tree().nodes.len(), before);
 }
 
 #[test]

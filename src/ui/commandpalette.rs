@@ -297,9 +297,14 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
         for s in sources {
             source_children.push(N::item(&s.label, "", &s.command));
         }
+        // The trailing separator + "Clear All" are added ONLY when there are
+        // saved sources (the C++ `populateSourceMenu` keeps both inside the
+        // `if (!savedSources.isEmpty())` guard; providerregistry.cpp:100-114).
+        // Previously these were pushed unconditionally, so an empty source set
+        // showed a stray separator + "Clear All" row.
+        source_children.push(N::Separator);
+        source_children.push(N::item("Clear All", "", "source.clear"));
     }
-    source_children.push(N::Separator);
-    source_children.push(N::item("Clear All", "", "source.clear"));
     vec![
         N::submenu(
             "&File",
@@ -1188,9 +1193,10 @@ mod tests {
     #[test]
     fn data_source_menu_matches_cpp_provider_set() {
         // The C++ `ProviderRegistry::populateSourceMenu` (providerregistry.cpp:63)
-        // emits File + the registered providers + saved sources + Clear All — the
-        // registered provider set being exactly processmemory / remoteprocessmemory
-        // / windbgmemory / reclass.netcompatlayer (`s_providerIcons`). There is NO
+        // emits File + the registered providers, then (ONLY when saved sources
+        // exist) the saved rows + a separator + Clear All — the registered
+        // provider set being exactly processmemory / remoteprocessmemory /
+        // windbgmemory / reclass.netcompatlayer (`s_providerIcons`). There is NO
         // "Kernel Memory" data-source row: `kernelmemory` is only a provider-tab id
         // used by the right-click Browse-Page-Tables path, never a Data-Source entry.
         let entries = flatten_menu_bar(&default_menu_tree());
@@ -1202,10 +1208,19 @@ mod tests {
             "source.remote",
             "source.windbg",
             "source.rcnet",
-            "source.clear",
         ] {
             assert!(cmds.contains(&c), "Data Source menu missing {c}");
         }
+        // UPDATED (item 7): this assertion previously demanded `source.clear` even
+        // in the default (no-saved-source) tree, pinning the OLD wrong behavior
+        // where the separator + Clear All were emitted unconditionally. The C++
+        // adds them only inside `if (!savedSources.isEmpty())`, so with no saved
+        // sources "Clear All" must be absent (see
+        // `data_source_menu_omits_separator_and_clear_all_when_no_saved_sources`).
+        assert!(
+            !cmds.contains(&"source.clear"),
+            "Clear All must NOT appear when there are no saved sources"
+        );
         // The invented Kernel Memory row (no C++ counterpart) is gone.
         assert!(
             !cmds.contains(&"source.kernel"),
@@ -1248,6 +1263,76 @@ mod tests {
         assert_eq!(recent_menu_label(0, "foo.rcx"), "1  foo.rcx");
         assert_eq!(recent_menu_label(1, "bar.rcx"), "2  bar.rcx");
         assert_eq!(recent_menu_label(9, "tenth.rcx"), "10  tenth.rcx");
+    }
+
+    /// The direct children of the Data Source submenu, in order.
+    fn data_source_children(tree: &[MenuNode]) -> Vec<MenuNode> {
+        fn find(nodes: &[MenuNode]) -> Option<&[MenuNode]> {
+            for n in nodes {
+                match n {
+                    MenuNode::Submenu { label, children } if label == "Data Source" => {
+                        return Some(children);
+                    }
+                    MenuNode::Submenu { children, .. } => {
+                        if let Some(c) = find(children) {
+                            return Some(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        find(tree).expect("Data Source submenu present").to_vec()
+    }
+
+    #[test]
+    fn data_source_menu_omits_separator_and_clear_all_when_no_saved_sources() {
+        // Item 7: the C++ `populateSourceMenu` adds the trailing separator +
+        // "Clear All" ONLY inside `if (!savedSources.isEmpty())`
+        // (providerregistry.cpp:100-114). With no saved sources the menu ends at
+        // the registered providers — no stray separator, no "Clear All".
+        use super::{menu_tree_with, MenuNode};
+        let children = data_source_children(&menu_tree_with(&[], &[]));
+        // The five fixed provider rows only (File + 4 providers); no separator,
+        // no Clear All.
+        assert_eq!(children.len(), 5, "expected only the 5 fixed provider rows");
+        assert!(
+            !children.iter().any(|n| matches!(n, MenuNode::Separator)),
+            "no trailing separator with zero saved sources"
+        );
+        assert!(
+            !children
+                .iter()
+                .any(|n| matches!(n, MenuNode::Item { command, .. } if command == "source.clear")),
+            "no 'Clear All' row with zero saved sources"
+        );
+    }
+
+    #[test]
+    fn data_source_menu_keeps_separator_and_clear_all_with_saved_sources() {
+        // Item 7 (the other branch): WITH a saved source the layout is
+        // File + 4 providers, separator, the saved row(s), separator, Clear All.
+        use super::{menu_tree_with, MenuNode, SourceMenuEntry};
+        let sources = vec![SourceMenuEntry {
+            label: "File 'game.bin'".into(),
+            command: "source.saved.0".into(),
+            active: true,
+        }];
+        let children = data_source_children(&menu_tree_with(&[], &sources));
+        // 5 providers + sep + 1 saved + sep + Clear All = 9.
+        assert_eq!(children.len(), 9);
+        assert!(
+            children
+                .iter()
+                .any(|n| matches!(n, MenuNode::Item { command, .. } if command == "source.clear")),
+            "'Clear All' present once a saved source exists"
+        );
+        // The last two rows are the trailing separator then Clear All.
+        assert!(matches!(children[7], MenuNode::Separator));
+        assert!(
+            matches!(&children[8], MenuNode::Item { command, .. } if command == "source.clear")
+        );
     }
 
     #[test]

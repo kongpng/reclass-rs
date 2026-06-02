@@ -211,6 +211,17 @@ actions!(
         EditorStaticAddField,
         EditorStaticEditExpr,
         EditorStaticDissolveUnion,
+        // Item 11: the no-node (empty-area) menu's "Add Static Field" — adds a
+        // static field to the current VIEW ROOT struct/array (the C++ `!hasNode`
+        // branch's `insertStaticField(rootId)`, controller.cpp:3904). Distinct from
+        // `EditorStaticAddField`, which targets the right-clicked node.
+        EditorRootAddStaticField,
+        // Item 11: type-inference quick-convert (the C++ `Convert to <type>` /
+        // `Split into <type>xN`). The suggested kind(s) are stashed in
+        // `pending_hint_convert` when the menu opens (a parameterless gpui action
+        // can't carry the dynamic kind), and these read it back.
+        EditorHintConvert,
+        EditorHintSplit,
     ]
 );
 
@@ -348,6 +359,25 @@ pub enum RcxEditorEvent {
     /// `setAppStatus(...)`, e.g. "Copied C struct to clipboard"). The host
     /// status bar reads this; if unconsumed it is harmless.
     Status { message: String },
+    /// Item 12: an in-editor View-option toggle the user flipped from WITHIN the
+    /// editor surface (the offset-margin double-click or the right-click
+    /// Relative/Absolute actions), which must propagate like the menu toggle: the
+    /// host persists the setting, sets the View-menu checkmark, and pushes the value
+    /// to every open editor / split pane (the C++ `setRelativeOffsets` emits
+    /// `relativeOffsetsChanged`, editor.cpp:2754). The editor has already applied
+    /// the value locally; this event asks the host to mirror it everywhere.
+    ViewOptionToggled {
+        option: EditorViewOption,
+        value: bool,
+    },
+}
+
+/// Item 12: the editor-originated View options that can be toggled from within the
+/// editor surface and must propagate to the host (currently only Relative Offsets;
+/// kept as an enum so further in-editor toggles can join without a new event).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorViewOption {
+    RelativeOffsets,
 }
 
 /// The bespoke editor surface view.
@@ -524,6 +554,23 @@ pub struct RcxEditor {
     cycle_macro_at: Option<std::time::Instant>,
     cycle_macro_open: bool,
     _cycle_macro_task: Task<()>,
+    /// The most-recently-picked type display names, most-recent-first, capped at 8
+    /// and deduped-to-front (the C++ `RcxController::m_recentTypeNames` /
+    /// `pushRecentType`). Surfaces as the Type Selector's "Recent" section. The C++
+    /// keeps this on the controller; the read-only file controller here exposes no
+    /// such list, so the view owns it (purely a UI affordance).
+    recent_type_names: Vec<String>,
+    /// Item 13: set while the cursor is INSIDE the floating hover popup card. While
+    /// set, `dispatch_row_hover` suppresses popup dismissal so moving onto the card
+    /// (e.g. to click a value-history 'Set' button) does not clear it first (the
+    /// C++ `m_hoverInside` / geometry-contains guard, editor.cpp:2815/4531).
+    popup_cursor_inside: bool,
+    /// Item 11: the type-inference quick-convert payload captured when the node
+    /// context menu is built — `(node_id, [hint kinds])`. The `EditorHintConvert` /
+    /// `EditorHintSplit` actions read this so the dynamic suggested kind(s) survive
+    /// the trip through a parameterless gpui action (the C++ captures them in the
+    /// menu-action lambda, controller.cpp:3478/3487).
+    pending_hint_convert: Option<(u64, Vec<NodeKind>)>,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
 }
@@ -677,6 +724,9 @@ impl RcxEditor {
             cycle_macro_at: None,
             cycle_macro_open: false,
             _cycle_macro_task: Task::ready(()),
+            recent_type_names: Vec::new(),
+            popup_cursor_inside: false,
+            pending_hint_convert: None,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
@@ -1081,15 +1131,29 @@ impl RcxEditor {
                 ) && lm.line_kind == LineKind::Header
                     && lm.node_idx >= 0
                 {
-                    let ref_id = {
+                    // Item 10: resolve the open-in-new-tab target exactly like the
+                    // C++ `openTypeInNewTabRequested` (controller.cpp:834): the
+                    // node's `ref_id` if set, an array-of-struct's `ref_id`, else a
+                    // PLAIN embedded `Struct` (no ref) opens its OWN subtree (its own
+                    // id). Previously this only fired when `ref_id != 0`, so a plain
+                    // embedded struct header fell through to Ctrl-toggle selection.
+                    let target = {
                         let tree = self.controller.tree();
-                        tree.nodes
-                            .get(lm.node_idx as usize)
-                            .map(|n| n.ref_id)
-                            .unwrap_or(0)
+                        match tree.nodes.get(lm.node_idx as usize) {
+                            Some(n) if n.ref_id != 0 => n.ref_id,
+                            Some(n)
+                                if n.kind == NodeKind::Array
+                                    && n.element_kind == NodeKind::Struct
+                                    && n.ref_id != 0 =>
+                            {
+                                n.ref_id
+                            }
+                            Some(n) if n.kind == NodeKind::Struct && n.parent_id != 0 => n.id,
+                            _ => 0,
+                        }
                     };
-                    if ref_id != 0 && self.controller.tree().index_of_id(ref_id) >= 0 {
-                        cx.emit(RcxEditorEvent::OpenTypeInNewTab { ref_id });
+                    if target != 0 && self.controller.tree().index_of_id(target) >= 0 {
+                        cx.emit(RcxEditorEvent::OpenTypeInNewTab { ref_id: target });
                         return;
                     }
                 }
@@ -2093,6 +2157,13 @@ impl RcxEditor {
             return;
         }
         let n = &tree.nodes[idx];
+        // Item 7: only a STATIC node gets an offsetExpr written (the C++
+        // `EditTarget::StaticExpr` guard `if (node.isStatic && text != ...)`,
+        // controller.cpp:1405). A non-static node must NOT acquire an offsetExpr
+        // (which would quietly make it relative on the next compose).
+        if !n.is_static {
+            return;
+        }
         let node_id = n.id;
         let old_expr = n.offset_expr.clone();
         if old_expr == text {
@@ -2362,8 +2433,11 @@ impl RcxEditor {
         }
         self.find_bar = None;
         self._find_bar_sub = None;
-        self.find_match = None;
-        self.find_matches.clear();
+        // Item 14: KEEP the IND_FIND highlights + the current/all match set after
+        // the bar hides (the C++ `hideFindBar` deliberately preserves them and
+        // `m_findPos` so the user still sees the hits and can resume; editor.cpp:1771).
+        // Only a fresh query clears them. (Previously this cleared `find_match` /
+        // `find_matches`, contradicting the bar's own on_close preservation comment.)
         cx.notify();
     }
 
@@ -2877,6 +2951,9 @@ impl RcxEditor {
             self.hover_popup = None;
             changed = true;
         }
+        // Item 13: a full hover clear (viewport leave) also drops the
+        // cursor-inside-popup guard so a stale flag can't suppress the next popup.
+        self.popup_cursor_inside = false;
         if changed {
             cx.notify();
         }
@@ -4426,9 +4503,10 @@ impl RcxEditor {
                         cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
                             if e.click_count >= 2 {
                                 cx.stop_propagation();
+                                // Item 12: flip + propagate (persist / View-menu ✓ /
+                                // push to every editor) via the host event.
                                 let rel = this.relative_offsets;
-                                this.relative_offsets = !rel;
-                                cx.notify();
+                                this.toggle_relative_offsets(!rel, cx);
                             }
                         }),
                     )
@@ -4952,6 +5030,18 @@ impl RcxEditor {
         // (disasm/struct-preview) are still suppressed while editing because the
         // field owns the surface; `compute_hover_popup` only returns the
         // value-history variant when `editing` is active.
+        // Item 13: while the cursor is INSIDE the floating hover card, suppress
+        // popup dismissal/replacement entirely (the C++ keeps the popup while the
+        // cursor is over its geometry; editor.cpp:2815). Moving onto the card to
+        // click a value-history 'Set' button would otherwise re-fire hover for the
+        // row under the card and clear the popup before the click lands. The hover
+        // band still tracks the row for other affordances.
+        if self.popup_cursor_inside {
+            if changed_band {
+                cx.notify();
+            }
+            return;
+        }
         let want = if self.hover_effects {
             self.compute_hover_popup(line, rel_x, pos)
         } else {
@@ -5017,6 +5107,32 @@ impl RcxEditor {
         if !editing {
             // 1) Function / void pointer → disasm / hex-dump of the TARGET (item 13).
             if is_fp || is_void_ptr {
+                // Item 8 (66/69/81): for the void-ptr (hex-dump) branch the C++
+                // additionally requires `node.refId == 0` (a TYPED-but-unnamed
+                // pointer, refId != 0, must NOT show a hex dump), and narrows the
+                // trigger to the pointer-ADDRESS chip span (before the first chip)
+                // rather than the full value span. The disasm (func-ptr) branch is
+                // unconditional. `node.refId` is read from the live tree by id (the
+                // C++ reads it off `m_disasmTree->nodes[lm.nodeIdx]`).
+                if is_void_ptr && !is_fp {
+                    let ref_id = {
+                        let idx = self.controller.tree().index_of_id(lm.node_id);
+                        if idx >= 0 {
+                            self.controller.tree().nodes[idx as usize].ref_id
+                        } else {
+                            0
+                        }
+                    };
+                    if ref_id != 0 {
+                        return None;
+                    }
+                    // Narrow to the pointer-address chip span: the value column up
+                    // to the first chip (the C++ `narrowPtrValueSpan`).
+                    let narrowed = geometry::narrow_value_at_first_chip(&lm, vs);
+                    if !narrowed.valid || col < narrowed.start || col >= narrowed.end {
+                        return None;
+                    }
+                }
                 if let Some(state) = self.pointer_disasm_popup(&lm, is_fp, pos) {
                     return Some(state);
                 }
@@ -5348,13 +5464,22 @@ impl RcxEditor {
                     .position(state.pos + point(px(12.0), px(16.0)))
                     .snap_to_window_with_margin(px(8.0))
                     .child(
-                        card.bg(palette.gutter_bg)
+                        card.id("rcx-hover-popup-card")
+                            .bg(palette.gutter_bg)
                             .border_1()
                             .border_color(palette.border)
                             .rounded(px(design::tokens::radius::MD))
                             .px(px(design::tokens::space::SM))
                             .py(px(design::tokens::space::XS))
-                            .shadow_md(),
+                            .shadow_md()
+                            // Item 13: containment guard — while the cursor is over
+                            // the card, set `popup_cursor_inside` so the row-level
+                            // hover handler beneath does NOT dismiss the popup before
+                            // a click (notably the value-history 'Set' buttons) lands.
+                            // Cleared when the cursor leaves the card.
+                            .on_hover(cx.listener(|this, inside: &bool, _w, _cx| {
+                                this.popup_cursor_inside = *inside;
+                            })),
                     ),
             )
             .with_priority(2)
@@ -5462,17 +5587,24 @@ impl RcxEditor {
         // node actions. Resolve member-ness from the row's `is_member_line` +
         // `sub_line` against the node's enum/bitfield kind.
         if lm.is_member_line && target.sub_line >= 0 {
-            let (is_enum_member, is_bitfield_member) = {
+            let (is_enum_member, is_bitfield_member, bit_width) = {
                 let tree = self.controller.tree();
                 match tree.nodes.get(target.node_idx) {
                     Some(n) => {
                         let sl = target.sub_line as usize;
-                        (
-                            n.is_enum() && sl < n.enum_members.len(),
-                            n.is_bitfield() && sl < n.bitfield_members.len(),
-                        )
+                        let is_bf = n.is_bitfield() && sl < n.bitfield_members.len();
+                        // Item 9: the member's bit width — Toggle Bit is offered ONLY
+                        // for a single-bit member (bitWidth == 1); a multi-bit member
+                        // gets Edit Value… instead (the C++ `bm.bitWidth == 1`
+                        // branch, controller.cpp:3350).
+                        let bw = if is_bf {
+                            n.bitfield_members[sl].bit_width
+                        } else {
+                            0
+                        };
+                        (n.is_enum() && sl < n.enum_members.len(), is_bf, bw)
                     }
-                    None => (false, false),
+                    None => (false, false, 0),
                 }
             };
             if is_enum_member || is_bitfield_member {
@@ -5480,6 +5612,7 @@ impl RcxEditor {
                     target,
                     is_enum_member,
                     is_bitfield_member,
+                    bit_width,
                     pos,
                     window,
                     cx,
@@ -5503,12 +5636,14 @@ impl RcxEditor {
         _target: ContextTarget,
         is_enum_member: bool,
         is_bitfield_member: bool,
+        // Item 9: the bitfield member's bit width — gates Toggle Bit (width == 1) vs
+        // Edit Value… (multi-bit). Unused for enum members.
+        bit_width: u8,
         pos: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let editor_focus = self.focus_handle.clone();
-        let writable = self.provider_writable();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, _mw, _mcx| {
             let mut menu = menu.min_w(px(200.0)).action_context(editor_focus.clone());
             if is_enum_member {
@@ -5538,19 +5673,23 @@ impl RcxEditor {
                     );
             }
             if is_bitfield_member {
-                menu = menu
-                    .menu_with_icon(
+                // Item 9: Toggle Bit ONLY for a single-bit member; a multi-bit member
+                // gets Edit Value… instead (mutually exclusive — the C++
+                // `bm.bitWidth == 1 ? "Toggle Bit" : "Edit Value..."`,
+                // controller.cpp:3350). The C++ does NOT gate this on writability.
+                if bit_width == 1 {
+                    menu = menu.menu_with_icon(
                         "Toggle Bit",
                         IconName::Check,
                         Box::new(EditorMemberToggleBit),
-                    )
-                    .when(writable, |m| {
-                        m.menu_with_icon(
-                            "Edit Value...\tEnter",
-                            IconName::SquareTerminal,
-                            Box::new(EditorBeginValueEdit),
-                        )
-                    });
+                    );
+                } else {
+                    menu = menu.menu_with_icon(
+                        "Edit Value...\tEnter",
+                        IconName::SquareTerminal,
+                        Box::new(EditorBeginValueEdit),
+                    );
+                }
             }
             menu
         });
@@ -5633,9 +5772,12 @@ impl RcxEditor {
         self.show_context_menu_at(menu, pos, window, cx);
     }
 
-    /// Item 17: the no-node (empty area) context menu — Insert 4 / Insert 8 /
-    /// Append bytes… (the C++ `!hasNode` branch, controller.cpp:3882). The Insert
-    /// actions append at the view-root struct when no node is current.
+    /// Item 11/17: the no-node (empty area) context menu (the C++ `!hasNode`
+    /// branch, controller.cpp:3882). Insert ▸ (Insert 4 / Insert 8 / Append bytes…),
+    /// then "Add Static Field" when the view root is a Struct/Array, then the
+    /// always-appended Fold / Copy / Tracking submenus the C++ adds after the
+    /// hasNode/!hasNode split (controller.cpp:3913-3974). The empty-area Copy has no
+    /// Address/Offset group (no node) — only Copy Line / Copy All as Text.
     fn open_empty_area_menu(
         &mut self,
         pos: Point<Pixels>,
@@ -5643,6 +5785,19 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         let editor_focus = self.focus_handle.clone();
+        // "Add Static Field" appears only when the view root is a Struct/Array.
+        let root_is_container = {
+            let root_id = self.controller.view_root_id();
+            let tree = self.controller.tree();
+            let idx = tree.index_of_id(root_id);
+            root_id != 0
+                && idx >= 0
+                && matches!(
+                    tree.nodes[idx as usize].kind,
+                    NodeKind::Struct | NodeKind::Array
+                )
+        };
+        let track_values = self.controller.track_values();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
             menu.min_w(px(200.0))
                 .action_context(editor_focus.clone())
@@ -5655,6 +5810,54 @@ impl RcxEditor {
                             IconName::Plus,
                             Box::new(EditorAppendBytes),
                         )
+                })
+                // Add Static Field to the current view root (Struct/Array only).
+                .when(root_is_container, |menu| {
+                    menu.menu_with_icon(
+                        "Add Static Field",
+                        IconName::Plus,
+                        Box::new(EditorRootAddStaticField),
+                    )
+                })
+                .separator()
+                // Fold ▸ — Collapse All / Expand All (whole tree).
+                .submenu("Fold", mw, mcx, |sub, _w, _cx| {
+                    sub.menu_with_icon(
+                        "Collapse All\tCtrl+Shift+[",
+                        IconName::ChevronRight,
+                        Box::new(EditorCollapseAll),
+                    )
+                    .menu_with_icon(
+                        "Expand All\tCtrl+Shift+]",
+                        IconName::ChevronDown,
+                        Box::new(EditorExpandAll),
+                    )
+                })
+                // Copy ▸ — Copy Line / Copy All as Text (no node ⇒ no Address/Offset).
+                .submenu("Copy", mw, mcx, |sub, _w, _cx| {
+                    sub.menu_with_icon(
+                        "Copy Line\tCtrl+X",
+                        IconName::Copy,
+                        Box::new(EditorCopyLine),
+                    )
+                    .menu_with_icon(
+                        "Copy All as Text",
+                        IconName::Copy,
+                        Box::new(EditorCopyAllText),
+                    )
+                })
+                // Tracking ▸ — Track Value Changes (checkable) / Clear All History.
+                .submenu("Tracking", mw, mcx, move |sub, _w, _cx| {
+                    sub.menu_with_check(
+                        "Track Value Changes",
+                        track_values,
+                        Box::new(EditorTrackToggle),
+                    )
+                    .menu_with_icon(
+                        "Clear All History",
+                        IconName::Delete,
+                        Box::new(EditorTrackClear),
+                    )
                 })
         });
         self.show_context_menu_at(menu, pos, window, cx);
@@ -5693,6 +5896,44 @@ impl RcxEditor {
         let big_endian = {
             let idx = self.controller.tree().index_of_id(target.node_id);
             idx >= 0 && self.controller.tree().nodes[idx as usize].big_endian
+        };
+        // ── Item 11: inference-based quick-convert (the C++ `Convert to <type>` /
+        // `Split into <type>xN`, controller.cpp:3471) ──
+        //   For a HEX node, read the row's TypeHint chip `type_hint_kinds` (populated
+        //   by compose). A single hint → "Convert to <name>" (changeNodeKind); a
+        //   multi-kind hint → "Split into <name>xN". The dynamic kind(s) are stashed
+        //   in `pending_hint_convert` so the parameterless menu actions can read them
+        //   on click.
+        let hint_kinds: Vec<NodeKind> = if is_hex_ctx {
+            self.line_meta(target.line)
+                .and_then(|lm| {
+                    lm.chips
+                        .iter()
+                        .find(|c| c.kind == crate::core::linemeta::ChipKind::TypeHint)
+                        .map(|c| c.type_hint_kinds.clone())
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let hint_label: Option<String> = match hint_kinds.len() {
+            0 => None,
+            1 => Some(format!(
+                "Convert to {}",
+                crate::core::kind_to_string(hint_kinds[0])
+            )),
+            n => Some(format!(
+                "Split into {}\u{00D7}{}",
+                crate::core::kind_to_string(hint_kinds[0]),
+                n
+            )),
+        };
+        let hint_is_split = hint_kinds.len() > 1;
+        // Stash for the action handlers (cleared by them via `.take()`).
+        self.pending_hint_convert = if hint_kinds.is_empty() {
+            None
+        } else {
+            Some((target.node_id, hint_kinds))
         };
         // ── Menu-item gates (items 16/17/42), computed against the C++ rules ──
         let byte_size = crate::core::size_for_kind(target.kind);
@@ -5983,6 +6224,20 @@ impl RcxEditor {
                         }
                         sub
                     })
+                })
+                // Item 11: inference-based quick-convert — "Convert to <type>"
+                // (single hint) or "Split into <type>xN" (multi). Shown only for a
+                // hex node with a TypeHint (the C++ `lm.typeHintKinds` block,
+                // controller.cpp:3471), with a trailing separator.
+                .when(hint_label.is_some(), |menu| {
+                    let label = SharedString::from(hint_label.clone().unwrap_or_default());
+                    let action: Box<dyn gpui::Action> = if hint_is_split {
+                        Box::new(EditorHintSplit)
+                    } else {
+                        Box::new(EditorHintConvert)
+                    };
+                    menu.menu_with_icon(label, IconName::Frame, action)
+                        .separator()
                 })
                 // Item 16: Big endian only for scalar numeric kinds.
                 .when(show_big_endian, |menu| {
@@ -6376,10 +6631,7 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.close_context_menu(cx);
-        if !self.relative_offsets {
-            self.relative_offsets = true;
-            cx.notify();
-        }
+        self.toggle_relative_offsets(true, cx);
     }
 
     /// Item 27: switch the offset margin to absolute-address mode.
@@ -6390,10 +6642,25 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.close_context_menu(cx);
-        if self.relative_offsets {
-            self.relative_offsets = false;
-            cx.notify();
+        self.toggle_relative_offsets(false, cx);
+    }
+
+    /// Item 12: set the relative-offsets margin mode from WITHIN the editor (the
+    /// margin double-click / the right-click Relative/Absolute actions), then emit
+    /// [`RcxEditorEvent::ViewOptionToggled`] so the host persists the setting, sets
+    /// the View-menu checkmark, and pushes the value to every open editor / split
+    /// pane (the C++ `setRelativeOffsets` → `relativeOffsetsChanged`,
+    /// editor.cpp:2754). No-op (and no emit) when the value is unchanged.
+    fn toggle_relative_offsets(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.relative_offsets == value {
+            return;
         }
+        self.relative_offsets = value;
+        cx.emit(RcxEditorEvent::ViewOptionToggled {
+            option: EditorViewOption::RelativeOffsets,
+            value,
+        });
+        cx.notify();
     }
 
     /// Item 6 / B4: convert the root class keyword to `struct` (the C++
@@ -6512,6 +6779,71 @@ impl RcxEditor {
         }
     }
 
+    // ── Item 11: type-inference quick-convert (Convert to / Split into) ──
+
+    /// "Convert to <type>" (single type hint): change the captured hex node to the
+    /// single suggested kind (the C++ `changeNodeKind(ni, suggested)`,
+    /// controller.cpp:3478). Reads the kind stashed in `pending_hint_convert`.
+    fn action_hint_convert(
+        &mut self,
+        _: &EditorHintConvert,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some((node_id, kinds)) = self.pending_hint_convert.take() {
+            if let Some(&k) = kinds.first() {
+                let idx = self.controller.tree().index_of_id(node_id);
+                if idx >= 0 {
+                    self.controller.change_node_kind(idx as usize, k);
+                    self.after_mutation(cx);
+                }
+            }
+        }
+    }
+
+    /// "Split into <type>xN" (multiple type hints): change the captured hex node to
+    /// the first kind, then for each remaining kind change the NEXT sibling node if
+    /// it is still a hex node (the C++ split loop, controller.cpp:3487). Re-resolves
+    /// the node index each step (a kind change can shift indices).
+    fn action_hint_split(&mut self, _: &EditorHintSplit, _w: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let Some((node_id, kinds)) = self.pending_hint_convert.take() else {
+            return;
+        };
+        if kinds.is_empty() {
+            return;
+        }
+        // Mirror the C++ split loop (controller.cpp:3487): change the node to the
+        // first kind, then for each remaining kind change the NEXT sibling node iff
+        // it is still a hex node. Re-resolve the node index each step (a kind change
+        // can shift indices).
+        let idx = self.controller.tree().index_of_id(node_id);
+        if idx >= 0 {
+            self.controller.change_node_kind(idx as usize, kinds[0]);
+        }
+        for k in kinds.iter().skip(1) {
+            let ni = self.controller.tree().index_of_id(node_id);
+            if ni < 0 {
+                break;
+            }
+            let next = ni as usize + 1;
+            let next_is_hex = self
+                .controller
+                .tree()
+                .nodes
+                .get(next)
+                .map(|n| is_hex_preview(n.kind))
+                .unwrap_or(false);
+            if next_is_hex {
+                self.controller.change_node_kind(next, *k);
+            } else {
+                break;
+            }
+        }
+        self.after_mutation(cx);
+    }
+
     // ── Item 7: in-place hex / ASCII overwrite editor entry points ──
 
     fn action_edit_bytes_hex(
@@ -6548,10 +6880,14 @@ impl RcxEditor {
     ) {
         self.close_context_menu(cx);
         if let Some(t) = self.action_target() {
-            if let Some(lm) = self.line_meta(t.line).cloned() {
-                let base = self.controller.last_result().layout.base_address;
-                let off = lm.offset_addr.saturating_sub(base);
-                cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{:X}", off)));
+            // Item 4: copy the node's LOCAL `.offset` field (its offset within its
+            // parent), formatted "+0x" + uppercase-hex right-justified to 4 digits —
+            // NOT the absolute composed offset (the C++ `Copy &Offset`,
+            // controller.cpp:3940). e.g. node.offset 8 → "+0x0008".
+            let idx = self.controller.tree().index_of_id(t.node_id);
+            if idx >= 0 {
+                let off = self.controller.tree().nodes[idx as usize].offset;
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("+0x{off:04X}")));
             }
         }
     }
@@ -6741,6 +7077,35 @@ impl RcxEditor {
                 self.controller.insert_static_field(parent);
                 self.apply_document(cx);
             }
+        }
+    }
+
+    /// Item 11: "Add Static Field" from the no-node (empty-area) menu — add a
+    /// static field to the current VIEW ROOT, when it is a Struct/Array (the C++
+    /// `!hasNode` branch, controller.cpp:3904).
+    fn action_root_add_static_field(
+        &mut self,
+        _: &EditorRootAddStaticField,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let root_id = self.controller.view_root_id();
+        if root_id == 0 {
+            return;
+        }
+        let is_container = {
+            let tree = self.controller.tree();
+            let idx = tree.index_of_id(root_id);
+            idx >= 0
+                && matches!(
+                    tree.nodes[idx as usize].kind,
+                    NodeKind::Struct | NodeKind::Array
+                )
+        };
+        if is_container {
+            self.controller.insert_static_field(root_id);
+            self.apply_document(cx);
         }
     }
 
@@ -7095,9 +7460,26 @@ impl RcxEditor {
     /// structs"). Composites are appended after the primitives, mirroring the C++
     /// catalogue. `exclude_id` drops a struct from the list (so a struct cannot
     /// reference itself).
-    fn full_type_entries(&self, exclude_id: u64) -> Vec<crate::ui::typeselectorpopup::TypeEntry> {
-        use crate::ui::typeselectorpopup::{default_type_entries, TypeEntry};
-        let mut entries = default_type_entries();
+    ///
+    /// In [`TypePopupMode::PointerTarget`] mode the synthetic **void** entry is
+    /// prepended (item 43): a `Hex8`-backed primitive named "void" so a Ctrl+Click
+    /// pointer-retarget can pick void (the C++ `PointerTarget` `voidEntry`,
+    /// controller.cpp:4724). It applies as `refId = 0` via the PointerTarget branch
+    /// of `apply_type_popup_result` (a primitive entry ⇒ refId 0).
+    fn full_type_entries(
+        &self,
+        exclude_id: u64,
+        mode: crate::ui::typeselectorpopup::TypePopupMode,
+    ) -> Vec<crate::ui::typeselectorpopup::TypeEntry> {
+        use crate::ui::typeselectorpopup::{default_type_entries, TypeEntry, TypePopupMode};
+        let mut entries: Vec<TypeEntry> = Vec::new();
+        if mode == TypePopupMode::PointerTarget {
+            // Synthetic "void" target — a Hex8-backed primitive applied as refId 0.
+            let mut void = TypeEntry::primitive(NodeKind::Hex8, "void");
+            void.enabled = true;
+            entries.push(void);
+        }
+        entries.extend(default_type_entries());
         let tree = self.controller.tree();
         let mut composites: Vec<TypeEntry> = Vec::new();
         for n in tree.nodes.iter() {
@@ -7143,7 +7525,7 @@ impl RcxEditor {
             EditTarget::PointerTarget => TypePopupMode::PointerTarget,
             _ => TypePopupMode::FieldType,
         };
-        let entries = self.full_type_entries(target.node_id);
+        let entries = self.full_type_entries(target.node_id, mode);
         self.spawn_type_selector(entries, target, mode, window, cx);
     }
 
@@ -7169,7 +7551,7 @@ impl RcxEditor {
         };
         // Root mode lists every declared composite so the user can re-root onto a
         // different struct (do NOT exclude the current root — it may be re-picked).
-        let entries = self.full_type_entries(0);
+        let entries = self.full_type_entries(0, TypePopupMode::Root);
         self.spawn_type_selector(entries, target, TypePopupMode::Root, window, cx);
     }
 
@@ -7184,14 +7566,47 @@ impl RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
+        use crate::ui::typeselectorpopup::{TypePopupMode, TypeSelectorEvent, TypeSelectorPopup};
+        // The popup opens pre-highlighting the node's ACTUAL current type (the C++
+        // `setTypes(.., &currentEntry)`): for a composite that means the referenced
+        // struct id (pre-select by structId), for a primitive the kind. Also compute
+        // the C++ footer-size baseline (`nodeSize = sizeForKind(node.kind)`, or the
+        // ELEMENT kind in ArrayElement mode) + the tree's pointer size, and feed the
+        // recent-type names so the "Recent" section appears (items 38/39/40/41).
+        let (node_size, ptr_size, cur_struct_id) = {
+            let tree = self.controller.tree();
+            let ps = tree.pointer_size;
+            let idx = tree.index_of_id(target.node_id);
+            if idx >= 0 {
+                let n = &tree.nodes[idx as usize];
+                let sz = if mode == TypePopupMode::ArrayElement {
+                    crate::core::size_for_kind(n.element_kind)
+                } else {
+                    crate::core::size_for_kind(n.kind)
+                };
+                // The node already references a composite when its `ref_id` is set
+                // (typed pointer / embedded struct / array-of-struct).
+                (sz, ps, n.ref_id)
+            } else {
+                (crate::core::size_for_kind(target.kind), ps, 0u64)
+            }
+        };
+        let recent = self.recent_type_names.clone();
         let popup = cx.new(|cx| {
-            let mut p = TypeSelectorPopup::new(entries, window, cx);
+            let mut p = TypeSelectorPopup::new_with_current(entries, target.kind, window, cx);
             p.set_mode(mode, cx);
+            p.set_sizes(node_size, ptr_size);
+            p.set_recent_names(recent, cx);
+            // Pre-highlight the composite the node already references, by structId
+            // (the C++ `m_currentEntry.entryKind == Composite` branch). For a plain
+            // primitive node this is 0 and the kind pre-select (in new_with_current)
+            // stands.
+            if cur_struct_id != 0 {
+                p.set_current_struct(cur_struct_id, cx);
+            }
             p
         });
         let focus = popup.read(cx).focus_handle(cx);
-        let node_idx = target.node_idx;
         let node_id = target.node_id;
         self._type_selector_sub = Some(cx.subscribe_in(
             &popup,
@@ -7201,6 +7616,9 @@ impl RcxEditor {
                     kind,
                     modifier,
                     create_new,
+                    entry_kind,
+                    struct_id,
+                    display_name,
                 } => {
                     window.close_dialog(cx);
                     this._type_selector_sub = None;
@@ -7211,7 +7629,16 @@ impl RcxEditor {
                         this.controller.new_class_on_node(node_id);
                         this.apply_document(cx);
                     } else {
-                        this.apply_type_choice(node_idx, node_id, *kind, *modifier, cx);
+                        this.apply_type_choice(
+                            mode,
+                            node_id,
+                            *kind,
+                            *modifier,
+                            *entry_kind,
+                            *struct_id,
+                            display_name,
+                            cx,
+                        );
                     }
                 }
                 TypeSelectorEvent::Cancel => {
@@ -7232,102 +7659,81 @@ impl RcxEditor {
         cx.notify();
     }
 
-    /// Apply a TypeSelector choice: set the base kind, then the chosen modifier
-    /// (the existing `typeselectorpopup::Modifier`: pointer/double-pointer/array)
-    /// via the controller ops, then recompose. Resolves the node by id first so a
-    /// kind change that shifts indices does not desync the modifier step.
+    /// Apply a TypeSelector choice by routing the WHOLE pick through the
+    /// controller's `apply_type_popup_result` with a faithful `TypePopupChoice`
+    /// (items 35/36/37). This is the single C++-parity apply path: it carries the
+    /// composite identity (`struct_id` / `display_name`) so selecting an EXISTING
+    /// composite references it by id (not a bare empty Struct); routes a primitive
+    /// `*` through `is_valid_primitive_ptr_target` (element_kind + ptr_depth, NOT
+    /// `convert_to_typed_pointer`); and keeps the `refId` for a composite `[]`
+    /// array. The optional `modifier` (`*`/`**`/`[N]`) becomes the `full_text`
+    /// suffix that `apply_type_popup_result` parses into a `TypeSpec`.
+    #[allow(clippy::too_many_arguments)]
     fn apply_type_choice(
         &mut self,
-        node_idx: usize,
+        mode: crate::ui::typeselectorpopup::TypePopupMode,
         node_id: u64,
         kind: NodeKind,
         modifier: Option<crate::ui::typeselectorpopup::Modifier>,
+        entry_kind: crate::ui::typeselectorpopup::EntryKind,
+        struct_id: u64,
+        display_name: &str,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::typeselectorpopup::Modifier;
-        // Base kind first.
-        self.controller.change_node_kind(node_idx, kind);
-        // Then the modifier (pointer / double-pointer / array) via the controller
-        // ops, re-resolving the node id (change_node_kind may have shifted indices).
-        match modifier {
-            // `*` single pointer to a fresh class.
-            Some(Modifier::Pointer) => {
-                self.controller.convert_to_typed_pointer(node_id);
+        use crate::controller::{TypeEntryKind, TypePopupChoice, TypePopupMode as CMode};
+        use crate::ui::typeselectorpopup::{EntryKind, Modifier, TypePopupMode};
+
+        // Map the popup's mode → the controller's mode (same four cases).
+        let cmode = match mode {
+            TypePopupMode::Root => CMode::Root,
+            TypePopupMode::FieldType => CMode::FieldType,
+            TypePopupMode::ArrayElement => CMode::ArrayElement,
+            TypePopupMode::PointerTarget => CMode::PointerTarget,
+        };
+
+        // The base display name: a primitive uses its canonical kind name, a
+        // composite the struct/enum display name carried from the popup row.
+        let base_name = if entry_kind == EntryKind::Composite && !display_name.is_empty() {
+            display_name.to_string()
+        } else {
+            crate::core::kind_to_string(kind).to_string()
+        };
+        // The modifier suffix (`*` / `**` / `[N]`) → the `full_text` the controller
+        // parses (`acceptCurrent` `fullText`); empty modifier ⇒ derive from name.
+        let full_text = match modifier {
+            Some(m @ (Modifier::Pointer | Modifier::PointerPointer | Modifier::Array(_))) => {
+                format!("{}{}", base_name, m.suffix())
             }
-            // `**` double pointer (item 7): the C++ keeps a distinct pointer DEPTH.
-            // We have no dedicated double-pointer op, so make the node a typed
-            // pointer to a fresh class AND retarget that class's first field as a
-            // pointer too — the on-disk `**` shape (a pointer whose pointee is a
-            // pointer), rather than silently collapsing `**` to a single `*`.
-            Some(Modifier::PointerPointer) => {
-                self.controller.convert_to_typed_pointer(node_id);
-                // Resolve the new pointee struct's first child and make it a pointer
-                // as well, giving the second level of indirection.
-                let inner_kind = if self.controller.tree().pointer_size >= 8 {
-                    NodeKind::Pointer64
-                } else {
-                    NodeKind::Pointer32
-                };
-                if let Some(first_child_idx) = self.first_pointee_field_idx(node_id) {
-                    self.controller
-                        .convert_to_typed_pointer(self.controller.tree().nodes[first_child_idx].id);
-                    let _ = inner_kind;
-                }
-            }
-            // `[N]` array with the chosen element COUNT (item 7): change to Array,
-            // then push a `ChangeArrayMeta` carrying the element kind + the count so
-            // the `[N]` is not dropped.
-            Some(Modifier::Array(count)) => {
-                let idx = self.controller.tree().index_of_id(node_id);
-                if idx >= 0 {
-                    self.controller
-                        .change_node_kind(idx as usize, NodeKind::Array);
-                    self.set_array_meta(node_id, kind, count.max(1));
-                }
-            }
-            Some(Modifier::None) | None => {}
-        }
+            Some(Modifier::None) | None => String::new(),
+        };
+
+        let choice = TypePopupChoice {
+            entry_kind: if entry_kind == EntryKind::Composite {
+                TypeEntryKind::Composite
+            } else {
+                TypeEntryKind::Primitive
+            },
+            primitive_kind: kind,
+            struct_id,
+            display_name: base_name.clone(),
+            full_text,
+            create_new: false,
+        };
+
+        // Record the pick in the recent-types list (the C++ `pushRecentType` on
+        // apply) so a subsequent open surfaces it in the "Recent" section.
+        self.push_recent_type(&base_name);
+
+        self.controller
+            .apply_type_popup_result(cmode, node_id, choice);
         self.apply_document(cx);
     }
 
-    /// The tree index of the FIRST child field of the struct a typed pointer
-    /// (`node_id`) references (its `ref_id`'s first child), if any — used to apply
-    /// the second level of a `**` double pointer (item 7).
-    fn first_pointee_field_idx(&self, node_id: u64) -> Option<usize> {
-        let tree = self.controller.tree();
-        let pi = tree.index_of_id(node_id);
-        if pi < 0 {
-            return None;
-        }
-        let ref_id = tree.nodes[pi as usize].ref_id;
-        if ref_id == 0 {
-            return None;
-        }
-        tree.children_of(ref_id).first().copied()
-    }
-
-    /// Push an undoable `ChangeArrayMeta` setting the array element kind + length
-    /// (item 7). Reads the node's current array meta for the undo half. No-op when
-    /// the node id no longer resolves.
-    fn set_array_meta(&mut self, node_id: u64, element_kind: NodeKind, count: i32) {
-        let idx = self.controller.tree().index_of_id(node_id);
-        if idx < 0 {
-            return;
-        }
-        let n = &self.controller.tree().nodes[idx as usize];
-        let old_element_kind = n.element_kind;
-        let old_array_len = n.array_len;
-        if old_element_kind == element_kind && old_array_len == count {
-            return;
-        }
-        self.controller
-            .push_command(crate::core::Command::ChangeArrayMeta {
-                node_id,
-                old_element_kind,
-                new_element_kind: element_kind,
-                old_array_len,
-                new_array_len: count,
-            });
+    /// Push a picked type `display_name` to the front of the recent-types list,
+    /// dedup-to-front and capped at 8 (the C++ `RcxController::pushRecentType`,
+    /// controller.cpp:4819). Empty names are ignored.
+    fn push_recent_type(&mut self, display_name: &str) {
+        push_recent_type_into(&mut self.recent_type_names, display_name);
     }
 
     // ── Data-source picker (SourceChooserPopup; items 1/5, contract CONSUMES) ──
@@ -7837,6 +8243,19 @@ fn alt_kind_for(kind: NodeKind) -> NodeKind {
 /// kinds, exactly the C++ set (controller.cpp:3763): `Hex16..=Hex128`,
 /// `Int16..=UInt128`, `Float16`, `Float`, `Double`. Never Hex8, bool, ptr/fnptr,
 /// struct/array/enum/bitfield/string/vector.
+/// Push a picked type `display_name` to the FRONT of `list`, removing any prior
+/// occurrence (dedup-to-front) and capping the list at 8 entries — the C++
+/// `RcxController::pushRecentType` (controller.cpp:4819). Empty names are ignored.
+/// Free so it is unit-testable without a gpui view (item 3/11 recent-types list).
+fn push_recent_type_into(list: &mut Vec<String>, display_name: &str) {
+    if display_name.is_empty() {
+        return;
+    }
+    list.retain(|n| n != display_name);
+    list.insert(0, display_name.to_string());
+    list.truncate(8);
+}
+
 fn is_scalar_numeric_kind(kind: NodeKind) -> bool {
     use crate::core::NodeKind::*;
     matches!(
@@ -7849,6 +8268,11 @@ fn is_scalar_numeric_kind(kind: NodeKind) -> bool {
             | Int32
             | Int64
             | Int128
+            // Item 6: UInt8 sits between Int128 and UInt16 in the C++ enum order,
+            // so the C++ predicate `node.kind in [Int16 .. UInt128]` SPANS UInt8 —
+            // the Big-endian item shows for a UInt8 node. (Int8, below Int16, is
+            // NOT in range and stays excluded, matching the C++.)
+            | UInt8
             | UInt16
             | UInt32
             | UInt64
@@ -8035,6 +8459,9 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_static_add_field))
             .on_action(cx.listener(Self::action_static_edit_expr))
             .on_action(cx.listener(Self::action_static_dissolve_union))
+            .on_action(cx.listener(Self::action_root_add_static_field))
+            .on_action(cx.listener(Self::action_hint_convert))
+            .on_action(cx.listener(Self::action_hint_split))
             .on_action(cx.listener(Self::action_toggle_big_endian))
             .on_action(cx.listener(Self::action_duplicate))
             .on_action(cx.listener(Self::action_delete))
@@ -9099,5 +9526,79 @@ mod tests {
             ..Node::default()
         };
         assert_eq!(goto_def_target(&scalar), 0);
+    }
+
+    #[test]
+    fn ctrl_click_new_tab_target_matches_goto_definition_resolution() {
+        // Item 10: the Ctrl+Click "open in new tab" target resolves IDENTICALLY to
+        // go-to-definition: a typed ref wins, else a plain embedded struct opens its
+        // OWN subtree (its id) — previously the Ctrl+Click branch only fired for
+        // `ref_id != 0`, so a plain embedded struct header fell through to selection.
+        use crate::core::{Node, NodeKind};
+        let embedded = Node {
+            kind: NodeKind::Struct,
+            ref_id: 0,
+            parent_id: 1,
+            id: 77,
+            ..Node::default()
+        };
+        // The new-tab branch must NOT yield 0 for a plain embedded struct.
+        assert_eq!(goto_def_target(&embedded), 77);
+        assert_ne!(goto_def_target(&embedded), 0);
+    }
+
+    #[test]
+    fn big_endian_eligibility_spans_uint8_but_not_int8() {
+        // Item 6: the C++ predicate `kind in [Int16 .. UInt128]` SPANS UInt8 in the
+        // enum ordering (Int8 < Int16 .. < UInt8 < .. < UInt128), so UInt8 IS
+        // eligible for the Big-endian item; Int8 (below Int16) is NOT.
+        use crate::core::NodeKind;
+        assert!(super::is_scalar_numeric_kind(NodeKind::UInt8));
+        assert!(!super::is_scalar_numeric_kind(NodeKind::Int8));
+        // Hex8 is excluded (only Hex16..Hex128 are scalar), Hex16 included.
+        assert!(!super::is_scalar_numeric_kind(NodeKind::Hex8));
+        assert!(super::is_scalar_numeric_kind(NodeKind::Hex16));
+        // Containers / pointers are never scalar-numeric.
+        assert!(!super::is_scalar_numeric_kind(NodeKind::Struct));
+        assert!(!super::is_scalar_numeric_kind(NodeKind::Pointer64));
+        // Spot-check the rest of the spanned range.
+        assert!(super::is_scalar_numeric_kind(NodeKind::Int16));
+        assert!(super::is_scalar_numeric_kind(NodeKind::UInt128));
+        assert!(super::is_scalar_numeric_kind(NodeKind::Double));
+    }
+
+    #[test]
+    fn copy_offset_format_is_plus_0x_uppercase_zero_padded_4() {
+        // Item 4: Copy Offset copies the node's LOCAL `.offset` field formatted
+        // "+0x" + uppercase-hex right-justified to 4 digits (the C++
+        // `"+0x" + QString::number(off,16).toUpper().rightJustified(4,'0')`).
+        let fmt = |off: i32| format!("+0x{off:04X}");
+        assert_eq!(fmt(8), "+0x0008");
+        assert_eq!(fmt(0), "+0x0000");
+        assert_eq!(fmt(0x1a), "+0x001A");
+        // A wide offset is NOT truncated (rightJustified only pads).
+        assert_eq!(fmt(0x12345), "+0x12345");
+    }
+
+    #[test]
+    fn recent_types_dedup_to_front_and_cap_at_8() {
+        // Item 3/11: pushRecentType moves a re-picked name to the front (dedup) and
+        // caps the list at 8, most-recent-first.
+        let mut list: Vec<String> = Vec::new();
+        for i in 0..10 {
+            super::push_recent_type_into(&mut list, &format!("T{i}"));
+        }
+        // Capped at 8, newest first.
+        assert_eq!(list.len(), 8);
+        assert_eq!(list[0], "T9");
+        assert_eq!(list[7], "T2");
+        // Re-picking an existing name moves it to the front (no duplicate).
+        super::push_recent_type_into(&mut list, "T4");
+        assert_eq!(list[0], "T4");
+        assert_eq!(list.iter().filter(|n| *n == "T4").count(), 1);
+        assert_eq!(list.len(), 8);
+        // Empty names are ignored.
+        super::push_recent_type_into(&mut list, "");
+        assert_eq!(list[0], "T4");
     }
 }

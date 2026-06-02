@@ -854,25 +854,138 @@ pub fn resolved_span_for(
     }
 }
 
-/// Header type-name span: the type column on a header line, rejecting anonymous
-/// `struct/union/class`/`[N]` names (editor-surface.md §8 header fallbacks). A
-/// minimal column-based approximation of the editor-local `headerTypeNameSpan`.
-fn header_type_span(lm: &LineMeta, _text: &str, type_w: i32) -> ColumnSpan {
+/// The `[start, end)` char-column slice of `text`, trimmed of surrounding ASCII
+/// whitespace, returned with its trimmed char bounds. Mirrors the C++
+/// `QString::mid(start, len).trimmed()` semantics used by the header span helpers.
+fn col_slice_trimmed(text: &str, start: i32, end: i32) -> (String, i32, i32) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len() as i32;
+    let s = start.clamp(0, n);
+    let e = end.clamp(s, n);
+    let mut ts = s;
+    while ts < e && chars[ts as usize].is_whitespace() {
+        ts += 1;
+    }
+    let mut te = e;
+    while te > ts && chars[(te - 1) as usize].is_whitespace() {
+        te -= 1;
+    }
+    let inner: String = chars[ts as usize..te as usize].iter().collect();
+    (inner, ts, te)
+}
+
+/// Header type-name span: the clickable type-name column on a struct header line
+/// (NOT an array header). Faithful port of the editor-local `headerTypeNameSpan`
+/// (editor.cpp:2165): rejects anonymous bare `struct`/`union`/`class` keyword
+/// headers, skips a leading `static ` prefix on static-field headers, and trims
+/// the column padding to the actual type-name bounds. Returns an invalid span
+/// (so the caller falls through / refuses the edit) when the type column is empty
+/// or a bare keyword. Items 90/91.
+fn header_type_span(lm: &LineMeta, text: &str, type_w: i32) -> ColumnSpan {
+    if lm.line_kind != LineKind::Header || lm.is_array_header {
+        return ColumnSpan::default();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len() as i32;
     let ind = compose::K_FOLD_COL + lm.depth * compose::K_TREE_INDENT;
+    let type_end = (ind + type_w).min(len);
+
+    let (type_col, _, _) = col_slice_trimmed(text, ind, type_end);
+    if type_col.is_empty() {
+        return ColumnSpan::default();
+    }
+    // Anonymous structs use bare keywords — not clickable.
+    if matches!(type_col.as_str(), "struct" | "union" | "class") {
+        return ColumnSpan::default();
+    }
+
+    // Static field headers: "static hex64 target {" — skip the "static " prefix,
+    // then return the FIRST whitespace-delimited token (the type name).
+    if lm.is_static_line {
+        let mut cursor = ind;
+        while cursor < type_end && chars[cursor as usize] == ' ' {
+            cursor += 1;
+        }
+        // Peek the 7 chars "static " at the cursor.
+        let peek: String = chars
+            .iter()
+            .skip(cursor as usize)
+            .take(7)
+            .collect::<String>();
+        if peek == "static " {
+            cursor += 7;
+        }
+        while cursor < type_end && chars[cursor as usize] == ' ' {
+            cursor += 1;
+        }
+        let t_start = cursor;
+        while cursor < type_end && chars[cursor as usize] != ' ' {
+            cursor += 1;
+        }
+        if cursor > t_start {
+            return ColumnSpan {
+                start: t_start,
+                end: cursor,
+                valid: true,
+            };
+        }
+        return ColumnSpan::default();
+    }
+
+    // Named struct: the entire type column is the type name; find its bounds
+    // within the padded column.
+    let mut start = ind;
+    while start < type_end && chars[start as usize] == ' ' {
+        start += 1;
+    }
+    let mut end = start;
+    while end < type_end && chars[end as usize] != ' ' {
+        end += 1;
+    }
+    if end <= start {
+        return ColumnSpan::default();
+    }
     ColumnSpan {
-        start: ind,
-        end: ind + type_w,
+        start,
+        end,
         valid: true,
     }
 }
 
-/// Header field-name span: the name column on a header line.
-fn header_name_span(lm: &LineMeta, _text: &str, type_w: i32, name_w: i32) -> ColumnSpan {
+/// Header field-name span: the clickable name column on a header line. Faithful
+/// port of `headerNameSpan` (editor.cpp:2137): the name ends before a trailing
+/// `" {"` (expanded headers) or at line end (collapsed), and the span is INVALID
+/// for an empty name or an array-element name (`[0]`/`[1]`/…) — so clicking those
+/// does not open an inline editor (matching C++). Items 90/91.
+fn header_name_span(lm: &LineMeta, text: &str, type_w: i32, _name_w: i32) -> ColumnSpan {
+    if lm.line_kind != LineKind::Header {
+        return ColumnSpan::default();
+    }
+    let len = col_len(text);
     let ind = compose::K_FOLD_COL + lm.depth * compose::K_TREE_INDENT;
-    let start = ind + type_w + compose::K_SEP_WIDTH;
+    let name_start = ind + type_w + compose::K_SEP_WIDTH;
+    if name_start >= len {
+        return ColumnSpan::default();
+    }
+    // Name ends before the " {" suffix (expanded) or at line end (collapsed).
+    let mut name_end = len;
+    if text.ends_with(" {") {
+        name_end = len - 2;
+    }
+    if name_end <= name_start {
+        return ColumnSpan::default();
+    }
+    // Reject empty / array-element names ("[0]", "[1]", …).
+    let (name, _, _) = col_slice_trimmed(text, name_start, name_end);
+    if name.is_empty() {
+        return ColumnSpan::default();
+    }
+    if name.starts_with('[') && name.ends_with(']') {
+        return ColumnSpan::default();
+    }
     ColumnSpan {
-        start,
-        end: start + name_w,
+        start: name_start,
+        end: name_end,
         valid: true,
     }
 }
@@ -1661,5 +1774,105 @@ mod tests {
         assert_eq!(span.0, vs.start);
         // Narrowed: the recolor ends at the chip, not the full value span.
         assert_eq!(span.1, chip_start);
+    }
+
+    // ── Header type/name span ports (items 5/90/91) ──
+
+    fn header_line(depth: i32) -> LineMeta {
+        LineMeta {
+            line_kind: LineKind::Header,
+            node_kind: NodeKind::Struct,
+            depth,
+            ..LineMeta::default()
+        }
+    }
+
+    /// Build a header line text whose type column occupies `[ind, ind+type_w)` and
+    /// the name follows after the separator. `ind = K_FOLD_COL + depth*K_TREE_INDENT`.
+    fn compose_header_text(depth: i32, type_text: &str, type_w: i32, name: &str) -> String {
+        let ind = (compose::K_FOLD_COL + depth * compose::K_TREE_INDENT) as usize;
+        let mut s = " ".repeat(ind);
+        s.push_str(type_text);
+        // Pad the type column out to type_w.
+        let cur = type_text.chars().count() as i32;
+        if cur < type_w {
+            s.push_str(&" ".repeat((type_w - cur) as usize));
+        }
+        s.push_str(&" ".repeat(compose::K_SEP_WIDTH as usize));
+        s.push_str(name);
+        s
+    }
+
+    #[test]
+    fn header_type_span_rejects_anonymous_keyword_headers() {
+        // "union {" — a bare keyword type column is NOT clickable (item 90).
+        let lm = header_line(0);
+        let text = compose_header_text(0, "union", 9, "{");
+        let s = header_type_span(&lm, &text, 9);
+        assert!(!s.valid, "bare 'union' keyword type column must be invalid");
+
+        // "class"/"struct" likewise.
+        let text2 = compose_header_text(0, "struct", 9, "{");
+        assert!(!header_type_span(&lm, &text2, 9).valid);
+    }
+
+    #[test]
+    fn header_type_span_trims_named_type_and_skips_brace() {
+        // "_MMPTE   OriginalPte {" — the type column is just the (padded) name.
+        let lm = header_line(0);
+        let type_w = 12;
+        let text = compose_header_text(0, "_MMPTE", type_w, "OriginalPte {");
+        let s = header_type_span(&lm, &text, type_w);
+        assert!(s.valid);
+        let slice: String = text.chars().collect::<Vec<_>>()[s.start as usize..s.end as usize]
+            .iter()
+            .collect();
+        // Trimmed to the actual type-name bounds (no padding, no following columns).
+        assert_eq!(slice, "_MMPTE");
+    }
+
+    #[test]
+    fn header_type_span_skips_static_prefix() {
+        // A static-field header "static hex64 target {" — the type span is the type
+        // token AFTER the "static " prefix (item 91).
+        let mut lm = header_line(0);
+        lm.is_static_line = true;
+        let type_w = 20;
+        let text = compose_header_text(0, "static hex64", type_w, "target {");
+        let s = header_type_span(&lm, &text, type_w);
+        assert!(s.valid);
+        let slice: String = text.chars().collect::<Vec<_>>()[s.start as usize..s.end as usize]
+            .iter()
+            .collect();
+        assert_eq!(slice, "hex64");
+    }
+
+    #[test]
+    fn header_name_span_trims_trailing_brace_and_padding() {
+        // Expanded header "Player   instance {" — the name ends BEFORE " {".
+        let lm = header_line(0);
+        let type_w = 9;
+        let text = compose_header_text(0, "Player", type_w, "instance {");
+        let s = header_name_span(&lm, &text, type_w, 22);
+        assert!(s.valid);
+        // The name span must NOT include the trailing " {".
+        assert!(
+            !text.chars().collect::<Vec<_>>()[s.start as usize..s.end as usize]
+                .iter()
+                .collect::<String>()
+                .contains('{')
+        );
+        // And it ends exactly at len-2 (the " {" suffix).
+        assert_eq!(s.end, col_len(&text) - 2);
+    }
+
+    #[test]
+    fn header_name_span_rejects_array_element_names() {
+        // An array-element header name "[0]" is NOT an editable name (item 91).
+        let lm = header_line(0);
+        let type_w = 9;
+        let text = compose_header_text(0, "Player", type_w, "[0] {");
+        let s = header_name_span(&lm, &text, type_w, 22);
+        assert!(!s.valid, "array-element name '[0]' must be invalid");
     }
 }

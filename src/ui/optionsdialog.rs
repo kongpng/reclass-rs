@@ -94,6 +94,13 @@ pub const REFRESH_DESC: &str =
     "How often live memory is re-read and the view is updated, in milliseconds. \
      Lower values give faster updates but use more CPU. Default: 660 ms.";
 
+/// The verbatim C++ AI-page MCP description (`optionsdialog.cpp:152-154`), shown
+/// under the "Auto-start MCP server" checkbox. The two adjacent C++ string
+/// literals concatenate (with the space the first literal ends on) into one line.
+pub const MCP_DESC: &str =
+    "Automatically start the MCP bridge server when the application launches, \
+     allowing external AI tools to connect and interact with the editor.";
+
 /// The font combo items (`optionsdialog.cpp:111-112`) — exactly two, in source
 /// order: the C++ ctor calls `m_fontCombo->addItem("JetBrains Mono")` then
 /// `addItem("Consolas")` and nothing else. (An earlier port added a third
@@ -249,7 +256,7 @@ pub use view::{OptionsDialog, OptionsEvent};
 mod view {
     use super::{
         filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
-        OptionsResult, FONT_CHOICES, REFRESH_DESC,
+        OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DESC,
     };
     use crate::ui::design::{color, section_label, tokens, zed_list_row};
     use crate::ui::dialogs::modal;
@@ -689,11 +696,8 @@ mod view {
                             cx.notify();
                         })),
                 )
-                .child(modal::help_text(
-                    "Starts the Model-Context-Protocol server automatically when \
-                     Reclass launches.",
-                    cx,
-                ))
+                // Verbatim C++ MCP description (optionsdialog.cpp:152-154).
+                .child(modal::help_text(MCP_DESC, cx))
         }
 
         fn render_generator(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -702,6 +706,8 @@ mod view {
                 .gap(px(tokens::space::SM))
                 .flex_1()
                 .child(section_label("C++ Header", cx))
+                // The C++ `cppGroup` (optionsdialog.cpp:174-179) holds ONLY the
+                // checkbox — no description label — so we add none here.
                 .child(
                     Checkbox::new("opt-asserts")
                         .label("Emit static_assert size checks")
@@ -711,11 +717,6 @@ mod view {
                             cx.notify();
                         })),
                 )
-                .child(modal::help_text(
-                    "Appends a static_assert after each generated struct to verify \
-                     its size at compile time.",
-                    cx,
-                ))
         }
     }
 
@@ -853,7 +854,8 @@ mod view {
 mod tests {
     use super::{
         filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
-        OptionsResult, FONT_CHOICES, REFRESH_DEFAULT, REFRESH_FALLBACK, REFRESH_MAX, REFRESH_MIN,
+        OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DEFAULT, REFRESH_FALLBACK, REFRESH_MAX,
+        REFRESH_MIN,
     };
 
     #[test]
@@ -1005,6 +1007,25 @@ mod tests {
         assert_eq!(step_visible_page(&visible, OptionsPage::General, 1), None);
         // Empty list → no move.
         assert_eq!(step_visible_page(&[], OptionsPage::General, 1), None);
+    }
+
+    #[test]
+    fn mcp_desc_is_verbatim_cpp() {
+        // The AI-page MCP help must be the verbatim C++ string
+        // (optionsdialog.cpp:152-154), not a rephrase. The two adjacent C++
+        // literals concatenate to a single line with exactly one space at the
+        // seam ("launches, allowing").
+        assert_eq!(
+            MCP_DESC,
+            "Automatically start the MCP bridge server when the application \
+             launches, allowing external AI tools to connect and interact with \
+             the editor."
+        );
+        // The seam joins with exactly one space (no doubled/zero spaces).
+        assert!(MCP_DESC.contains("launches, allowing external"));
+        // The earlier rephrase wording is gone.
+        assert!(!MCP_DESC.contains("Model-Context-Protocol"));
+        assert!(!MCP_DESC.contains("Reclass launches"));
     }
 
     #[test]

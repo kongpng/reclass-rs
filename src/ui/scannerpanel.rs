@@ -195,9 +195,14 @@ impl Default for ScannerForm {
             value_type: ValueType::Int32,
             value_text: String::new(),
             value2_text: String::new(),
-            alignment: 1,
+            // Fast-Scan default is index 1 = 4 (dword), matching the C++
+            // `m_fastScanCombo->setCurrentIndex(1)` (scannerpanel.cpp:529).
+            alignment: 4,
             filter_executable: false,
-            filter_writable: false,
+            // Value mode scans writable memory by default — the C++ constructor
+            // calls `m_writeCheck->setChecked(true)` (scannerpanel.cpp:720), so a
+            // fresh first scan is writable-only, not all readable memory.
+            filter_writable: true,
             private_only: false,
             skip_system_modules: false,
             user_mode_only: false,
@@ -1083,13 +1088,73 @@ pub fn serialize_results_json(
     )
 }
 
+/// A parsed scanner results document — the recovered [`ScanResult`] list plus
+/// the saved scan mode + value type (the C++ `loadResultsFrom` reads
+/// `root["scanMode"]` / `root["valueType"]`, scannerpanel.cpp:2417-2418). The
+/// scan mode + value type drive how the Value column formats the loaded bytes,
+/// so they must be restored — without them a saved uint64 scan would format
+/// with the form's current type.
+#[derive(Clone, Debug)]
+pub struct ScannerResultsDoc {
+    /// The recovered result rows.
+    pub results: Vec<ScanResult>,
+    /// The saved scan mode (the C++ `m_lastScanMode`, 0 = Signature, 1 = Value).
+    /// Defaults to [`ScanMode::Signature`] (C++ `toInt(0)`) when absent.
+    pub scan_mode: ScanMode,
+    /// The saved value type (the C++ `m_lastValueType`). Defaults to
+    /// [`ValueType::Int32`] (C++ `toInt((int)ValueType::Int32)`) when absent.
+    pub value_type: ValueType,
+}
+
 /// Parse a scanner results JSON document (the inverse of
 /// [`serialize_results_json`]; the C++ `loadResultsFrom`). Returns the recovered
-/// [`ScanResult`] list. Tolerant hand-rolled scan over the `results` array (the
-/// format is a flat list of `{address, value, module?}` objects with hex
-/// fields), so loading a file the port itself wrote round-trips. Unknown / extra
-/// keys are ignored; a malformed entry is skipped. Pure + unit-tested.
-pub fn deserialize_results_json(json: &str) -> Vec<ScanResult> {
+/// [`ScanResult`] list together with the saved scan mode + value type. Tolerant
+/// hand-rolled scan over the `results` array (the format is a flat list of
+/// `{address, value, module?}` objects with hex fields), so loading a file the
+/// port itself wrote round-trips. Unknown / extra keys are ignored; a malformed
+/// entry is skipped. Pure + unit-tested.
+///
+/// The top-level `scanMode` / `valueType` ints are parsed the way the C++
+/// `loadResultsFrom` reads them (default scanMode 0 = Signature, default
+/// valueType = int32) so the Value column formats loaded bytes with the saved
+/// type rather than the form's current type.
+pub fn deserialize_results_json(json: &str) -> ScannerResultsDoc {
+    // Extract a top-level integer field `"key": N` (numeric, not string-quoted).
+    fn int_field(json: &str, key: &str) -> Option<i64> {
+        let pat = format!("\"{key}\"");
+        let kpos = json.find(&pat)?;
+        let after = &json[kpos + pat.len()..];
+        let colon = after.find(':')?;
+        let rest = after[colon + 1..].trim_start();
+        // Numeric run (optional leading '-'); stops at the first non-digit.
+        let mut end = 0;
+        let bytes = rest.as_bytes();
+        while end < bytes.len() && (bytes[end] == b'-' || bytes[end].is_ascii_digit()) {
+            end += 1;
+        }
+        rest[..end].parse::<i64>().ok()
+    }
+
+    let scan_mode = match int_field(json, "scanMode") {
+        Some(1) => ScanMode::Value,
+        // C++ `toInt(0)` defaults to 0 = Signature when absent / non-1.
+        _ => ScanMode::Signature,
+    };
+    let value_type = int_field(json, "valueType")
+        .and_then(|d| value_type_from_i32(d as i32))
+        .unwrap_or(ValueType::Int32);
+
+    ScannerResultsDoc {
+        results: deserialize_result_rows(json),
+        scan_mode,
+        value_type,
+    }
+}
+
+/// Parse just the `results:[...]` array of a scanner JSON document into the
+/// recovered [`ScanResult`] list (the row-parsing half of
+/// [`deserialize_results_json`]).
+fn deserialize_result_rows(json: &str) -> Vec<ScanResult> {
     fn unhex(s: &str) -> Vec<u8> {
         let bytes = s.as_bytes();
         let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -1607,6 +1672,13 @@ mod view {
         /// `customContextMenuRequested` → `rowToResultIdx`). Indexes the
         /// displayed (filtered/sorted) row list.
         context_target: Option<usize>,
+        /// The active editor's view-root span `(start, size)` for the
+        /// "Current struct" scan-filter chip (the C++ `m_boundsGetter`,
+        /// scannerpanel.cpp:1336-1342). The window sets this from the active
+        /// document; `run_scan` passes it to `build_request` so the `struct_only`
+        /// chip can actually clamp the scan range. `None` (no editor / no
+        /// boundsGetter) leaves the chip a no-op, like the C++ null-getter path.
+        struct_bounds: Option<(u64, u64)>,
         focus_handle: FocusHandle,
         _subs: Vec<Subscription>,
     }
@@ -1735,6 +1807,7 @@ mod view {
                 reset_armed: false,
                 reset_arm_gen: 0,
                 context_target: None,
+                struct_bounds: None,
                 focus_handle: cx.focus_handle(),
                 _subs: subs,
             }
@@ -1760,6 +1833,23 @@ mod view {
                 }
             });
             self.provider = provider;
+        }
+
+        /// Set the active editor's view-root span `(start, size)` for the
+        /// "Current struct" scan-filter chip (the C++ `setBoundsGetter`,
+        /// scannerpanel.cpp:1065-1074). The window calls this from the active
+        /// document's struct bounds; `run_scan` passes the value to
+        /// `build_request` so the `struct_only` chip clamps the scan range.
+        ///
+        /// Mirrors the C++ null-getter handling: when `bounds` is `None` (no
+        /// editor / empty view), the chip is disabled and force-unchecked so a
+        /// checked chip can't silently degrade to a full scan.
+        pub fn set_struct_bounds(&mut self, bounds: Option<(u64, u64)>, cx: &mut Context<Self>) {
+            self.struct_bounds = bounds.filter(|(_, size)| *size > 0);
+            if self.struct_bounds.is_none() {
+                self.form.struct_only = false;
+            }
+            cx.notify();
         }
 
         /// Attach the active source by [`Entity`] handle is not needed — the
@@ -1882,7 +1972,10 @@ mod view {
                 return;
             };
             let ptr_size = provider.pointer_size();
-            let req = match self.form.build_request(ptr_size, None) {
+            // Supply the active editor's struct bounds so the "Current struct"
+            // chip can clamp the scan range (the C++ `m_boundsGetter`,
+            // scannerpanel.cpp:1336-1342); `None` leaves it a no-op.
+            let req = match self.form.build_request(ptr_size, self.struct_bounds) {
                 Err(msg) => {
                     self.status = msg;
                     cx.notify();
@@ -2689,11 +2782,30 @@ mod view {
             }
         }
 
-        /// Load a result list previously saved with [`results_json`]
-        /// (the C++ `loadResultsFrom`): replace the results + refresh.
-        pub fn load_results(&mut self, results: Vec<ScanResult>, cx: &mut Context<Self>) {
+        /// Load a result document previously saved with [`results_json`]
+        /// (the C++ `loadResultsFrom`): replace the results, restore the saved
+        /// scan mode + value type so the Value column formats with the saved type
+        /// (the C++ `m_lastScanMode = root["scanMode"]` / `m_lastValueType =
+        /// root["valueType"]`, scannerpanel.cpp:2417-2418), then refresh.
+        pub fn load_results(&mut self, doc: super::ScannerResultsDoc, cx: &mut Context<Self>) {
+            let super::ScannerResultsDoc {
+                results,
+                scan_mode,
+                value_type,
+            } = doc;
             let n = results.len();
             self.results = results;
+            // Restore the last-scan snapshot the Value column formats against.
+            // The file stores no searched pattern, so the pattern is empty (a
+            // signature-mode load then shows the full cached bytes, like the C++
+            // which has no `m_lastPattern` persisted either).
+            self.form
+                .set_last_scan(scan_mode, value_type, ScanCondition::ExactValue, &[]);
+            // Mirror the saved value type onto the form so a subsequent Next Scan
+            // / inline edit decodes with the same width.
+            if scan_mode == ScanMode::Value {
+                self.form.value_type = value_type;
+            }
             self.show_previous = false;
             self.generation = if n > 0 { 1 } else { 0 };
             self.undo_stack.clear();
@@ -2716,7 +2828,11 @@ mod view {
                 .iter()
                 .map(|r| (r.address, r.scan_value.clone(), r.region_module.clone()))
                 .collect();
-            serialize_results_json(self.form.mode(), self.form.value_type, &rows)
+            // The C++ `saveResultsTo` writes `m_lastScanMode` / `m_lastValueType`
+            // (scannerpanel.cpp:2397-2398) — the mode + type of the *last* scan,
+            // not the current form selection — so a loaded file restores the type
+            // the saved bytes were captured with.
+            serialize_results_json(self.form.last_mode(), self.form.last_value_type(), &rows)
         }
 
         /// "Save…" footer button — write the current results to a file the user
@@ -2776,9 +2892,9 @@ mod view {
                         return;
                     }
                 };
-                let results = super::deserialize_results_json(&json);
+                let doc = super::deserialize_results_json(&json);
                 let _ = this.update(cx, |this, cx| {
-                    this.load_results(results, cx);
+                    this.load_results(doc, cx);
                 });
             })
             .detach();
@@ -3234,9 +3350,16 @@ mod view {
                                         })),
                                 )
                                 .child(
+                                    // Disabled when no view-root span is wired
+                                    // (the C++ `setBoundsGetter` disables + unchecks
+                                    // the chip when the bounds getter is null,
+                                    // scannerpanel.cpp:1070-1073) — checking it
+                                    // would otherwise silently fall back to a full
+                                    // scan.
                                     Checkbox::new("scanner-struct")
                                         .label("Current Struct")
                                         .checked(self.form.struct_only)
+                                        .disabled(self.struct_bounds.is_none())
                                         .on_click(cx.listener(|this, on: &bool, _w, cx| {
                                             this.toggle_struct_only(*on, cx)
                                         })),
@@ -3561,7 +3684,8 @@ mod tests {
             (0x7ff0u64, vec![0xFFu8], "game.exe".to_string()),
         ];
         let json = serialize_results_json(ScanMode::Value, ValueType::Int32, &rows);
-        let parsed = deserialize_results_json(&json);
+        let doc = deserialize_results_json(&json);
+        let parsed = &doc.results;
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].address, 0x401000);
         assert_eq!(parsed[0].scan_value, vec![0x39, 0x05, 0x00, 0x00]);
@@ -3569,17 +3693,51 @@ mod tests {
         assert_eq!(parsed[1].address, 0x7ff0);
         assert_eq!(parsed[1].scan_value, vec![0xFF]);
         assert_eq!(parsed[1].region_module, "game.exe");
+        // The saved scan mode + value type round-trip (the C++ loadResultsFrom
+        // restoring m_lastScanMode / m_lastValueType).
+        assert_eq!(doc.scan_mode, ScanMode::Value);
+        assert_eq!(doc.value_type, ValueType::Int32);
+    }
+
+    #[test]
+    fn deserialize_results_json_restores_mode_and_type() {
+        // A saved uint64 Value scan must round-trip its scanMode + valueType so
+        // the Value column formats with the saved type, not the form default.
+        let rows = vec![(
+            0x1000u64,
+            0xDEADBEEFu64.to_le_bytes().to_vec(),
+            String::new(),
+        )];
+        let json = serialize_results_json(ScanMode::Value, ValueType::UInt64, &rows);
+        let doc = deserialize_results_json(&json);
+        assert_eq!(doc.scan_mode, ScanMode::Value);
+        assert_eq!(doc.value_type, ValueType::UInt64);
+        assert_eq!(doc.results.len(), 1);
+
+        // Signature mode round-trips as scanMode 0.
+        let sig = serialize_results_json(ScanMode::Signature, ValueType::Int32, &[]);
+        let sig_doc = deserialize_results_json(&sig);
+        assert_eq!(sig_doc.scan_mode, ScanMode::Signature);
+
+        // A document with no scanMode/valueType keys defaults the C++ way
+        // (scanMode 0 = Signature, valueType int32).
+        let bare = "{\"results\":[]}";
+        let bare_doc = deserialize_results_json(bare);
+        assert_eq!(bare_doc.scan_mode, ScanMode::Signature);
+        assert_eq!(bare_doc.value_type, ValueType::Int32);
     }
 
     #[test]
     fn deserialize_results_json_empty_and_malformed() {
         // No results array → empty.
-        assert!(deserialize_results_json("{}").is_empty());
+        assert!(deserialize_results_json("{}").results.is_empty());
         // Empty results list.
         let empty = serialize_results_json(ScanMode::Value, ValueType::Int32, &[]);
-        assert!(deserialize_results_json(&empty).is_empty());
+        assert!(deserialize_results_json(&empty).results.is_empty());
         // Garbage → empty, no panic.
-        assert!(deserialize_results_json("not json at all").is_empty());
+        assert!(deserialize_results_json("not json at all")
+            .results
+            .is_empty());
     }
 
     // ── Field-visibility reducer (onConditionChanged) ──
@@ -3649,6 +3807,32 @@ mod tests {
     }
 
     // ── build_request (buildRequest) ──
+
+    #[test]
+    fn default_form_matches_cpp_first_scan() {
+        // The C++ Fast-Scan default is index 1 = 4 (dword), and the Value-mode
+        // constructor checks the Writable chip before the first scan, while the
+        // Executable chip stays unchecked (scannerpanel.cpp:529,720).
+        let f = ScannerForm::new();
+        assert_eq!(f.alignment, 4);
+        assert!(f.filter_writable, "Value scans default to writable-only");
+        assert!(!f.filter_executable);
+        assert!(FAST_SCAN_ALIGNMENTS.contains(&f.alignment));
+    }
+
+    #[test]
+    fn default_first_scan_uses_dword_stride_and_writable_filter() {
+        // A fresh sub-dword (int8) Value scan still strides by 4 (the default
+        // alignment, floored at the type's natural alignment of 1) and filters
+        // to writable memory — not stride 1 over all readable memory.
+        let mut f = ScannerForm::new();
+        f.value_type = ValueType::Int8;
+        f.value_text = "7".to_string();
+        let req = f.build_request(8, None).expect("ok");
+        assert_eq!(req.alignment, 4);
+        assert!(req.filter_writable);
+        assert!(!req.filter_executable);
+    }
 
     #[test]
     fn build_request_exact_int32() {

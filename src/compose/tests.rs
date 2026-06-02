@@ -2541,3 +2541,236 @@ fn pointer_to_class_fold_footer_has_add_bytes_pills() {
         "pointer-to-class footer should carry add-bytes pills, got: {text:?}"
     );
 }
+
+// ── On-line chip ordering: enum -> comment -> typeHint -> RTTI ──
+//
+// C++ `composeLeaf` (`compose.cpp:388-484`) appends, in order: the enum member
+// name, the `// comment` annotation, the type-hint, then the RTTI hint. So a
+// field carrying BOTH an enum mapping and a comment must render
+// `… (NAME)  // comment` — enum chip first, comment chip second — and the chip
+// column spans must reflect that order.
+#[test]
+fn chip_order_enum_then_comment_on_one_line() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ei = tree.add_node(Node {
+        class_keyword: "enum".into(),
+        struct_type_name: "Status".into(),
+        name: "Status".into(),
+        enum_members: vec![
+            ("READY".into(), 0),
+            ("RUNNING".into(), 1),
+            ("DONE".into(), 2),
+        ],
+        kind: NodeKind::Struct,
+        ..Node::default()
+    });
+    let enum_id = tree.nodes[ei].id;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(Node {
+        ref_id: enum_id,
+        comment: "state field".into(),
+        ..child(root_id, NodeKind::UInt32, 0, "status")
+    });
+
+    let mut data = vec![0u8; (K_STRUCT_BASE + 16) as usize];
+    data[K_STRUCT_BASE as usize..K_STRUCT_BASE as usize + 4].copy_from_slice(&1u32.to_le_bytes());
+    let prov = BufferProvider::new(data, "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+
+    let enum_chip = first_chip(&r, ChipKind::Enum).expect("enum chip should fire");
+    let comment_chip = first_chip(&r, ChipKind::Comment).expect("comment chip should fire");
+    assert!(enum_chip.text.contains("RUNNING"), "{}", enum_chip.text);
+    assert_eq!(comment_chip.text, "// state field");
+    // Enum precedes comment on the line (start/end cols ordered).
+    assert!(
+        enum_chip.end_col <= comment_chip.start_col,
+        "enum chip [{},{}) must come before comment chip [{},{})",
+        enum_chip.start_col,
+        enum_chip.end_col,
+        comment_chip.start_col,
+        comment_chip.end_col
+    );
+
+    // The visible trailing text must read `(RUNNING)` then `// state field`.
+    let field_line = lines(&r)
+        .into_iter()
+        .find(|l| l.contains("status"))
+        .expect("status field line present");
+    let enum_pos = field_line.find("(RUNNING)").expect("enum text present");
+    let comment_pos = field_line
+        .find("// state field")
+        .expect("comment text present");
+    assert!(
+        enum_pos < comment_pos,
+        "rendered order must be enum then comment: {field_line:?}"
+    );
+}
+
+// ── Comment chip ordered BEFORE RTTI on a Pointer64 (enum->comment->typeHint->RTTI) ──
+#[test]
+fn chip_order_comment_before_rtti() {
+    let mut data = build_address_space_with_rtti();
+    let vtable_va = RTTI_IMAGE_BASE + 0x1000;
+    data[RTTI_STRUCT_BASE as usize..RTTI_STRUCT_BASE as usize + 8]
+        .copy_from_slice(&vtable_va.to_le_bytes());
+
+    let mut tree = NodeTree::new();
+    tree.base_address = RTTI_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Demo".into(),
+        struct_type_name: "Demo".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // A bare Pointer64 leaf (no ref_id) carrying a comment whose value lands in
+    // the module → both a Comment chip and an RTTI chip on the same row. The
+    // comment must precede the RTTI hint.
+    tree.add_node(Node {
+        comment: "vtable ptr".into(),
+        ..child(root_id, NodeKind::Pointer64, 0, "vptr")
+    });
+
+    let prov = FakeModuleProvider::new(data);
+    let r = compose_default(&tree, &prov);
+
+    let comment_chip = first_chip(&r, ChipKind::Comment).expect("comment chip should fire");
+    let rtti_chip = first_chip(&r, ChipKind::Rtti).expect("RTTI chip should fire");
+    assert_eq!(comment_chip.text, "// vtable ptr");
+    assert!(rtti_chip.text.contains("Foo"), "{}", rtti_chip.text);
+    assert!(
+        comment_chip.end_col <= rtti_chip.start_col,
+        "comment chip [{},{}) must come before RTTI chip [{},{})",
+        comment_chip.start_col,
+        comment_chip.end_col,
+        rtti_chip.start_col,
+        rtti_chip.end_col
+    );
+}
+
+// ── Pointer value symbol annotation surfaces in the live editor line ──
+//
+// `render::read_value` (the live-editor value formatter) must mirror
+// `format::read_value` and append `  // <module>!<symbol>` to Pointer32/64 and
+// FuncPtr32/64 values via `prov.get_symbol` (`format.cpp:421-475`). Previously
+// the live path dropped this suffix entirely.
+#[test]
+fn pointer_value_symbol_suffix_in_compose_line() {
+    // Provider: one symbol at a chosen pointer value, NO modules (so the RTTI
+    // detector never fires — isolates the symbol-suffix path).
+    struct SymOnlyProvider {
+        sym_val: u64,
+    }
+    impl crate::provider::Provider for SymOnlyProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            // The pointer field sits at struct base (== K_STRUCT_BASE); return
+            // the symbol value there, zeros elsewhere.
+            let v: u64 = if addr == K_STRUCT_BASE {
+                self.sym_val
+            } else {
+                0
+            };
+            let bytes = v.to_le_bytes();
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = bytes.get(i).copied().unwrap_or(0);
+            }
+            true
+        }
+        fn size(&self) -> i32 {
+            (K_STRUCT_BASE + 0x1000) as i32
+        }
+        fn get_symbol(&self, a: u64) -> String {
+            if a == self.sym_val {
+                "ntdll!RtlUserThreadStart".to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Holder".into(),
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // Bare Pointer64 leaf (no ref_id → leaf path, not a typed header).
+    tree.add_node(child(root_id, NodeKind::Pointer64, 0, "pfn"));
+
+    // A value clearly outside our (empty) module set so no RTTI chip fires.
+    let sym_val = 0x7FF7_1857_0000u64;
+    let prov = SymOnlyProvider { sym_val };
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+
+    let line = lines(&r)
+        .into_iter()
+        .find(|l| l.contains("pfn"))
+        .expect("pointer field line present");
+    assert!(
+        line.contains("// ntdll!RtlUserThreadStart"),
+        "Pointer64 value must carry the `// module!symbol` suffix, got: {line:?}"
+    );
+    assert!(line.contains("0x7ff718570000"), "{line:?}");
+}
+
+// ── A comment on a typed pointer-to-class header is INVISIBLE in C++ ──
+//
+// `composeNode`'s typed-pointer header path (`compose.cpp:1213-1257`) attaches
+// only the RTTI hint, never a comment chip — so a comment on a pointer-to-class
+// node must produce NO Comment chip (it is only visible on leaf fields).
+#[test]
+fn typed_pointer_header_drops_comment_chip() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let mi = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Main".into(),
+        ..Node::default()
+    });
+    let main_id = tree.nodes[mi].id;
+    let ti = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "VTable".into(),
+        ..Node::default()
+    });
+    let tmpl_id = tree.nodes[ti].id;
+    tree.add_node(child(tmpl_id, NodeKind::UInt64, 0, "fn_one"));
+    // Pointer-to-class node WITH a comment, collapsed so the header is one line.
+    tree.add_node(Node {
+        ref_id: tmpl_id,
+        collapsed: true,
+        comment: "should be invisible on the header".into(),
+        ..child(main_id, NodeKind::Pointer64, 0, "ptr")
+    });
+
+    let mut data = vec![0u8; 256];
+    data[0..8].copy_from_slice(&100u64.to_le_bytes()); // ptr -> 100 (readable)
+    let prov = BufferProvider::new(data, "");
+    let r = compose_default(&tree, &prov);
+
+    assert_eq!(
+        count_chips(&r, ChipKind::Comment),
+        0,
+        "typed pointer-to-class header must not carry a comment chip"
+    );
+    assert!(
+        !r.text.contains("should be invisible"),
+        "comment text must not appear on the pointer header:\n{}",
+        r.text
+    );
+}

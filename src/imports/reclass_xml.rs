@@ -303,6 +303,7 @@ pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, Im
                         &mut reader,
                         &content,
                         attrs,
+                        is_empty,
                         version,
                         pointer_size,
                         struct_id,
@@ -346,6 +347,7 @@ fn handle_node<B: BufRead>(
     reader: &mut Reader<B>,
     content: &[u8],
     attrs: NodeAttrs,
+    is_empty: bool,
     version: XmlVersion,
     pointer_size: i32,
     struct_id: u64,
@@ -408,32 +410,42 @@ fn handle_node<B: BufRead>(
         }
 
         // Read child <Array> element for class name. Iterate inner events until
-        // </Node>.
+        // </Node> (cpp:269-280).
+        //
+        // A self-closing `<Node Type="27" .../>` has no children. QXmlStreamReader
+        // reports it as a StartElement immediately followed by an EndElement, so
+        // the C++ inner loop's first `readNext()` yields the `</Node>` end and
+        // breaks at once. quick-xml delivers a self-closing element as a single
+        // `Event::Empty` with NO matching `Event::End`, so running the inner loop
+        // would read past this node into following siblings (or to EOF). Skip the
+        // inner loop entirely when the element is self-closing.
         let mut array_class_name = String::new();
-        loop {
-            let inner = match reader.read_event_into(buf) {
-                Ok(ev) => ev,
-                Err(err) => {
-                    return Err(ImportError::XmlParse {
-                        line: byte_pos_to_line(content, reader.buffer_position()),
-                        msg: err.to_string(),
-                    })
-                }
-            };
-            match inner {
-                Event::Eof => break,
-                Event::End(ee) if ee.name().as_ref() == b"Node" => break,
-                Event::Start(ae) | Event::Empty(ae) if ae.name().as_ref() == b"Array" => {
-                    array_class_name = attr_str(&ae, "Name");
-                    let mut array_total = attr_int(&ae, "Total");
-                    if array_total <= 0 {
-                        array_total = attr_int(&ae, "Count");
+        if !is_empty {
+            loop {
+                let inner = match reader.read_event_into(buf) {
+                    Ok(ev) => ev,
+                    Err(err) => {
+                        return Err(ImportError::XmlParse {
+                            line: byte_pos_to_line(content, reader.buffer_position()),
+                            msg: err.to_string(),
+                        })
                     }
-                    if array_total > 0 {
-                        total = array_total;
+                };
+                match inner {
+                    Event::Eof => break,
+                    Event::End(ee) if ee.name().as_ref() == b"Node" => break,
+                    Event::Start(ae) | Event::Empty(ae) if ae.name().as_ref() == b"Array" => {
+                        array_class_name = attr_str(&ae, "Name");
+                        let mut array_total = attr_int(&ae, "Total");
+                        if array_total <= 0 {
+                            array_total = attr_int(&ae, "Count");
+                        }
+                        if array_total > 0 {
+                            total = array_total;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -958,6 +970,109 @@ mod tests {
         let tree = import_str(xml).expect("import");
         let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"Empty") && names.contains(&"After"));
+    }
+
+    // ── Self-closing ClassInstanceArray <Node/> must not over-consume ──
+
+    #[test]
+    fn self_closing_class_instance_array_node_does_not_over_consume() {
+        // A self-closing `<Node Type="27" .../>` (ClassInstanceArray, no inner
+        // <Array> child) is followed by a sibling primitive node, then a second
+        // class. quick-xml delivers the CIA node as Event::Empty with no matching
+        // </Node>; the importer must NOT run the inner read loop, or it would
+        // walk over the sibling node and the following </Class>/<Class>.
+        let xml = "\
+<ReClass>
+  <Class Name=\"A\">
+    <Node Type=\"27\" Name=\"arr\" Total=\"3\" Size=\"0\"/>
+    <Node Type=\"10\" Name=\"after\" Size=\"4\"/>
+  </Class>
+  <Class Name=\"B\">
+    <Node Type=\"10\" Name=\"b0\" Size=\"4\"/>
+  </Class>
+</ReClass>
+";
+        let tree = import_str(xml).expect("import should succeed");
+
+        // Both top-level classes must survive (the CIA node must not eat the
+        // following sibling/class boundaries).
+        let class_names: Vec<&str> = tree
+            .nodes
+            .iter()
+            .filter(|n| n.parent_id == 0 && n.kind == NodeKind::Struct)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            class_names.contains(&"A") && class_names.contains(&"B"),
+            "both classes must import, got {class_names:?}"
+        );
+
+        // Class A must keep BOTH children: the CIA array AND the sibling that
+        // follows it on the next line.
+        let a_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.parent_id == 0 && n.name == "A")
+            .unwrap();
+        let a_id = tree.nodes[a_idx].id;
+        let a_children = tree.children_of(a_id);
+        let child_names: Vec<&str> = a_children
+            .iter()
+            .map(|&ci| tree.nodes[ci].name.as_str())
+            .collect();
+        assert!(
+            child_names.contains(&"arr"),
+            "CIA array node must be imported, got {child_names:?}"
+        );
+        assert!(
+            child_names.contains(&"after"),
+            "the sibling node after a self-closing CIA node must NOT be consumed, got {child_names:?}"
+        );
+
+        // Class B's child must remain attached to B (not stolen by A's CIA loop).
+        let b_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.parent_id == 0 && n.name == "B")
+            .unwrap();
+        let b_id = tree.nodes[b_idx].id;
+        assert_eq!(
+            tree.children_of(b_id).len(),
+            1,
+            "class B must keep its own child"
+        );
+    }
+
+    #[test]
+    fn open_class_instance_array_node_still_reads_inner_array() {
+        // Sanity: a non-self-closing CIA node with an inner <Array> child still
+        // resolves the element class name and array length via the inner loop.
+        let xml = "\
+<ReClass>
+  <Class Name=\"Elem\">
+    <Node Type=\"10\" Name=\"e0\" Size=\"4\"/>
+  </Class>
+  <Class Name=\"Host\">
+    <Node Type=\"27\" Name=\"arr\" Total=\"2\" Size=\"8\">
+      <Array Name=\"Elem\" Total=\"5\"/>
+    </Node>
+  </Class>
+</ReClass>
+";
+        let tree = import_str(xml).expect("import should succeed");
+        let host_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.parent_id == 0 && n.name == "Host")
+            .unwrap();
+        let host_id = tree.nodes[host_idx].id;
+        let arr_ci = *tree.children_of(host_id).first().unwrap();
+        let arr = &tree.nodes[arr_ci];
+        assert_eq!(arr.kind, NodeKind::Array);
+        assert_eq!(arr.name, "arr");
+        // Inner <Array Total="5"> overrides the node-level Total="2".
+        assert_eq!(arr.array_len, 5);
+        assert_eq!(arr.struct_type_name, "Elem");
     }
 
     // ── Item 4: XML declaration has no standalone attribute ──

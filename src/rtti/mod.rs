@@ -36,6 +36,8 @@ pub use names::bookmark::{BookmarkHost, BookmarkNameProvider};
 pub use names::pdb::{PdbNameProvider, PdbTypeProvider};
 pub use names::rtti::RttiNameProvider;
 pub use names::{NameProvider, NameRegistry, NamedAddress};
+#[cfg(feature = "imports")]
+pub use symbol_store::load_pdb_and_cache_types;
 pub use symbol_store::{PdbSymbolSet, PdbTypeInfo, SymbolStore};
 pub use walk::{
     find_owning_module, walk_rtti, walk_rtti_itanium, OwningModule, RttiBaseClass, RttiInfo,

@@ -808,6 +808,25 @@ impl TypeModel {
         found
     }
 
+    /// Pre-select the row matching a COMPOSITE `struct_id` (`setTypes`
+    /// current-entry pre-select for composites, `typeselectorpopup.cpp:1280`:
+    /// `entry.structId == m_currentEntry.structId`). Scan for a composite row
+    /// with that id and select it. Returns the selected row index, if found.
+    pub fn select_struct(&mut self, struct_id: u64) -> Option<usize> {
+        if struct_id == 0 {
+            return None;
+        }
+        let found = self.rows.iter().position(|r| {
+            r.entry.selectable()
+                && r.entry.entry_kind == EntryKind::Composite
+                && r.entry.struct_id == struct_id
+        });
+        if let Some(i) = found {
+            self.selected = Some(i);
+        }
+        found
+    }
+
     /// Select a specific row if it is selectable (a click; `acceptIndex`).
     pub fn select_row(&mut self, row: usize) -> bool {
         if self
@@ -921,6 +940,20 @@ mod view {
             /// populated `NewClass[_N]` (8×Hex64) and embeds the node as an
             /// instance of it, rather than applying a bare empty `Struct`.
             create_new: bool,
+            /// Whether the picked row is a primitive or a composite (struct/enum).
+            /// The editor routes the apply through `apply_type_popup_result` and
+            /// needs the entry kind to build the right `TypePopupChoice` (a
+            /// composite carries its `struct_id`, a primitive its `kind`). Mirrors
+            /// the C++ `TypeEntry::entryKind` passed to `applyTypePopupResult`.
+            entry_kind: EntryKind,
+            /// For a composite pick: the referenced struct/enum id (0 ⇒ a built-in
+            /// or cross-document type imported by `display_name`). Ignored for
+            /// primitives. The C++ `TypeEntry::structId`.
+            struct_id: u64,
+            /// The picked row's display name (`int32_t`, `Player`, …). Carried so
+            /// the editor can record it in the recent-types list and import a
+            /// built-in composite by name. The C++ `TypeEntry::displayName`.
+            display_name: String,
         },
         /// Dismissed (the `×`, Esc, or clicking outside).
         Cancel,
@@ -931,6 +964,10 @@ mod view {
         model: TypeModel,
         /// The kind the node currently has — highlighted as the active type.
         current: NodeKind,
+        /// When the node is a COMPOSITE, the referenced struct/enum id so the popup
+        /// opens pre-highlighting that row by id (the C++ `m_currentEntry.structId`
+        /// branch in `setTypes`). 0 ⇒ the node is a primitive (use `current`).
+        current_struct_id: u64,
         /// Which group chips are enabled (Hex/Int/Float/Ptr); `None` filter for the
         /// rest. Empty set = all shown (the "all" state); a non-empty set filters
         /// the list to those groups.
@@ -980,7 +1017,7 @@ mod view {
             Self::new_with_current(entries, NodeKind::Hex8, window, cx)
         }
 
-        fn new_with_current(
+        pub fn new_with_current(
             entries: Vec<TypeEntry>,
             current: NodeKind,
             window: &mut Window,
@@ -1000,7 +1037,7 @@ mod view {
                         this.model.apply_filter(&q);
                         // Re-pin the current type when the filter clears.
                         if q.trim().is_empty() {
-                            this.model.select_kind(this.current);
+                            this.re_pin_current();
                         }
                         this.scroll_selected_into_view();
                         cx.notify();
@@ -1021,6 +1058,7 @@ mod view {
             TypeSelectorPopup {
                 model,
                 current,
+                current_struct_id: 0,
                 active_groups: std::collections::BTreeSet::new(),
                 input,
                 array_count_input,
@@ -1121,8 +1159,29 @@ mod view {
         pub fn set_recent_names(&mut self, names: Vec<String>, cx: &mut Context<Self>) {
             self.model.set_recent_names(names);
             // Re-pin the current type after the rows rebuild.
-            self.model.select_kind(self.current);
+            self.re_pin_current();
             cx.notify();
+        }
+
+        /// Set the node's CURRENT composite (struct/enum) id so the popup opens
+        /// pre-highlighting that composite row (the C++ `setTypes` with a Composite
+        /// `m_currentEntry`). Re-pins the selection immediately. Pass 0 to clear.
+        pub fn set_current_struct(&mut self, struct_id: u64, cx: &mut Context<Self>) {
+            self.current_struct_id = struct_id;
+            self.re_pin_current();
+            cx.notify();
+        }
+
+        /// Pre-select the row for the node's current type — a composite by
+        /// `current_struct_id` when set (the C++ structId match), else the
+        /// primitive `current` kind. Shared by every rows-rebuild path.
+        fn re_pin_current(&mut self) {
+            if self.current_struct_id != 0 {
+                if self.model.select_struct(self.current_struct_id).is_some() {
+                    return;
+                }
+            }
+            self.model.select_kind(self.current);
         }
 
         /// Whether an entry's group passes the active category-chip filter.
@@ -1181,10 +1240,19 @@ mod view {
                 Modifier::None => None,
                 m => Some(m),
             };
+            // Carry the full identity of the picked row (kind/entryKind/structId/
+            // displayName) so the editor can build a faithful `TypePopupChoice` and
+            // route through `apply_type_popup_result` — selecting an EXISTING
+            // composite must reference it by `struct_id` (not materialize a bare
+            // empty Struct), and a primitive must apply by kind. Mirrors the C++
+            // `typeSelected(const TypeEntry&, ...)` payload (items 35/36/37).
             cx.emit(TypeSelectorEvent::Chosen {
                 kind: entry.primitive_kind,
                 modifier,
                 create_new: false,
+                entry_kind: entry.entry_kind,
+                struct_id: entry.struct_id,
+                display_name: entry.display_name.clone(),
             });
         }
 
@@ -1234,6 +1302,12 @@ mod view {
                 kind: NodeKind::Struct,
                 modifier,
                 create_new: true,
+                // "+ New" makes a fresh composite; the editor's create-new path
+                // materializes it and fills in the struct_id, so the carried
+                // identity here is an empty composite placeholder.
+                entry_kind: EntryKind::Composite,
+                struct_id: 0,
+                display_name: String::new(),
             });
         }
 
@@ -2382,6 +2456,26 @@ mod tests {
         let before = model.selected();
         assert_eq!(model.select_kind(NodeKind::Mat4x4), None);
         assert_eq!(model.selected(), before);
+    }
+
+    // ── composite current-entry pre-select by structId (items 38/39) ──
+
+    #[test]
+    fn select_struct_preselects_matching_composite_by_id() {
+        let mut model = TypeModel::new(sample_entries());
+        // The sample has a composite "Player" with struct_id 100.
+        let row = model.select_struct(100).unwrap();
+        assert_eq!(model.selected(), Some(row));
+        let e = model.selected_entry().unwrap();
+        assert_eq!(e.entry_kind, EntryKind::Composite);
+        assert_eq!(e.struct_id, 100);
+        assert_eq!(e.display_name, "Player");
+        // A struct_id not present yields None and leaves the selection unchanged.
+        let before = model.selected();
+        assert_eq!(model.select_struct(999), None);
+        assert_eq!(model.selected(), before);
+        // struct_id 0 never matches (a primitive node uses select_kind instead).
+        assert_eq!(model.select_struct(0), None);
     }
 
     // ── recent names (item 16) ──

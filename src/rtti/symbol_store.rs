@@ -352,6 +352,117 @@ impl SymbolStore {
     }
 }
 
+/// The C++ Types-tab sort comparator
+/// (`a.name.compare(b.name, Qt::CaseInsensitive) < 0`; `main.cpp:7982-7984`).
+///
+/// Qt's case-insensitive `compare` orders by case-folded name; ties (names that
+/// differ only in case) fall back to the original case so the order is
+/// deterministic (Qt's `compare` returns 0 for those and `std::sort` leaves the
+/// order unspecified — pinning it here is a strict refinement, never a deviation
+/// for distinct case-insensitive names). Pure + unit-tested.
+pub fn pdb_type_name_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
+/// `MainWindow::loadPdbAndCacheTypes(pdbPath)` (`main.cpp:7958`) — the one entry
+/// point that pulls symbols + types out of a local/cached PDB and folds them into
+/// the process-global [`SymbolStore`].
+///
+/// This is the production wiring the host (`window.rs`) calls from the
+/// Download-All loop and from a module-row activation once a PDB has been located
+/// on disk (network fetch is the only true platform stub). It is the missing
+/// caller for [`extract_pdb_symbols`](crate::imports::extract_pdb_symbols),
+/// [`enumerate_pdb_types`](crate::imports::enumerate_pdb_types),
+/// [`add_module`](SymbolStore::add_module),
+/// [`add_module_type_indices`](SymbolStore::add_module_type_indices), and
+/// [`add_module_types`](SymbolStore::add_module_types).
+///
+/// Faithful to the C++ post-conditions:
+///   1. `extractPdbSymbols(pdbPath)`; if it has **no symbols**, return `0` and
+///      touch nothing (the C++ `if (result.symbols.isEmpty()) return 0;`).
+///   2. Build the `(name, rva)` pairs in symbol order and the `name → typeIndex`
+///      map for symbols whose `typeIndex != 0`.
+///   3. `addModule(result.moduleName, pdbPath, pairs)` → the returned count.
+///   4. `addModuleTypeIndices(result.moduleName, typeIndices)` **only when the map
+///      is non-empty** (the C++ `if (!typeIndices.isEmpty())`).
+///   5. `enumeratePdbTypes(pdbPath)`; when non-empty, sort case-insensitively by
+///      name (the C++ `std::sort` comparator) and `addModuleTypes(...)` — this is
+///      where the Rust port caches the C++ `m_cachedModuleTypes` entries so the
+///      Modules ▸ Types tab can list them.
+///
+/// `module` is accepted for API symmetry with the C++ call sites (which already
+/// know the module the PDB belongs to) but the canonical module name always comes
+/// from the PDB itself (`result.moduleName`), exactly as the C++ does — the store
+/// keys off the PDB's own name so reverse lookups stay consistent.
+///
+/// Returns the number of unique symbols stored (`0` when the PDB has none, or on
+/// an extract error — the C++ has no symbols to add in that case either).
+#[cfg(feature = "imports")]
+pub fn load_pdb_and_cache_types(path: &std::path::Path, _module: &str) -> i32 {
+    let result = match crate::imports::extract_pdb_symbols(path) {
+        Ok(r) => r,
+        // No symbols extractable (bad/locked/non-PDB) — nothing to add, like the
+        // C++ early-out on an empty result.
+        Err(_) => return 0,
+    };
+    if result.symbols.is_empty() {
+        return 0;
+    }
+
+    let mut pairs: Vec<(String, u32)> = Vec::with_capacity(result.symbols.len());
+    let mut type_indices: HashMap<String, u32> = HashMap::new();
+    for s in &result.symbols {
+        pairs.push((s.name.clone(), s.rva));
+        if s.type_index != 0 {
+            type_indices.insert(s.name.clone(), s.type_index);
+        }
+    }
+
+    let pdb_path = path.to_string_lossy();
+    let count = {
+        let mut store = match SymbolStore::global().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let count = store.add_module(&result.module_name, &pdb_path, &pairs);
+        if !type_indices.is_empty() {
+            store.add_module_type_indices(&result.module_name, type_indices);
+        }
+        count
+    };
+
+    // Cache enumerated types for the Types tab (the C++ `m_cachedModuleTypes`
+    // entry + `rebuildTypesModel()`; the Rust port stores them on the module set).
+    if let Ok(mut types) = crate::imports::enumerate_pdb_types(path) {
+        if !types.is_empty() {
+            // C++ `std::sort(..., a.name.compare(b.name, Qt::CaseInsensitive) < 0)`.
+            types.sort_by(|a, b| pdb_type_name_order(&a.name, &b.name));
+            // `imports::PdbTypeInfo` and `symbol_store::PdbTypeInfo` are field-for-
+            // field mirrors; convert across the seam.
+            let mapped: Vec<PdbTypeInfo> = types
+                .into_iter()
+                .map(|t| PdbTypeInfo {
+                    type_index: t.type_index,
+                    name: t.name,
+                    size: t.size,
+                    child_count: t.child_count,
+                    is_union: t.is_union,
+                    is_enum: t.is_enum,
+                })
+                .collect();
+            let mut store = match SymbolStore::global().lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            store.add_module_types(&result.module_name, mapped);
+        }
+    }
+
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +644,54 @@ mod tests {
         assert!(s.has_symbols());
         s.unload_module("m");
         assert!(!s.has_symbols());
+    }
+
+    // ── pdb_type_name_order: the C++ Qt::CaseInsensitive sort comparator ──
+    #[test]
+    fn pdb_type_name_order_is_case_insensitive() {
+        use std::cmp::Ordering;
+        // Case-insensitive primary order: "apple" < "Banana" < "cherry".
+        assert_eq!(pdb_type_name_order("apple", "Banana"), Ordering::Less);
+        assert_eq!(pdb_type_name_order("Banana", "cherry"), Ordering::Less);
+        assert_eq!(pdb_type_name_order("ZEBRA", "apple"), Ordering::Greater);
+        // Names equal under case-fold are NOT Equal (deterministic tiebreak), but
+        // they sort adjacent — the C++ post-condition (case-insensitive grouping)
+        // holds.
+        assert_eq!(pdb_type_name_order("Foo", "Foo"), Ordering::Equal);
+        assert_ne!(pdb_type_name_order("Foo", "foo"), Ordering::Equal);
+        // Sorting a mixed-case list groups case-insensitively.
+        let mut v = vec!["delta", "Alpha", "charlie", "Bravo"];
+        v.sort_by(|a, b| pdb_type_name_order(a, b));
+        assert_eq!(v, vec!["Alpha", "Bravo", "charlie", "delta"]);
+    }
+
+    // ── load_pdb_and_cache_types: the C++ early-out (main.cpp:7960-7961) ──
+    // A path that doesn't resolve to a readable PDB yields no symbols, so the
+    // loader returns 0 and adds nothing to the store (the
+    // `if (result.symbols.isEmpty()) return 0;` short-circuit). The success path
+    // needs a real PDB fixture (the network/PDB seam) and is exercised by the
+    // imports-layer tests; here we pin the no-op contract that gates it.
+    #[cfg(feature = "imports")]
+    #[test]
+    fn load_pdb_missing_file_is_a_noop_returning_zero() {
+        let before = SymbolStore::global()
+            .lock()
+            .map(|g| g.module_count())
+            .unwrap_or(0);
+        let n = super::load_pdb_and_cache_types(
+            std::path::Path::new("nonexistent-load-pdb-xyzzy.pdb"),
+            "ghost.dll",
+        );
+        assert_eq!(n, 0, "a missing PDB must extract no symbols");
+        let after = SymbolStore::global()
+            .lock()
+            .map(|g| g.module_count())
+            .unwrap_or(0);
+        assert_eq!(after, before, "a failed load must not mutate the store");
+        // And nothing was keyed under the requested module name.
+        assert!(SymbolStore::global()
+            .lock()
+            .map(|g| g.module_data("ghost.dll").is_none())
+            .unwrap_or(true));
     }
 }

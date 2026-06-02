@@ -343,6 +343,11 @@ pub fn sort_profile_rows(
     });
 }
 
+/// The verbatim profiler enable-checkbox label (`profilerdialog.cpp:123`). The
+/// C++ checkbox names the three instrumented hot paths exactly, rather than a
+/// generic "Profile hot paths".
+pub const PROFILE_ENABLE_LABEL: &str = "Profile compose / refresh / applyDocument";
+
 /// One CSV line per bucket plus the header, as `profilerdialog.cpp:145-158`'s
 /// "Copy CSV": `name,count,total_ms,mean_us,min_us,max_us,last_us`. Pure, so
 /// it's unit-tested. The rows are emitted in the order given (the dialog passes
@@ -391,7 +396,10 @@ pub use profiler_view::{ProfilerDialog, ProfilerEvent};
 #[cfg(feature = "ui")]
 mod profiler_view {
     use super::modal;
-    use super::{profile_rows_to_csv, profile_summary, sort_profile_rows, ProfileSortColumn};
+    use super::{
+        profile_rows_to_csv, profile_summary, sort_profile_rows, ProfileSortColumn,
+        PROFILE_ENABLE_LABEL,
+    };
     use crate::theme::{ProfileStats, Profiler};
     use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
@@ -545,7 +553,8 @@ mod profiler_view {
                 .gap(px(tokens::space::MD))
                 .child(
                     Checkbox::new("prof-enable")
-                        .label("Profile hot paths")
+                        // Verbatim C++ label (profilerdialog.cpp:123).
+                        .label(PROFILE_ENABLE_LABEL)
                         .checked(enabled)
                         .on_click(cx.listener(|this, checked: &bool, _window, cx| {
                             this.set_enabled(*checked, cx);
@@ -854,6 +863,17 @@ mod tests {
     }
 
     // ── Profiler dialog logic ──
+
+    #[test]
+    fn profile_enable_label_is_verbatim_cpp() {
+        // The enable checkbox must name the three instrumented hot paths
+        // verbatim (profilerdialog.cpp:123), not the generic "Profile hot paths".
+        assert_eq!(
+            PROFILE_ENABLE_LABEL,
+            "Profile compose / refresh / applyDocument"
+        );
+        assert_ne!(PROFILE_ENABLE_LABEL, "Profile hot paths");
+    }
 
     fn mk(total_ns: u64, count: u64, min_ns: u64, max_ns: u64, last_ns: u64) -> ProfileStats {
         ProfileStats {

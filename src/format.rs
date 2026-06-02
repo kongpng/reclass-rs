@@ -360,8 +360,10 @@ pub fn fmt_float(v: f32) -> String {
     }
 
     // body = digits + "." + decimals + "f", target exactly 7 chars.
+    // Round half-AWAY-from-zero (Qt `QString::number(av,'f',dec)`), NOT Rust's
+    // built-in round-half-to-even, so e.g. 37428.5 → "37429.f".
     for dec in (0..=4).rev() {
-        let mut body = format!("{:.*}", dec as usize, av);
+        let mut body = fmt_fixed_away(f64::from(av), dec as usize);
         body += if dec == 0 { ".f" } else { "f" };
         if body.len() == 7 {
             if v < 0.0 {
@@ -412,9 +414,185 @@ pub fn fmt_pointer64(v: u64) -> String {
     }
 }
 
+/// Exact decimal expansion of a finite `f64`'s magnitude, as `(int, frac)`
+/// digit strings (no sign). Rust's `{:.*}` formatting emits the *exact* decimal
+/// value of a double (a dyadic rational, so it terminates) — formatting with a
+/// precision past the longest possible expansion (`1074` for `2^-1074`) yields
+/// the true digits with no rounding. We then do our own rounding so we can pick
+/// round-half-AWAY-from-zero (Qt `QString::number`) instead of Rust's built-in
+/// round-half-to-even.
+fn exact_decimal_parts(mag: f64) -> (String, String) {
+    debug_assert!(mag.is_finite() && mag >= 0.0);
+    let s = format!("{mag:.1100}");
+    match s.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (s, String::new()),
+    }
+}
+
+/// Round a (non-negative) decimal given as `int`/`frac` digit strings to exactly
+/// `keep` fractional digits, **rounding half away from zero**. Returns the
+/// rounded `(int, frac)` digit strings (frac has length `keep`). Propagates carry
+/// into the integer part (e.g. `99.9` → `keep=0` → `("100","")`).
+fn round_half_away(int_digits: &str, frac_digits: &str, keep: usize) -> (String, String) {
+    // Combine into a single digit buffer; remember the decimal point position.
+    let mut digits: Vec<u8> = Vec::with_capacity(int_digits.len() + frac_digits.len());
+    for c in int_digits.bytes() {
+        digits.push(c - b'0');
+    }
+    for c in frac_digits.bytes() {
+        digits.push(c - b'0');
+    }
+    let int_len = int_digits.len();
+    // Index of the first dropped fractional digit (the rounding digit).
+    let cut = int_len + keep;
+    let mut round_up = false;
+    if cut < digits.len() {
+        // Half away from zero: round up when the first dropped digit >= 5.
+        if digits[cut] >= 5 {
+            round_up = true;
+        }
+    }
+    digits.truncate(cut);
+    if round_up {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, 1);
+                // Carried a new leading digit into the integer part.
+                let int_part: String = digits[..int_len + 1]
+                    .iter()
+                    .map(|d| (d + b'0') as char)
+                    .collect();
+                let frac_part: String = digits[int_len + 1..]
+                    .iter()
+                    .map(|d| (d + b'0') as char)
+                    .collect();
+                return (int_part, frac_part);
+            }
+            i -= 1;
+            if digits[i] == 9 {
+                digits[i] = 0;
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    // Pad the fractional part back up to `keep` digits (truncation may have cut
+    // it short if the source had fewer digits than requested).
+    let mut int_part: String = digits[..int_len]
+        .iter()
+        .map(|d| (d + b'0') as char)
+        .collect();
+    let mut frac_part: String = digits[int_len..]
+        .iter()
+        .map(|d| (d + b'0') as char)
+        .collect();
+    while frac_part.len() < keep {
+        frac_part.push('0');
+    }
+    if int_part.is_empty() {
+        int_part.push('0');
+    }
+    (int_part, frac_part)
+}
+
+/// printf `%.*f`-faithful fixed-point formatting with round-half-AWAY-from-zero
+/// (matching Qt `QString::number(v,'f',frac)`). Mirrors Rust's `{:.*}` output
+/// *shape* (no decimal point when `frac == 0`, leading `-` for negatives,
+/// `-0.000` preserved) so existing post-processing keeps working.
+fn fmt_fixed_away(v: f64, frac: usize) -> String {
+    let neg = v.is_sign_negative();
+    let (int_d, frac_d) = exact_decimal_parts(v.abs());
+    let (int_r, frac_r) = round_half_away(&int_d, &frac_d, frac);
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&int_r);
+    if frac > 0 {
+        out.push('.');
+        out.push_str(&frac_r);
+    }
+    out
+}
+
+/// printf `%.*e`-faithful scientific formatting with round-half-AWAY-from-zero.
+/// Produces the same *shape* as Rust's `{:.*e}` (one digit before the point,
+/// `frac` digits after, lowercase `e`, exponent with no leading zeros and a sign
+/// only when negative) so `format_e_strip` can post-process it unchanged.
+fn fmt_sci_away(v: f64, frac: usize) -> String {
+    let neg = v.is_sign_negative();
+    let mag = v.abs();
+    if mag == 0.0 {
+        let mantissa = if frac > 0 {
+            format!("0.{}", "0".repeat(frac))
+        } else {
+            "0".to_string()
+        };
+        return format!("{}{mantissa}e0", if neg { "-" } else { "" });
+    }
+    let (int_d, frac_d) = exact_decimal_parts(mag);
+    // Full exact significant-digit sequence (no decimal point) and the decimal
+    // exponent X such that value = d[0].d[1..] × 10^X.
+    let mut all: String = int_d.clone();
+    all.push_str(&frac_d);
+    let trimmed_int = int_d.trim_start_matches('0');
+    let exp10: i32;
+    let sig: String;
+    if !trimmed_int.is_empty() {
+        // Magnitude >= 1: exponent is (#integer digits - 1).
+        exp10 = trimmed_int.len() as i32 - 1;
+        let lead = int_d.len() - trimmed_int.len();
+        sig = all[lead..].to_string();
+    } else {
+        // Magnitude < 1: skip leading zeros in the fractional part.
+        let lead_zeros = frac_d.len() - frac_d.trim_start_matches('0').len();
+        exp10 = -(lead_zeros as i32) - 1;
+        sig = frac_d.trim_start_matches('0').to_string();
+    }
+    // `sig` now has its first digit as the single pre-point digit. Round the
+    // remaining `frac` significant digits (half away). Reuse round_half_away by
+    // treating the first sig digit as the "integer" part.
+    let first = &sig[..1];
+    let rest = &sig[1..];
+    let (int_r, frac_r) = round_half_away(first, rest, frac);
+    // A carry can push e.g. 9.99→10.0, lengthening the integer part: re-normalize
+    // so exactly one digit sits before the point and bump the exponent.
+    let (digit, exp_final, frac_final) = if int_r.len() > 1 {
+        // int_r is "10" (carry); becomes 1.0 × 10^(exp+1), dropping a frac digit.
+        let mut combined = int_r.clone();
+        combined.push_str(&frac_r);
+        let d = combined[..1].to_string();
+        let mut f = combined[1..].to_string();
+        // Keep exactly `frac` fractional digits.
+        f.truncate(frac);
+        while f.len() < frac {
+            f.push('0');
+        }
+        (d, exp10 + 1, f)
+    } else {
+        (int_r, exp10, frac_r)
+    };
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&digit);
+    if frac > 0 {
+        out.push('.');
+        out.push_str(&frac_final);
+    }
+    out.push('e');
+    out.push_str(&exp_final.to_string());
+    out
+}
+
 /// Emulates Qt `QString::number(double, 'g', precision)` = C `printf %.*g`
 /// (significant-digit form, shortest of `%e`/`%f`, trailing zeros stripped),
 /// then Qt lowercases the exponent marker (`e`). Used by `fmtDouble`/`fmtFloat16`.
+/// Rounding is round-half-AWAY-from-zero to match Qt (not Rust's half-to-even).
 fn qstring_number_g(v: f64, precision: i32) -> String {
     // C `%g`: precision 0 is treated as 1.
     let p = if precision <= 0 {
@@ -422,21 +600,17 @@ fn qstring_number_g(v: f64, precision: i32) -> String {
     } else {
         precision as usize
     };
-    // Rust's `{:e}` / `{:.*e}` mirror C `%e` (lowercase 'e', sign on exponent,
-    // at least 2 exponent digits is NOT guaranteed in Rust — but `%g` chooses
-    // between %e and %f, and after trailing-zero stripping the exact exponent
-    // digit count rarely matters for our (loose) tests; we still match Qt which
-    // strips a leading zero in the exponent on most platforms).
     if v == 0.0 {
         return "0".to_string();
     }
 
-    // Determine decimal exponent X (as in C %g: choose %e if X < -4 or X >= P).
-    let mag = v.abs();
-    let exp10 = mag.log10().floor() as i32;
-    // Recompute exponent precisely via formatting to avoid log10 rounding edge
-    // cases: format with %e at p-1 fractional digits and read its exponent.
-    let e_str = format!("{:.*e}", p - 1, v);
+    // Determine decimal exponent X (as in C `%g`: choose `%e` if X < -4 or X >= P).
+    // printf rounds to P significant digits FIRST, then picks the exponent, so a
+    // carry like 9.99999e5 → 1.00000e6 must bump X. Formatting the (half-away)
+    // scientific form at (P-1) fractional digits already applies that rounding,
+    // so we read the post-rounding exponent straight off the result.
+    let e_str = fmt_sci_away(v, p - 1);
+    let exp10 = v.abs().log10().floor() as i32;
     let x = e_str
         .rsplit('e')
         .next()
@@ -449,7 +623,7 @@ fn qstring_number_g(v: f64, precision: i32) -> String {
     } else {
         // %f form with (P-1-X) fractional digits, then strip trailing zeros.
         let frac = (p as i32 - 1 - x).max(0) as usize;
-        let f_str = format!("{:.*}", frac, v);
+        let f_str = fmt_fixed_away(v, frac);
         strip_trailing_zeros_fixed(&f_str)
     }
 }
@@ -1300,6 +1474,9 @@ pub fn parse_value_kind(kind: NodeKind, text: &str) -> Option<Vec<u8>> {
                 n.pop();
             }
             let n = n.replace(',', ".");
+            if !qt_float_token_ok(&n) {
+                return None;
+            }
             let val: f32 = n.parse().ok()?;
             Some(float_to_half(val).to_le_bytes().to_vec())
         }
@@ -1309,11 +1486,17 @@ pub fn parse_value_kind(kind: NodeKind, text: &str) -> Option<Vec<u8>> {
                 n.pop();
             }
             let n = n.replace(',', ".");
+            if !qt_float_token_ok(&n) {
+                return None;
+            }
             let val: f32 = n.parse().ok()?;
             Some(val.to_le_bytes().to_vec())
         }
         NodeKind::Double => {
             let n = s.replace(',', ".");
+            if !qt_float_token_ok(&n) {
+                return None;
+            }
             let val: f64 = n.parse().ok()?;
             Some(val.to_le_bytes().to_vec())
         }
@@ -1338,9 +1521,14 @@ pub fn parse_value_kind(kind: NodeKind, text: &str) -> Option<Vec<u8>> {
             Some(val.to_le_bytes().to_vec())
         }
         NodeKind::UTF8 => {
+            // Qt: `if (s.startsWith('"') && s.endsWith('"')) s = s.mid(1, s.size()-2);`
+            // A lone `"` both starts AND ends with `"`, and `mid(1, -1)` is empty,
+            // so it strips to "" (writes no bytes) — NOT the literal 0x22 byte the
+            // old `len >= 2` guard produced (`format.cpp:818-820`).
             let mut t = s;
-            if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
-                t = &t[1..t.len() - 1];
+            if t.starts_with('"') && t.ends_with('"') {
+                // mirror QString::mid(1, size-2): start past the end → empty.
+                t = if t.len() >= 2 { &t[1..t.len() - 1] } else { "" };
             }
             Some(t.as_bytes().to_vec())
         }
@@ -1367,6 +1555,39 @@ pub fn parse_value_kind(kind: NodeKind, text: &str) -> Option<Vec<u8>> {
 #[inline]
 fn is_hex_prefixed(s: &str) -> bool {
     s.len() >= 2 && s[..2].eq_ignore_ascii_case("0x")
+}
+
+/// Gate float tokens to Qt `toFloat`/`toDouble` semantics. Rust's `str::parse`
+/// for `f32`/`f64` accepts more non-finite spellings than Qt: `infinity`,
+/// `INFINITY`, `+nan`/`-nan`, etc. Qt only accepts (case-insensitive) the exact
+/// tokens `inf`, `+inf`, `-inf`, and `nan` (no sign) for non-finite values; any
+/// other inf/nan spelling fails the parse. Finite numeric tokens are unaffected
+/// (Rust and Qt agree there), so we only reject the divergent inf/nan spellings.
+fn qt_float_token_ok(token: &str) -> bool {
+    // Cheaply check whether this token even *looks* like an inf/nan literal.
+    // (Plain numbers contain a digit; inf/nan literals never do.)
+    if token.bytes().any(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    let core = lower
+        .strip_prefix('+')
+        .or_else(|| lower.strip_prefix('-'))
+        .unwrap_or(&lower);
+    // `nan` accepts no sign in Qt (`+nan`/`-nan` are rejected).
+    if core == "nan" {
+        return lower == "nan";
+    }
+    if core == "inf" {
+        return true; // inf / +inf / -inf all accepted
+    }
+    // Anything else non-numeric (e.g. `infinity`, empty, stray text) — let the
+    // normal Rust parse decide (it will reject genuine garbage; `infinity` would
+    // wrongly succeed in Rust, so reject it here explicitly).
+    if core == "infinity" {
+        return false;
+    }
+    true
 }
 
 /// Mirrors `QString::toUInt/toULongLong(&ok, base)` for our needs: parse the
@@ -1901,6 +2122,38 @@ mod tests {
         assert!(fmt_double(42.0).contains('.'));
     }
 
+    // ── Round-half-AWAY-from-zero parity with Qt QString::number ──
+    // Rust's built-in formatters round half-to-EVEN; Qt rounds half-AWAY, so
+    // these exact ties diverge. Pin the Qt-faithful outputs.
+    #[test]
+    fn test_fmt_float_rounds_half_away() {
+        // 37428.5 → "37429.f" (half-even would give "37428.f").
+        assert_eq!(fmt_float(37428.5), "37429.f");
+        // Generic half ties round away from zero (not to even).
+        assert_eq!(fmt_fixed_away(2.5, 0), "3");
+        assert_eq!(fmt_fixed_away(-2.5, 0), "-3");
+        assert_eq!(fmt_fixed_away(1.25, 1), "1.3");
+    }
+
+    #[test]
+    fn test_fmt_double_rounds_half_away() {
+        // 0.1015625 → "0.101563" (half-even would give "0.101562").
+        assert_eq!(fmt_double(0.1015625), "0.101563");
+        // Sanity: ordinary values unchanged.
+        assert_eq!(fmt_double(0.1), "0.1");
+        assert_eq!(fmt_double(42.0), "42.0");
+        assert_eq!(fmt_double(1.5), "1.5");
+        // Significant-digit carry bumps the exponent (999999.5 → 1e+06).
+        assert_eq!(fmt_double(999999.5), "1e+06");
+        assert_eq!(fmt_double(1234567.0), "1.23457e+06");
+    }
+
+    #[test]
+    fn test_fmt_float16_rounds_half_away() {
+        // half 0x2000 == 0.0078125 → "0.007813h" (half-even → "0.007812h").
+        assert_eq!(fmt_float16(0x2000), "0.007813h");
+    }
+
     // ── testValidateValueEmpty (test_format.cpp:355-358) ──
     #[test]
     fn test_validate_value_empty() {
@@ -1985,6 +2238,87 @@ mod tests {
     fn test_parse_value_utf8() {
         let b = parse_value_kind(NodeKind::UTF8, "\"hello\"").expect("ok");
         assert_eq!(b, b"hello".to_vec());
+    }
+
+    // ── UTF8 lone-quote strips to empty (Qt mid(1,size-2), format.cpp:818-820) ──
+    // A single `"` both starts and ends with `"`; Qt's mid(1,-1) yields "" so no
+    // bytes are written. The old `len >= 2` guard wrongly emitted the 0x22 byte.
+    #[test]
+    fn test_parse_value_utf8_lone_quote_is_empty() {
+        let b = parse_value_kind(NodeKind::UTF8, "\"").expect("ok");
+        assert!(b.is_empty(), "lone quote must strip to empty, got {b:?}");
+        // A pair of quotes (empty string literal) also yields no bytes.
+        assert!(parse_value_kind(NodeKind::UTF8, "\"\"").unwrap().is_empty());
+        // Unquoted text is taken verbatim (no stripping).
+        assert_eq!(
+            parse_value_kind(NodeKind::UTF8, "ab").unwrap(),
+            b"ab".to_vec()
+        );
+    }
+
+    // ── Float parse rejects inf/nan spellings Qt toFloat/toDouble reject ──
+    // Qt accepts only inf/-inf/+inf/nan (canonical tokens, case-insensitive);
+    // Rust additionally accepts "infinity"/"INFINITY"/"+nan"/"-nan", which Qt
+    // rejects (`format.cpp:775/782/788`). These divergent tokens contain no `f`/`h`
+    // suffix, so the per-kind suffix-chop does not touch them — the gate is what
+    // rejects them, for all three float kinds.
+    #[test]
+    fn test_parse_value_float_rejects_qt_invalid_nonfinite() {
+        for kind in [NodeKind::Float, NodeKind::Double, NodeKind::Float16] {
+            assert!(
+                parse_value_kind(kind, "infinity").is_none(),
+                "{kind:?} must reject 'infinity'"
+            );
+            assert!(
+                parse_value_kind(kind, "INFINITY").is_none(),
+                "{kind:?} must reject 'INFINITY'"
+            );
+            assert!(
+                parse_value_kind(kind, "+nan").is_none(),
+                "{kind:?} must reject '+nan'"
+            );
+            assert!(
+                parse_value_kind(kind, "-nan").is_none(),
+                "{kind:?} must reject '-nan'"
+            );
+            // `nan` (no sign) survives the (no-op) suffix chop and the gate.
+            assert!(
+                parse_value_kind(kind, "nan").is_some(),
+                "{kind:?} accepts 'nan'"
+            );
+            // Ordinary finite numbers are unaffected.
+            assert!(
+                parse_value_kind(kind, "1.5").is_some(),
+                "{kind:?} accepts '1.5'"
+            );
+        }
+        // Double has NO suffix chop, so the canonical inf tokens round-trip.
+        assert!(parse_value_kind(NodeKind::Double, "inf").is_some());
+        assert!(parse_value_kind(NodeKind::Double, "-inf").is_some());
+        assert!(parse_value_kind(NodeKind::Double, "+inf").is_some());
+        // Float/Float16 chop a trailing `f`, so a bare "inf" → "in" → rejected —
+        // matching the C++ (this is the existing suffix-chop behavior, unchanged).
+        // The display form "inff" (one `f` suffix) DOES round-trip back to inf.
+        assert!(parse_value_kind(NodeKind::Float, "inff").is_some());
+    }
+
+    #[test]
+    fn test_qt_float_token_ok_unit() {
+        // Divergent spellings rejected.
+        assert!(!qt_float_token_ok("infinity"));
+        assert!(!qt_float_token_ok("INFINITY"));
+        assert!(!qt_float_token_ok("+nan"));
+        assert!(!qt_float_token_ok("-nan"));
+        // Canonical tokens accepted (case-insensitive).
+        assert!(qt_float_token_ok("inf"));
+        assert!(qt_float_token_ok("-inf"));
+        assert!(qt_float_token_ok("+inf"));
+        assert!(qt_float_token_ok("nan"));
+        assert!(qt_float_token_ok("NaN"));
+        // Numeric tokens always pass the gate (Rust parse decides validity).
+        assert!(qt_float_token_ok("1.5"));
+        assert!(qt_float_token_ok("-0.0"));
+        assert!(qt_float_token_ok("garbage")); // gate lets Rust parse reject it
     }
 
     // ── testParseValueHex16SpaceSeparated (test_format.cpp:446-453) ──

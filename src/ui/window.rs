@@ -334,6 +334,16 @@ pub struct MainWindow {
     /// Live subscription to an open Tools ▸ Options dialog — kept so its
     /// Apply/Cancel events fire while shown (mirrors [`goto_sub`](Self::goto_sub)).
     options_sub: Option<Subscription>,
+    /// Live subscription to an open View ▸ Edit Theme… [`ThemeEditor`] dialog —
+    /// kept so its Saved/Cancelled events fire while shown (the dedicated theme
+    /// editor; the C++ `editTheme`).
+    theme_editor_sub: Option<Subscription>,
+    /// Which right-dock tab the user last raised (Modules vs Bookmarks). The
+    /// right dock tabifies both panels (one `Dock` open flag), so the View ✓
+    /// for each must be driven from THIS (which tab is active) AND the dock's
+    /// visibility — not from the shared open flag alone (the C++ ties each ✓ to
+    /// its own dock's visibility; item 9).
+    right_dock_panel: RightDockPanel,
     /// Persisted MCP autostart preference (the C++ `autoStartMcp` setting). Owned
     /// here so Options can toggle + persist it; the MCP label reflects
     /// [`mcp_running`](Self::mcp_running) which this seeds on startup.
@@ -361,6 +371,16 @@ pub struct MainWindow {
     /// controller). Empty ⇒ the editor is unsplit (the default single-pane view).
     /// `view.split` appends a pane; `view.unsplit` removes the last.
     split_panes: Vec<ViewMode>,
+}
+
+/// Which panel is active in the shared right dock (Modules vs Bookmarks). Used
+/// to drive each panel's independent View-menu ✓ (item 9): the two panels share
+/// one `Dock`, so the checkmark must reflect which tab is raised, not just the
+/// dock's open state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RightDockPanel {
+    Modules,
+    Bookmarks,
 }
 
 /// The seven checkable View-menu options (the C++ View menu defaults; the
@@ -728,6 +748,36 @@ fn window_title_string(root_name: &str, modified: bool) -> String {
     format!("{name} - Reclass")
 }
 
+/// The unsaved-changes guard's header sentence, picked by the count of distinct
+/// dirty documents (the C++ `closeEvent`: two complete sentences by count
+/// instead of in-string pluralization; main.cpp:9003-9006). Pure; unit-tested.
+fn unsaved_changes_text(dirty_count: usize) -> String {
+    if dirty_count == 1 {
+        "One project has unsaved changes:".to_string()
+    } else {
+        format!("{dirty_count} projects have unsaved changes:")
+    }
+}
+
+/// The GitHub URL the Help ▸ About dialog advertises (the C++ About dialog's
+/// "Open GitHub" button opens `https://github.com/IChooseYou/Reclass`;
+/// main.cpp:4434). Was wrongly `github.com/reclassnet/reclass` (item 8).
+const ABOUT_GITHUB_URL: &str = "https://github.com/IChooseYou/Reclass";
+
+/// Dedup the dirty-document display names while preserving first-seen order (the
+/// C++ `closeEvent` builds `dirtyNames` from unique dirty docs, skipping repeats
+/// — multiple tabs can share a document; main.cpp:8988-8996). Pure; unit-tested.
+fn unique_dirty_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for n in names {
+        if seen.insert(n.clone()) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 impl MainWindow {
     /// Construct the main window view: build the [`DockArea`], assemble the
     /// default dock layout, seed [`AppState`], wire the dock/tab/workspace events,
@@ -920,6 +970,32 @@ impl MainWindow {
         )
         .detach();
 
+        // ── Scanner "Add as Nodes" (the C++ drag-result-into-editor / add-as-nodes
+        // path): append a node per address into the active editor's container.
+        // Previously emitted but unsubscribed, so the button only set a status and
+        // appended nothing (item 6). ──
+        cx.subscribe_in(
+            &scanner,
+            window,
+            |this, _sc, ev: &super::scannerpanel::ScannerAddNodes, window, cx| {
+                this.on_scanner_add_nodes(&ev.addresses, window, cx);
+            },
+        )
+        .detach();
+
+        // ── Scanner "Change All Values" (the C++ batch write): write `bytes` to
+        // every result address through the mutable provider, re-read each, then
+        // hand the results back so the panel produces the "Wrote to X/Y" tail.
+        // Previously emitted but unsubscribed, so it never wrote (item 6). ──
+        cx.subscribe_in(
+            &scanner,
+            window,
+            |this, sc, ev: &super::scannerpanel::ScannerBatchEdit, window, cx| {
+                this.on_scanner_batch_edit(sc.clone(), ev.clone(), window, cx);
+            },
+        )
+        .detach();
+
         // ── Wire the modules dock row activation (double-click → set the active
         // document's base address to the module base). ──
         cx.subscribe_in(
@@ -944,6 +1020,15 @@ impl MainWindow {
         cx.observe_window_activation(window, |this, window, cx| {
             let focused = window.is_window_active();
             this.set_controllers_window_state(focused, true, cx);
+            // On window blur, dismiss the editor's open fly-out popups (the C++
+            // `changeEvent` → `editor.dismissAllPopups()` per pane when the window
+            // becomes inactive; item 10). The editor's type-selector / root-type /
+            // format fly-outs are opened as window (`Root`) dialogs, so closing
+            // the dialog layer collapses them — the user-visible "popups close on
+            // blur" behaviour.
+            if !focused {
+                window.close_all_dialogs(cx);
+            }
         })
         .detach();
 
@@ -974,6 +1059,10 @@ impl MainWindow {
             settings,
             scanner,
             options_sub: None,
+            theme_editor_sub: None,
+            // The right dock defaults to the Modules tab (the first tabified
+            // panel; docks.rs builds [modules, bookmarks]).
+            right_dock_panel: RightDockPanel::Modules,
             auto_start_mcp,
             brace_wrap,
             generator_asserts,
@@ -986,7 +1075,7 @@ impl MainWindow {
 
         // Observe the initial editor(s) so a row selection re-renders the window
         // (and thus refreshes the status bar; see [`Self::observe_editors`]).
-        win.observe_editors(cx);
+        win.observe_editors(window, cx);
         // Push the active font family into the Font submenu ✓, mark the active
         // theme, and rebuild the dynamic menus (Recent Files / Data Source / MCP
         // label) on first paint.
@@ -1288,10 +1377,11 @@ impl MainWindow {
             "view.split" => self.split_view(window, cx),
             "view.unsplit" => self.unsplit_view(window, cx),
             "view.presentation" => self.toggle_presentation(cx),
-            // View ▸ Edit Theme — fold into the Options dialog's Appearance page
-            // (the port's theme editing lives there); open it directly rather than
-            // pointing the user at another menu.
-            "view.theme_edit" => self.open_options_dialog(window, cx),
+            // View ▸ Edit Theme — open the dedicated ThemeEditor (swatch grid /
+            // live preview / save-as-user-copy), the C++ `editTheme`. Previously
+            // this folded into the Options dialog and the ThemeEditor view had no
+            // caller (item 4).
+            "view.theme_edit" => self.open_theme_editor(window, cx),
 
             // ── Tools ──
             "tools.rtti" => self.open_rtti_browser(window, cx),
@@ -1370,7 +1460,7 @@ impl MainWindow {
         self.rebuild_workspace(cx);
         // A fresh doc has the NullProvider — clear the docks accordingly.
         self.refresh_docks_for_active(cx);
-        self.observe_editors(cx);
+        self.observe_editors(window, cx);
     }
 
     // ── File: data source providers (the C++ m_sourceMenu → selectSource) ──
@@ -1811,6 +1901,86 @@ impl MainWindow {
         }
     }
 
+    /// Scanner "Add as Nodes" — append one node per result address into the active
+    /// editor's view-root container (the C++ drag-result-into-editor / add-as-nodes
+    /// path; scannerpanel.cpp:655). Each append is a tail `Hex64` field via the
+    /// controller (the same path the editor's own add-member uses). Reports the
+    /// count added; rebuilds the workspace + dirty dot like any other mutation.
+    fn on_scanner_add_nodes(
+        &mut self,
+        addresses: &[u64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first to add scanner nodes.", window, cx);
+            return;
+        };
+        if addresses.is_empty() {
+            return;
+        }
+        let added = editor.update(cx, |ed, cx| {
+            let view_root = ed.controller().view_root_id();
+            let mut added = 0usize;
+            for _ in addresses {
+                // Append into the view-root container (or its first root struct
+                // when the view root is the whole document). `append_single_field`
+                // walks up to the owning Struct/Array/Enum and adds a tail Hex64.
+                if ed.controller_mut().append_single_field(view_root).is_some() {
+                    added += 1;
+                }
+            }
+            ed.apply_document(cx);
+            added
+        });
+        self.rebuild_workspace(cx);
+        self.sync_dirty_state(cx);
+        self.notify(format!("Added {added} node(s) from scanner"), window, cx);
+        cx.notify();
+    }
+
+    /// Scanner "Change All Values" — write `bytes` to every result address through
+    /// the active editor's mutable controller, re-read each, and hand the results
+    /// back to [`ScannerPanel::apply_change_all`] so it produces the "Wrote to X/Y"
+    /// tail (the C++ batch write + re-read; scannerpanel.cpp:981). A failed write
+    /// (read-only provider) yields `None` for that address so the count reflects
+    /// only the writes that landed.
+    fn on_scanner_batch_edit(
+        &mut self,
+        scanner: Entity<super::scannerpanel::ScannerPanel>,
+        ev: super::scannerpanel::ScannerBatchEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Attach a data source first.", window, cx);
+            return;
+        };
+        if ev.bytes.is_empty() || ev.addresses.is_empty() {
+            return;
+        }
+        let read_size = ev.bytes.len() as i32;
+        let provider = editor.read(cx).controller().document().provider.clone();
+        let mut results: Vec<(u64, Option<Vec<u8>>)> = Vec::with_capacity(ev.addresses.len());
+        for &addr in &ev.addresses {
+            let wrote = editor.update(cx, |ed, _cx| {
+                ed.controller_mut().write_memory(addr, &ev.bytes)
+            });
+            if wrote {
+                // Re-read the just-written bytes so the scanner row reflects the
+                // new value (the C++ `prov->readBytes(r.address, readSize)`).
+                let nb = provider.read_bytes(addr, read_size);
+                results.push((addr, Some(nb)));
+            } else {
+                results.push((addr, None));
+            }
+        }
+        // A live write changed memory under the editor — recompose so it reflects.
+        editor.update(cx, |ed, cx| ed.apply_document(cx));
+        scanner.update(cx, |sp, cx| sp.apply_change_all(results, cx));
+        cx.notify();
+    }
+
     // ── View: font family (the C++ exclusive Consolas / JetBrains Mono picker) ──
 
     /// View ▸ Font ▸ {Consolas / JetBrains Mono} — set + persist the editor font
@@ -1824,6 +1994,25 @@ impl MainWindow {
         // the ctor.
         self.settings.borrow_mut().set(settings_keys::FONT, family);
         self.sync_font_menu_checked(cx);
+        // Push the chosen family into every open editor surface (the C++
+        // `setEditorFont` applies the font to all editors; main.cpp:5071).
+        // Previously this only persisted the key + synced the menu ✓, so the
+        // Font submenu was cosmetic — no editor ever changed font. Split panes
+        // view the SAME active editor entity, so iterating the tab editors
+        // covers every visible pane.
+        let family_ss: SharedString = family.to_string().into();
+        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        for editor in editors {
+            editor.update(cx, |ed, cx| {
+                ed.set_font_family(Some(family_ss.clone()), cx);
+            });
+        }
         self.notify(format!("Editor font: {family}"), window, cx);
     }
 
@@ -2024,6 +2213,53 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// View ▸ Edit Theme… — open the dedicated [`ThemeEditor`] (the swatch grid /
+    /// live preview / theme combo / name edit / save-as-user-copy) for the
+    /// active theme (the C++ `editTheme`; main.cpp). On accept the editor has
+    /// already committed via the manager (`updateTheme` — persists + commits the
+    /// preview + re-styles), so the host only re-syncs its theme state + the
+    /// Theme submenu ✓; on reject the editor reverts the live preview
+    /// (`revertPreview`). Previously `view.theme_edit` routed to the Options
+    /// dialog and this fully-built view had no caller (item 4).
+    fn open_theme_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::theme::editor::{ThemeEditor, ThemeEditorEvent};
+        let index = self.theme_manager.borrow().current_index();
+        let dialog = cx.new(|cx| ThemeEditor::new(index, window, cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        self.theme_editor_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            |this, _d, ev: &ThemeEditorEvent, window, cx| match ev {
+                // Saved: the manager already committed + re-styled in
+                // `ThemeEditor::save` (the C++ `updateTheme`); mirror the commit
+                // into the host's theme state + Theme submenu ✓.
+                ThemeEditorEvent::Saved(_index) => {
+                    window.close_dialog(cx);
+                    let name = this.theme_manager.borrow().current().name.clone();
+                    this.state.set_theme_name(&name);
+                    this.settings.borrow_mut().set(settings_keys::THEME, &name);
+                    this.sync_theme_menu_checked(cx);
+                    cx.notify();
+                }
+                // Cancelled: the editor already reverted the live preview (the
+                // C++ `revertPreview`); just dismiss.
+                ThemeEditorEvent::Cancelled => {
+                    window.close_dialog(cx);
+                    cx.notify();
+                }
+            },
+        ));
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(480.))
+                .margin_top(px(60.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     /// Apply an accepted [`OptionsResult`] to the live app + persist every field
     /// (the C++ Options "OK" path). Theme + font reuse the existing switch/set
     /// helpers (which persist on their own); the remaining fields persist here.
@@ -2122,7 +2358,7 @@ impl MainWindow {
             "About Reclass",
             &format!(
                 "Reclass {} — a Rust + GPUI port of ReClass.\n\nA memory structure editor.\n\
-                 GitHub: github.com/reclassnet/reclass",
+                 GitHub: {ABOUT_GITHUB_URL}",
                 env!("CARGO_PKG_VERSION")
             ),
         );
@@ -2352,30 +2588,158 @@ impl MainWindow {
 
     // ── Unsaved-changes guard + quit (the C++ closeEvent + project_close) ──
 
-    /// File ▸ Exit — if any open document is modified, show the unsaved-changes
-    /// guard before quitting (the C++ `closeEvent`); otherwise quit immediately.
+    /// File ▸ Exit — if any open document is modified, show the 3-way
+    /// unsaved-changes guard (Save changes / Discard / Cancel) before quitting
+    /// (the C++ `closeEvent`; main.cpp:8984): **Save** persists each dirty
+    /// document and aborts the quit on the first save failure, **Discard** quits
+    /// without saving, **Cancel** aborts. With nothing dirty, quit immediately.
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.any_document_modified(cx) {
-            let spec = super::messagebox::confirm(
-                "Unsaved changes",
-                "One or more documents have unsaved changes. Quit without saving?",
-                "Quit anyway",
-                true,
-            );
-            super::messagebox::open_confirm(spec, |_window, app| app.quit(), window, cx);
-        } else {
+        let dirty = self.collect_dirty_docs(cx);
+        if dirty.is_empty() {
             cx.quit();
+            return;
         }
+        self.open_unsaved_guard(
+            dirty,
+            |me, window, cx| {
+                // Save succeeded for every dirty doc → quit.
+                let _ = (me, window);
+                cx.quit();
+            },
+            |_me, _window, cx| cx.quit(), // Discard → quit without saving.
+            window,
+            cx,
+        );
     }
 
-    /// Whether any open editor's document is modified (the C++ scans every tab's
-    /// `doc.modified`).
-    fn any_document_modified(&self, cx: &Context<Self>) -> bool {
-        self.document_area
-            .read(cx)
-            .tabs()
-            .iter()
-            .any(|t| t.editor.read(cx).controller().document().modified)
+    /// Collect the open editors whose document is modified, deduped by document
+    /// (the C++ `closeEvent` walks `m_tabs`, skipping repeat docs; here each tab
+    /// owns its editor so we dedup by [`DocId`]). Each entry is
+    /// `(doc id, editor, display name)` where the name is the file name when the
+    /// document has a path, else the view-root struct name (the C++ name rule;
+    /// main.cpp:8991-8993).
+    fn collect_dirty_docs(
+        &self,
+        cx: &Context<Self>,
+    ) -> Vec<(Entity<super::editor::RcxEditor>, String)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for t in self.document_area.read(cx).tabs() {
+            if seen.contains(&t.id) {
+                continue;
+            }
+            let ed = t.editor.read(cx);
+            let ctrl = ed.controller();
+            let doc = ctrl.document();
+            if !doc.modified {
+                continue;
+            }
+            seen.insert(t.id);
+            let name = match &doc.file_path {
+                Some(p) => p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| root_name_for_title(ctrl.tree(), ctrl.view_root_id())),
+                None => root_name_for_title(ctrl.tree(), ctrl.view_root_id()),
+            };
+            out.push((t.editor.clone(), name));
+        }
+        out
+    }
+
+    /// Open the 3-way unsaved-changes guard for `dirty` docs (the C++
+    /// `ThemedMessageBox::unsavedChanges`). On **Save changes** it persists every
+    /// dirty doc through its editor (the C++ `project_save(dock,false)` per doc),
+    /// and only runs `on_saved` when ALL saved; on the first failure it reports +
+    /// aborts (the C++ `event->ignore()` on a failed save). On **Discard** it runs
+    /// `on_discard`. On **Cancel** (or Esc) it dismisses with no action.
+    fn open_unsaved_guard<S, D>(
+        &mut self,
+        dirty: Vec<(Entity<super::editor::RcxEditor>, String)>,
+        on_saved: S,
+        on_discard: D,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        S: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        D: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let names = unique_dirty_names(dirty.iter().map(|(_, n)| n.clone()));
+        let text = unsaved_changes_text(names.len());
+        let editors: Vec<Entity<super::editor::RcxEditor>> =
+            dirty.iter().map(|(e, _)| e.clone()).collect();
+        let dialog = cx.new(|cx| RcxUnsavedDialog::new("Unsaved Changes", &text, names, cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        let on_saved = Rc::new(on_saved);
+        let on_discard = Rc::new(on_discard);
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            move |this, _d, choice: &super::messagebox::UnsavedChoice, window, cx| {
+                use super::messagebox::UnsavedChoice;
+                match choice {
+                    UnsavedChoice::Cancel => window.close_dialog(cx),
+                    UnsavedChoice::Discard => {
+                        window.close_dialog(cx);
+                        on_discard(this, window, cx);
+                    }
+                    UnsavedChoice::Save => {
+                        // Persist each dirty doc; abort on the first failure (the
+                        // C++ `if (!project_save(...)) { event->ignore(); return; }`).
+                        let all_saved = this.save_dirty_docs(&editors, window, cx);
+                        if all_saved {
+                            window.close_dialog(cx);
+                            on_saved(this, window, cx);
+                        }
+                        // On failure the dialog stays open + a notification was
+                        // raised, mirroring the C++ aborted close.
+                    }
+                }
+            },
+        ));
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(super::messagebox::MSG_MAX_WIDTH))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Persist each editor's document to its known path (the C++
+    /// `project_save(dock,false)` per dirty doc). Returns `true` only if every doc
+    /// was written; a doc with NO file path can't be saved synchronously here, so
+    /// it counts as a failure (a notification points the user at Save As). On a
+    /// write failure it notifies + returns `false` (the C++ aborts the close).
+    fn save_dirty_docs(
+        &mut self,
+        editors: &[Entity<super::editor::RcxEditor>],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        for editor in editors {
+            let path = editor.read(cx).controller().document().file_path.clone();
+            let Some(path) = path else {
+                self.notify(
+                    "An unsaved document has no file yet — use File ▸ Save As… first.",
+                    window,
+                    cx,
+                );
+                return false;
+            };
+            let ok = editor.update(cx, |ed, _cx| ed.controller_mut().document_mut().save(&path));
+            if !ok {
+                self.notify(format!("Failed to save {}", path.display()), window, cx);
+                return false;
+            }
+            self.record_recent_file(&path, cx);
+        }
+        // Reflect cleared dirty bits in the tab dots.
+        self.sync_dirty_state(cx);
+        true
     }
 
     /// Recompute the OS window title from the active document and push it to the
@@ -2651,35 +3015,41 @@ impl MainWindow {
     }
 
     /// File ▸ Close Project (Ctrl+W) — close the active document tab. If the
-    /// active document is modified, show the unsaved-changes guard first (the C++
-    /// `closeFile` → unsaved prompt; act on the result). The document area never
-    /// leaves a blank window (it re-seeds a fresh tab when the last closes).
+    /// active document is modified, show the 3-way unsaved-changes guard first
+    /// (the C++ `closeFile` → unsaved prompt): **Save** persists the active doc
+    /// then closes (aborting on a save failure), **Discard** closes without
+    /// saving, **Cancel** aborts. The document area never leaves a blank window
+    /// (it re-seeds a fresh tab when the last closes).
     fn close_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let modified = self
-            .document_area
-            .read(cx)
-            .active_editor()
-            .map(|ed| ed.read(cx).controller().document().modified)
-            .unwrap_or(false);
-        if modified {
-            let spec = super::messagebox::confirm(
-                "Unsaved changes",
-                "This document has unsaved changes. Close it without saving?",
-                "Close without saving",
-                true,
-            );
-            let this = cx.entity().downgrade();
-            super::messagebox::open_confirm(
-                spec,
-                move |window, app| {
-                    let _ = this.update(app, |me, cx| me.do_close_active(window, cx));
-                },
-                window,
-                cx,
-            );
-        } else {
+        let active = self.document_area.read(cx).active_editor().cloned();
+        let dirty: Vec<(Entity<super::editor::RcxEditor>, String)> = match active {
+            Some(editor) if editor.read(cx).controller().document().modified => {
+                let ed = editor.read(cx);
+                let ctrl = ed.controller();
+                let doc = ctrl.document();
+                let name = match &doc.file_path {
+                    Some(p) => p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| root_name_for_title(ctrl.tree(), ctrl.view_root_id())),
+                    None => root_name_for_title(ctrl.tree(), ctrl.view_root_id()),
+                };
+                vec![(editor.clone(), name)]
+            }
+            _ => Vec::new(),
+        };
+        if dirty.is_empty() {
             self.do_close_active(window, cx);
+            return;
         }
+        self.open_unsaved_guard(
+            dirty,
+            |me, window, cx| me.do_close_active(window, cx), // Saved → close.
+            |me, window, cx| me.do_close_active(window, cx), // Discard → close.
+            window,
+            cx,
+        );
     }
 
     /// Actually close the active tab (after any unsaved-changes guard).
@@ -2794,6 +3164,15 @@ impl MainWindow {
     /// the checkmark survives tab switches and reflects the C++ defaults.
     fn toggle_view_option(&mut self, opt: ViewOpt, cx: &mut Context<Self>) {
         let value = !self.view_opts.get(opt);
+        self.set_view_option_value(opt, value, cx);
+    }
+
+    /// Set a checkable View option to an explicit `value` (shared by
+    /// [`toggle_view_option`] and the in-editor `ViewOptionToggled` event): push
+    /// the value into EVERY open editor, mirror it into the window's `view_opts`,
+    /// refresh the menu ✓, and persist it. Pushing to all panes is idempotent for
+    /// the editor that originated an in-editor toggle.
+    fn set_view_option_value(&mut self, opt: ViewOpt, value: bool, cx: &mut Context<Self>) {
         self.view_opts.set(opt, value);
         // Push the new value into EVERY open editor via the EDITOR SETTER
         // CONTRACT (the C++ applies each view option to all open tabs, not just
@@ -2845,6 +3224,15 @@ impl MainWindow {
         let o = self.view_opts;
         let brace_wrap = self.brace_wrap;
         let refresh_ms = self.refresh_ms;
+        // The persisted editor font family (the C++ applies the chosen font to
+        // every editor; main.cpp). New editors start `font_family: None` (the
+        // mono default), so without this push a fresh tab ignores the saved
+        // View ▸ Font selection. An empty string means "no override" → mono.
+        let font_family: Option<SharedString> = if self.editor_font.trim().is_empty() {
+            None
+        } else {
+            Some(self.editor_font.clone().into())
+        };
         editor.update(cx, |ed, cx| {
             ed.set_compact_columns(o.compact_columns, cx);
             ed.set_tree_lines(o.tree_lines, cx);
@@ -2853,6 +3241,7 @@ impl MainWindow {
             ed.set_show_comments(o.show_comments, cx);
             ed.set_hover_effects(o.hover_effects, cx);
             ed.set_minimap(o.minimap, cx);
+            ed.set_font_family(font_family.clone(), cx);
             // Generator brace-wrap + the persisted refresh interval are
             // controller-level (the C++ pushes both into every controller).
             ed.controller_mut().set_brace_wrap(brace_wrap);
@@ -3194,14 +3583,28 @@ impl MainWindow {
             .dock_area
             .read(cx)
             .is_dock_open(DockPlacement::Right, cx);
+        let right_panel = self.right_dock_panel;
         let presentation = self.presentation;
         self.menubar.update(cx, |mb, cx| {
             for opt in ViewOpt::ALL {
                 mb.set_command_checked(opt.command_id(), opts.get(opt), cx);
             }
             mb.set_command_checked("view.project", project_open, cx);
-            mb.set_command_checked("view.modules", right_open, cx);
-            mb.set_command_checked("view.bookmarks", right_open, cx);
+            // Modules / Bookmarks share the right dock, but each ✓ is tied to its
+            // OWN panel's visibility (the C++ binds each ✓ to its dock; item 9).
+            // A panel is "visible" only when the right dock is open AND that panel
+            // is the raised tab — so opening Modules no longer also checks
+            // Bookmarks (and vice versa).
+            mb.set_command_checked(
+                "view.modules",
+                right_open && right_panel == RightDockPanel::Modules,
+                cx,
+            );
+            mb.set_command_checked(
+                "view.bookmarks",
+                right_open && right_panel == RightDockPanel::Bookmarks,
+                cx,
+            );
             mb.set_command_checked("view.presentation", presentation, cx);
         });
     }
@@ -3256,6 +3659,9 @@ impl MainWindow {
     /// raising == open + focus the panel). Re-syncs the View ✓.
     fn raise_modules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_dock_open(true, window, cx);
+        // Record which right-dock tab is now active so the View ✓ for Modules
+        // (and NOT Bookmarks) lights up (item 9).
+        self.right_dock_panel = RightDockPanel::Modules;
         let focus = self.modules.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         self.sync_view_menu_checked(cx);
@@ -3267,6 +3673,9 @@ impl MainWindow {
     /// [`raise_modules`](Self::raise_modules) but targeting the Bookmarks panel.
     fn raise_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_dock_open(true, window, cx);
+        // Record which right-dock tab is now active so the View ✓ for Bookmarks
+        // (and NOT Modules) lights up (item 9).
+        self.right_dock_panel = RightDockPanel::Bookmarks;
         let focus = self.bookmarks.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         self.sync_view_menu_checked(cx);
@@ -3577,6 +3986,22 @@ impl MainWindow {
         // controllers use a calm refresh interval; restoring leaves them at the
         // persisted interval. Mirror the blur-throttle path the window already owns.
         self.set_controllers_window_state(!on, true, cx);
+        // Engage the editor spotlight on every open pane (the C++
+        // `setPresentationMode(on)` on each editor; main.cpp:1511). This is the
+        // central effect — the focus-glow + non-focused-row dimming — which was
+        // dead because no pane's `set_presentation_mode` was ever called. Split
+        // panes view the SAME active editor entity, so iterating the tab editors
+        // covers every visible pane.
+        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+            .document_area
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|t| t.editor.clone())
+            .collect();
+        for editor in editors {
+            editor.update(cx, |ed, cx| ed.set_presentation_mode(on, cx));
+        }
         // The render reads `self.presentation` to fade the chrome (titlebar +
         // status bar); request a repaint so the fade applies immediately.
         cx.notify();
@@ -3755,12 +4180,7 @@ impl MainWindow {
 
     // ── Document-area event handling (app-shell §8 step 9) ──
 
-    fn on_doc_area_event(
-        &mut self,
-        ev: DocAreaEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_doc_area_event(&mut self, ev: DocAreaEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             DocAreaEvent::Activated(id) => {
                 // Mirror the activation into AppState if the id is known; the area
@@ -3777,12 +4197,12 @@ impl MainWindow {
                 self.rebuild_workspace(cx);
                 // The tab set grew — re-observe so the new editor's selections
                 // refresh the status bar.
-                self.observe_editors(cx);
+                self.observe_editors(window, cx);
             }
             DocAreaEvent::Closed(id) => {
                 self.state.close_document(id);
                 self.rebuild_workspace(cx);
-                self.observe_editors(cx);
+                self.observe_editors(window, cx);
             }
             DocAreaEvent::ViewModeChanged(id, mode) => {
                 self.state.set_view_mode(id, mode);
@@ -3800,7 +4220,7 @@ impl MainWindow {
     /// change forces our (sibling) status bar to refresh. Called on construction
     /// and whenever the tab set changes (new/closed document); the previous
     /// observations are dropped (and thus unsubscribed) by reassigning the `Vec`.
-    fn observe_editors(&mut self, cx: &mut Context<Self>) {
+    fn observe_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editors: Vec<Entity<super::editor::RcxEditor>> = self
             .document_area
             .read(cx)
@@ -3808,10 +4228,41 @@ impl MainWindow {
             .iter()
             .map(|t| t.editor.clone())
             .collect();
-        self.editor_observers = editors
-            .into_iter()
-            .map(|editor| cx.observe(&editor, |_this, _editor, cx| cx.notify()))
-            .collect();
+        let mut subs = Vec::with_capacity(editors.len() * 2);
+        for editor in editors {
+            // A row-selection change re-renders the window (refreshes the status
+            // bar). The editors `cx.notify()` themselves but don't emit up.
+            subs.push(cx.observe(&editor, |_this, _editor, cx| cx.notify()));
+            // Editor → host events. Ctrl+Click on a navigable header token emits
+            // `OpenTypeInNewTab { ref_id }`; route it to the createTab+setViewRootId
+            // flow (item 5). `Status` messages are harmless if unconsumed.
+            subs.push(cx.subscribe_in(
+                &editor,
+                window,
+                |this, _editor, ev: &super::editor::RcxEditorEvent, window, cx| match ev {
+                    super::editor::RcxEditorEvent::OpenTypeInNewTab { ref_id } => {
+                        this.open_type_in_new_tab(*ref_id, window, cx);
+                    }
+                    super::editor::RcxEditorEvent::Status { message } => {
+                        this.notify(message.clone(), window, cx);
+                    }
+                    // An in-editor View-option toggle (offset-margin double-click /
+                    // right-click Relative/Absolute): the editor already applied it
+                    // locally; mirror it to the window (persist + ✓ + push to every
+                    // pane) so it behaves like the menu toggle (the C++
+                    // `relativeOffsetsChanged`).
+                    super::editor::RcxEditorEvent::ViewOptionToggled { option, value } => {
+                        let opt = match option {
+                            super::editor::EditorViewOption::RelativeOffsets => {
+                                ViewOpt::RelativeOffsets
+                            }
+                        };
+                        this.set_view_option_value(opt, *value, cx);
+                    }
+                },
+            ));
+        }
+        self.editor_observers = subs;
     }
 
     /// Activate a document in `AppState` by id (best-effort: the document area is
@@ -3845,6 +4296,84 @@ impl MainWindow {
         if let Some(t) = self.state.active_tab_mut() {
             t.view_root = Some(nav.node_id);
         }
+        cx.notify();
+    }
+
+    /// Ctrl+Click on a navigable header token → open the referenced struct
+    /// (`ref_id`) in a NEW tab (the C++ Ctrl+Click → `openTypeInNewTabRequested`
+    /// → `createTab(doc)` + `setViewRootId`; main.cpp:3092). The Rust port's tabs
+    /// each own their document, so "the same document in a new tab" is a deep copy
+    /// of the active document's tree (node ids — and thus `ref_id` — preserved by
+    /// [`NodeTree::clone`]) sharing the same provider `Arc`; the new tab's view
+    /// root is set to `ref_id`. Without this the editor's
+    /// [`RcxEditorEvent::OpenTypeInNewTab`] had no subscriber and the new tab was
+    /// never created (item 5).
+    fn open_type_in_new_tab(&mut self, ref_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.document_area.read(cx).active_editor().cloned() else {
+            return;
+        };
+        // Deep-copy the active document (tree clone keeps ids/ref_ids; the provider
+        // Arc is shared so the new tab reads the same source).
+        let (tree, provider, file_path) = {
+            let ed = active.read(cx);
+            let doc = ed.controller().document();
+            (
+                doc.tree.clone(),
+                doc.provider.clone(),
+                doc.file_path.clone(),
+            )
+        };
+        // Only open if the referenced struct actually exists in the tree (the C++
+        // guards on a resolvable target before emitting).
+        if tree.index_of_id(ref_id) < 0 {
+            self.notify("No type to open in a new tab.", window, cx);
+            return;
+        }
+        let mut doc = crate::controller::RcxDocument::new();
+        doc.tree = tree;
+        doc.provider = provider;
+        doc.file_path = file_path;
+        let title = root_name_for_title(&doc.tree, ref_id);
+        let title = if title.is_empty() {
+            "Untitled".to_string()
+        } else {
+            title
+        };
+        let source = Self::source_for_doc(&doc);
+        // Append the new tab + push the cloned document into its editor, then set
+        // the view root to the referenced struct (the C++ createTab + setViewRootId).
+        let mut new_editor: Option<Entity<super::editor::RcxEditor>> = None;
+        self.document_area.update(cx, |area, cx| {
+            area.push_document(title.clone(), window, cx);
+            if let Some(editor) = area.active_editor().cloned() {
+                editor.update(cx, |ed, cx| {
+                    ed.set_document(doc, cx);
+                    ed.controller_mut().set_view_root_id(ref_id);
+                    ed.apply_document(cx);
+                });
+                new_editor = Some(editor);
+            }
+        });
+        if let Some(id) = self.active_doc_id(cx) {
+            self.document_area.update(cx, |area, cx| {
+                area.set_source(id, source.clone(), cx);
+            });
+        }
+        // Mirror into AppState (title + source + view root) so the new tab is a
+        // first-class document.
+        let state_id = self.state.open_document(title);
+        if let Some(t) = self.state.tab_mut(state_id) {
+            t.view_root = Some(ref_id);
+            t.source = source;
+        }
+        // Realign the fresh editor to the persisted view options + font, refresh
+        // the docks + workspace, and re-observe so its events route.
+        if let Some(editor) = new_editor {
+            self.apply_view_opts_to_editor(&editor, cx);
+        }
+        self.rebuild_workspace(cx);
+        self.refresh_docks_for_active(cx);
+        self.observe_editors(window, cx);
         cx.notify();
     }
 
@@ -4408,6 +4937,126 @@ impl MainWindow {
         });
         window.focus(&focus, cx);
         cx.notify();
+    }
+}
+
+/// The three-way unsaved-changes guard dialog (the C++ `closeEvent`'s
+/// `ThemedMessageBox::unsavedChanges`): Cancel / Discard / Save changes, with the
+/// dirty document names listed and **Save changes** as the default (Enter)
+/// button. Built from [`messagebox::unsaved_changes`] (button order + labels +
+/// variants + default) so the layout matches the rest of the themed message
+/// boxes; emits a [`messagebox::UnsavedChoice`] mapped via
+/// [`messagebox::unsaved_choice_for`]. Replaces the old 2-button confirm that
+/// quit/closed WITHOUT ever offering Save (item 1).
+struct RcxUnsavedDialog {
+    spec: super::messagebox::MessageSpec,
+    focus_handle: FocusHandle,
+}
+
+impl RcxUnsavedDialog {
+    fn new(title: &str, text: &str, dirty_names: Vec<String>, cx: &mut Context<Self>) -> Self {
+        Self {
+            spec: super::messagebox::unsaved_changes(title, text, dirty_names),
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Emit the choice for `button_index` (0=Cancel, 1=Discard, 2=Save), per the
+    /// `[Cancel, Discard, Save changes]` order [`messagebox::unsaved_changes`]
+    /// builds.
+    fn choose(&mut self, button_index: usize, cx: &mut Context<Self>) {
+        cx.emit(super::messagebox::unsaved_choice_for(button_index));
+    }
+}
+
+impl Focusable for RcxUnsavedDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<super::messagebox::UnsavedChoice> for RcxUnsavedDialog {}
+
+impl Render for RcxUnsavedDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use super::dialogs::modal;
+        use super::messagebox::{ButtonVariant, DetailLayout};
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let card_w = modal::clamp_width(super::messagebox::MSG_MAX_WIDTH, window);
+        let detail_layout = super::messagebox::format_detail(&self.spec.detail);
+
+        // Body: the count sentence, then the dirty-name list (label for ≤5,
+        // scrollable list for >5 — the C++ detail threshold).
+        let mut body = modal::body(cx).child(
+            div()
+                .text_size(px(super::design::tokens::font::UI_MD))
+                .text_color(super::design::color::text(cx))
+                .child(self.spec.text.clone()),
+        );
+        body = match detail_layout {
+            DetailLayout::None => body,
+            DetailLayout::Label(s) => body.child(
+                div()
+                    .text_size(px(super::design::tokens::font::UI_SM))
+                    .text_color(super::design::color::text_muted(cx))
+                    .child(s),
+            ),
+            DetailLayout::List(items) => body.child(
+                gpui_component::v_flex()
+                    .id("rcx-unsaved-detail")
+                    .max_h(px(140.))
+                    .overflow_y_scroll()
+                    .gap(px(super::design::tokens::space::XXS))
+                    .children(items.into_iter().map(|item| {
+                        div()
+                            .text_size(px(super::design::tokens::font::UI_SM))
+                            .text_color(super::design::color::text_muted(cx))
+                            .child(item)
+                    })),
+            ),
+        };
+
+        // Footer: the buttons in the spec's left→right order [Cancel, Discard,
+        // Save changes], each carrying its variant.
+        let mut footer = modal::footer(cx);
+        for (i, b) in self.spec.buttons.iter().enumerate() {
+            let label = b.label.clone();
+            let btn = Button::new(("unsaved-btn", i))
+                .label(label)
+                .map(|btn| match b.variant {
+                    ButtonVariant::Primary => btn.primary(),
+                    ButtonVariant::Secondary => btn,
+                    ButtonVariant::Destructive => btn.danger(),
+                })
+                .on_click(cx.listener(move |this, _e, _w, cx| this.choose(i, cx)));
+            footer = footer.child(btn);
+        }
+
+        modal::card(cx)
+            .id("rcx-unsaved-dialog")
+            .track_focus(&self.focus_handle)
+            .key_context("RcxUnsaved")
+            // Enter → the default (Save changes = last button); Esc → Cancel
+            // (index 0) — the C++ default-button / reject wiring.
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "enter" => {
+                        let last = this.spec.buttons.len().saturating_sub(1);
+                        this.choose(last, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        this.choose(0, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .w(card_w)
+            .child(modal::header(self.spec.title.clone(), cx))
+            .child(body)
+            .child(footer)
     }
 }
 
@@ -5503,8 +6152,9 @@ mod tests {
     // These import specific items (NOT `super::*`) so the module's `gpui::*` glob
     // is not pulled into the test-hygiene expansion (see the menubar.rs note).
     use super::{
-        builtin_plugins, root_name_for_title, seed_root_doc, settings_keys, window_title_string,
-        DiskSettings, ExportKind, ImportKind, RootKind, ViewOpt, ViewOptions,
+        builtin_plugins, root_name_for_title, seed_root_doc, settings_keys, unique_dirty_names,
+        unsaved_changes_text, window_title_string, DiskSettings, ExportKind, ImportKind, RootKind,
+        ViewOpt, ViewOptions, ABOUT_GITHUB_URL,
     };
     use crate::theme::SettingsStore;
 
@@ -5628,6 +6278,49 @@ mod tests {
         assert_eq!(window_title_string("Player", true), "Player * - Reclass");
         assert_eq!(window_title_string("", false), "Reclass");
         assert_eq!(window_title_string("", true), "Reclass");
+    }
+
+    // ── Unsaved-changes guard (the C++ closeEvent; item 1) ──
+
+    #[test]
+    fn unsaved_changes_text_picks_sentence_by_count() {
+        // The C++ uses two complete sentences keyed on the distinct-dirty-doc
+        // count (main.cpp:9003-9006): singular for one, "%1 projects …" otherwise.
+        assert_eq!(unsaved_changes_text(1), "One project has unsaved changes:");
+        assert_eq!(unsaved_changes_text(2), "2 projects have unsaved changes:");
+        assert_eq!(unsaved_changes_text(7), "7 projects have unsaved changes:");
+    }
+
+    #[test]
+    fn unique_dirty_names_dedups_preserving_first_seen_order() {
+        // The C++ `dirtyNames` skips repeats (a doc shared across tabs is listed
+        // once; main.cpp:8994-8995) while keeping discovery order.
+        let names = vec![
+            "Player".to_string(),
+            "World".to_string(),
+            "Player".to_string(), // duplicate (shared doc) → dropped
+            "Enemy".to_string(),
+        ];
+        assert_eq!(
+            unique_dirty_names(names),
+            vec![
+                "Player".to_string(),
+                "World".to_string(),
+                "Enemy".to_string()
+            ]
+        );
+        // Empty in → empty out (nothing dirty).
+        assert!(unique_dirty_names(Vec::<String>::new()).is_empty());
+    }
+
+    // ── Help ▸ About GitHub URL (the C++ about() "Open GitHub"; item 8) ──
+
+    #[test]
+    fn about_github_url_points_at_ichooseyou_repo() {
+        // The C++ About dialog opens https://github.com/IChooseYou/Reclass
+        // (main.cpp:4434), NOT the old reclassnet/reclass URL.
+        assert_eq!(ABOUT_GITHUB_URL, "https://github.com/IChooseYou/Reclass");
+        assert!(!ABOUT_GITHUB_URL.contains("reclassnet"));
     }
 
     #[test]

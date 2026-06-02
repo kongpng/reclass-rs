@@ -1040,8 +1040,16 @@ impl RcxController {
                         if is_undo { *old_kind } else { *new_kind };
                 }
                 self.apply_off_adjs(off_adjs, is_undo);
-                self.refresh_gen += 1;
-                // Value history intentionally KEPT across kind changes.
+                // The changed node's value format changed; clear its history
+                // (`controller.cpp:2150-2155`). If `off_adjs` is empty (same-size
+                // change) still bump the refresh gen to discard any in-flight
+                // async read that would otherwise re-record the OLD format and
+                // flash false change-heat; when `off_adjs` is non-empty,
+                // `clear_history_for_adjs` performs the bump instead.
+                if off_adjs.is_empty() {
+                    self.refresh_gen += 1;
+                }
+                self.clear_node_history(*node_id);
                 self.clear_history_for_adjs(off_adjs);
             }
             Command::Rename {
@@ -2853,13 +2861,22 @@ impl RcxController {
         root_id
     }
 
-    /// `createNewTypeRequested` handler (`controller.cpp:4520`): materialize a
-    /// fresh `NewClass`/`NewClassN` root struct with 8×Hex64 fields in one
-    /// "Create new type" macro. Returns `(root_id, type_name)`.
+    /// Editor "New Class" materialization (`controller.cpp:3390-3423`): create a
+    /// fresh `NewClass` / `NewClass_2` / `NewClass_3` … root **class** definition
+    /// with 8×Hex64 fields in one macro. Returns `(root_id, type_name)`.
+    ///
+    /// Matches the C++ editor New-Class lambda exactly: `classKeyword = "class"`
+    /// (so it renders + round-trips as `class NewClass { … }`, not `struct`) and
+    /// the collision suffix is `"%1_%2"` starting the counter at **2** —
+    /// identical to `convert_to_typed_pointer`. (The C++ type-picker
+    /// `createNewTypeRequested` path used a different `NewClass1`/empty-keyword
+    /// naming; in this port both the editor New-Class action and the type-picker
+    /// "+ New" share `new_class_on_node` → this materialization, so we follow the
+    /// editor New-Class semantics that the user actually sees.)
     pub fn create_new_class_struct(&mut self) -> (u64, String) {
         let base = "NewClass";
         let mut type_name = base.to_string();
-        let mut counter = 1;
+        let mut counter = 2;
         let existing: std::collections::HashSet<String> = self
             .doc
             .tree
@@ -2869,17 +2886,18 @@ impl RcxController {
             .map(|n| n.struct_type_name.clone())
             .collect();
         while existing.contains(&type_name) {
-            type_name = format!("{base}{counter}");
+            type_name = format!("{base}_{counter}");
             counter += 1;
         }
 
         let was = self.suppress_refresh;
         self.suppress_refresh = true;
-        self.begin_macro("Create new type");
+        self.begin_macro("New Class");
 
         let mut root = Node {
             kind: NodeKind::Struct,
             struct_type_name: type_name.clone(),
+            class_keyword: "class".to_string(),
             name: "instance".to_string(),
             parent_id: 0,
             offset: 0,
@@ -3559,6 +3577,76 @@ impl RcxController {
         self.end_macro();
         self.suppress_refresh = false;
         self.refresh();
+    }
+
+    /// "Convert to Hex" — decompose a non-hex primitive into raw hex pads
+    /// (`controller.cpp:3713-3753`).
+    ///
+    /// Unlike the multi-select "Convert to Hex" (which just `changeNodeKind`s
+    /// each node to a single same-size hex equivalent, keeping identity/name),
+    /// the single-node convert REMOVES the node entirely and re-fills its byte
+    /// range with the largest-first hex pads (Hex64 → Hex32 → Hex16 → Hex8) that
+    /// cover the full `byteSize()`, each named `pad_<offset>` (2-wide zero-padded
+    /// lowercase hex of the absolute offset). Example: a 12-byte `Vec3` at +0
+    /// becomes `pad_00` (Hex64) + `pad_08` (Hex32). Containers (Struct/Array) and
+    /// nodes that are already hex are not converted (the menu only offers this for
+    /// non-hex non-container primitives), and a `byteSize() <= 0` node is a no-op.
+    pub fn convert_to_hex(&mut self, node_id: u64) {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return;
+        }
+        let node = self.doc.tree.nodes[ni as usize].clone();
+        // Mirror the C++ menu guard: only non-hex, non-container primitives.
+        if is_hex_node(node.kind) || node.kind == NodeKind::Struct || node.kind == NodeKind::Array {
+            return;
+        }
+        let total_size = node.byte_size();
+        if total_size <= 0 {
+            return;
+        }
+        let parent_id = node.parent_id;
+        let base_offset = node.offset;
+
+        let was = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Convert to Hex");
+
+        // Remove the original node (and its — for a primitive, empty — subtree).
+        self.push_command(Command::Remove {
+            node_id,
+            subtree: vec![node.clone()],
+            off_adjs: Vec::new(),
+        });
+
+        // Largest-first hex pads covering the whole byte range.
+        let mut pad_offset = base_offset;
+        let mut gap = total_size;
+        while gap > 0 {
+            let (pad_kind, pad_size) = if gap >= 8 {
+                (NodeKind::Hex64, 8)
+            } else if gap >= 4 {
+                (NodeKind::Hex32, 4)
+            } else if gap >= 2 {
+                (NodeKind::Hex16, 2)
+            } else {
+                (NodeKind::Hex8, 1)
+            };
+            self.insert_node(
+                parent_id,
+                pad_offset,
+                pad_kind,
+                &format!("pad_{:02x}", pad_offset),
+            );
+            pad_offset += pad_size;
+            gap -= pad_size;
+        }
+
+        self.end_macro();
+        self.suppress_refresh = was;
+        if !self.suppress_refresh {
+            self.refresh();
+        }
     }
 
     /// `joinHexNodes(nodeId, targetKind)` (`controller.cpp:3598`).

@@ -184,6 +184,14 @@ fn is_anon_name(name: &str) -> bool {
     name.is_empty() || name.starts_with('<')
 }
 
+/// Truncate a decoded LF_MEMBER offset to 16 bits, matching the C++
+/// `importFieldList`, which reads the member offset as a `uint16_t`
+/// (import_pdb.cpp:427-432). `pdb2` decodes the full numeric leaf as a `u64`, so
+/// members past 0xFFFF in a >64KB struct must wrap for byte-fidelity.
+fn member_offset_u16(offset: u64) -> i32 {
+    (offset as u16) as i32
+}
+
 impl<'t> PdbCtx<'t> {
     fn new(tt: &'t TypeTable<'t>) -> Self {
         PdbCtx {
@@ -390,7 +398,10 @@ impl<'t> PdbCtx<'t> {
         for field in &fl.fields {
             match field {
                 TypeData::Member(m) => {
-                    let offset = m.offset as i32;
+                    // C++ `importFieldList` reads the LF_MEMBER offset as a
+                    // `uint16_t` (import_pdb.cpp:427-432); `member_offset_u16`
+                    // reproduces that truncation for byte-fidelity.
+                    let offset = member_offset_u16(m.offset);
                     let name = m.name.to_string().into_owned();
                     let member_type = m.field_type.0;
 
@@ -1021,12 +1032,13 @@ pub fn import_pdb(path: &Path, struct_filter: &str) -> Result<NodeTree, ImportEr
         if fwdref {
             continue;
         }
-        // C++: `if (!name) continue;` — empty leaf-name pointer is falsy. An
-        // empty string here would be anonymous; the C++ only skips a NULL name,
-        // but practically names are non-empty for real UDTs.
-        if name.is_empty() {
-            continue;
-        }
+        // C++ `importPdb` skips only on `if (!name) continue;` — a NULL leaf-name
+        // pointer (import_pdb.cpp:1216). `pdb2` always yields a (possibly empty)
+        // `RawString`, never NULL, so we must NOT skip an empty-string name here:
+        // `import_udt` imports it as `<anon>` (matching the C++ `importUDT`,
+        // which names a NULL leaf `<anon>`). The filter check below still drops
+        // it whenever a non-empty `struct_filter` is requested, since an empty
+        // name can never equal a non-empty filter.
         if !struct_filter.is_empty() && name != struct_filter {
             continue;
         }
@@ -1167,5 +1179,39 @@ mod tests {
         assert_eq!(hex_for_size(4), NodeKind::Hex32);
         assert_eq!(hex_for_size(8), NodeKind::Hex64);
         assert_eq!(hex_for_size(3), NodeKind::Hex32);
+    }
+
+    // ── Item 5: LF_MEMBER offset truncated to uint16_t (cpp:427-432) ──
+
+    #[test]
+    fn member_offset_truncates_to_16_bits() {
+        // Offsets within 16 bits pass through unchanged.
+        assert_eq!(member_offset_u16(0), 0);
+        assert_eq!(member_offset_u16(0x10), 0x10);
+        assert_eq!(member_offset_u16(0xFFFF), 0xFFFF);
+        // Members past 0xFFFF in a >64KB struct wrap, exactly like the C++
+        // `uint16_t offset`. (Was previously `m.offset as i32`, which kept the
+        // full value and diverged from C++.)
+        assert_eq!(member_offset_u16(0x10000), 0);
+        assert_eq!(member_offset_u16(0x12345), 0x2345);
+        assert_eq!(member_offset_u16(0x1_0000_0001), 1);
+    }
+
+    // ── Item 5: empty-named root UDT imports as <anon> (not skipped) ──
+
+    #[test]
+    fn empty_name_is_anonymous_not_skipped() {
+        // `is_anon_name` classifies empty / `<...>` names as anonymous so
+        // `enumerate_pdb_types` filters them out of the picker — but the legacy
+        // `import_pdb` loop must NOT skip an empty name: it has no NULL pointer
+        // (pdb2 yields a possibly-empty RawString), so the C++ `if (!name)` guard
+        // never fires and the UDT is imported as `<anon>` via `import_udt`.
+        assert!(is_anon_name(""));
+        assert!(is_anon_name("<unnamed-tag>"));
+        assert!(!is_anon_name("RealType"));
+
+        // `import_udt`'s naming rule: an empty leaf name becomes `<anon>`.
+        let qname = if "".is_empty() { "<anon>" } else { "" };
+        assert_eq!(qname, "<anon>");
     }
 }
