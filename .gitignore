@@ -1,4 +1,8 @@
 /target
+# Workspace members (crates/*, examples/plugins/*) build into the root `target/`,
+# but a standalone `cargo build` inside a member dir creates a nested `target/`.
+# Ignore those build-artifact dirs everywhere (never commit build output).
+**/target/
 **/*.rs.bk
 *.pdb
 

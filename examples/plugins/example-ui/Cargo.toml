@@ -1,0 +1,22 @@
+# example-ui — a minimal native UI plugin (design §6 Phase 3 deliverable, §G
+# "example plugins (…, UI panel)"). Contributes a Command, a Panel, and a Dialog
+# as declarative ViewTrees the host renders (design §3). No provider — proves the
+# "add UI" goal crosses the ABI with only plain data.
+[package]
+name = "example-ui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Example native Reclass UI plugin (panel + dialog)."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+reclass-plugin = { path = "../../../crates/reclass-plugin" }
+# `#[export_root_module]` (applied by `export_plugin!`) generates `::abi_stable::…`
+# paths, so a plugin crate must have `abi_stable` as a direct dependency (the
+# idiomatic abi_stable plugin requirement). Same major/minor as the SDK.
+abi_stable = "0.11"

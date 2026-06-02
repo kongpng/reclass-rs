@@ -1,0 +1,19 @@
+# reclass-plugin — the author-facing SDK (design §G "a published reclass-plugin SDK
+# crate: the trait + abi_stable glue"). A plugin author depends on THIS crate (not
+# on the host), implements the plain-Rust `Plugin`/`Provider` traits, and calls
+# `export_plugin!` to generate the `abi_stable` root-module export. The conversion
+# from the author's plain types to the `reclass-plugin-abi` `Abi*`/`*_TO` types
+# lives here so plugin code stays clean.
+[package]
+name = "reclass-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Author-facing SDK for writing native Reclass plugins."
+repository = "https://github.com/IChooseYou/Reclass"
+publish = false
+
+[dependencies]
+abi_stable = "0.11"
+reclass-plugin-abi = { path = "../reclass-plugin-abi" }

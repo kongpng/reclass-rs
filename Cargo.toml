@@ -1,11 +1,31 @@
-# Single `reclass` package — a faithful Rust + GPUI port of Reclass
-# (github.com/IChooseYou/Reclass, MIT). NOT a Cargo workspace: the C++ app
-# links everything into one executable and its `src/` is cleanly layered, so the
-# port mirrors that layering as modules inside one package (see ARCHITECTURE.md
-# §2 — the subsystem crates of the diagram become the top-level `src/` modules).
+# Single `reclass` APP package — a faithful Rust + GPUI port of Reclass
+# (github.com/IChooseYou/Reclass, MIT). The C++ app links everything into one
+# executable and its `src/` is cleanly layered, so the port mirrors that layering
+# as modules inside one package (see ARCHITECTURE.md §2 — the subsystem crates of
+# the diagram become the top-level `src/` modules).
+#
+# DOCUMENTED DEVIATION (was "NOT a Cargo workspace"): a minimal `[workspace]` now
+# exists below, but ONLY to build the separately-distributed plugin SDK
+# (`crates/reclass-plugin-abi` + `crates/reclass-plugin`) and the example native
+# plugins (`examples/plugins/*`) that design §6 Phase 3 requires as standalone
+# cdylibs (they cannot live in the app's `src/` without pulling `abi_stable` into
+# the app's library graph). The APP is still ONE package (`reclass`); none of the
+# workspace members are dependencies of the default app build. The stable-ABI deps
+# (`abi_stable`/`libloading`/the SDK) are all gated behind the `plugins` feature,
+# so default app builds are byte-for-byte unaffected.
 #
 # Portable headless logic builds with `--no-default-features`; the GPUI UI is
 # isolated behind the default `ui` feature (the only thing that pulls gpui).
+
+# ── Workspace (design §6 Phase 3 SDK + examples only; see the note above). ──
+[workspace]
+resolver = "2"
+members = [
+    "crates/reclass-plugin-abi",
+    "crates/reclass-plugin",
+    "examples/plugins/example-provider",
+    "examples/plugins/example-ui",
+]
 
 [package]
 name = "reclass"
@@ -61,15 +81,14 @@ mcp = ["dep:interprocess"]
 # default: stubs only, so the package builds on Linux without them.
 native-plugins = ["dep:libloading"]
 
-# Phase-3 seam for the stable-ABI native plugin boundary (design §2/§6 Phase 3).
-# Currently EMPTY and carries NO dependencies: it exists only so later phases can
-# gate the `abi_stable`/`libloading` stable-ABI wrapping of the plugin contract
-# behind it without re-touching this file. Phase 2 adds no heavy deps — the
-# declarative `ViewTree` renderer (Phase 2 deliverable) lives entirely behind the
-# existing `ui` feature (`src/ui/pluginview.rs` / `pluginpanel.rs` /
-# `plugindialog.rs`), and the plugin contract itself stays plain-Rust/dep-free.
-# Default builds are unaffected (empty feature). Leave `native-plugins` untouched.
-plugins = []
+# Phase-3 stable-ABI native plugin boundary (design §2/§6 Phase 3). Pulls the
+# HOST-side loader deps: `abi_stable` (the stable ABI + load-time version/layout
+# check), `libloading` (open the `.so`/`.dll`/`.dylib`), and the shared contract
+# crate `reclass-plugin-abi` (the single definition of the FFI types host and
+# plugin agree on). OFF by default → default app builds pull NONE of these and are
+# byte-for-byte unaffected. `native-plugins` is a SEPARATE, untouched feature (the
+# out-of-scope live-OS-source loader seam); the two do not overlap.
+plugins = ["dep:abi_stable", "dep:libloading", "dep:reclass-plugin-abi"]
 
 # Optional parallel scanner (rayon). Off by default: the scanner falls back to
 # a serial scan so `--no-default-features` stays lean. (ARCHITECTURE.md §3.)
@@ -117,6 +136,12 @@ msvc-demangler = { version = "0.11", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }
 interprocess = { version = "2", optional = true }
 libloading = { version = "0.9", optional = true }
+
+# ── plugins (Phase 3 stable-ABI native loader) — host side only, off by default ──
+# The stable ABI + load-time version/layout check (design §7.B [+]).
+abi_stable = { version = "0.11", optional = true }
+# The shared FFI contract crate (the single definition host + plugin agree on).
+reclass-plugin-abi = { path = "crates/reclass-plugin-abi", optional = true }
 
 # ── UI (gpui) — unpinned git, SAME source form as gpui-component (§7). ──
 # Do NOT add `rev=` to gpui/gpui_platform; reproducibility = committed Cargo.lock.

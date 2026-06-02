@@ -56,6 +56,14 @@ pub mod manifest;
 pub mod provider_spec;
 pub mod view;
 
+// ── Phase 3: the native stable-ABI dynamic loader (design §6 Phase 3) ──
+// Gated behind the `plugins` feature so default builds pull no `abi_stable`/
+// `libloading`/SDK deps (the feature is wired in Cargo.toml; design §2/§6).
+#[cfg(feature = "plugins")]
+pub mod discovery;
+#[cfg(feature = "plugins")]
+pub mod loader;
+
 // ── Public contract re-exports (design §2/§3) ──
 pub use contract::{
     CommandResult, CommandSlot, Contribution, DialogResult, DockSide, Plugin, ProcessInfo,

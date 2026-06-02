@@ -231,6 +231,50 @@ impl PluginManager {
         })
     }
 
+    // ── Phase-3 native dynamic loading (design §6 Phase 3; `plugins` feature) ──
+
+    /// Load a single native plugin `.so`/`.dll`/`.dylib` from `path` and register
+    /// it through the SAME [`add_plugin`](PluginManager::add_plugin) flow as an
+    /// in-tree built-in (design §6 Phase 3 — the §1 parity table satisfied by a
+    /// real loaded library). Returns the derived identifier, or a surfaced load /
+    /// ABI-mismatch error (design §7.A [fix]). The C++ `LoadPluginFromPath`,
+    /// cpp_reference §2.
+    #[cfg(feature = "plugins")]
+    pub fn load_native_plugin(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<String, crate::plugin::loader::LoadError> {
+        let plugin = crate::plugin::loader::load_native_plugin(path)?;
+        Ok(self.add_plugin(plugin))
+    }
+
+    /// Discover + load every native plugin in the default plugin directories
+    /// (design §6 Phase 3, §7.C [+] multi-dir). Registers each loaded plugin and
+    /// returns the `(path, error)` failures so the caller can surface them with
+    /// detail (design §7.A [fix]). The C++ deferred `LoadPlugins()` folder scan,
+    /// cpp_reference §2.
+    #[cfg(feature = "plugins")]
+    pub fn load_native_plugins_from_default_dirs(
+        &mut self,
+    ) -> Vec<(std::path::PathBuf, crate::plugin::loader::LoadError)> {
+        let dirs = crate::plugin::discovery::default_plugin_dirs();
+        self.load_native_plugins_from_dirs(&dirs)
+    }
+
+    /// Discover + load every native plugin across `dirs`, registering each loaded
+    /// plugin; returns the load failures (design §6 Phase 3).
+    #[cfg(feature = "plugins")]
+    pub fn load_native_plugins_from_dirs(
+        &mut self,
+        dirs: &[std::path::PathBuf],
+    ) -> Vec<(std::path::PathBuf, crate::plugin::loader::LoadError)> {
+        let (loaded, failures) = crate::plugin::discovery::load_from_dirs(dirs);
+        for plugin in loaded {
+            self.add_plugin(plugin);
+        }
+        failures
+    }
+
     /// Re-ask the plugin that owns `view` for that view's current `ViewTree`
     /// (the [`PluginHost::request_rerender`](crate::plugin::host::PluginHost::request_rerender)
     /// resolution: the host calls this to pull the fresh tree out of the plugin's

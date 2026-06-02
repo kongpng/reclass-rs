@@ -1,0 +1,17 @@
+# reclass-plugin-abi — the stable-ABI CONTRACT shared by the host (when built with
+# the `plugins` feature) and EVERY plugin cdylib. This is the single definition of
+# the FFI layout so host and plugin agree (design §2/§3/§8). Pure-Rust, tiny: only
+# `abi_stable`. It is an rlib (default crate-type) linked INTO cdylibs — it is not
+# itself a cdylib.
+[package]
+name = "reclass-plugin-abi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Stable-ABI contract types shared by the Reclass host and native plugins."
+repository = "https://github.com/IChooseYou/Reclass"
+publish = false
+
+[dependencies]
+abi_stable = "0.11"
