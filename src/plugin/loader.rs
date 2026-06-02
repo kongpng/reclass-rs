@@ -39,12 +39,26 @@ pub enum LoadError {
     /// `abi_stable` refused or failed to load the library (missing export,
     /// version/layout mismatch, dlopen failure, …).
     Abi(LibraryError),
+    /// A ReClass.NET **native** compat bridge failed to load (the discovery
+    /// sniffer routed the library here, but opening / resolving / validating the
+    /// 8 CoreFunctions failed — design §6 Phase 4, §7.A [fix]). Carries the
+    /// surfaced reason from
+    /// [`load_reclassnet_native`](crate::plugin::reclassnet::load_reclassnet_native).
+    RcNet(String),
+    /// A library matched no known plugin format: it is neither our `abi_stable`
+    /// root-module plugin nor a ReClass.NET native plugin (the 8 CoreFunctions).
+    /// Recorded by the discovery sniffer so the host can surface "not a plugin"
+    /// with the underlying reason (design §4 discovery, §7.A [fix]). The string is
+    /// a short classification note (e.g. the managed-assembly Phase-5 skip).
+    Unrecognized(String),
 }
 
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::Abi(e) => write!(f, "native plugin load failed: {e}"),
+            LoadError::RcNet(e) => write!(f, "ReClass.NET native compat load failed: {e}"),
+            LoadError::Unrecognized(e) => write!(f, "not a recognized plugin: {e}"),
         }
     }
 }

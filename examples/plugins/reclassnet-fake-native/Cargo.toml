@@ -1,0 +1,24 @@
+# reclassnet-fake-native — a TEST ReClass.NET-style **native** plugin (design §6
+# Phase 4 deliverable). It exports the 8 ReClass.NET CoreFunctions as raw
+# `extern "C"` symbols (the `memflow-reclass-plugin` shape) over an in-memory
+# buffer "process" — memflow itself needs real connectors (KVM/QEMU/PCILeech), so
+# this stands in for one in a cross-platform test.
+#
+# Crucially this crate has NO dependency on the host or the abi_stable SDK: it is a
+# plain cdylib exporting the ReClass.NET ABI, exactly like a third-party native
+# ReClass.NET plugin. The host's folder scan sniffs its exports and bridges it.
+[package]
+name = "reclassnet-fake-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Test ReClass.NET native plugin (8 CoreFunctions over an in-memory buffer)."
+publish = false
+
+[lib]
+# A native dynamic library the host dlopen's + resolves the 8 exports from. Plain
+# cdylib (no abi_stable) — this mimics a real ReClass.NET native plugin.
+crate-type = ["cdylib"]
+
+[dependencies]

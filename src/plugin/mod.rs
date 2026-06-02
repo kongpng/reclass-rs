@@ -64,6 +64,13 @@ pub mod discovery;
 #[cfg(feature = "plugins")]
 pub mod loader;
 
+// ── Phase 4: the ReClass.NET native compat subsystem (design §6 Phase 4) ──
+// A CORE host subsystem (not a wrapped plugin) that bridges ReClass.NET's native
+// CoreFunctions ABI into our `Provider`; the folder scan sniffs + routes here.
+// Same `plugins` feature gate (it reuses `libloading`); default builds unaffected.
+#[cfg(feature = "plugins")]
+pub mod reclassnet;
+
 // ── Public contract re-exports (design §2/§3) ──
 pub use contract::{
     CommandResult, CommandSlot, Contribution, DialogResult, DockSide, Plugin, ProcessInfo,

@@ -25,6 +25,8 @@ members = [
     "crates/reclass-plugin",
     "examples/plugins/example-provider",
     "examples/plugins/example-ui",
+    # Phase 4: a test ReClass.NET native plugin (raw extern-C CoreFunctions).
+    "examples/plugins/reclassnet-fake-native",
 ]
 
 [package]
