@@ -1367,6 +1367,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Locate a built example-plugin cdylib under the cargo target dir(s) (mirrors
+    /// the loader-test helper). `None` when it hasn't been built, so the
+    /// successful-load assertion skips rather than failing in an environment where
+    /// the example wasn't compiled.
+    #[cfg(feature = "plugins")]
+    fn example_plugin_path(crate_name: &str) -> Option<std::path::PathBuf> {
+        let ext = crate::plugin::discovery::platform_lib_extension();
+        let lib_prefix = if cfg!(target_os = "windows") {
+            ""
+        } else {
+            "lib"
+        };
+        let file = format!("{lib_prefix}{}.{ext}", crate_name.replace('-', "_"));
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        [
+            root.join("target/debug").join(&file),
+            root.join("target/release").join(&file),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+    }
+
+    /// The F4 startup folder-scan path: a single scan both LOADS a recognized
+    /// plugin into the shared registry AND retains the failure for an
+    /// unrecognized sibling. This is exactly what `MainWindow::new` runs at startup
+    /// (via `load_native_plugins_from_default_dirs`, which delegates to the
+    /// dirs-variant). When the example cdylib isn't built we still assert the
+    /// failure-retention half so the test is meaningful in any environment.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn startup_scan_loads_a_plugin_and_records_failures() {
+        let dir = std::env::temp_dir().join(format!("rcx-mgr-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = crate::plugin::discovery::platform_lib_extension();
+
+        // A junk file with a plugin extension → discovery sniffs, fails to
+        // recognize, and reports a structured failure (the [fix] retains it).
+        let junk = dir.join(format!("not_a_plugin.{ext}"));
+        std::fs::write(&junk, b"definitely not a shared library").unwrap();
+
+        // Stage a real recognized plugin beside it when the fixture is built.
+        let staged_ok = if let Some(built) = example_plugin_path("example-provider") {
+            let staged = dir.join(built.file_name().unwrap());
+            std::fs::copy(&built, &staged).expect("stage the example cdylib");
+            true
+        } else {
+            eprintln!("skipping the successful-load half: example-provider cdylib not built");
+            false
+        };
+
+        let mut mgr = PluginManager::with_builtins();
+        let before = mgr.registry().enabled_providers().count();
+        let failures = mgr.load_native_plugins_from_dirs(&[dir.clone()]);
+
+        // The junk file failed and was retained for the dialog.
+        assert!(!failures.is_empty(), "the junk file should fail to load");
+        assert_eq!(mgr.load_errors().len(), failures.len());
+        let (path, detail) = mgr
+            .load_errors()
+            .iter()
+            .find(|(p, _)| p.file_name() == junk.file_name())
+            .expect("the junk failure is retained with its path");
+        assert_eq!(path.file_name(), junk.file_name());
+        assert!(!detail.is_empty());
+
+        // When the fixture was staged, it loaded into the SAME registry the pickers
+        // read (one more provider) and is discoverable like a built-in.
+        if staged_ok {
+            assert!(mgr.find_plugin("exampleprovider").is_some());
+            assert_eq!(
+                mgr.registry().enabled_providers().count(),
+                before + 1,
+                "the loaded plugin's provider joined the shared registry"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARITY: scanning an absent directory makes no load attempt, retains no
+    /// errors, and leaves the registry at exactly the four built-ins — so the
+    /// startup hook over an empty/missing `plugins/` dir is byte-for-byte the
+    /// pre-F4 state (`default_plugin_dirs` filters to existing dirs, so this is the
+    /// realistic default-environment case).
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn startup_scan_over_absent_dir_changes_nothing() {
+        let absent = std::env::temp_dir().join(format!(
+            "rcx-mgr-absent-{}-does-not-exist",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&absent);
+
+        let mut mgr = PluginManager::with_builtins();
+        let failures = mgr.load_native_plugins_from_dirs(&[absent]);
+
+        assert!(failures.is_empty());
+        assert!(mgr.load_errors().is_empty());
+        assert_eq!(mgr.registry().enabled_providers().count(), 4);
+    }
+
     // ── Phase-2 routing ──
 
     use crate::plugin::demo;

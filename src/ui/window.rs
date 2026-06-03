@@ -896,6 +896,26 @@ impl MainWindow {
         if std::env::var_os("RECLASS_DEMO_PLUGIN").is_some() {
             plugin_manager.add_plugin(crate::plugin::DemoPlugin::boxed());
         }
+        // F4: startup folder-scan discovery (design §6 Phase 3, §7.C [+]; the C++
+        // deferred `LoadPlugins()` folder scan). ONLY under `plugins`: scan
+        // discovery::default_plugin_dirs() (<exe>/plugins + ~/.config/reclass/plugins),
+        // sniff+route each .so/.dll/.dylib, and register every loaded plugin through
+        // the SAME add_plugin flow (so its providers join the one shared registry the
+        // pickers read, and persisted enabled flags + load=manual are honored by
+        // add_plugin). Failures are retained in load_errors() for the dialog (§7.A
+        // [fix]). default_plugin_dirs() filters to EXISTING dirs, so an absent/empty
+        // plugins dir = no attempts, load_errors empty, registry unchanged — byte
+        // parity. The default build (no `plugins`) does NOT compile this: no scan.
+        #[cfg(feature = "plugins")]
+        {
+            let failures = plugin_manager.load_native_plugins_from_default_dirs();
+            if !failures.is_empty() {
+                tracing::warn!(
+                    count = failures.len(),
+                    "plugin discovery: load failure(s); see Manage Plugins for detail"
+                );
+            }
+        }
         let recent_files: Vec<std::path::PathBuf> = settings
             .borrow()
             .get_list(settings_keys::RECENT_FILES)
@@ -2436,6 +2456,17 @@ impl MainWindow {
                 cx,
             )
         });
+        // Surface the session manager's retained native-load failures (design §7.A
+        // [fix]) so ABI/load errors are visible with detail in the dialog instead of
+        // only logged at startup. Feature-gated: the default build has no loader, so
+        // there are no errors to push (and `set_load_errors` doesn't exist there).
+        #[cfg(feature = "plugins")]
+        {
+            let errs = self.plugin_manager.load_errors().to_vec();
+            if !errs.is_empty() {
+                dialog.update(cx, |d, cx| d.set_load_errors(errs, cx));
+            }
+        }
         let focus = dialog.read(cx).focus_handle(cx);
         // The dialog reports Close + Toggle; Toggle drives the owned manager and
         // pushes the refreshed rows back so the chip reflects the real state.
@@ -6051,6 +6082,12 @@ enum PluginManagerEvent {
 /// not supported in this build" note (the honest boundary).
 struct PluginManagerDialog {
     plugins: Vec<PluginInfo>,
+    /// Retained native-load failures, `(path, detail)` (design §7.A [fix]). Always
+    /// present so `new()` stays uniform across builds; populated only under the
+    /// `plugins` feature (the default build has no runtime loader, so it stays
+    /// empty and the render emits nothing — parity). The opener pushes the session
+    /// manager's `load_errors()` in via [`set_load_errors`](Self::set_load_errors).
+    load_errors: Vec<(std::path::PathBuf, String)>,
     focus_handle: FocusHandle,
 }
 
@@ -6058,8 +6095,19 @@ impl PluginManagerDialog {
     fn new(plugins: Vec<PluginInfo>, cx: &mut Context<Self>) -> Self {
         PluginManagerDialog {
             plugins,
+            load_errors: Vec::new(),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Install the session manager's retained native-load failures so the dialog
+    /// can surface them with detail (design §7.A [fix] — C++ logs then drops the
+    /// detail). Feature-gated: the default build has no loader, so neither the
+    /// caller nor this setter exists there and `load_errors` stays empty.
+    #[cfg(feature = "plugins")]
+    fn set_load_errors(&mut self, errs: Vec<(std::path::PathBuf, String)>, cx: &mut Context<Self>) {
+        self.load_errors = errs;
+        cx.notify();
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
@@ -6254,16 +6302,53 @@ impl Render for PluginManagerDialog {
             .text_size(px(tokens::font::UI_SM))
             .child(note_text);
 
-        let body = modal::body(cx).child(
-            gpui_component::v_flex()
-                .id("rcx-plugin-rows")
-                .w_full()
-                .max_h(px(300.))
-                .overflow_y_scroll()
-                .gap(px(tokens::space::XS))
-                .children(rows)
-                .child(note),
-        );
+        // Native-load failure section (design §7.A [fix] — surface ABI/load errors
+        // with detail rather than only logging them, the way the C++ generic "check
+        // the console" box did NOT). Gated on the `plugins` feature so the default
+        // build (no loader, no errors) emits nothing — byte parity. Rendered ABOVE
+        // the footer note, inside the same scroll area.
+        #[cfg(feature = "plugins")]
+        let error_section: Option<AnyElement> = if self.load_errors.is_empty() {
+            None
+        } else {
+            let header = div()
+                .text_color(cx.theme().danger)
+                .text_size(px(tokens::font::UI_SM))
+                .child(format!(
+                    "Failed to load {} plugin(s):",
+                    self.load_errors.len()
+                ));
+            let lines: Vec<AnyElement> = self
+                .load_errors
+                .iter()
+                .map(|(path, detail)| {
+                    div()
+                        .text_color(color::text_muted(cx))
+                        .text_size(px(tokens::font::UI_SM))
+                        .child(format!("{}: {}", path.display(), detail))
+                        .into_any_element()
+                })
+                .collect();
+            Some(
+                gpui_component::v_flex()
+                    .w_full()
+                    .gap(px(tokens::space::XS))
+                    .child(header)
+                    .children(lines)
+                    .into_any_element(),
+            )
+        };
+
+        let body_col = gpui_component::v_flex()
+            .id("rcx-plugin-rows")
+            .w_full()
+            .max_h(px(300.))
+            .overflow_y_scroll()
+            .gap(px(tokens::space::XS))
+            .children(rows);
+        #[cfg(feature = "plugins")]
+        let body_col = body_col.children(error_section);
+        let body = modal::body(cx).child(body_col.child(note));
 
         let footer = modal::footer(cx);
         // "Load plugin…" — the C++ load-from-path, only behind the `plugins`
