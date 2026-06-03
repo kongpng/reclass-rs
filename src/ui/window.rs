@@ -863,6 +863,19 @@ fn dirty_doc_name(
     Some(name)
 }
 
+/// Detect a ReClass-XML file from its leading bytes (the C++ `project_open`
+/// signature sniff; main.cpp:6129): after trimming leading ASCII whitespace, the
+/// head starts with `<?xml` or `<ReClass`. The C++ used
+/// `head.trimmed().startsWith(...)` — `QByteArray::trimmed()` strips both ends,
+/// but only the leading run matters for a prefix test, so trimming the start is
+/// equivalent. Chosen by content, not by file *name*: a `.rcx` carrying XML is
+/// imported as XML and an `.xml` carrying JSON falls through to the native JSON
+/// load (the headline of this gap). Pure; unit-tested.
+fn sniff_is_reclass_xml(head: &[u8]) -> bool {
+    let trimmed = head.trim_ascii_start();
+    trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<ReClass")
+}
+
 /// Assemble the OS window-title string from a root name + dirty flag (the C++
 /// `updateWindowTitle` formatting; main.cpp:5176-5186): `"<name>[ *] - Reclass"`,
 /// or plain `"Reclass"` when the name is empty (no document / unnamed root).
@@ -3052,9 +3065,11 @@ impl MainWindow {
                 .set_bool(settings_keys::MENU_BAR_TITLE_CASE, self.menu_bar_title_case);
         }
         // Titlebar show-icon (the C++ `r.showIcon` → `m_titleBar->setShowIcon` +
-        // persist "showIcon"; main.cpp:5046). The port's titlebar has no icon slot
-        // yet, so this is faithfully persisted but visually inert — applied the
-        // moment a titlebar icon lands.
+        // persist "showIcon"; main.cpp:5046). When on, the titlebar swaps its bold
+        // "Reclass" text for a class-icon badge (the C++ `setShowIcon(true)` clears
+        // `m_appLabel`'s text and sets it to the class.png pixmap; titlebar.cpp:202-
+        // 214). The flag re-renders the bar on the next paint (see the
+        // `render_titlebar` call site, which passes `self.show_icon`).
         if result.show_icon != self.show_icon {
             self.show_icon = result.show_icon;
             self.settings
@@ -5406,27 +5421,47 @@ impl MainWindow {
 
     /// The recent-files entries for the start page, built from the session
     /// recent-files list (the C++ `recentFiles` QSettings, surfaced by the start
-    /// page). Most-recent-first; the age is left at 0 (no persisted timestamps in
-    /// this port).
+    /// page). Most-recent-first; each entry's age is the whole-day delta between
+    /// now and the file's last-modified time (the C++ `buildGroups` compared
+    /// `QFileInfo::lastModified()` against `now`; startpage.h:236), so the start
+    /// page buckets recent files into Today / Yesterday / This Week / This Month /
+    /// Older. On a metadata/time error the age falls back to 0 (today's bucket).
     fn recent_entries(&self) -> Vec<RecentEntry> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Sample the clock once so every entry buckets against the same "now".
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         // Skip entries whose file no longer exists (the C++ start-page filters
         // the same way the Recent Files menu does; main.cpp:8789).
         let mut entries: Vec<RecentEntry> = self
             .existing_recent_files()
             .into_iter()
-            .map(|(_, p)| RecentEntry {
-                path: p.to_string_lossy().into_owned(),
-                file_name: p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("(file)")
-                    .to_string(),
-                dir_path: p
-                    .parent()
-                    .map(|d| d.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                age_days: 0,
-                is_example: false,
+            .map(|(_, p)| {
+                // Whole-day age from the file's mtime (UNIX seconds). Any
+                // metadata/time failure → age 0 (today), matching the C++ "no
+                // timestamp ⇒ treat as recent" fallthrough.
+                let age_days = std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| super::startpage::age_days_from_secs(now_secs, d.as_secs()))
+                    .unwrap_or(0);
+                RecentEntry {
+                    path: p.to_string_lossy().into_owned(),
+                    file_name: p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("(file)")
+                        .to_string(),
+                    dir_path: p
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    age_days,
+                    is_example: false,
+                }
             })
             .collect();
         // Append the bundled examples (the C++ `loadEntries` always lists the
@@ -5508,7 +5543,7 @@ impl MainWindow {
         &mut self,
         path: &std::path::Path,
         data_path: Option<&std::path::Path>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         use crate::controller::RcxDocument;
@@ -5516,12 +5551,12 @@ impl MainWindow {
         // Build the document from disk. ReClass-XML imports go through the XML
         // importer (when compiled in); `.rcx`/`.json`/anything else is the native
         // forgiving JSON load. On any failure we leave the current doc untouched.
+        //
+        // The importer is chosen by the file's leading BYTES (the C++ 64-byte
+        // signature probe; main.cpp:6123-6131), not by extension: an `.rcx`
+        // holding XML imports as XML, and an `.xml` holding JSON loads natively.
         let mut doc = RcxDocument::new();
-        let is_xml = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("xml"))
-            .unwrap_or(false);
+        let is_xml = Self::path_is_reclass_xml(path);
 
         let loaded = if is_xml {
             self.load_reclass_xml(path, &mut doc)
@@ -5546,35 +5581,61 @@ impl MainWindow {
             doc.load_data_file(dp);
         }
 
-        // Push the loaded document into the active editor (the C++ rebinds the
-        // active tab's controller). The editor recomposes + picks a view root.
-        let Some(active_id) = self.active_doc_id(cx) else {
-            return false;
-        };
-        let mut source = super::state::DataSource::none();
-        if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
-            editor.update(cx, |ed, cx| ed.set_document(doc, cx));
-            // Realign the fresh editor to the window's (persisted) view options —
-            // a new doc otherwise inherits controller/view defaults that disagree.
-            self.apply_view_opts_to_editor(&editor, cx);
-            // Derive the source icon from the controller's NOW-attached provider
-            // (post-ingest), so a .rcx's saved File source shows the File icon.
-            source = Self::source_for_controller(editor.read(cx).controller());
+        // REPLACE-ALL into a fresh tab (the C++ `project_open` does NOT rebind the
+        // active tab — it closes every existing doc dock then creates a brand-new
+        // tab bound to the loaded document: `{ ClosingGuard guard(m_closingAll);
+        // closeAllDocDocks(); dock = createTab(doc); }`; main.cpp:6147-6150 /
+        // 6190-6194). `replace_all_with_fresh` drops the prior tabs (signalling each
+        // `Closed` so the per-tab state unwinds) and returns the fresh id + editor;
+        // the loaded document is then driven into THAT editor.
+        let title = Self::title_for_path(path);
+        let (fresh_id, editor) = self.document_area.update(cx, |area, cx| {
+            area.replace_all_with_fresh(title.clone(), window, cx)
+        });
+        // Mirror the replace-all into AppState SYNCHRONOUSLY so its tab list +
+        // monotonic id counter stay in lockstep with the area. The area's `Closed`
+        // events are delivered later (deferred), and — unlike a `+`-tab open —
+        // `replace_all_with_fresh` emits NO `NewDocumentRequested`, so the fresh
+        // doc must be registered in state here, not via the event. Both id
+        // allocators were equal before this call, so closing every state doc then
+        // opening one fresh yields the SAME id the area just allocated; the later
+        // `Closed(old_id)` events then no-op on the already-removed docs.
+        let old_ids: Vec<DocId> = self.state.tabs().iter().map(|t| t.id).collect();
+        for id in old_ids {
+            self.state.close_document(id);
         }
+        let state_fresh_id = self.state.open_document(title.clone());
+        debug_assert_eq!(
+            state_fresh_id, fresh_id,
+            "AppState + DocumentArea id allocators must stay in lockstep"
+        );
+        editor.update(cx, |ed, cx| ed.set_document(doc, cx));
+        // Realign the fresh editor to the window's (persisted) view options — a new
+        // doc otherwise inherits controller/view defaults that disagree.
+        self.apply_view_opts_to_editor(&editor, cx);
+        // Derive the source icon from the controller's NOW-attached provider
+        // (post-ingest), so a .rcx's saved File source shows the File icon.
+        let source = Self::source_for_controller(editor.read(cx).controller());
 
         // Sync the tab title (file stem ≈ the C++ `rootName`) + source icon into
-        // both the document area and the window state.
-        let title = Self::title_for_path(path);
+        // both the document area and the window state, keyed on the FRESH id.
         self.document_area.update(cx, |area, cx| {
-            area.set_title(active_id, title.clone(), cx);
-            area.set_source(active_id, source.clone(), cx);
+            area.set_title(fresh_id, title.clone(), cx);
+            area.set_source(fresh_id, source.clone(), cx);
         });
-        self.state.set_title(active_id, title);
-        self.state.set_source(active_id, source);
+        self.state.set_title(fresh_id, title);
+        self.state.set_source(fresh_id, source);
 
         // Refresh the workspace tree from the freshly loaded document + dismiss
         // the start page so the user lands on the document.
         self.rebuild_workspace(cx);
+        // Force the workspace dock open (the C++ `placeSidebarDock(m_workspaceDock,
+        // LeftDockWidgetArea); m_workspaceDock->show()` runs unconditionally after a
+        // successful open; main.cpp:6152-6155 / 6196-6199). Done here — on the
+        // open_project path only, not on every `set_document` — so an open always
+        // reveals the project tree while plain in-editor reloads leave the layout
+        // alone.
+        self.apply_layout_preset(LayoutPreset::Workspace, window, cx);
         self.dismiss_start_page(cx);
         // Feed the freshly-attached provider into the scanner/modules docks and
         // the document's bookmarks into the bookmarks dock.
@@ -5674,6 +5735,25 @@ impl MainWindow {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Untitled".to_string())
+    }
+
+    /// Probe a file for the ReClass-XML byte signature (the C++ `project_open`
+    /// sniff; main.cpp:6123-6131). Opens the file, reads the first 64 bytes
+    /// (matching `probe.read(64)`), and delegates to [`sniff_is_reclass_xml`]. On
+    /// any open/read failure returns `false` — the C++ leaves `isXml=false` when
+    /// the probe `QFile` fails to open, falling through to the native JSON load.
+    ///
+    /// An associated fn (no `&self`) so the byte-sniff is testable without a window.
+    fn path_is_reclass_xml(path: &std::path::Path) -> bool {
+        use std::io::Read as _;
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut head = [0u8; 64];
+        match f.read(&mut head) {
+            Ok(n) => sniff_is_reclass_xml(&head[..n]),
+            Err(_) => false,
+        }
     }
 
     /// Switch the active theme by index and re-apply it (themes.md §4.4
@@ -6711,6 +6791,7 @@ impl Render for MainWindow {
             preset,
             doc_title,
             has_doc,
+            self.show_icon,
             self.menubar.clone(),
             layout_cb,
             close_cb,
@@ -7188,8 +7269,8 @@ mod tests {
     // is not pulled into the test-hygiene expansion (see the menubar.rs note).
     use super::{
         builtin_plugins, dirty_doc_name, root_name_for_title, seed_root_doc, settings_keys,
-        unique_dirty_names, unsaved_changes_text, window_title_string, DiskSettings, ExportKind,
-        ImportKind, RootKind, ViewOpt, ViewOptions, ABOUT_GITHUB_URL,
+        sniff_is_reclass_xml, unique_dirty_names, unsaved_changes_text, window_title_string,
+        DiskSettings, ExportKind, ImportKind, RootKind, ViewOpt, ViewOptions, ABOUT_GITHUB_URL,
     };
     use crate::theme::SettingsStore;
     use std::cell::RefCell;
@@ -8144,5 +8225,98 @@ mod tests {
             host.data_source(),
             Some(&(DEMO_IDENTIFIER.to_string(), "1234:notepad.exe".to_string()))
         );
+    }
+
+    // ── A2 GAP 2: ReClass-XML byte-sniff (the C++ project_open probe) ──
+
+    #[test]
+    fn sniff_detects_reclass_xml_signatures() {
+        // Port of the C++ `head.trimmed().startsWith("<?xml") ||
+        // startsWith("<ReClass")` (main.cpp:6129).
+        // A `<?xml …` prolog → XML.
+        assert!(sniff_is_reclass_xml(b"<?xml version=\"1.0\"?>"));
+        // Leading whitespace is trimmed before the prefix test → still XML.
+        assert!(sniff_is_reclass_xml(b"  <ReClass>"));
+        assert!(sniff_is_reclass_xml(b"\n\t <?xml"));
+        // A JSON document is NOT XML (the native `.rcx` load path).
+        assert!(!sniff_is_reclass_xml(b"{\"json\": true}"));
+        // Empty / non-matching bytes → not XML.
+        assert!(!sniff_is_reclass_xml(b""));
+        assert!(!sniff_is_reclass_xml(b"GIF89a"));
+    }
+
+    #[test]
+    fn path_sniff_chooses_importer_by_content_not_extension() {
+        // The headline of the gap: the importer is chosen by the file's BYTES, not
+        // its name. An `.xml` holding JSON is NOT XML; a `.rcx` holding XML IS XML.
+        let base = temp_settings_path();
+
+        // `<?xml …` true.
+        let xml = base.with_extension("rcx_xmlprolog");
+        std::fs::write(&xml, b"<?xml version=\"1.0\"?>\n<ReClass>").unwrap();
+        assert!(super::MainWindow::path_is_reclass_xml(&xml));
+
+        // Leading-whitespace `<ReClass>` true.
+        let ws = base.with_extension("rcx_wsreclass");
+        std::fs::write(&ws, b"   <ReClass>\n").unwrap();
+        assert!(super::MainWindow::path_is_reclass_xml(&ws));
+
+        // An `.xml`-EXTENSION file carrying JSON bytes → NOT XML (falls through to
+        // the native JSON load).
+        let xml_ext_json = base.with_extension("xml");
+        std::fs::write(&xml_ext_json, b"{\"json\": 1}").unwrap();
+        assert!(!super::MainWindow::path_is_reclass_xml(&xml_ext_json));
+
+        // A `.rcx`-EXTENSION file carrying XML bytes → XML (the importer chosen by
+        // signature, not by name).
+        let rcx_ext_xml = base.with_extension("rcx");
+        std::fs::write(&rcx_ext_xml, b"<?xml version=\"1.0\"?>").unwrap();
+        assert!(super::MainWindow::path_is_reclass_xml(&rcx_ext_xml));
+
+        // A missing file → false (the C++ leaves isXml=false when the probe fails
+        // to open).
+        let missing = base.with_extension("does_not_exist");
+        assert!(!super::MainWindow::path_is_reclass_xml(&missing));
+
+        for p in [&xml, &ws, &xml_ext_json, &rcx_ext_xml] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // ── A2 GAP 4: recent-file age from mtime (the C++ buildGroups bucketing) ──
+
+    #[test]
+    fn age_days_computed_from_known_timestamp() {
+        // `age_days_from_secs` is the per-recent-file age `recent_entries` now feeds
+        // into the start-page buckets. Assert the day-delta and the resulting
+        // bucket for known timestamps.
+        use super::super::startpage::{age_days_from_secs, bucket_for, Bucket, RecentEntry};
+        const DAY: u64 = 24 * 60 * 60;
+        let now = 1_000 * DAY; // an arbitrary fixed "now" in whole days.
+
+        // Same day → 0 (Today).
+        assert_eq!(age_days_from_secs(now, now), 0);
+        // 1 day ago → Yesterday.
+        assert_eq!(age_days_from_secs(now, now - DAY), 1);
+        // 3 days ago → This Week.
+        assert_eq!(age_days_from_secs(now, now - 3 * DAY), 3);
+        // 40 days ago → Older.
+        assert_eq!(age_days_from_secs(now, now - 40 * DAY), 40);
+        // A future mtime (clock skew) floors at 0.
+        assert_eq!(age_days_from_secs(now, now + 5 * DAY), 0);
+
+        // The computed age drives the bucket the start page files the row under.
+        let entry_for = |age: i64| RecentEntry {
+            path: "/p/x.rcx".into(),
+            file_name: "x.rcx".into(),
+            dir_path: "/p".into(),
+            age_days: age,
+            is_example: false,
+        };
+        assert_eq!(bucket_for(&entry_for(0)), Bucket::Today);
+        assert_eq!(bucket_for(&entry_for(1)), Bucket::Yesterday);
+        assert_eq!(bucket_for(&entry_for(3)), Bucket::ThisWeek);
+        assert_eq!(bucket_for(&entry_for(15)), Bucket::ThisMonth);
+        assert_eq!(bucket_for(&entry_for(40)), Bucket::Older);
     }
 }

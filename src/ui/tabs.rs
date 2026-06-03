@@ -384,6 +384,40 @@ impl DocumentArea {
         }
     }
 
+    /// Replace **every** tab with a single fresh document tab and return its id +
+    /// editor (the C++ `project_open` replace-all: `{ ClosingGuard guard; …
+    /// closeAllDocDocks(); dock = createTab(doc); }`; main.cpp:6147-6150 /
+    /// 6190-6194). Unlike [`close_all`](Self::close_all) — which leaves a generic
+    /// "Untitled" tab — the caller drives a *loaded* document into the returned
+    /// editor, so this never emits a `NewDocumentRequested` (the C++ `createTab`
+    /// binds the just-loaded doc, it does not run `project_new`). Every prior tab
+    /// emits a `Closed` so the window's per-tab bookkeeping (state map, dock
+    /// refresh) unwinds exactly as it would for an explicit close.
+    pub fn replace_all_with_fresh(
+        &mut self,
+        title: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (DocId, Entity<RcxEditor>) {
+        // closeAllDocDocks(): drop the prior tabs, signalling each so the window
+        // releases its per-tab state (the C++ `destroyed` cleanup).
+        let ids: Vec<DocId> = self.tabs.iter().map(|t| t.id).collect();
+        self.tabs.clear();
+        for id in ids {
+            cx.emit(DocAreaEvent::Closed(id));
+        }
+        // createTab(doc): one fresh tab, made active. The caller pushes the loaded
+        // document into the editor (no NewDocumentRequested — this is a load, not
+        // an empty `project_new`).
+        self.active = 0;
+        let id = self.alloc_id();
+        let editor = RcxEditor::view(window, cx);
+        self.tabs.push(DocEntry::new(id, title, editor.clone()));
+        self.active = self.tabs.len() - 1;
+        cx.notify();
+        (id, editor)
+    }
+
     /// Close **every** tab (the C++ "Close All Tabs"; `closeAllDocDocks`). The
     /// "never leave a blank area" reflex still applies — closing the final tab
     /// re-opens a fresh document — so this collapses to one fresh untitled tab.
@@ -1690,6 +1724,15 @@ mod tests {
             self.active = 0;
             self.push();
         }
+        // Mirror of replace_all_with_fresh: drop every tab, allocate ONE fresh tab
+        // and make it active — the same shape as `close_all` (the C++ replace-all
+        // `closeAllDocDocks(); createTab(doc)`), returning the fresh id.
+        fn replace_all_with_fresh(&mut self) -> DocId {
+            self.ids.clear();
+            self.kinds.clear();
+            self.active = 0;
+            self.push()
+        }
         // Mirror of reorder: move `from_id` to sit at `to_id`'s position, keeping
         // the moved tab active (the same index math as `DocumentArea::reorder`).
         fn reorder(&mut self, from_id: DocId, to_id: DocId) {
@@ -1811,6 +1854,27 @@ mod tests {
         assert_eq!(m.active, 0);
         // The surviving tab is brand-new (not any previously open id).
         assert!(!old.contains(&m.ids[0]));
+    }
+
+    #[test]
+    fn replace_all_with_fresh_collapses_to_one_active_new_tab() {
+        // The C++ `project_open` replace-all (`closeAllDocDocks(); createTab(doc)`,
+        // main.cpp:6147-6150 / 6190-6194): every prior tab is dropped and ONE fresh
+        // tab is left active to host the loaded document.
+        let mut m = TabModel::new();
+        m.push();
+        m.push(); // [1,2,3]
+        let old: Vec<DocId> = m.ids.clone();
+        let fresh = m.replace_all_with_fresh();
+        assert_eq!(m.ids.len(), 1, "exactly one tab remains after replace-all");
+        assert_eq!(m.active, 0, "the fresh tab is active");
+        assert_eq!(m.ids[0], fresh, "the returned id is the surviving tab");
+        // The surviving tab is brand-new (id never reused) and source-clean.
+        assert!(
+            !old.contains(&fresh),
+            "fresh id is not any previously open id"
+        );
+        assert_eq!(m.kinds[0], SourceKind::None);
     }
 
     #[test]

@@ -132,6 +132,28 @@ fn chrome_toggle(
         .on_click(move |_e, w, cx| on_click(w, cx))
 }
 
+/// Which form the titlebar's app label takes (the C++ `setShowIcon` toggle,
+/// titlebar.cpp:202-214). Pure decision split out so it is unit-testable without
+/// a window/`App`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AppLabelMode {
+    /// The bold "Reclass" word (the C++ `show=false` branch).
+    Text,
+    /// The class-icon badge (the C++ `show=true` branch: `class.png`).
+    Icon,
+}
+
+/// Pick the app-label mode from the persisted `show_icon` flag (the C++
+/// `setShowIcon(show)`): `true` → [`AppLabelMode::Icon`], `false` →
+/// [`AppLabelMode::Text`]. Pure; unit-tested.
+fn app_label_mode(show_icon: bool) -> AppLabelMode {
+    if show_icon {
+        AppLabelMode::Icon
+    } else {
+        AppLabelMode::Text
+    }
+}
+
 /// Assemble the titlebar contents into a [`TitleBar`] (app-shell §5 layout:
 /// app label · menu bar · stretch · document title · sidebar toggle). The window
 /// controls (min/max/close) are supplied by the gpui-component [`TitleBar`]
@@ -154,12 +176,20 @@ fn chrome_toggle(
 ///
 /// `preset` is the current workspace state (drives the toggle's checked styling);
 /// `doc_title` is the active document's display title (the right-aligned label);
-/// `menubar` is the in-window menu-bar entity (rendered as a child so its
-/// dropdowns open from the bar).
+/// `show_icon` is the persisted Options ▸ "Show icon in title bar" flag (the C++
+/// `setShowIcon`): when set, the bar shows a class-icon badge instead of the bold
+/// "Reclass" text; `menubar` is the in-window menu-bar entity (rendered as a child
+/// so its dropdowns open from the bar).
+///
+/// Note: the C++ `setShowIcon` also bumps the bar height 32 → 34px
+/// (titlebar.cpp:206/213). That is NOT portable here — gpui-component's
+/// [`TitleBar`] owns its own fixed height — so the height bump is an accepted
+/// cosmetic-only divergence; only the label-vs-icon swap is reproduced.
 pub fn render_titlebar(
     preset: LayoutPreset,
     doc_title: impl Into<SharedString>,
     has_doc: bool,
+    show_icon: bool,
     menubar: Entity<MenuBar>,
     on_layout: impl Fn(LayoutPreset, &mut Window, &mut App) + 'static,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
@@ -167,13 +197,23 @@ pub fn render_titlebar(
 ) -> TitleBar {
     let on_layout = std::rc::Rc::new(on_layout);
 
-    // App label (the C++ bold "Reclass" `m_appLabel`).
+    // App label — the C++ `m_appLabel`. Two modes (the C++ `setShowIcon`,
+    // titlebar.cpp:202-214): when `show_icon` is set, the text is cleared and a
+    // class-icon badge (the C++ `class.png` 24×24 pixmap) is shown; otherwise the
+    // bold "Reclass" text. [`app_label_mode`] picks the mode (unit-tested).
     let app_label = div()
         .flex_none()
         .px_2()
-        .font_weight(FontWeight::BOLD)
-        .text_color(cx.theme().foreground)
-        .child("Reclass");
+        .when(app_label_mode(show_icon) == AppLabelMode::Icon, |d| {
+            // The class-icon badge (the C++ `class.png`); `Frame` is the closest
+            // gpui-component glyph for a struct/class outline.
+            d.child(Icon::new(IconName::Frame).text_color(cx.theme().foreground))
+        })
+        .when(app_label_mode(show_icon) == AppLabelMode::Text, |d| {
+            d.font_weight(FontWeight::BOLD)
+                .text_color(cx.theme().foreground)
+                .child("Reclass")
+        });
 
     // Workspace (sidebar) toggle — a single clean ghost icon button (Zed's panel
     // toggle), replacing the crude exclusive glyph pair. Selected = sidebar shown.
@@ -273,7 +313,15 @@ mod tests {
     // Import only the gpui-free items under test — NOT `super::*`, which would
     // pull the module's `gpui::*` glob into the `#[test]` hygiene expansion and
     // overflow the type-recursion budget (see lib.rs note).
-    use super::{title_case, upper_case, LayoutPreset};
+    use super::{app_label_mode, title_case, upper_case, AppLabelMode, LayoutPreset};
+
+    #[test]
+    fn show_icon_selects_app_label_mode() {
+        // The C++ `setShowIcon(true)` swaps the bold "Reclass" text for the
+        // class-icon badge; `false` restores the text.
+        assert_eq!(app_label_mode(true), AppLabelMode::Icon);
+        assert_eq!(app_label_mode(false), AppLabelMode::Text);
+    }
 
     #[test]
     fn layout_preset_roundtrips_through_id() {
