@@ -7486,7 +7486,11 @@ impl RcxEditor {
             // Named composite declarations (a struct with a type name), excluding
             // the self-reference target.
             if n.kind == NodeKind::Struct && !n.struct_type_name.is_empty() && n.id != exclude_id {
-                let size = crate::core::size_for_kind(n.kind).max(0);
+                // Composite size is the struct's actual byte extent (sum/extent of
+                // its children) — matching C++ `e.sizeBytes = structSpan(n.id)`
+                // (controller.cpp:4555) which feeds the popup size bar/preview
+                // (typeselectorpopup.cpp:1515-1557), *not* the flat `size_for_kind`.
+                let size = tree.struct_span(n.id).max(0);
                 let keyword = if n.class_keyword.is_empty() {
                     "struct"
                 } else {
@@ -9600,5 +9604,44 @@ mod tests {
         // Empty names are ignored.
         super::push_recent_type_into(&mut list, "");
         assert_eq!(list[0], "T4");
+    }
+
+    #[test]
+    fn composite_type_entry_reports_computed_struct_extent() {
+        // Parity: the type-selector catalogue must set a composite's `size_bytes`
+        // to the struct's actual byte extent (C++ `e.sizeBytes = structSpan(n.id)`,
+        // controller.cpp:4555) — NOT the flat `size_for_kind(Struct)`, which is 0
+        // and would render every struct as "dyn" in the popup size bar/preview
+        // (typeselectorpopup.cpp:1515-1557).
+        //
+        // The `editor_with_struct` Player has Int32@0 (4B) + Hex64@4 (8B), so its
+        // extent is 12. `full_type_entries` itself needs a gpui Window, so we
+        // exercise the same two pieces it composes: the extent source
+        // (`tree.struct_span`) and the `TypeEntry::composite` carry-through.
+        use crate::ui::typeselectorpopup::{EntryKind, TypeEntry};
+        let c = editor_with_struct();
+        let tree = c.tree();
+        let player_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.struct_type_name == "Player")
+            .expect("Player struct present");
+        let player = &tree.nodes[player_idx];
+
+        // The flat size used by the old code is the "dyn" sentinel.
+        assert_eq!(crate::core::size_for_kind(player.kind), 0);
+        // The real extent (what compose uses for struct extents) is the sum of
+        // the children's footprints: 4 (Int32@0) + 8 (Hex64@4) = 12.
+        let extent = tree.struct_span(player.id).max(0);
+        assert_eq!(extent, 12, "Player extent = Int32@0 + Hex64@4 = 12B");
+
+        // The composite entry must carry that extent, not 0.
+        let entry = TypeEntry::composite(player.id, &player.struct_type_name, "struct", extent);
+        assert_eq!(entry.entry_kind, EntryKind::Composite);
+        assert_eq!(entry.size_bytes, 12);
+        assert_ne!(
+            entry.size_bytes, 0,
+            "composite must not report dyn for a sized struct"
+        );
     }
 }
