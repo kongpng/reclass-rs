@@ -3514,6 +3514,139 @@ fn reevaluate_base_address_formula_relocates() {
     assert_eq!(c.tree().base_address, 7);
 }
 
+/// `navigateToFormula` (`controller.cpp:5908`): a non-undoable "go to" that sets
+/// base + formula directly. On success it returns Ok, sets both fields, and does
+/// NOT push an undo entry (distinct from `commit_base_address`). On failure it
+/// returns the parser's error string and leaves the document untouched.
+#[test]
+fn navigate_to_formula_sets_base_without_undo() {
+    // Buffer with a pointer value 0xABCD at offset 0x10 so a `[ptr]` formula
+    // exercises the provider read-pointer callback.
+    let mut data = vec![0u8; 256];
+    data[0x10..0x18].copy_from_slice(&0xABCDu64.to_le_bytes());
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0x400;
+    doc.provider = Arc::new(BufferProvider::new(data, "x.bin"));
+    let mut c = RcxController::new(doc);
+    let undo_before = c.undo_stack().count();
+
+    // Bare literal: base + formula set verbatim (C++ stores the trimmed formula
+    // as-is — no literal-collapsing like commit_base_address).
+    assert_eq!(c.navigate_to_formula("  0x1000  "), Ok(()));
+    assert_eq!(c.tree().base_address, 0x1000);
+    assert_eq!(c.document().tree.base_address_formula, "0x1000");
+    // Crucially: no undo command pushed.
+    assert_eq!(
+        c.undo_stack().count(),
+        undo_before,
+        "navigate_to_formula must not push an undo entry"
+    );
+    assert!(!c.undo_stack().can_undo());
+
+    // An expression that dereferences a provider pointer.
+    assert_eq!(c.navigate_to_formula("[0x10] + 4"), Ok(()));
+    assert_eq!(c.tree().base_address, 0xABCD + 4);
+    assert_eq!(c.document().tree.base_address_formula, "[0x10] + 4");
+    assert_eq!(c.undo_stack().count(), undo_before, "still no undo entry");
+}
+
+/// Empty/whitespace formula → `Err("empty formula")`, document untouched
+/// (mirrors C++ `if (f.isEmpty()) { *errOut = "empty formula"; return false; }`).
+#[test]
+fn navigate_to_formula_empty_is_error() {
+    let mut c = make_ctrl();
+    c.document_mut().tree.base_address = 0x1234;
+    c.document_mut().tree.base_address_formula = "keepme".into();
+
+    assert_eq!(c.navigate_to_formula("   "), Err("empty formula".into()));
+    // Document left exactly as it was.
+    assert_eq!(c.tree().base_address, 0x1234);
+    assert_eq!(c.document().tree.base_address_formula, "keepme");
+}
+
+/// A formula the parser rejects propagates the parser's error string and leaves
+/// base + formula untouched (C++ `if (!result.ok) { *errOut = result.error; }`).
+#[test]
+fn navigate_to_formula_parse_error_is_propagated() {
+    let mut c = make_ctrl();
+    c.document_mut().tree.base_address = 0x2000;
+    c.document_mut().tree.base_address_formula = "orig".into();
+
+    // An unbalanced bracket fails to parse.
+    let r = c.navigate_to_formula("[0x10");
+    assert!(r.is_err(), "unbalanced expression must fail");
+    assert!(
+        !r.unwrap_err().is_empty(),
+        "error string is propagated (non-empty)"
+    );
+    // Unchanged on failure.
+    assert_eq!(c.tree().base_address, 0x2000);
+    assert_eq!(c.document().tree.base_address_formula, "orig");
+}
+
+/// `switchToSavedSource` File branch (`controller.cpp:5228-5232`): restoring a
+/// File slot keeps the slot's *literal* saved base + formula. It must NOT
+/// reevaluate the formula against the freshly-loaded source (a stored relocating
+/// formula stays literal on a File switch — only plugin/attach paths relocate).
+#[test]
+fn switch_to_saved_source_file_keeps_literal_base() {
+    // Two on-disk files; file B has a pointer at 0x10 that, if (wrongly)
+    // reevaluated, would relocate the base away from the saved literal.
+    let dir = std::env::temp_dir().join(format!("rcx_srcswitch_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path_a = dir.join("a.bin");
+    let path_b = dir.join("b.bin");
+    let mut bytes_b = vec![0u8; 64];
+    // A value the formula `[0x10]` would resolve to if it were reevaluated.
+    bytes_b[0x10..0x18].copy_from_slice(&0xFEEDu64.to_le_bytes());
+    std::fs::write(&path_a, vec![0u8; 64]).unwrap();
+    std::fs::write(&path_b, &bytes_b).unwrap();
+
+    let mut doc = RcxDocument::new();
+    build_small_tree(&mut doc.tree);
+    doc.provider = Arc::new(BufferProvider::new(vec![0u8; 64], "a.bin"));
+    let mut c = RcxController::new(doc);
+
+    // Register two File sources; B carries a literal saved base AND a formula
+    // that would resolve to a *different* value if reevaluated.
+    c.copy_saved_sources(
+        vec![
+            SavedSourceEntry {
+                kind: "File".into(),
+                display_name: "a.bin".into(),
+                file_path: path_a.to_string_lossy().into_owned(),
+                base_address: 0x100,
+                ..Default::default()
+            },
+            SavedSourceEntry {
+                kind: "File".into(),
+                display_name: "b.bin".into(),
+                file_path: path_b.to_string_lossy().into_owned(),
+                base_address: 0xCAFE,
+                base_address_formula: "[0x10]".into(),
+                ..Default::default()
+            },
+        ],
+        0,
+    );
+
+    c.switch_to_saved_source(1);
+
+    // Active index moved; provider swapped to file B.
+    assert_eq!(c.active_source_index(), 1);
+    assert_eq!(c.document().provider.name(), "b.bin");
+    // Literal saved base + formula preserved verbatim — NOT relocated to
+    // [0x10] == 0xFEED. This is the parity fix: no reevaluate on a File switch.
+    assert_eq!(
+        c.tree().base_address,
+        0xCAFE,
+        "literal saved base preserved (no reevaluate)"
+    );
+    assert_eq!(c.document().tree.base_address_formula, "[0x10]");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn new_class_on_node_embeds_populated_class_instance() {
     // C++ "New Class" (controller.cpp:3390): converting a node to a New Class

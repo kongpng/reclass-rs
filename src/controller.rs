@@ -3432,14 +3432,28 @@ impl RcxController {
     /// provider attach / source switch re-evaluation, and goto/scanner address
     /// resolution (raw gaps 63/64/65/66).
     pub fn resolve_address_expr(&self, expr: &str) -> (u64, bool) {
-        use crate::addr::{AddressParser, AddressParserCallbacks};
+        let result = self.resolve_address_expr_full(expr);
+        (result.value, result.ok)
+    }
+
+    /// Like [`resolve_address_expr`](Self::resolve_address_expr) but returns the
+    /// full [`AddressParseResult`] so callers can surface the parser's error
+    /// string (mirrors C++ `AddressParser::evaluate` feeding `result.error` back
+    /// to `navigateToFormula`, `controller.cpp:5929-5933`).
+    pub fn resolve_address_expr_full(&self, expr: &str) -> crate::addr::AddressParseResult {
+        use crate::addr::{AddressParseResult, AddressParser, AddressParserCallbacks};
         #[cfg(feature = "symbols")]
         use crate::rtti::symbol_store::SymbolStore;
 
         let cleaned: String = expr.chars().filter(|&c| c != '`' && c != '\'').collect();
         let cleaned = cleaned.trim();
         if cleaned.is_empty() {
-            return (0, false);
+            return AddressParseResult {
+                ok: false,
+                value: 0,
+                error: "empty expression".to_string(),
+                error_pos: 0,
+            };
         }
 
         let prov = &*self.doc.provider;
@@ -3491,8 +3505,7 @@ impl RcxController {
             }));
         }
 
-        let result = AddressParser::evaluate(cleaned, ptr_sz, Some(&cbs));
-        (result.value, result.ok)
+        AddressParser::evaluate(cleaned, ptr_sz, Some(&cbs))
     }
 
     /// Commit a base-address inline edit (`EditTarget::BaseAddress`,
@@ -3533,6 +3546,31 @@ impl RcxController {
                 new_formula,
             });
         }
+    }
+
+    /// `navigateToFormula(formula)` (`controller.cpp:5908`).
+    ///
+    /// Non-undoable "go to" used by the bookmark list and the goto-address
+    /// dialog: trims the formula, evaluates it through the live provider
+    /// callbacks, and on success sets `base_address` + `base_address_formula`
+    /// **directly** (no [`Command::ChangeBase`] / undo entry — distinct from the
+    /// user-driven [`commit_base_address`](Self::commit_base_address)). On
+    /// failure the parser's error string is returned verbatim and the document is
+    /// left untouched. Mirrors C++ which returns `false` + `*errOut = error` and
+    /// only emits `documentChanged()` + `refresh()` on success.
+    pub fn navigate_to_formula(&mut self, formula: &str) -> Result<(), String> {
+        let f = formula.trim();
+        if f.is_empty() {
+            return Err("empty formula".to_string());
+        }
+        let result = self.resolve_address_expr_full(f);
+        if !result.ok {
+            return Err(result.error);
+        }
+        self.doc.tree.base_address = result.value;
+        self.doc.tree.base_address_formula = f.to_string();
+        self.on_document_changed();
+        Ok(())
     }
 
     /// Re-evaluate the stored `base_address_formula` against the current provider
@@ -4960,14 +4998,17 @@ impl RcxController {
         let entry = self.saved_sources[idx as usize].clone();
         if entry.kind == "File" {
             if !entry.file_path.is_empty() {
+                // `loadData(path)` clears the undo stack; the stack lives on the
+                // controller in the Rust port so we clear it here.
                 self.undo.clear();
                 self.doc.load_data_file(&entry.file_path);
+                // Restore the slot's *literal* saved base + formula. C++
+                // (`controller.cpp:5228-5232`) deliberately does NOT reevaluate
+                // the formula here — it keeps exactly what was saved — and does
+                // NOT resetSnapshot in this branch; only `refresh()` follows
+                // `loadData`.
                 self.doc.tree.base_address = entry.base_address;
                 self.doc.tree.base_address_formula = entry.base_address_formula.clone();
-                // Re-resolve a stored formula against the freshly-loaded source so
-                // a module-relative base relocates on switch (`controller.cpp:5231`).
-                self.reevaluate_base_address_formula();
-                self.reset_snapshot();
                 self.refresh();
             }
         }
