@@ -430,6 +430,19 @@ pub struct TypeModel {
     /// section at the top of the group view (`m_recentNames`,
     /// `typeselectorpopup.cpp:1716`).
     recent_names: Vec<String>,
+    /// The byte size of the node's current type (`m_currentNodeSize`). When
+    /// non-zero AND the mode is not [`TypePopupMode::Root`], the group-bucketed
+    /// view lists the entries whose `size_bytes` equal this size FIRST within
+    /// each group ("same-size-first", `typeselectorpopup.cpp:1735-1745`).
+    current_node_size: i32,
+    /// Which chip-bearing groups (Hex/Int/Float/Ptr) are active — the model-side
+    /// mirror of the C++ category chips (`m_groupChips` / `catAllowed`,
+    /// `typeselectorpopup.cpp:1602-1608`). An EMPTY set means "all visible" (the
+    /// default all-checked state); a non-empty set restricts the scored/bucketed
+    /// list to those chip-bearing groups (the always-on Vec/Str/Ctr/Common groups
+    /// are never filtered out). Filtering happens in the model so hidden rows are
+    /// excluded from the ranked/bucketed list rather than hidden at render.
+    active_groups: std::collections::BTreeSet<&'static str>,
 }
 
 impl TypeModel {
@@ -445,6 +458,8 @@ impl TypeModel {
             sort_dir: 1,
             last_filter: String::new(),
             recent_names: Vec::new(),
+            current_node_size: 0,
+            active_groups: std::collections::BTreeSet::new(),
         };
         m.apply_filter("");
         m
@@ -530,9 +545,85 @@ impl TypeModel {
 
     /// `setMode(mode)` (`typeselectorpopup.cpp:1086`): set the mode and **always
     /// clear the modifier** (the test `testSetModeResetsModifierInPointerTargetMode`).
+    /// Re-runs the last filter so the group-bucketed same-size-first ordering
+    /// (which is gated on `mode != Root`) re-layouts immediately.
     pub fn set_mode(&mut self, mode: TypePopupMode) {
         self.mode = mode;
         self.modifier = Modifier::None;
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
+    }
+
+    /// The byte size of the node's current type (`m_currentNodeSize`).
+    pub fn current_node_size(&self) -> i32 {
+        self.current_node_size
+    }
+
+    /// Set the node's current type size (`setCurrentNodeSize`/`m_currentNodeSize`).
+    /// Drives the group-bucketed same-size-first ordering when the mode is not
+    /// [`TypePopupMode::Root`]. Re-runs the last filter so the rows re-layout.
+    pub fn set_current_node_size(&mut self, size: i32) {
+        self.current_node_size = size;
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
+    }
+
+    /// The active chip-bearing groups (empty ⇒ all visible).
+    pub fn active_groups(&self) -> &std::collections::BTreeSet<&'static str> {
+        &self.active_groups
+    }
+
+    /// Whether a chip-bearing group is currently active (its key is in the set).
+    pub fn group_active(&self, group: KindGroup) -> bool {
+        self.active_groups.contains(group.key())
+    }
+
+    /// `catAllowed(entry)` (`typeselectorpopup.cpp:1602-1608`): whether an entry's
+    /// group passes the active category-chip filter.
+    ///
+    /// - empty active set → all visible (the all-checked default);
+    /// - groups WITHOUT a chip toggle (Vec/Str/Ctr/Common) are always visible
+    ///   (only chip-bearing groups can be filtered out);
+    /// - otherwise a chip-bearing group passes iff its key is active.
+    fn group_allowed(&self, group: KindGroup) -> bool {
+        if self.active_groups.is_empty() {
+            return true;
+        }
+        if !group.has_chip() {
+            return true;
+        }
+        self.active_groups.contains(group.key())
+    }
+
+    /// Toggle a chip-bearing category (Hex/Int/Float/Ptr) and re-run the last
+    /// filter so the bucketed/ranked list re-excludes the hidden group's rows
+    /// (`m_groupChips` toggle → `applyFilter`).
+    pub fn toggle_group(&mut self, group: KindGroup) {
+        let key = group.key();
+        if self.active_groups.contains(key) {
+            self.active_groups.remove(key);
+        } else {
+            self.active_groups.insert(key);
+        }
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
+    }
+
+    /// "all" — clear the category filter (every group shown) and re-filter.
+    pub fn select_all_groups(&mut self) {
+        self.active_groups.clear();
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
+    }
+
+    /// "none" — the C++ `noneBtn` keeps AT LEAST ONE group checked (the first
+    /// chip stays on, the rest go off) so the list never goes fully empty. We
+    /// restrict to the first chip-bearing group (Hex), then re-filter.
+    pub fn select_no_groups(&mut self) {
+        self.active_groups.clear();
+        self.active_groups.insert(KindGroup::Hex.key());
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
     }
 
     /// `setModifier(modId, arr)` (`typeselectorpopup.cpp:1106`): set the modifier
@@ -619,11 +710,9 @@ impl TypeModel {
         if !self.recent_names.is_empty() {
             let mut recents: Vec<TypeEntry> = Vec::new();
             for nm in &self.recent_names {
-                if let Some(e) = self
-                    .entries
-                    .iter()
-                    .find(|e| &e.display_name == nm && e.selectable())
-                {
+                if let Some(e) = self.entries.iter().find(|e| {
+                    &e.display_name == nm && e.selectable() && self.group_allowed(e.group)
+                }) {
                     recents.push(e.clone());
                 }
             }
@@ -640,21 +729,42 @@ impl TypeModel {
                 }
             }
         }
+        // Case-insensitive alphabetical comparator — the single within-group sort
+        // key for EVERY group (`typeselectorpopup.cpp:1690`'s `alphabetical`); the
+        // Hex group is no longer special-cased to size-descending.
+        let alphabetical = |a: &TypeEntry, b: &TypeEntry| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        };
         for group in KindGroup::ALL {
+            // Category-chip gate (`catAllowed` → `buckets`,
+            // `typeselectorpopup.cpp:1687`): chip-hidden groups are skipped so
+            // their rows never enter the bucketed list.
             let mut group_entries: Vec<TypeEntry> = self
                 .entries
                 .iter()
-                .filter(|e| e.group == group)
+                .filter(|e| e.group == group && self.group_allowed(e.group))
                 .cloned()
                 .collect();
             if group_entries.is_empty() {
                 continue;
             }
-            // Hex always sorts size-desc; others alphabetic for stability.
-            if group == KindGroup::Hex {
-                group_entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            // Same-size-first within the group when retyping a sized node
+            // (`m_mode != Root && m_currentNodeSize > 0`,
+            // `typeselectorpopup.cpp:1735-1745`): entries whose `size_bytes`
+            // equal the node's current size come first (each part sorted
+            // case-insensitively alphabetical), then the rest.
+            if self.mode != TypePopupMode::Root && self.current_node_size > 0 {
+                let (mut same_size, mut other): (Vec<TypeEntry>, Vec<TypeEntry>) = group_entries
+                    .into_iter()
+                    .partition(|e| e.size_bytes == self.current_node_size);
+                same_size.sort_by(alphabetical);
+                other.sort_by(alphabetical);
+                same_size.extend(other);
+                group_entries = same_size;
             } else {
-                group_entries.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+                group_entries.sort_by(alphabetical);
             }
             rows.push(TypeRow {
                 entry: TypeEntry::section(group.section_label()),
@@ -680,6 +790,11 @@ impl TypeModel {
     fn build_filtered(&mut self, query: &str) {
         let mut scored: Vec<(i32, usize, Vec<usize>)> = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
+            // Category-chip gate (`catAllowed`, `typeselectorpopup.cpp:1660`):
+            // chip-hidden groups are excluded from the scored list entirely.
+            if !self.group_allowed(e.group) {
+                continue;
+            }
             let mut pos = Vec::new();
             let s = super::fuzzy::source_score(query, &e.display_name, Some(&mut pos));
             if s > 0 {
@@ -968,10 +1083,6 @@ mod view {
         /// opens pre-highlighting that row by id (the C++ `m_currentEntry.structId`
         /// branch in `setTypes`). 0 ⇒ the node is a primitive (use `current`).
         current_struct_id: u64,
-        /// Which group chips are enabled (Hex/Int/Float/Ptr); `None` filter for the
-        /// rest. Empty set = all shown (the "all" state); a non-empty set filters
-        /// the list to those groups.
-        active_groups: std::collections::BTreeSet<&'static str>,
         input: Entity<InputState>,
         /// The array-element count input (the `[]` modifier's `n` box,
         /// `m_arrayCountEdit`); shown only when the array modifier is active.
@@ -1059,7 +1170,6 @@ mod view {
                 model,
                 current,
                 current_struct_id: 0,
-                active_groups: std::collections::BTreeSet::new(),
                 input,
                 array_count_input,
                 focus_handle: cx.focus_handle(),
@@ -1095,35 +1205,13 @@ mod view {
         }
 
         /// Scroll the currently-selected model row into view (B2 / item 1 / item
-        /// 9). The list renders a subset of model rows (filtered by the category
-        /// chips), so the selected MODEL row index is mapped to its RENDERED child
-        /// index before scrolling.
+        /// 9). The category-chip filtering now happens in the MODEL (chip-hidden
+        /// rows are excluded from `model.rows()`), so the rendered children map
+        /// 1:1 onto the model rows and the model row index IS the child index.
         fn scroll_selected_into_view(&self) {
-            let Some(sel) = self.model.selected() else {
-                return;
-            };
-            if let Some(child_ix) = self.rendered_index_of(sel) {
-                self.list_scroll.scroll_to_item(child_ix);
+            if let Some(sel) = self.model.selected() {
+                self.list_scroll.scroll_to_item(sel);
             }
-        }
-
-        /// Map a model row index to the index of the corresponding rendered child
-        /// (the list skips category-filtered rows), or `None` if it is not
-        /// rendered.
-        fn rendered_index_of(&self, model_row: usize) -> Option<usize> {
-            let mut child = 0usize;
-            for (row, r) in self.model.rows().iter().enumerate() {
-                let visible =
-                    r.entry.entry_kind == EntryKind::Section || self.group_visible(r.entry.group);
-                if !visible {
-                    continue;
-                }
-                if row == model_row {
-                    return Some(child);
-                }
-                child += 1;
-            }
-            None
         }
 
         /// Read-only access to the model.
@@ -1149,10 +1237,15 @@ mod view {
         }
 
         /// Set the node's current type size + pointer size for the footer size
-        /// diff (`setCurrentNodeSize`/`setPointerSize`).
+        /// diff (`setCurrentNodeSize`/`setPointerSize`). The current node size is
+        /// also pushed into the model so the group-bucketed same-size-first
+        /// ordering applies (re-pinning the current selection after the rows
+        /// rebuild).
         pub fn set_sizes(&mut self, current_node_size: i32, pointer_size: i32) {
             self.current_node_size = current_node_size;
             self.pointer_size = pointer_size;
+            self.model.set_current_node_size(current_node_size);
+            self.re_pin_current();
         }
 
         /// Set the recently-picked type names (item 16) — forwarded to the model.
@@ -1184,48 +1277,29 @@ mod view {
             self.model.select_kind(self.current);
         }
 
-        /// Whether an entry's group passes the active category-chip filter.
-        ///
-        /// - empty set → all visible (the "all" state);
-        /// - groups WITHOUT a category chip (Vec/Str/Ctr/Common) are always
-        ///   visible (the C++ `catAllowed`: only chip-bearing groups can be
-        ///   filtered out);
-        /// - otherwise a chip-bearing group is visible iff its key is active.
-        fn group_visible(&self, group: KindGroup) -> bool {
-            // No active chips → show all.
-            if self.active_groups.is_empty() {
-                return true;
-            }
-            // Groups without a chip toggle are always visible.
-            if !group.has_chip() {
-                return true;
-            }
-            self.active_groups.contains(group.key())
-        }
-
-        /// Toggle a category chip (Hex/Int/Float/Ptr).
+        /// Toggle a category chip (Hex/Int/Float/Ptr) — delegated to the model,
+        /// which now does the filtering (chip-hidden rows are excluded from the
+        /// scored/bucketed list rather than hidden at render). Re-pins the current
+        /// selection after the rows rebuild.
         fn toggle_group(&mut self, group: KindGroup, cx: &mut Context<Self>) {
-            let key = group.key();
-            if self.active_groups.contains(key) {
-                self.active_groups.remove(key);
-            } else {
-                self.active_groups.insert(key);
-            }
+            self.model.toggle_group(group);
+            self.re_pin_current();
             cx.notify();
         }
 
-        /// "all" — clear the category filter (every group shown).
+        /// "all" — clear the category filter (every group shown), via the model.
         fn select_all_groups(&mut self, cx: &mut Context<Self>) {
-            self.active_groups.clear();
+            self.model.select_all_groups();
+            self.re_pin_current();
             cx.notify();
         }
 
         /// "none" — the C++ `noneBtn` keeps AT LEAST ONE group checked (the first
         /// chip stays on, the rest go off), so the list never goes fully empty.
-        /// We restrict to the first chip-bearing group (Hex).
+        /// Delegated to the model.
         fn select_no_groups(&mut self, cx: &mut Context<Self>) {
-            self.active_groups.clear();
-            self.active_groups.insert(KindGroup::Hex.key());
+            self.model.select_no_groups();
+            self.re_pin_current();
             cx.notify();
         }
 
@@ -1428,11 +1502,9 @@ mod view {
                 .rows()
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| {
-                    // Hide entries whose group is filtered out by the category chips
-                    // (sections always show — they head their own group).
-                    r.entry.entry_kind == EntryKind::Section || self.group_visible(r.entry.group)
-                })
+                // Category-chip filtering now happens in the model (chip-hidden
+                // rows are excluded from `model.rows()`), so the rendered children
+                // map 1:1 onto the model rows — no render-time filter needed.
                 .map(|(row, r)| {
                     if r.entry.entry_kind == EntryKind::Section {
                         // A Zed section caption: a colored group dot + uppercase
@@ -1772,7 +1844,7 @@ mod view {
             let group_color = |g: KindGroup| -> Hsla {
                 super::super::theme_apply::to_hsla(super::kind_group_color(g, theme))
             };
-            let on = |g: KindGroup| self.active_groups.contains(g.key());
+            let on = |g: KindGroup| self.model.group_active(g);
 
             // A small "all" / "none" text control.
             let text_btn = |id: &'static str,
@@ -1797,11 +1869,12 @@ mod view {
                     .into_any_element()
             };
 
-            let all_active = self.active_groups.is_empty();
+            let active_groups = self.model.active_groups();
+            let all_active = active_groups.is_empty();
             // "none" = exactly the first chip-bearing group (Hex) is active — the
             // C++ keeps one group on (it never goes fully empty).
             let none_active =
-                self.active_groups.len() == 1 && self.active_groups.contains(KindGroup::Hex.key());
+                active_groups.len() == 1 && active_groups.contains(KindGroup::Hex.key());
 
             gpui_component::h_flex()
                 .w_full()
@@ -2565,5 +2638,181 @@ mod tests {
             .collect();
         desc.reverse();
         assert_eq!(asc, desc);
+    }
+
+    // ── within-group alphabetical-case-insensitive ordering (cpp:1690) ──
+
+    /// Helper: the entry display names in the group section headed by `label`,
+    /// in row order (stops at the next section header).
+    fn group_section_names(model: &TypeModel, label: &str) -> Vec<String> {
+        let rows = model.rows();
+        let start = rows
+            .iter()
+            .position(|r| r.entry.entry_kind == EntryKind::Section && r.entry.display_name == label)
+            .expect("section present");
+        let mut out = Vec::new();
+        for r in &rows[start + 1..] {
+            if r.entry.entry_kind == EntryKind::Section {
+                break;
+            }
+            out.push(r.entry.display_name.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn within_group_sorted_case_insensitive_alphabetical() {
+        // The C++ uses a single case-insensitive alphabetical comparator for EVERY
+        // group (`typeselectorpopup.cpp:1690`), including Hex — the old size-desc
+        // Hex special case is gone. Build an Int group with mixed-case names whose
+        // case-sensitive and case-insensitive orders differ.
+        let entries = vec![
+            TypeEntry::primitive(NodeKind::UInt32, "Zeta"),
+            TypeEntry::primitive(NodeKind::Int32, "alpha"),
+            TypeEntry::primitive(NodeKind::Int16, "Beta"),
+            TypeEntry::primitive(NodeKind::UInt16, "gamma"),
+        ];
+        let model = TypeModel::new(entries);
+        let names = group_section_names(&model, KindGroup::Int.section_label());
+        assert_eq!(
+            names,
+            vec!["alpha", "Beta", "gamma", "Zeta"],
+            "group must be case-insensitive alphabetical (not ASCII upper-before-lower)"
+        );
+    }
+
+    #[test]
+    fn hex_group_is_alphabetical_not_size_descending() {
+        // Hex no longer sorts size-descending — it is alphabetical like the rest.
+        let entries = vec![
+            TypeEntry::primitive(NodeKind::Hex8, "hex8"),
+            TypeEntry::primitive(NodeKind::Hex64, "hex64"),
+            TypeEntry::primitive(NodeKind::Hex16, "hex16"),
+            TypeEntry::primitive(NodeKind::Hex32, "hex32"),
+        ];
+        let model = TypeModel::new(entries);
+        let names = group_section_names(&model, KindGroup::Hex.section_label());
+        // Case-insensitive alphabetical over the strings (digit order):
+        // "hex16" < "hex32" < "hex64" < "hex8".
+        assert_eq!(names, vec!["hex16", "hex32", "hex64", "hex8"]);
+    }
+
+    // ── same-size-first (mode != Root && node_size > 0; cpp:1735-1745) ──
+
+    #[test]
+    fn same_size_first_when_mode_not_root_and_node_size_set() {
+        // An Int group with two 4-byte and two 8-byte entries. With a node of size
+        // 4 in a non-Root mode, the 4-byte entries lead (each part alphabetical).
+        let entries = vec![
+            TypeEntry::primitive(NodeKind::Int64, "bigB"),    // 8B
+            TypeEntry::primitive(NodeKind::Int32, "smallA"),  // 4B
+            TypeEntry::primitive(NodeKind::UInt64, "bigA"),   // 8B
+            TypeEntry::primitive(NodeKind::UInt32, "smallB"), // 4B
+        ];
+        let mut model = TypeModel::new(entries);
+        // Sanity: the chosen kinds really have the expected sizes.
+        assert_eq!(crate::core::kind::size_for_kind(NodeKind::Int32), 4);
+        assert_eq!(crate::core::kind::size_for_kind(NodeKind::Int64), 8);
+
+        model.set_mode(TypePopupMode::FieldType);
+        model.set_current_node_size(4);
+        let names = group_section_names(&model, KindGroup::Int.section_label());
+        assert_eq!(
+            names,
+            vec!["smallA", "smallB", "bigA", "bigB"],
+            "size-4 entries lead (alphabetical), then the rest (alphabetical)"
+        );
+
+        // In Root mode the same-size-first gate is OFF → pure alphabetical.
+        model.set_mode(TypePopupMode::Root);
+        // set_mode clears node size? No — only the modifier. Re-assert ordering.
+        let names_root = group_section_names(&model, KindGroup::Int.section_label());
+        assert_eq!(names_root, vec!["bigA", "bigB", "smallA", "smallB"]);
+    }
+
+    #[test]
+    fn same_size_first_off_when_node_size_zero() {
+        let entries = vec![
+            TypeEntry::primitive(NodeKind::Int64, "bigB"),
+            TypeEntry::primitive(NodeKind::Int32, "smallA"),
+        ];
+        let mut model = TypeModel::new(entries);
+        model.set_mode(TypePopupMode::FieldType);
+        // node size 0 → no same-size partition, pure alphabetical.
+        model.set_current_node_size(0);
+        let names = group_section_names(&model, KindGroup::Int.section_label());
+        assert_eq!(names, vec!["bigB", "smallA"]);
+    }
+
+    // ── model-side chip filtering (catAllowed; cpp:1684-1688) ──
+
+    #[test]
+    fn chip_off_excludes_group_from_bucketed_list() {
+        let mut model = TypeModel::new(sample_entries());
+        // All groups visible by default.
+        assert!(model.active_groups().is_empty());
+        assert!(model
+            .rows()
+            .iter()
+            .any(|r| r.entry.group == KindGroup::Int && r.entry.selectable()));
+        // Turn the Int chip OFF (toggling makes a non-empty active set without Int):
+        // the C++ catAllowed excludes the unchecked group. Start from "none" (Hex
+        // only on) then make the active set everything-but-Int by toggling chips on.
+        model.select_no_groups(); // active = {Hex}
+        model.toggle_group(KindGroup::Float); // active = {Hex, Float}
+        model.toggle_group(KindGroup::Ptr); // active = {Hex, Float, Ptr}
+                                            // Int is NOT in the active set → its rows are excluded.
+        assert!(
+            !model.rows().iter().any(|r| r.entry.group == KindGroup::Int),
+            "chip-off Int group must be excluded from the bucketed list"
+        );
+        // A chip-less group (Ctr) is always visible (Player composite).
+        assert!(model
+            .rows()
+            .iter()
+            .any(|r| r.entry.group == KindGroup::Ctr && r.entry.selectable()));
+    }
+
+    #[test]
+    fn chip_off_excludes_group_from_fuzzy_ranked_list() {
+        // A fuzzy query with one chip OFF must drop that group's rows from the
+        // ranked list (model-side catAllowed gate, cpp:1660).
+        let entries = vec![
+            // Both match the fuzzy query "t" but live in different groups.
+            TypeEntry::primitive(NodeKind::Int32, "int32_t"), // Int group
+            TypeEntry::primitive(NodeKind::Pointer64, "ptr64"), // Ptr group
+            TypeEntry::composite(100, "Trophy", "struct", 8), // Ctr group (always on)
+        ];
+        let mut model = TypeModel::new(entries);
+        // With all chips on, "t" matches int32_t, ptr64 and Trophy.
+        model.apply_filter("t");
+        let names: Vec<&str> = model
+            .rows()
+            .iter()
+            .map(|r| r.entry.display_name.as_str())
+            .collect();
+        assert!(names.contains(&"int32_t"));
+        assert!(names.contains(&"ptr64"));
+        // Restrict the active chips so Int is OFF: make the set {Ptr}. The Int
+        // group's "int32_t" must vanish from the ranked list; Ptr's "ptr64" stays;
+        // the chip-less Ctr "Trophy" is always allowed.
+        model.select_no_groups(); // {Hex}
+        model.toggle_group(KindGroup::Ptr); // {Hex, Ptr}
+        model.toggle_group(KindGroup::Hex); // {Ptr}  (Hex off too)
+        model.apply_filter("t");
+        let names: Vec<&str> = model
+            .rows()
+            .iter()
+            .map(|r| r.entry.display_name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"int32_t"),
+            "Int chip off → int32_t excluded from ranked list"
+        );
+        assert!(names.contains(&"ptr64"), "Ptr chip on → ptr64 still ranked");
+        assert!(
+            names.contains(&"Trophy"),
+            "chip-less Ctr group always allowed"
+        );
     }
 }
