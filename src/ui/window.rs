@@ -302,6 +302,14 @@ pub struct MainWindow {
     /// events fire while shown (a dropped subscription stops them; mirrors
     /// [`palette_sub`](Self::palette_sub)).
     goto_sub: Option<Subscription>,
+    /// Re-entrancy guard for the window-close path (the C++ `ClosingGuard
+    /// m_closingAll`; app-shell.md:167). [`guarded_window_close`](Self::guarded_window_close)
+    /// shows the async unsaved-changes dialog and aborts the in-flight close;
+    /// the chosen Save/Discard branch then performs the *programmatic* close —
+    /// which fires the same OS/titlebar hook again. This flag is set before that
+    /// re-close so the second pass bypasses the prompt (mirrors the C++ guard that
+    /// suppresses the re-prompt while closing-all is in progress).
+    closing: bool,
     /// Whether Presentation Mode is on (View ▸ Presentation Mode). A live toggle
     /// flag reflected in the View menu ✓; the chrome dimming lands with its own
     /// pass — here it owns the state + the checkmark so the menu reflects reality.
@@ -830,6 +838,31 @@ fn root_name_for_title(tree: &crate::core::NodeTree, view_root_id: u64) -> Strin
     String::new()
 }
 
+/// The unsaved-changes display name for one dirty document (the C++ `closeEvent`
+/// per-doc name rule; main.cpp:8991-8993): the file name when the document has a
+/// path, else the view-root struct name. Pure; unit-tested. Returns `None` for a
+/// clean document so callers can filter in one pass (the C++ `if (modified ...)`
+/// gate; main.cpp:8989) — a clean set yields no names ⇒ the close is accepted.
+fn dirty_doc_name(
+    modified: bool,
+    file_path: Option<&std::path::Path>,
+    tree: &crate::core::NodeTree,
+    view_root_id: u64,
+) -> Option<String> {
+    if !modified {
+        return None;
+    }
+    let name = match file_path {
+        Some(p) => p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| root_name_for_title(tree, view_root_id)),
+        None => root_name_for_title(tree, view_root_id),
+    };
+    Some(name)
+}
+
 /// Assemble the OS window-title string from a root name + dirty flag (the C++
 /// `updateWindowTitle` formatting; main.cpp:5176-5186): `"<name>[ *] - Reclass"`,
 /// or plain `"Reclass"` when the name is empty (no document / unnamed root).
@@ -1197,6 +1230,20 @@ impl MainWindow {
         })
         .detach();
 
+        // ── OS/WM window-close interception (the C++ `closeEvent`; main.cpp:8984).
+        // gpui's `on_window_should_close` is the Alt+F4 / `WM_DELETE_WINDOW` hook:
+        // returning `false` aborts the close (Qt `event->ignore()`), `true` allows
+        // it (Qt `event->accept()`). Route it through the shared unsaved-changes
+        // guard. The hook is fire-and-forget on the platform window (no
+        // Subscription to retain); it re-enters this entity via a weak handle and
+        // defaults to allowing the close if the entity is already gone. ──
+        let close_entity = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            close_entity
+                .update(cx, |this, cx| this.guarded_window_close(window, cx))
+                .unwrap_or(true)
+        });
+
         let mut win = MainWindow {
             state,
             dock_area,
@@ -1211,6 +1258,8 @@ impl MainWindow {
             palette_sub: None,
             editor_observers: Vec::new(),
             goto_sub: None,
+            // Not closing yet (the C++ `m_closingAll` starts false).
+            closing: false,
             presentation: false,
             // View toggles, recent files, the editor font, and go-to recents are
             // loaded from the disk store above (persisted across launches).
@@ -3284,6 +3333,58 @@ impl MainWindow {
         );
     }
 
+    /// The single window-close guard (the C++ `MainWindow::closeEvent`;
+    /// main.cpp:8984-9031). Intercepts the OS/WM close (Alt+F4, `WM_DELETE_WINDOW`)
+    /// and the in-app titlebar X, mirroring Qt's accept/ignore protocol:
+    ///
+    /// - **return `true`** ⇒ allow the close (the C++ `event->accept()`),
+    /// - **return `false`** ⇒ abort *this* close (the C++ `event->ignore()`).
+    ///
+    /// With nothing dirty it returns `true` immediately (main.cpp:8998). Otherwise
+    /// it opens the **async** 3-way unsaved-changes guard and returns `false`
+    /// (abort) — the dialog is asynchronous, so the chosen Save/Discard branch
+    /// performs the *actual* close itself ([`Window::remove_window`], the gpui
+    /// analog of `event->accept()` for this single-window app). **Cancel** keeps the
+    /// window open (no re-close), matching the C++ `event->ignore()` on Cancel
+    /// (main.cpp:9013-9015).
+    ///
+    /// The programmatic re-close from the Save/Discard branch fires this hook
+    /// again; the [`closing`](Self::closing) re-entrancy guard (the C++
+    /// `ClosingGuard m_closingAll`; app-shell.md:167) makes that second pass return
+    /// `true` without re-prompting.
+    fn guarded_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Re-entrant close from the Save/Discard branch below → allow it through
+        // without re-prompting (the C++ closing-all guard).
+        if self.closing {
+            return true;
+        }
+        let dirty = self.collect_dirty_docs(cx);
+        if dirty.is_empty() {
+            // Clean document set → accept the close (main.cpp:8998).
+            return true;
+        }
+        self.open_unsaved_guard(
+            dirty,
+            |me, window, cx| {
+                // Save succeeded for every dirty doc → perform the close.
+                me.closing = true;
+                window.remove_window();
+                let _ = cx;
+            },
+            |me, window, cx| {
+                // Discard → close without saving.
+                me.closing = true;
+                window.remove_window();
+                let _ = cx;
+            },
+            window,
+            cx,
+        );
+        // Abort *this* close — the async dialog's Save/Discard branch re-closes
+        // (the C++ `event->ignore()` while the modal decides).
+        false
+    }
+
     /// Collect the open editors whose document is modified, deduped by document
     /// (the C++ `closeEvent` walks `m_tabs`, skipping repeat docs; here each tab
     /// owns its editor so we dedup by [`DocId`]). Each entry is
@@ -3303,18 +3404,15 @@ impl MainWindow {
             let ed = t.editor.read(cx);
             let ctrl = ed.controller();
             let doc = ctrl.document();
-            if !doc.modified {
+            let Some(name) = dirty_doc_name(
+                doc.modified,
+                doc.file_path.as_deref(),
+                ctrl.tree(),
+                ctrl.view_root_id(),
+            ) else {
                 continue;
-            }
-            seen.insert(t.id);
-            let name = match &doc.file_path {
-                Some(p) => p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| root_name_for_title(ctrl.tree(), ctrl.view_root_id())),
-                None => root_name_for_title(ctrl.tree(), ctrl.view_root_id()),
             };
+            seen.insert(t.id);
             out.push((t.editor.clone(), name));
         }
         out
@@ -6597,12 +6695,25 @@ impl Render for MainWindow {
                 let _ = this.update(app, |me, cx| me.apply_layout_preset(p, window, cx));
             }
         };
+        // The in-app titlebar X (gpui-component's Linux close control) must route
+        // through the same close guard as the OS/WM close — without this it falls
+        // to the default `window.remove_window()` and bypasses the unsaved-changes
+        // prompt (title_bar.rs:189-194). `guarded_window_close` returns a bool we
+        // ignore here: on Cancel it has already aborted (kept the window open); on
+        // Save/Discard the async branch re-closes.
+        let close_cb = {
+            let this = this.clone();
+            move |window: &mut Window, app: &mut App| {
+                let _ = this.update(app, |me, cx| me.guarded_window_close(window, cx));
+            }
+        };
         let titlebar: TitleBar = titlebar::render_titlebar(
             preset,
             doc_title,
             has_doc,
             self.menubar.clone(),
             layout_cb,
+            close_cb,
             cx,
         );
 
@@ -7076,9 +7187,9 @@ mod tests {
     // These import specific items (NOT `super::*`) so the module's `gpui::*` glob
     // is not pulled into the test-hygiene expansion (see the menubar.rs note).
     use super::{
-        builtin_plugins, root_name_for_title, seed_root_doc, settings_keys, unique_dirty_names,
-        unsaved_changes_text, window_title_string, DiskSettings, ExportKind, ImportKind, RootKind,
-        ViewOpt, ViewOptions, ABOUT_GITHUB_URL,
+        builtin_plugins, dirty_doc_name, root_name_for_title, seed_root_doc, settings_keys,
+        unique_dirty_names, unsaved_changes_text, window_title_string, DiskSettings, ExportKind,
+        ImportKind, RootKind, ViewOpt, ViewOptions, ABOUT_GITHUB_URL,
     };
     use crate::theme::SettingsStore;
     use std::cell::RefCell;
@@ -7237,6 +7348,54 @@ mod tests {
         );
         // Empty in → empty out (nothing dirty).
         assert!(unique_dirty_names(Vec::<String>::new()).is_empty());
+    }
+
+    // ── A1: window-close guard decision logic (the C++ closeEvent; main.cpp:8989) ──
+
+    #[test]
+    fn clean_document_yields_no_dirty_name_so_close_is_accepted() {
+        // Port of the C++ `closeEvent` early-out (main.cpp:8989, 8998): an
+        // unmodified document contributes NO dirty name. `collect_dirty_docs`
+        // filters each tab through `dirty_doc_name`; a set of only-clean docs
+        // therefore collects empty ⇒ `guarded_window_close` returns true (the Qt
+        // `event->accept()` — close immediately, no prompt). `seed_root_doc` builds
+        // a fresh doc which starts `modified == false`.
+        let doc = seed_root_doc(RootKind::Class);
+        assert!(!doc.modified, "a freshly seeded doc starts clean");
+        let root_id = doc.tree.nodes.iter().find(|n| n.parent_id == 0).unwrap().id;
+        assert_eq!(
+            dirty_doc_name(doc.modified, doc.file_path.as_deref(), &doc.tree, root_id),
+            None,
+            "a clean doc must not enter the dirty set (allow-close path)"
+        );
+    }
+
+    #[test]
+    fn dirty_unsaved_document_names_by_view_root_struct() {
+        // The C++ name rule for a dirty, never-saved doc: the view-root struct name
+        // (main.cpp:8991, the `filePath.isEmpty()` branch). A dirty doc DOES enter
+        // the set (the prompt path).
+        let doc = seed_root_doc(RootKind::Class);
+        let root_id = doc.tree.nodes.iter().find(|n| n.parent_id == 0).unwrap().id;
+        assert_eq!(
+            dirty_doc_name(true, None, &doc.tree, root_id),
+            Some(root_name_for_title(&doc.tree, root_id)),
+            "an unsaved dirty doc names by its view-root struct"
+        );
+    }
+
+    #[test]
+    fn dirty_saved_document_names_by_file_basename() {
+        // The C++ name rule for a dirty, saved doc: the file BASENAME (main.cpp:8993,
+        // `QFileInfo(filePath).fileName()`), not the struct name and not the full path.
+        let doc = seed_root_doc(RootKind::Class);
+        let root_id = doc.tree.nodes.iter().find(|n| n.parent_id == 0).unwrap().id;
+        let path = std::path::PathBuf::from("/home/u/projects/Player.rcx");
+        assert_eq!(
+            dirty_doc_name(true, Some(path.as_path()), &doc.tree, root_id),
+            Some("Player.rcx".to_string()),
+            "a saved dirty doc names by its file basename"
+        );
     }
 
     // ── Help ▸ About GitHub URL (the C++ about() "Open GitHub"; item 8) ──

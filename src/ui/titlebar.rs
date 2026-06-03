@@ -143,9 +143,14 @@ fn chrome_toggle(
 /// titlebar copy was inconsistent dead UI, so this bar carries only the sidebar
 /// (workspace) toggle.
 ///
-/// Callback (a plain `Fn` so the titlebar stays decoupled from `MainWindow`):
+/// Callbacks (plain `Fn`s so the titlebar stays decoupled from `MainWindow`):
 /// - `on_layout` — the workspace-toggle button was clicked (the C++
 ///   `layoutPresetSelected`); receives the chosen [`LayoutPreset`].
+/// - `on_close` — the in-app titlebar **close** (X) control was clicked. Wired to
+///   the bar's [`TitleBar::on_close_window`] so the close routes through the
+///   window's unsaved-changes guard instead of the gpui-component default
+///   `window.remove_window()` (title_bar.rs:49-57 / 189-194), which would bypass
+///   the prompt. Linux-only at the gpui-component layer (a no-op elsewhere).
 ///
 /// `preset` is the current workspace state (drives the toggle's checked styling);
 /// `doc_title` is the active document's display title (the right-aligned label);
@@ -157,6 +162,7 @@ pub fn render_titlebar(
     has_doc: bool,
     menubar: Entity<MenuBar>,
     on_layout: impl Fn(LayoutPreset, &mut Window, &mut App) + 'static,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> TitleBar {
     let on_layout = std::rc::Rc::new(on_layout);
@@ -200,6 +206,10 @@ pub fn render_titlebar(
     let title: SharedString = doc_title.into();
 
     TitleBar::new()
+        // Route the titlebar X through the window's unsaved-changes guard (the
+        // gpui-component default would call `window.remove_window()` directly and
+        // bypass the prompt; title_bar.rs:189-194). Linux-only at this layer.
+        .on_close_window(move |_ev, w, cx| on_close(w, cx))
         // Left cluster: the app label + the in-window menu bar (PIC1/PIC5:
         // "Reclass  File  Edit  View  Tools  Plugins  Help").
         .child(
