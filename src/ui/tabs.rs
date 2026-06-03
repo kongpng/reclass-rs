@@ -360,6 +360,33 @@ impl DocumentArea {
         cx.notify();
     }
 
+    /// Close every open tab whose data source is of `kind`, returning how many
+    /// were closed (the live-host **safe-unload** detach; design §7.A [fix]).
+    ///
+    /// The [`LivePluginHost`](super::pluginhost::LivePluginHost) drives this when
+    /// the manager safe-unloads a provider plugin: every document still pointing
+    /// at that provider's source kind is closed **before** the backing library is
+    /// dropped, so none outlives the provider it reads (the C++ dangling-provider
+    /// crash this fixes; cpp_reference §2/§10.3). Walks the strip in reverse so an
+    /// index removal never disturbs a not-yet-visited tab, and reuses
+    /// [`close_index`](Self::close_index) for the active-index fix-up + the
+    /// never-leave-a-blank-area reflex.
+    pub fn detach_sources_of_kind(
+        &mut self,
+        kind: SourceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let mut closed = 0;
+        for i in (0..self.tabs.len()).rev() {
+            if self.tabs[i].source.kind == kind {
+                self.close_index(i, window, cx);
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// Close every tab **except** `keep` (the C++ "Close All But This"; the loop
     /// `for d in docks: if d != target d->close()`). Order-independent: it walks
     /// from the end so index removal never disturbs a not-yet-visited tab, and
@@ -1381,11 +1408,14 @@ mod tests {
     // on a lightweight mirror of `DocumentArea`'s rules (the same invariants the
     // gpui methods enforce: active follows close, never blank, monotonic ids),
     // to keep them gpui-free and deterministic.
-    use super::super::state::{DocId, ViewMode};
+    use super::super::state::{DocId, SourceKind, ViewMode};
 
     /// A gpui-free mirror of `DocumentArea`'s tab list + active-index rules.
     struct TabModel {
         ids: Vec<DocId>,
+        /// Per-tab source kind, index-parallel to `ids` — exercises the
+        /// `detach_sources_of_kind` selection without a display.
+        kinds: Vec<SourceKind>,
         active: usize,
         next: u64,
     }
@@ -1393,6 +1423,7 @@ mod tests {
         fn new() -> Self {
             let mut m = TabModel {
                 ids: Vec::new(),
+                kinds: Vec::new(),
                 active: 0,
                 next: 0,
             };
@@ -1403,8 +1434,28 @@ mod tests {
             self.next += 1;
             let id = DocId::from_raw(self.next);
             self.ids.push(id);
+            self.kinds.push(SourceKind::None);
             self.active = self.ids.len() - 1;
             id
+        }
+        /// Set a tab's source kind (so a detach test can mark which tabs use a
+        /// given provider kind).
+        fn set_kind(&mut self, ix: usize, kind: SourceKind) {
+            if ix < self.kinds.len() {
+                self.kinds[ix] = kind;
+            }
+        }
+        /// Mirror of `detach_sources_of_kind`: close every tab whose source kind
+        /// matches, in reverse, reusing `close`; returns the count closed.
+        fn detach_sources_of_kind(&mut self, kind: SourceKind) -> usize {
+            let mut closed = 0;
+            for i in (0..self.ids.len()).rev() {
+                if self.kinds[i] == kind {
+                    self.close(i);
+                    closed += 1;
+                }
+            }
+            closed
         }
         fn activate(&mut self, ix: usize) {
             if ix < self.ids.len() {
@@ -1418,6 +1469,7 @@ mod tests {
             }
             let was_active = ix == self.active;
             self.ids.remove(ix);
+            self.kinds.remove(ix);
             if self.ids.is_empty() {
                 self.push();
             } else {
@@ -1446,6 +1498,7 @@ mod tests {
         // Mirror of close_all: collapse to one fresh tab.
         fn close_all(&mut self) {
             self.ids.clear();
+            self.kinds.clear();
             self.active = 0;
             self.push();
         }
@@ -1459,12 +1512,14 @@ mod tests {
                 return;
             };
             let id = self.ids.remove(from);
+            let kind = self.kinds.remove(from);
             let mut insert = self.index_of(to_id).unwrap_or(to);
             if from < insert {
                 insert += 1;
             }
             let insert = insert.min(self.ids.len());
             self.ids.insert(insert, id);
+            self.kinds.insert(insert, kind);
             if let Some(i) = self.index_of(from_id) {
                 self.active = i;
             }
@@ -1592,6 +1647,51 @@ mod tests {
         let before = m.ids.clone();
         m.reorder(a, a);
         assert_eq!(m.ids, before);
+    }
+
+    #[test]
+    fn detach_sources_of_kind_closes_only_matching_and_returns_count() {
+        // The live-host safe-unload detach: close only the tabs whose source kind
+        // matches, leave the rest, and report how many closed (design §7.A [fix]).
+        let mut m = TabModel::new(); // [1] kind None
+        m.push(); // [1,2]
+        m.push(); // [1,2,3]
+        m.push(); // [1,2,3,4]
+                  // Mark tabs 1 and 3 as File, tab 2 as Buffer, tab 0 stays None.
+        m.set_kind(1, SourceKind::File);
+        m.set_kind(2, SourceKind::Buffer);
+        m.set_kind(3, SourceKind::File);
+        let none_id = m.ids[0];
+        let buffer_id = m.ids[2];
+
+        // Detaching the File kind closes exactly the two File tabs.
+        let closed = m.detach_sources_of_kind(SourceKind::File);
+        assert_eq!(closed, 2);
+        assert_eq!(m.ids.len(), 2);
+        // The None + Buffer tabs survive (and their kinds stay aligned).
+        assert!(m.ids.contains(&none_id));
+        assert!(m.ids.contains(&buffer_id));
+        assert!(!m.kinds.contains(&SourceKind::File));
+
+        // A kind no document uses closes nothing.
+        let closed = m.detach_sources_of_kind(SourceKind::Snapshot);
+        assert_eq!(closed, 0);
+        assert_eq!(m.ids.len(), 2);
+    }
+
+    #[test]
+    fn detach_sources_of_kind_never_leaves_blank_area() {
+        // Closing the last remaining tab via a detach re-opens a fresh untitled
+        // tab (the never-blank reflex still applies through `close_index`).
+        let mut m = TabModel::new(); // [1] kind None
+        m.set_kind(0, SourceKind::File);
+        let only = m.ids[0];
+        let closed = m.detach_sources_of_kind(SourceKind::File);
+        assert_eq!(closed, 1);
+        // One fresh (new-id, None-kind) tab remains.
+        assert_eq!(m.ids.len(), 1);
+        assert_ne!(m.ids[0], only);
+        assert_eq!(m.kinds[0], SourceKind::None);
     }
 
     #[test]

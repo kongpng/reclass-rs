@@ -2109,6 +2109,34 @@ impl MainWindow {
                     let rows = plugin_infos_from_rows(this.plugin_manager.plugins_view());
                     dialog.update(cx, |d, cx| d.set_plugins(rows, cx));
                 }
+                PluginManagerEvent::Unload { identifier } => {
+                    // Safe-unload through the LIVE host (design §7.A [fix]): build a
+                    // window-backed host that detaches affected documents FIRST
+                    // (manager.rs safe_unload step 1), drop the plugin + its backing
+                    // library, then refresh the rows. The host borrows `cx`, so it is
+                    // scoped + dropped before we re-borrow `cx` for `notify`/`update`.
+                    let toasts = {
+                        let mut host = super::pluginhost::LivePluginHost::new(
+                            this.document_area.clone(),
+                            this.settings.clone(),
+                            window,
+                            cx,
+                        );
+                        this.plugin_manager.safe_unload(identifier, &mut host);
+                        host.take_toasts()
+                    };
+                    // Drain any toasts the unload path surfaced (the host can't call
+                    // `notify` itself — it lacks `&mut MainWindow`).
+                    for msg in toasts {
+                        this.notify(msg, window, cx);
+                    }
+                    let rows = plugin_infos_from_rows(this.plugin_manager.plugins_view());
+                    dialog.update(cx, |d, cx| d.set_plugins(rows, cx));
+                }
+                #[cfg(feature = "plugins")]
+                PluginManagerEvent::Load => {
+                    this.load_plugin_from_path(dialog.clone(), window, cx);
+                }
             },
         ));
         let dialog_for_modal = dialog.clone();
@@ -2120,6 +2148,70 @@ impl MainWindow {
         });
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Load a native plugin from a user-chosen path (the C++ load-from-path;
+    /// design §6 Phase 3/6) — only compiled behind the `plugins` feature. Pops the
+    /// native path picker; on a chosen library, loads it through the session-owned
+    /// [`PluginManager`](crate::plugin::PluginManager) (the same registry the
+    /// source pickers read), surfaces a load / ABI-mismatch error via a toast
+    /// (design §7.A [fix]), and refreshes the open dialog's rows so the new plugin
+    /// appears. The chosen-path filter keeps only a real library extension
+    /// (`.so`/`.dll`/`.dylib`) so a stray pick is rejected cleanly.
+    #[cfg(feature = "plugins")]
+    fn load_plugin_from_path(
+        &mut self,
+        dialog: Entity<PluginManagerDialog>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Load a native plugin (.so/.dll/.dylib)".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(path) = rx
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|v| v.into_iter().next())
+            else {
+                return;
+            };
+            // Only accept a real shared-library extension (reject a stray pick).
+            let ok_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "so" | "dll" | "dylib"))
+                .unwrap_or(false);
+            let _ = this.update_in(cx, |me, window, cx| {
+                if !ok_ext {
+                    me.notify(
+                        format!("Not a plugin library: {}", path.display()),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                match me.plugin_manager.load_native_plugin(&path) {
+                    Ok(id) => {
+                        me.notify(format!("Loaded plugin '{id}'"), window, cx);
+                        // Refresh the open dialog's rows so the new plugin appears.
+                        let rows = plugin_infos_from_rows(me.plugin_manager.plugins_view());
+                        dialog.update(cx, |d, cx| d.set_plugins(rows, cx));
+                    }
+                    Err(e) => {
+                        // Surface the load / ABI-mismatch error with detail (design
+                        // §7.A [fix] — C++ shows a generic "check the console" box).
+                        me.notify(format!("Plugin load failed: {e}"), window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Tools ▸ Performance Profiler (Ctrl+Shift+F) — open the live
@@ -5511,6 +5603,10 @@ struct PluginInfo {
     author: String,
     description: String,
     enabled: bool,
+    /// Whether this is a compiled-in built-in provider. Built-ins are **not**
+    /// runtime-unloadable (the C++ never `dlopen`'d them; parity), so the dialog
+    /// shows no Unload control on a built-in row — only on a loaded native plugin.
+    is_builtin: bool,
     /// The derived routing identifier (`Name().toLower().replace(" ","")`) — the
     /// key the dialog hands back to [`PluginManager::set_enabled`] when the user
     /// flips this row's enabled state (design §7.A [fix] / §H).
@@ -5543,6 +5639,8 @@ fn builtin_plugins() -> Vec<PluginInfo> {
 fn plugin_infos_from_rows(rows: Vec<crate::plugin::PluginRow>) -> Vec<PluginInfo> {
     rows.into_iter()
         .map(|r| PluginInfo {
+            // Read `is_builtin` before `r.name` is moved by the display branch.
+            is_builtin: r.is_builtin,
             name: if r.is_builtin {
                 format!("{} Provider", r.name)
             } else {
@@ -5578,6 +5676,19 @@ enum PluginManagerEvent {
         identifier: String,
         enabled: bool,
     },
+    /// **Safe-unload** the plugin `identifier` (design §7.A [fix]). Emitted only by
+    /// a NON-builtin row's Unload button (built-ins are never `dlopen`'d, so they
+    /// have no Unload control — parity). The host detaches affected documents
+    /// FIRST, then drops the plugin + its backing library, then refreshes the rows.
+    Unload {
+        identifier: String,
+    },
+    /// Load a native plugin from a user-chosen path (the C++ load-from-path;
+    /// design §6 Phase 3/6). Only present + handled behind the `plugins` feature —
+    /// the default build ships no runtime loader, so this variant doesn't exist
+    /// there (and the dialog shows no "Load plugin…" button).
+    #[cfg(feature = "plugins")]
+    Load,
 }
 
 /// The read-only Plugins manager view (the C++ `showPluginsDialog`; main.cpp:8821).
@@ -5612,6 +5723,22 @@ impl PluginManagerDialog {
             identifier,
             enabled,
         });
+    }
+
+    /// Emit the intent to **safe-unload** `identifier` (design §7.A [fix]). Mirrors
+    /// [`toggle`](Self::toggle): the host owns the manager, applies the unload
+    /// (detach-first), and pushes the refreshed rows back via
+    /// [`set_plugins`](Self::set_plugins). Only a non-builtin row wires this.
+    fn unload(&mut self, identifier: String, cx: &mut Context<Self>) {
+        cx.emit(PluginManagerEvent::Unload { identifier });
+    }
+
+    /// Emit the intent to load a native plugin from a path (the C++ load-from-path;
+    /// design §6 Phase 3/6). Feature-gated — the default build has no loader, so
+    /// neither the button nor this method exists there.
+    #[cfg(feature = "plugins")]
+    fn load(&mut self, cx: &mut Context<Self>) {
+        cx.emit(PluginManagerEvent::Load);
     }
 
     /// Replace the rendered rows (the host calls this after applying a toggle so the
@@ -5708,7 +5835,27 @@ impl Render for PluginManagerDialog {
                                         this.toggle(id.clone(), target, cx);
                                     }
                                 })),
-                            ),
+                            )
+                            // Unload — only a loaded (non-builtin) plugin shows it
+                            // (built-ins are never `dlopen`'d, so there is nothing
+                            // to unload; parity). A Destructive button: the click
+                            // safe-unloads (detach-first) on the session manager.
+                            .when(!p.is_builtin, |row| {
+                                row.child(
+                                    Button::new(SharedString::from(format!(
+                                        "plugin-unload-{}",
+                                        p.identifier
+                                    )))
+                                    .danger()
+                                    .label("Unload")
+                                    .on_click(cx.listener({
+                                        let id = p.identifier.clone();
+                                        move |this, _e, _w, cx| {
+                                            this.unload(id.clone(), cx);
+                                        }
+                                    })),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -5738,14 +5885,22 @@ impl Render for PluginManagerDialog {
             })
             .collect();
 
+        // The footer note. With the `plugins` feature the runtime loader is
+        // present (so the wording invites Load plugin…); without it, the honest
+        // boundary note stays verbatim (the C++ load-from-path has no analogue in
+        // the default build).
+        #[cfg(feature = "plugins")]
+        let note_text = "Enable/Disable is applied to the session and persisted \
+             across launches. Use “Load plugin…” to load a native plugin (.so/.dll) \
+             from disk; built-in providers cannot be unloaded.";
+        #[cfg(not(feature = "plugins"))]
+        let note_text = "Enable/Disable is applied to the session and persisted \
+             across launches. Loading runtime plugins (DLL/SO) is not supported in \
+             this build; the provider plugins above are compiled in.";
         let note = div()
             .text_color(color::text_muted(cx))
             .text_size(px(tokens::font::UI_SM))
-            .child(
-                "Enable/Disable is applied to the session and persisted across \
-                 launches. Loading runtime plugins (DLL/SO) is not supported in \
-                 this build; the provider plugins above are compiled in.",
-            );
+            .child(note_text);
 
         let body = modal::body(cx).child(
             gpui_component::v_flex()
@@ -5758,7 +5913,16 @@ impl Render for PluginManagerDialog {
                 .child(note),
         );
 
-        let footer = modal::footer(cx).child(
+        let footer = modal::footer(cx);
+        // "Load plugin…" — the C++ load-from-path, only behind the `plugins`
+        // feature (the default build has no runtime loader). Placed BEFORE Close.
+        #[cfg(feature = "plugins")]
+        let footer = footer.child(
+            Button::new("plugins-load")
+                .label("Load plugin…")
+                .on_click(cx.listener(|this, _e, _w, cx| this.load(cx))),
+        );
+        let footer = footer.child(
             Button::new("plugins-close")
                 .primary()
                 .label("Close")
@@ -6625,6 +6789,112 @@ mod tests {
             !null.enabled,
             "disabled built-in shows disabled in the dialog"
         );
+        // Built-ins carry is_builtin = true (so the dialog shows no Unload control).
+        assert!(infos.iter().all(|i| i.is_builtin));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── F2: live-host safe-unload + the dialog's row refresh contract ──
+    //
+    // The window-backed `LivePluginHost` is gpui-bound (it needs a `Window`/`App`),
+    // so following the repo convention (no gpui-bound tests — see the tabs.rs note)
+    // these assert the NON-gpui logic the `Unload` arm runs: the manager's
+    // safe_unload + the `plugin_infos_from_rows` row refresh. The host's
+    // identifier→SourceKind detach mapping is tested in `pluginhost.rs`, and the
+    // concrete tab close in `tabs.rs::detach_sources_of_kind_*`.
+
+    /// A throwaway native (non-builtin) provider plugin, so a test can add a
+    /// runtime-loaded-style plugin to the session manager and then unload it.
+    struct UnloadableProvider {
+        manifest: crate::plugin::PluginManifest,
+    }
+    impl crate::plugin::Plugin for UnloadableProvider {
+        fn manifest(&self) -> &crate::plugin::PluginManifest {
+            &self.manifest
+        }
+        fn contributions(&self) -> Vec<crate::plugin::Contribution> {
+            vec![crate::plugin::Contribution::Provider(
+                crate::plugin::ProviderSpec::new(
+                    |_t| true,
+                    |t| {
+                        Ok(
+                            std::sync::Arc::new(crate::provider::BufferProvider::new(vec![], t))
+                                as crate::plugin::SharedProvider,
+                        )
+                    },
+                ),
+            )]
+        }
+    }
+
+    fn unloadable_native(name: &str) -> Box<dyn crate::plugin::Plugin> {
+        let mut m = crate::plugin::PluginManifest::builtin(
+            name,
+            "a runtime-loaded native provider",
+            vec![crate::plugin::Permission::ReadMemory],
+        );
+        m.kind = crate::plugin::PluginKind::Native;
+        m.load = crate::plugin::LoadType::Auto;
+        m.dll_file_name = format!("{}.so", name.to_lowercase());
+        Box::new(UnloadableProvider { manifest: m })
+    }
+
+    #[test]
+    fn plugin_info_marks_loaded_native_as_not_builtin() {
+        // A loaded native plugin is is_builtin = false → the dialog renders its
+        // Unload control (the per-row guard), while built-ins do not.
+        let path = temp_settings_path();
+        let mut mgr = session_manager_at(&path);
+        let id = mgr.add_plugin(unloadable_native("Remote Reader"));
+        let infos = super::plugin_infos_from_rows(mgr.plugins_view());
+
+        let native = infos.iter().find(|i| i.identifier == id).unwrap();
+        assert!(!native.is_builtin, "a loaded native plugin is not built-in");
+        // Its name is NOT given the built-in "<name> Provider" suffix.
+        assert_eq!(native.name, "Remote Reader");
+        // The built-ins are still flagged built-in.
+        assert!(infos
+            .iter()
+            .filter(|i| i.identifier != id)
+            .all(|i| i.is_builtin));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn safe_unload_through_host_removes_row_and_keeps_builtins() {
+        // The exact non-gpui work the dialog's Unload arm does: safe_unload on the
+        // session manager (with a host) drops the plugin's row + provider, and the
+        // refreshed `plugin_infos_from_rows` no longer lists it while every
+        // built-in survives (PARITY: built-ins are never unloaded).
+        let path = temp_settings_path();
+        let mut mgr = session_manager_at(&path);
+        let id = mgr.add_plugin(unloadable_native("Doomed Reader"));
+
+        // Pre-unload: the row + the registered provider are present.
+        let before = super::plugin_infos_from_rows(mgr.plugins_view());
+        assert!(before.iter().any(|i| i.identifier == id));
+        assert!(mgr.registry().find(&id).is_some());
+
+        // Safe-unload through a host (MockPluginHost stands in for the gpui-bound
+        // LivePluginHost; both call detach_documents_using FIRST inside safe_unload).
+        let mut host = crate::plugin::MockPluginHost::new();
+        assert!(mgr.safe_unload(&id, &mut host));
+        // The host WAS asked to detach the unloaded provider's documents first.
+        assert_eq!(host.detached(), [id.as_str()]);
+
+        // Post-unload: the row + provider are gone…
+        let after = super::plugin_infos_from_rows(mgr.plugins_view());
+        assert!(!after.iter().any(|i| i.identifier == id));
+        assert!(mgr.registry().find(&id).is_none());
+        // …and every built-in is still listed + still registered (parity).
+        for builtin in ["file", "buffer", "snapshot", "null"] {
+            assert!(
+                after.iter().any(|i| i.identifier == builtin),
+                "built-in {builtin} survives the unload"
+            );
+            assert!(mgr.registry().find(builtin).is_some());
+        }
+        assert_eq!(mgr.registry().providers().len(), 4);
         let _ = std::fs::remove_file(&path);
     }
 

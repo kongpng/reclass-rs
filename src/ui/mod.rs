@@ -49,6 +49,7 @@ pub mod modulespanel;
 pub mod optionsdialog;
 pub mod panels;
 pub mod plugindialog;
+pub mod pluginhost;
 pub mod pluginpanel;
 pub mod pluginview;
 pub mod processpicker;
