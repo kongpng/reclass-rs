@@ -39,6 +39,14 @@ pub fn target_at_col(
     type_w: i32,
     name_w: i32,
 ) -> Option<EditTarget> {
+    // ── ArrayElementSeparator rows are inert (no clickable region). ──
+    // C++ `hitTestTarget` bails out at the top for this line kind
+    // (editor.cpp:2400) — the `[ … ]` separator between rendered array elements
+    // is a pure visual divider, so a click on it resolves to NO edit target.
+    if lm.line_kind == LineKind::ArrayElementSeparator {
+        return None;
+    }
+
     // ── CommandRow: chevron → src → addr → root-name (line 0). ──
     if lm.line_kind == LineKind::CommandRow {
         if span_contains(compose::command_row_chevron_span(text), col) {
@@ -282,6 +290,38 @@ mod tests {
         let v = target_at_col(&lm, text, 42, 14, 22);
         assert_ne!(v, Some(EditTarget::Value));
         assert_ne!(v, Some(EditTarget::Name));
+    }
+
+    #[test]
+    fn array_element_separator_row_resolves_no_target() {
+        // C++ `hitTestTarget` bails out at the top for an ArrayElementSeparator
+        // (editor.cpp:2400): the `[ … ]` divider between rendered array elements is
+        // a pure visual separator, so any column on it resolves to NO edit target —
+        // even columns that would otherwise land in the Type/Name/Value region.
+        let lm = LineMeta {
+            line_kind: LineKind::ArrayElementSeparator,
+            node_kind: NodeKind::UInt8,
+            is_array_element: true,
+            ..LineMeta::default()
+        };
+        // A separator row's text is the `[ … ]` divider; columns across the whole
+        // row resolve to nothing.
+        let text = "  [ 0 ]";
+        for col in [
+            0,
+            compose::K_FOLD_COL + 1, // would-be type column
+            19,                      // would-be name column
+            42,                      // would-be value column
+        ] {
+            assert_eq!(
+                target_at_col(&lm, text, col, 14, 22),
+                None,
+                "separator row col {col} must resolve to no target"
+            );
+        }
+        // And through the full pixel hit test.
+        let hit = hit_test_row(&lm, text, 4.0 * 8.0, metrics(), 14, 22);
+        assert_eq!(hit.target, None);
     }
 
     #[test]

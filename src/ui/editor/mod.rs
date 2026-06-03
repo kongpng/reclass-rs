@@ -990,6 +990,19 @@ impl RcxEditor {
         self.controller.last_result().meta.get(idx)
     }
 
+    /// The nearest array-HEADER line strictly above `from_line` whose `node_idx`
+    /// matches `node_idx`, or `None` if none precedes it. Mirrors the C++ scan in
+    /// `hitTestTarget` (editor.cpp:2483-2490, `for (l = line - 1; l >= 0; l--)`)
+    /// that resolves an array element's type/name click back to its parent array
+    /// header line.
+    fn parent_array_header_line(&self, from_line: usize, node_idx: i32) -> Option<usize> {
+        let meta = &self.controller.last_result().meta;
+        (0..from_line).rev().find(|&l| {
+            meta.get(l)
+                .is_some_and(|hdr| hdr.is_array_header && hdr.node_idx == node_idx)
+        })
+    }
+
     /// Row text as an owned `String`, with the **command row substituted** by the
     /// controller's live [`build_command_row`](RcxController::build_command_row).
     ///
@@ -1041,6 +1054,15 @@ impl RcxEditor {
         let text = self.line_text_owned(line);
         let (type_w, name_w) = geometry::effective_widths(&lm);
         let hit = hit_test::hit_test_row(&lm, &text, rel_x, self.metrics, type_w, name_w);
+
+        // The array-element → parent-header redirect (below, after the
+        // fold/byte/footer early-returns) rebinds `line`/`lm`/`hit` to the parent
+        // array header so every downstream branch targets the array node. `text`
+        // and the column widths are only consumed by `hit_test_row`/`on_footer_click`
+        // above the redirect, so they stay immutable.
+        let mut line = line;
+        let mut lm = lm;
+        let mut hit = hit;
 
         // Plain LMB clears the byte selection (Shift/Ctrl preserve it; §9).
         if !modifiers.shift && !modifiers.control {
@@ -1103,6 +1125,39 @@ impl RcxEditor {
         // Footer pill click (item 10): the add-bytes / Top pills dispatch their op.
         if lm.line_kind == LineKind::Footer {
             if self.on_footer_click(&lm, &text, hit.col, cx) {
+                return;
+            }
+        }
+
+        // Array element → parent array-header redirect (C++ `hitTestTarget`,
+        // editor.cpp:2480-2492): a click on an array *element*'s Type or Name token
+        // is not editable on the element itself — it must open the element-type
+        // picker on the PARENT array header. Rewrite the hit to `ArrayElementType`
+        // and re-point `line`/`lm`/`hit` at the array header (the nearest preceding
+        // line with `is_array_header` and the SAME `node_idx`) so every downstream
+        // branch (selection, Ctrl+click open-in-tab, the type-selector picker)
+        // targets the array node, not the synthetic element row. If no parent header
+        // is found, the click resolves to nothing (the C++ `return false`).
+        if lm.is_array_element
+            && matches!(hit.target, Some(EditTarget::Type) | Some(EditTarget::Name))
+        {
+            if let Some(hdr_line) = self.parent_array_header_line(line, lm.node_idx) {
+                let Some(hdr_lm) = self.line_meta(hdr_line).cloned() else {
+                    return;
+                };
+                line = hdr_line;
+                lm = hdr_lm;
+                // Keep the originally-hit column; only the resolved TARGET and line
+                // change (matches the C++, which leaves `outCol` from the element
+                // click and only overrides `outTarget`/`outLine`). The picker
+                // positions itself from the header's type span regardless.
+                hit = hit_test::HitInfo {
+                    target: Some(EditTarget::ArrayElementType),
+                    ..hit
+                };
+            } else {
+                // No parent header (should not happen for a real element row):
+                // the click resolves to no edit target.
                 return;
             }
         }
@@ -8918,6 +8973,136 @@ mod tests {
         c.set_view_root_id(s_id);
         c.refresh();
         c
+    }
+
+    fn editor_with_primitive_array() -> RcxController {
+        use crate::core::{Node, NodeKind};
+        let mut doc = RcxDocument::new();
+        let s_idx = doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Holder".into(),
+            struct_type_name: "Holder".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let s_id = doc.tree.nodes[s_idx].id;
+        // A uint8_t[4] array — primitive elements are synthesized as element rows.
+        // Expanded (`collapsed: false`) so the element rows are materialized.
+        doc.tree.add_node(Node {
+            kind: NodeKind::Array,
+            element_kind: NodeKind::UInt8,
+            array_len: 4,
+            name: "bytes".into(),
+            parent_id: s_id,
+            offset: 0,
+            collapsed: false,
+            ..Node::default()
+        });
+        let mut c = RcxController::new(doc);
+        c.set_view_root_id(s_id);
+        c.refresh();
+        c
+    }
+
+    #[test]
+    fn array_element_rows_carry_parent_header_node_idx() {
+        // Fix #2 substrate: the array-element → parent-header redirect
+        // (editor.cpp:2480-2492) scans backward for the nearest line with
+        // `is_array_header` and the SAME `node_idx`. This verifies the compose
+        // layer wires array element rows to share the header's `node_idx` (so the
+        // scan lands on the parent), mirroring the C++ `hdr.nodeIdx == lm.nodeIdx`
+        // match.
+        let c = editor_with_primitive_array();
+        let meta = &c.last_result().meta;
+
+        // The array header line.
+        let hdr_line = meta
+            .iter()
+            .position(|m| m.is_array_header)
+            .expect("array header line exists");
+        let hdr_node_idx = meta[hdr_line].node_idx;
+        assert!(hdr_node_idx >= 0);
+
+        // Every synthesized element row shares the header's node_idx and is NOT
+        // itself an array header.
+        let elem_lines: Vec<usize> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_array_element)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(elem_lines.len(), 4, "uint8_t[4] yields four element rows");
+        for &el in &elem_lines {
+            assert_eq!(
+                meta[el].node_idx, hdr_node_idx,
+                "element row {el} must share the array header node_idx"
+            );
+            assert!(!meta[el].is_array_header);
+            assert!(el > hdr_line, "element rows follow the header");
+        }
+
+        // The backward scan (the exact predicate `parent_array_header_line` runs)
+        // resolves each element row to the parent header line.
+        for &el in &elem_lines {
+            let found = (0..el).rev().find(|&l| {
+                meta.get(l)
+                    .is_some_and(|hdr| hdr.is_array_header && hdr.node_idx == meta[el].node_idx)
+            });
+            assert_eq!(
+                found,
+                Some(hdr_line),
+                "element row {el} redirects to the parent array header line"
+            );
+        }
+    }
+
+    #[test]
+    fn array_element_type_name_hit_is_redirectable() {
+        // Fix #2: the column-level hit on an array *element* row's Type/Name token
+        // resolves to `Type`/`Name` (the input the redirect rewrites to
+        // `ArrayElementType` while re-pointing the line at the parent header). This
+        // confirms the element row exposes a redirectable Type/Name target — i.e.
+        // the redirect's precondition (`matches!(hit.target, Type | Name)`) can fire
+        // for a real element row.
+        use super::hit_test::target_at_col;
+        use crate::compose::EditTarget;
+        use crate::ui::editor::geometry;
+        let c = editor_with_primitive_array();
+        let result = c.last_result();
+        let meta = &result.meta;
+        let el = meta
+            .iter()
+            .position(|m| m.is_array_element)
+            .expect("element row exists");
+        let lm = &meta[el];
+        let text = {
+            use super::geometry::utf16_to_byte;
+            let begin = utf16_to_byte(&result.text, result.line_starts[el]);
+            let end = if el + 1 < result.line_starts.len() {
+                utf16_to_byte(&result.text, result.line_starts[el + 1])
+            } else {
+                result.text.len()
+            };
+            result.text[begin..end].trim_end_matches('\n').to_string()
+        };
+        let (type_w, name_w) = geometry::effective_widths(lm);
+        // Resolve the element row's Type span from its geometry, then probe a column
+        // inside it: it must hit Type (the redirect input rewritten to
+        // ArrayElementType against the parent header).
+        let ts = geometry::resolved_span_for(lm, &text, EditTarget::Type, type_w, name_w);
+        assert!(ts.valid, "array element row has a Type span");
+        let type_target = target_at_col(lm, &text, ts.start, type_w, name_w);
+        assert_eq!(
+            type_target,
+            Some(EditTarget::Type),
+            "array element type token resolves to Type (redirect input)"
+        );
+        // The redirect precondition holds for this target.
+        assert!(matches!(
+            type_target,
+            Some(EditTarget::Type) | Some(EditTarget::Name)
+        ));
     }
 
     #[test]
