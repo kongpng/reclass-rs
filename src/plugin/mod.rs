@@ -79,6 +79,7 @@ pub use demo::DemoPlugin;
 pub use host::{MockPluginHost, PluginHost};
 pub use manager::{
     DiskPluginPersistence, MemPluginPersistence, PluginManager, PluginPersistence, PluginRow,
+    UiContribution,
 };
 pub use manifest::{
     derive_identifier, detected_label, LoadType, ManifestError, Permission, PluginKind,

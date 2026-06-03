@@ -24,9 +24,18 @@
 //!   close every document tab of that kind via
 //!   [`DocumentArea::detach_sources_of_kind`], returning the count (design §7.A
 //!   [fix]; the C++ dangling-provider crash this fixes, cpp_reference §2/§10.3).
-//! - **open_dialog / close_dialog / add_node / set_data_source / request_rerender**
-//!   — F2 no-ops (the default [`PluginHost`] trait impls); the modal/tree wiring
-//!   is the F3 declarative-host step (design §6 Phase 2).
+//! - **open_dialog / request_rerender** — *collected* like toasts: each pushes the
+//!   requested view id onto a `Vec` the caller drains
+//!   ([`take_open_dialog_requests`](LivePluginHost::take_open_dialog_requests) /
+//!   [`take_rerender_requests`](LivePluginHost::take_rerender_requests)) after the
+//!   host drops, then opens the contributed `Dialog` / re-renders the mounted
+//!   `Panel` (the F3 declarative-host step, design §6 Phase 2). The host can't do
+//!   it inline — both need `&mut MainWindow` (to reach the dock / modal layer),
+//!   which the host doesn't hold.
+//! - **close_dialog** — *collected* like `open_dialog`: the window dismisses the
+//!   open modal if the plugin asked to close it (the demo's Attach closes its own
+//!   dialog this way). `add_node` / `set_data_source` are the default no-ops (live
+//!   document mutation + plugin-provider attach are intended-deferred).
 //!
 //! Gated behind the `ui` feature (it lives in the `ui` module). The plugin
 //! contract it implements is always-on core.
@@ -70,6 +79,59 @@ pub fn source_kind_for_provider(identifier: &str) -> Option<SourceKind> {
     }
 }
 
+/// The gpui-free request-collection buffers a [`LivePluginHost`] accumulates
+/// during one plugin call sequence (design §6 Phase 2). The host can't act on a
+/// `show_toast` / `open_dialog` / `request_rerender` inline — each needs
+/// `&mut MainWindow` (the notification / modal / dock layer) which the host
+/// doesn't hold — so it records them here and the caller drains them after the
+/// host drops. Factored out of the gpui-bound host so the collection + drain
+/// semantics are unit-testable without a `Window`/`App`.
+#[derive(Default)]
+pub struct HostRequests {
+    /// Toasts to surface via `MainWindow::notify`.
+    toasts: Vec<String>,
+    /// Contributed `Dialog` ids to open via `MainWindow::open_plugin_dialog`.
+    open_dialogs: Vec<String>,
+    /// Contributed `Dialog` ids the plugin asked to dismiss via
+    /// [`PluginHost::close_dialog`] — the window closes the open modal if one of
+    /// these matches it (the demo's Attach closes its own dialog this way).
+    close_dialogs: Vec<String>,
+    /// Mounted view ids to re-render via `MainWindow::rerender_plugin_panel`.
+    rerenders: Vec<String>,
+}
+
+impl HostRequests {
+    fn record_toast(&mut self, msg: &str) {
+        self.toasts.push(msg.to_string());
+    }
+    fn record_open_dialog(&mut self, id: &str) {
+        self.open_dialogs.push(id.to_string());
+    }
+    fn record_close_dialog(&mut self, id: &str) {
+        self.close_dialogs.push(id.to_string());
+    }
+    fn record_rerender(&mut self, view: &str) {
+        self.rerenders.push(view.to_string());
+    }
+
+    /// Drain the collected toasts.
+    pub fn take_toasts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.toasts)
+    }
+    /// Drain the collected `open_dialog` requests.
+    pub fn take_open_dialogs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.open_dialogs)
+    }
+    /// Drain the collected `close_dialog` requests.
+    pub fn take_close_dialogs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.close_dialogs)
+    }
+    /// Drain the collected `request_rerender` view ids.
+    pub fn take_rerenders(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.rerenders)
+    }
+}
+
 /// A window-backed [`PluginHost`] (design §2). Borrows the window's document area
 /// + settings store + the live `Window`/`App` for one plugin call sequence.
 ///
@@ -88,10 +150,11 @@ pub struct LivePluginHost<'a> {
     window: &'a mut Window,
     /// The app context entity `read`/`update` calls thread through.
     cx: &'a mut App,
-    /// Toasts the plugin asked to show, collected here because emitting them needs
-    /// `&mut MainWindow` (via `notify`) which the host doesn't hold; the caller
-    /// [`drains`](Self::take_toasts) them into `notify` after the host drops.
-    toasts: Vec<String>,
+    /// Toasts / open-dialog / re-render requests the plugin raised during this call
+    /// sequence, collected because each needs `&mut MainWindow` (the notification /
+    /// modal / dock layer) which the host doesn't hold; the caller drains them via
+    /// [`requests`](Self::requests) after the host drops (the F3 host seam).
+    requests: HostRequests,
 }
 
 impl<'a> LivePluginHost<'a> {
@@ -109,14 +172,22 @@ impl<'a> LivePluginHost<'a> {
             settings,
             window,
             cx,
-            toasts: Vec::new(),
+            requests: HostRequests::default(),
         }
     }
 
+    /// Mutable access to the collected requests so the caller can drain them
+    /// (toasts → `notify`, open-dialogs → `open_plugin_dialog`, re-renders →
+    /// `rerender_plugin_panel`) after the host drops (the F3 host seam).
+    pub fn requests(&mut self) -> &mut HostRequests {
+        &mut self.requests
+    }
+
     /// Take the collected toasts (draining them) so the caller can push each into
-    /// `MainWindow::notify` after the host drops (the toast-collection seam).
+    /// `MainWindow::notify` after the host drops (kept for the existing safe-unload
+    /// caller; equivalent to `self.requests().take_toasts()`).
     pub fn take_toasts(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.toasts)
+        self.requests.take_toasts()
     }
 
     /// The full namespaced settings key for a plugin scalar `key`.
@@ -150,15 +221,32 @@ impl PluginHost for LivePluginHost<'_> {
     fn show_toast(&mut self, msg: &str) {
         // Collected, not emitted: see the struct doc — the caller drains these
         // into `notify` after the host drops.
-        self.toasts.push(msg.to_string());
+        self.requests.record_toast(msg);
     }
 
-    fn open_dialog(&mut self, _id: &str) {
-        // F2 no-op: the modal machinery (mounting a contributed `Dialog`) is the
-        // F3 declarative-host step (design §6 Phase 2). A plugin that requests a
-        // dialog before then simply gets no modal; nothing in the shipping UI
-        // changes (HARD PARITY — no plugin UI unless a contributing plugin drives
-        // the F3 host).
+    fn open_dialog(&mut self, id: &str) {
+        // Collected, not opened inline: mounting a contributed `Dialog` modal needs
+        // `&mut MainWindow` (the dock/modal layer), which the host doesn't hold. The
+        // caller drains these via `requests().take_open_dialogs()` and calls
+        // `open_plugin_dialog` after the host drops (the F3 declarative-host step,
+        // design §6 Phase 2). Nothing in the shipping UI changes unless a
+        // contributing plugin drives this (HARD PARITY).
+        self.requests.record_open_dialog(id);
+    }
+
+    fn close_dialog(&mut self, id: &str) {
+        // Collected: the window dismisses the open modal if this id matches it
+        // (the demo's Attach closes its own dialog). Drained via
+        // `requests().take_close_dialogs()` after the host drops.
+        self.requests.record_close_dialog(id);
+    }
+
+    fn request_rerender(&mut self, view: &str) {
+        // Collected, not applied inline: pushing a panel's fresh tree needs
+        // `&mut MainWindow` (to reach the mounted `PluginPanel` entity). The caller
+        // drains these via `requests().take_rerenders()` and calls
+        // `rerender_plugin_panel` after the host drops.
+        self.requests.record_rerender(view);
     }
 
     fn get_setting(&self, key: &str) -> Option<String> {
@@ -212,5 +300,86 @@ mod tests {
         );
         // Distinct from the manager's enable/loadPaths namespaces (no collision).
         assert!(LivePluginHost::setting_key("enabled.file") != "plugin.enabled.file");
+    }
+
+    // ── The F3 request-collection seam ──
+    //
+    // `LivePluginHost` itself is gpui-bound (it holds `&mut Window`/`&mut App`),
+    // so it can't be constructed in a non-gpui test (the repo convention noted in
+    // `pluginpanel`/`plugindialog`). The collection + drain semantics it relies on
+    // live in the gpui-free `HostRequests`, which we test directly — the host's
+    // `show_toast`/`open_dialog`/`request_rerender` are one-line `record_*` calls
+    // into this exact buffer, and the live wiring is routed through it.
+
+    #[test]
+    fn host_requests_collect_and_drain() {
+        let mut reqs = HostRequests::default();
+        assert!(reqs.take_toasts().is_empty());
+        assert!(reqs.take_open_dialogs().is_empty());
+        assert!(reqs.take_rerenders().is_empty());
+
+        reqs.record_toast("hello");
+        reqs.record_open_dialog("demo.target");
+        reqs.record_open_dialog("demo.other");
+        reqs.record_rerender("demo.panel");
+
+        // Each take drains its own buffer independently and in order.
+        assert_eq!(reqs.take_toasts(), ["hello".to_string()]);
+        assert_eq!(
+            reqs.take_open_dialogs(),
+            ["demo.target".to_string(), "demo.other".to_string()]
+        );
+        assert_eq!(reqs.take_rerenders(), ["demo.panel".to_string()]);
+
+        // Draining empties them (a second take is empty) — no double-dispatch.
+        assert!(reqs.take_toasts().is_empty());
+        assert!(reqs.take_open_dialogs().is_empty());
+        assert!(reqs.take_rerenders().is_empty());
+    }
+
+    #[test]
+    fn demo_round_trips_through_the_request_seam() {
+        // The exact Elm round-trip the live path mirrors, but driven through the
+        // gpui-free seam: a fake host whose `open_dialog`/`request_rerender` record
+        // into a `HostRequests` (the same buffer `LivePluginHost` uses) — proving
+        // the demo's command handlers reach the F3 open-dialog + re-render seam.
+        use crate::plugin::demo::{DemoPlugin, CMD_OPEN_TARGET, CMD_REFRESH, DIALOG_ID, PANEL_ID};
+        use crate::plugin::{Plugin, PluginHost};
+
+        struct SeamHost {
+            reqs: HostRequests,
+        }
+        impl PluginHost for SeamHost {
+            fn read_provider(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+                false
+            }
+            fn provider_name(&self) -> String {
+                String::new()
+            }
+            fn show_toast(&mut self, msg: &str) {
+                self.reqs.record_toast(msg);
+            }
+            fn open_dialog(&mut self, id: &str) {
+                self.reqs.record_open_dialog(id);
+            }
+            fn get_setting(&self, _key: &str) -> Option<String> {
+                None
+            }
+            fn set_setting(&mut self, _key: &str, _val: &str) {}
+            fn request_rerender(&mut self, view: &str) {
+                self.reqs.record_rerender(view);
+            }
+        }
+
+        let mut plugin = DemoPlugin::new();
+        let mut host = SeamHost {
+            reqs: HostRequests::default(),
+        };
+        // open_target → the host's open_dialog seam records the dialog id.
+        plugin.handle_command(CMD_OPEN_TARGET, serde_json::Value::Null, &mut host);
+        assert_eq!(host.reqs.take_open_dialogs(), [DIALOG_ID.to_string()]);
+        // refresh → the host's request_rerender seam records the panel id.
+        plugin.handle_command(CMD_REFRESH, serde_json::Value::Null, &mut host);
+        assert_eq!(host.reqs.take_rerenders(), [PANEL_ID.to_string()]);
     }
 }

@@ -383,6 +383,18 @@ pub struct MainWindow {
     /// controller). Empty ⇒ the editor is unsplit (the default single-pane view).
     /// `view.split` appends a pane; `view.unsplit` removes the last.
     split_panes: Vec<ViewMode>,
+    /// The mounted plugin [`PluginPanel`](super::pluginpanel::PluginPanel) views,
+    /// keyed by the contributed panel id (design §6 Phase 2). One per enabled
+    /// `Panel` contribution, built in [`new`](Self::new) after the demo gating and
+    /// docked into the existing dock area. Empty in the default shipping build (no
+    /// plugin contributes a panel ⇒ no extra dock view ⇒ byte-identical UI). Held so
+    /// [`rerender_plugin_panel`](Self::rerender_plugin_panel) can push a fresh tree.
+    plugin_panels: Vec<(String, Entity<super::pluginpanel::PluginPanel>)>,
+    /// Live subscriptions to the mounted plugin panels' events — kept for the
+    /// window's lifetime so a panel's [`PluginPanelEvent`] keeps routing through the
+    /// manager (a dropped `Subscription` stops firing). Index-independent of
+    /// `plugin_panels` (just a retention bag).
+    plugin_panel_subs: Vec<Subscription>,
 }
 
 /// Which panel is active in the shared right dock (Modules vs Bookmarks). Used
@@ -713,6 +725,50 @@ fn relabel_command(nodes: &mut [super::commandpalette::MenuNode], command: &str,
     }
 }
 
+/// Map a plugin [`DockSide`](crate::plugin::DockSide) to the gpui-component
+/// [`DockPlacement`] a contributed panel mounts at (design §6 Phase 2). The demo's
+/// panel is `Right`, so it tabs in beside the Modules/Bookmarks right dock.
+fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement {
+    match side {
+        crate::plugin::DockSide::Left => DockPlacement::Left,
+        crate::plugin::DockSide::Right => DockPlacement::Right,
+        crate::plugin::DockSide::Bottom => DockPlacement::Bottom,
+    }
+}
+
+/// Inject one menu item per enabled plugin `Command` whose slot surfaces in the
+/// menu bar (`Menu`/`SourceMenu`/`Palette`) into the `&Plugins` submenu's children
+/// (design §6 Phase 2). Pure (no gpui) so the byte-identical-when-empty parity is
+/// unit-testable: with an empty `commands` list the tree is returned untouched
+/// (the `&Plugins` submenu keeps exactly its static `[Manage Plugins…]` row).
+/// `EditorContext`/`Toolbar` slots are not menu-bar surfaces, so they are skipped
+/// here (they'd be injected into the editor context menu / toolbar instead — those
+/// surfaces are intended-deferred for plugin contributions).
+fn inject_plugin_menu_items(
+    tree: &mut [super::commandpalette::MenuNode],
+    commands: &[crate::plugin::UiContribution],
+) {
+    use super::commandpalette::MenuNode;
+    use crate::plugin::{CommandSlot, UiContribution};
+    // Find the &Plugins submenu by its label (the static menu tree carries it).
+    let Some(MenuNode::Submenu { children, .. }) = tree
+        .iter_mut()
+        .find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == "&Plugins"))
+    else {
+        return;
+    };
+    for c in commands {
+        if let UiContribution::Command { id, title, slot } = c {
+            if matches!(
+                slot,
+                CommandSlot::Menu | CommandSlot::SourceMenu | CommandSlot::Palette
+            ) {
+                children.push(MenuNode::item(title, "", id));
+            }
+        }
+    }
+}
+
 /// The struct name of the active **view root** for the window title (the C++
 /// `rootName(tree, viewRootId())`; main.cpp:5180). Climbs from the view-root
 /// node to its top-level parent and returns that node's `struct_type_name`
@@ -825,11 +881,21 @@ impl MainWindow {
         // the SAME `settings.json` store as the rest of the window (coerced to the
         // shared `SettingsStore` trait object). With no stored flags the registry is
         // exactly the four Auto-enabled built-ins — byte-identical to before.
-        let plugin_manager = crate::plugin::PluginManager::with_persistence_and_builtins(Box::new(
-            crate::plugin::DiskPluginPersistence::new(
+        let mut plugin_manager = crate::plugin::PluginManager::with_persistence_and_builtins(
+            Box::new(crate::plugin::DiskPluginPersistence::new(
                 settings.clone() as Rc<RefCell<dyn SettingsStore>>
-            ),
-        ));
+            )),
+        );
+        // Developer affordance for the F3 declarative-UI host (design §6 Phase 2):
+        // gate the in-tree demo plugin behind `RECLASS_DEMO_PLUGIN`. UNSET (the
+        // default shipping build) leaves the manager at EXACTLY the four built-in
+        // providers — no plugin contributes UI, so the Plugins menu, docks, and
+        // modals are byte-for-byte identical to before (the HARD PARITY guarantee).
+        // SET (=anything) adds the demo, which contributes the two menu commands, a
+        // right-dock panel, and a target dialog the wiring below mounts + routes.
+        if std::env::var_os("RECLASS_DEMO_PLUGIN").is_some() {
+            plugin_manager.add_plugin(crate::plugin::DemoPlugin::boxed());
+        }
         let recent_files: Vec<std::path::PathBuf> = settings
             .borrow()
             .get_list(settings_keys::RECENT_FILES)
@@ -1097,6 +1163,10 @@ impl MainWindow {
             show_icon,
             // The editor starts unsplit (single pane); `view.split` appends panes.
             split_panes: Vec::new(),
+            // Plugin panels are mounted just below (after the window is built so the
+            // mount can subscribe to `self`). Empty in the default build.
+            plugin_panels: Vec::new(),
+            plugin_panel_subs: Vec::new(),
         };
 
         // Observe the initial editor(s) so a row selection re-renders the window
@@ -1138,6 +1208,12 @@ impl MainWindow {
         win.rebuild_workspace(cx);
         // Seed the docks for the initial (empty) document.
         win.refresh_docks_for_active(cx);
+        // Mount any enabled plugin-contributed dock panels (design §6 Phase 2). A
+        // no-op in the default build (the four providers contribute no `Panel`), so
+        // the dock layout is byte-identical; with a contributing plugin (the demo,
+        // gated above) it adds a tab into the existing right dock, which stays
+        // CLOSED until summoned — no behavior change on launch.
+        win.mount_plugin_panels(window, cx);
         win.show_start_page(window, cx);
         win
     }
@@ -1449,6 +1525,15 @@ impl MainWindow {
             // into the catch-all and did nothing.
             other if other.starts_with("source.saved.") => {
                 self.switch_saved_source_by_command(other, window, cx);
+            }
+
+            // A plugin-contributed command (design §6 Phase 2): route it through the
+            // session-owned manager + a scoped live host. Checked AFTER the built-in
+            // ids so a plugin can't shadow a host command, and BEFORE the catch-all
+            // so it doesn't fall to the log-noop. In the default build no plugin
+            // contributes a command, so this never matches.
+            other if self.plugin_manager.is_plugin_command(other) => {
+                self.dispatch_plugin_command(other, window, cx);
             }
 
             // ── Anything still unmapped: graceful, logged no-op. ──
@@ -2069,6 +2154,267 @@ impl MainWindow {
             window,
             cx,
         );
+    }
+
+    // ── F3 live declarative-UI host (design §6 Phase 2) ──
+    //
+    // The session-owned `plugin_manager` already routes a command / UI event /
+    // dialog result back to its owning plugin (`handle_command` /
+    // `handle_ui_event` / `handle_dialog_closed`); these methods are the gpui side
+    // that (1) enumerates the manager's `ui_contributions` to mount panels + inject
+    // menu items, (2) builds a scoped `LivePluginHost` per call sequence, and (3)
+    // drains the host's collected toasts / open-dialog / re-render requests into
+    // `notify` / `open_plugin_dialog` / `rerender_plugin_panel`. With NO contributing
+    // plugin loaded (the default build) every loop here is a no-op over an empty
+    // list — nothing is mounted, injected, or routed (HARD PARITY).
+
+    /// Mount each enabled plugin-contributed `Panel` into the existing dock area
+    /// (design §6 Phase 2). Adds one [`PluginPanel`](super::pluginpanel::PluginPanel)
+    /// tab per `UiContribution::Panel`, docked on the contribution's
+    /// [`DockSide`](crate::plugin::DockSide) (the demo's is `Right`, so it tabs in
+    /// beside Modules/Bookmarks), and subscribes to its
+    /// [`PluginPanelEvent`](super::pluginpanel::PluginPanelEvent) so a widget event
+    /// routes through the manager. The target dock is **not** forced open, so a
+    /// closed dock stays closed (no launch-time behavior change). Empty list ⇒
+    /// no-op (parity).
+    fn mount_plugin_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use super::pluginpanel::PluginPanel;
+        // Collect the panel contributions first (ends the borrow on the manager
+        // before we mount gpui views / subscribe to `self`).
+        let panels: Vec<(
+            String,
+            String,
+            crate::plugin::DockSide,
+            crate::plugin::ViewTree,
+        )> = self
+            .plugin_manager
+            .ui_contributions()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::plugin::UiContribution::Panel {
+                    id,
+                    title,
+                    dock,
+                    initial,
+                } => Some((id, title, dock, initial)),
+                _ => None,
+            })
+            .collect();
+        for (id, title, dock, initial) in panels {
+            let panel = PluginPanel::view(id.clone(), title, initial, window, cx);
+            // Route the panel's events through the manager + a scoped live host.
+            let sub = cx.subscribe_in(
+                &panel,
+                window,
+                |this, panel, ev: &super::pluginpanel::PluginPanelEvent, window, cx| {
+                    this.route_plugin_panel_event(panel, ev, window, cx);
+                },
+            );
+            self.plugin_panel_subs.push(sub);
+            // Tab into the existing dock at the contributed side (does not open it).
+            let placement = dock_placement_for(dock);
+            let panel_view: std::sync::Arc<dyn gpui_component::dock::PanelView> =
+                std::sync::Arc::new(panel.clone());
+            self.dock_area.update(cx, |area, cx| {
+                area.add_panel(panel_view, placement, None, window, cx);
+            });
+            self.plugin_panels.push((id, panel));
+        }
+    }
+
+    /// Route one [`PluginPanelEvent`](super::pluginpanel::PluginPanelEvent) through
+    /// the manager (design §6 Phase 2 Elm loop): build a scoped `LivePluginHost`,
+    /// call `handle_ui_event`, push any fresh tree back into the panel, then drain
+    /// the host's collected requests (toasts → `notify`, open-dialogs →
+    /// `open_plugin_dialog`, re-renders → `rerender_plugin_panel`).
+    fn route_plugin_panel_event(
+        &mut self,
+        panel: &Entity<super::pluginpanel::PluginPanel>,
+        ev: &super::pluginpanel::PluginPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Scope the host so its `cx` borrow ends before we re-borrow `cx`.
+        let (tree, toasts, open_dialogs, rerenders) = {
+            let mut host = super::pluginhost::LivePluginHost::new(
+                self.document_area.clone(),
+                self.settings.clone(),
+                window,
+                cx,
+            );
+            let tree =
+                self.plugin_manager
+                    .handle_ui_event(&ev.view_id, ev.event.clone(), &mut host);
+            let r = host.requests();
+            (
+                tree,
+                r.take_toasts(),
+                r.take_open_dialogs(),
+                r.take_rerenders(),
+            )
+        };
+        if let Some(tree) = tree {
+            panel.update(cx, |p, cx| p.set_tree(tree, window, cx));
+        }
+        self.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
+    }
+
+    /// Re-pull a mounted panel's current `ViewTree` from its owning plugin and push
+    /// it into the panel (the [`PluginHost::request_rerender`] resolution, design §3
+    /// Elm loop). No-op if `view` isn't a mounted panel or the plugin yields no tree.
+    fn rerender_plugin_panel(&mut self, view: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tree) = self.plugin_manager.view_tree(view) else {
+            return;
+        };
+        if let Some((_, panel)) = self.plugin_panels.iter().find(|(id, _)| id == view) {
+            let panel = panel.clone();
+            panel.update(cx, |p, cx| p.set_tree(tree, window, cx));
+        }
+    }
+
+    /// Dispatch a plugin-owned command id through the manager + a scoped live host
+    /// (design §6 Phase 2), draining the host's collected requests. Reached from
+    /// [`run_menu_command`](Self::run_menu_command) for an id
+    /// [`is_plugin_command`](crate::plugin::PluginManager::is_plugin_command)
+    /// recognizes (a contributed menu/palette item).
+    fn dispatch_plugin_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (cmd_toast, toasts, open_dialogs, rerenders) = {
+            let mut host = super::pluginhost::LivePluginHost::new(
+                self.document_area.clone(),
+                self.settings.clone(),
+                window,
+                cx,
+            );
+            let res = self
+                .plugin_manager
+                .handle_command(id, serde_json::Value::Null, &mut host);
+            let r = host.requests();
+            let toasts = r.take_toasts();
+            // Surface a command's own `CommandResult::toast` ONLY if the handler
+            // didn't already push the same message through `host.show_toast` (the
+            // demo's ping does both — collecting both here would double-toast).
+            let cmd_toast = res.toast.filter(|m| !toasts.iter().any(|t| t == m));
+            (cmd_toast, toasts, r.take_open_dialogs(), r.take_rerenders())
+        };
+        if let Some(msg) = cmd_toast {
+            self.notify(msg, window, cx);
+        }
+        self.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
+    }
+
+    /// Open a plugin-contributed `Dialog` modally (design §6 Phase 2 — the
+    /// generalized C++ `selectTarget`), modeled on
+    /// [`open_process_picker`](Self::open_process_picker). Pulls the initial tree +
+    /// title from the manager, mounts a [`PluginDialog`](super::plugindialog::PluginDialog)
+    /// via the proven `window.open_dialog` pattern, and subscribes (on the shared
+    /// close-only [`goto_sub`](Self::goto_sub)) to route the dialog's Ui / Closed
+    /// events through the manager. No-op if `id` isn't a contributed dialog.
+    fn open_plugin_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(initial) = self.plugin_manager.view_tree(id) else {
+            return;
+        };
+        // The contributed title (fall back to the id if somehow absent).
+        let title = self
+            .plugin_manager
+            .ui_contributions()
+            .into_iter()
+            .find_map(|c| match c {
+                crate::plugin::UiContribution::Dialog { id: did, title, .. } if did == id => {
+                    Some(title)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| id.to_string());
+
+        let dialog = super::plugindialog::PluginDialog::view(id, title, initial, window, cx);
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            |this, dialog, ev: &super::plugindialog::PluginDialogEvent, window, cx| match ev {
+                super::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
+                    let dialog_id = view_id.clone();
+                    let (tree, toasts, open_dialogs, close_dialogs, rerenders) = {
+                        let mut host = super::pluginhost::LivePluginHost::new(
+                            this.document_area.clone(),
+                            this.settings.clone(),
+                            window,
+                            cx,
+                        );
+                        let tree =
+                            this.plugin_manager
+                                .handle_ui_event(view_id, event.clone(), &mut host);
+                        let r = host.requests();
+                        (
+                            tree,
+                            r.take_toasts(),
+                            r.take_open_dialogs(),
+                            r.take_close_dialogs(),
+                            r.take_rerenders(),
+                        )
+                    };
+                    if let Some(tree) = tree {
+                        dialog.update(cx, |d, cx| d.set_tree(tree, window, cx));
+                    }
+                    this.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
+                    // If the plugin asked to close THIS dialog (the demo's Attach),
+                    // dismiss the modal.
+                    if close_dialogs.iter().any(|id| *id == dialog_id) {
+                        window.close_dialog(cx);
+                    }
+                }
+                super::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
+                    let toasts = {
+                        let mut host = super::pluginhost::LivePluginHost::new(
+                            this.document_area.clone(),
+                            this.settings.clone(),
+                            window,
+                            cx,
+                        );
+                        this.plugin_manager.handle_dialog_closed(
+                            view_id,
+                            result.clone(),
+                            &mut host,
+                        );
+                        host.requests().take_toasts()
+                    };
+                    for msg in toasts {
+                        this.notify(msg, window, cx);
+                    }
+                    window.close_dialog(cx);
+                }
+            },
+        ));
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(560.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        cx.notify();
+    }
+
+    /// Drain a scoped live host's collected requests into the window: toasts →
+    /// [`notify`](Self::notify), open-dialog ids → [`open_plugin_dialog`](Self::open_plugin_dialog),
+    /// re-render view ids → [`rerender_plugin_panel`](Self::rerender_plugin_panel).
+    /// Shared by every F3 routing path so the drain order is uniform.
+    fn drain_plugin_requests(
+        &mut self,
+        toasts: Vec<String>,
+        open_dialogs: Vec<String>,
+        rerenders: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for msg in toasts {
+            self.notify(msg, window, cx);
+        }
+        for id in open_dialogs {
+            self.open_plugin_dialog(&id, window, cx);
+        }
+        for view in rerenders {
+            self.rerender_plugin_panel(&view, window, cx);
+        }
     }
 
     /// Plugins ▸ Manage Plugins… — open the read-only [`PluginManagerDialog`] (the
@@ -2717,6 +3063,12 @@ impl MainWindow {
             "Start MCP Server"
         };
         relabel_command(&mut tree, "tools.mcp", mcp_label);
+        // Inject any enabled plugin-contributed menu commands into the &Plugins
+        // submenu (design §6 Phase 2). With no contributing plugin loaded (the
+        // default build) `ui_contributions()` is empty, so the tree is byte-identical
+        // to before — the &Plugins submenu keeps only [Manage Plugins…].
+        let plugin_commands = self.plugin_manager.ui_contributions();
+        inject_plugin_menu_items(&mut tree, &plugin_commands);
         self.menubar.update(cx, |mb, cx| mb.set_menus(tree, cx));
         // After rebuilding the tree, re-push the active-source checkmark so the
         // saved-source row stays checked across the rebuild.
@@ -7084,5 +7436,156 @@ mod tests {
 
         // The keystroke + action survive the rewrite (only the predicate changes).
         assert_eq!(out[0].keystrokes()[0].inner().key, "t");
+    }
+
+    // ── F3 live declarative-UI host: parity guard + menu injection + Elm loop ──
+    //
+    // The gpui mount (PluginPanel/PluginDialog into the dock/modal) follows the
+    // repo convention of NOT being unit-tested (it needs a live Window); every
+    // routing DECISION is covered here + in the manager/host modules. These tests
+    // import the pure helpers + the gpui-free manager/MockPluginHost seam the live
+    // path mirrors (so they stay headless — no `gpui::*` glob is pulled in).
+
+    /// The direct children-commands of the &Plugins submenu, in order (the menu-bar
+    /// surface the F3 injection targets).
+    fn plugins_submenu_commands(tree: &[crate::ui::commandpalette::MenuNode]) -> Vec<String> {
+        use crate::ui::commandpalette::MenuNode;
+        for n in tree {
+            if let MenuNode::Submenu { label, children } = n {
+                if label == "&Plugins" {
+                    return children
+                        .iter()
+                        .filter_map(|c| match c {
+                            MenuNode::Item { command, .. } => Some(command.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    #[test]
+    fn plugins_menu_is_byte_identical_without_contributions() {
+        // PARITY: with no plugin UI contributions, injecting leaves the &Plugins
+        // submenu EXACTLY as the static tree built it — only [plugins.manage].
+        use crate::ui::commandpalette::menu_tree_with;
+        let mut tree = menu_tree_with(&[], &[]);
+        let before = plugins_submenu_commands(&tree);
+        assert_eq!(before, ["plugins.manage"]);
+        // An empty contributions list is the default-build state.
+        super::inject_plugin_menu_items(&mut tree, &[]);
+        assert_eq!(plugins_submenu_commands(&tree), ["plugins.manage"]);
+    }
+
+    #[test]
+    fn plugins_menu_injects_demo_commands_after_manage() {
+        // With the demo loaded, its two Menu-slot commands are appended AFTER the
+        // static Manage Plugins… row (so the existing row is untouched, and the
+        // dialog dialog/panel — not Menu-slot — are NOT injected as menu items).
+        use crate::plugin::PluginManager;
+        use crate::ui::commandpalette::menu_tree_with;
+        let mgr = PluginManager::with_builtins_and_demo();
+        let mut tree = menu_tree_with(&[], &[]);
+        super::inject_plugin_menu_items(&mut tree, &mgr.ui_contributions());
+        assert_eq!(
+            plugins_submenu_commands(&tree),
+            [
+                "plugins.manage",
+                crate::plugin::demo::CMD_PING,
+                crate::plugin::demo::CMD_OPEN_TARGET,
+            ]
+        );
+    }
+
+    #[test]
+    fn dock_placement_maps_every_side() {
+        use crate::plugin::DockSide;
+        use gpui_component::dock::DockPlacement;
+        assert!(matches!(
+            super::dock_placement_for(DockSide::Left),
+            DockPlacement::Left
+        ));
+        assert!(matches!(
+            super::dock_placement_for(DockSide::Right),
+            DockPlacement::Right
+        ));
+        assert!(matches!(
+            super::dock_placement_for(DockSide::Bottom),
+            DockPlacement::Bottom
+        ));
+    }
+
+    #[test]
+    fn demo_command_elm_round_trips_through_manager_and_host() {
+        // The exact decisions `dispatch_plugin_command` / `route_plugin_panel_event`
+        // make, on the gpui-free seam the live path mirrors: ping toasts;
+        // open_target requests a dialog open (these two are the menu-injected
+        // commands run_menu_command routes); the panel's Refresh button bumps the
+        // counter and returns a fresh tree the panel re-renders.
+        use crate::plugin::demo::{CMD_OPEN_TARGET, CMD_PING, CMD_REFRESH, DIALOG_ID, PANEL_ID};
+        use crate::plugin::{MockPluginHost, PluginManager, UiEvent, ViewTree};
+
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+
+        // Only the two Menu-slot commands are plugin commands run_menu_command
+        // routes (refresh is a panel button id, not a contributed command).
+        assert!(mgr.is_plugin_command(CMD_PING));
+        assert!(mgr.is_plugin_command(CMD_OPEN_TARGET));
+        assert!(!mgr.is_plugin_command(CMD_REFRESH));
+
+        // ping → a toast surfaces (the live dispatch drains host toasts → notify).
+        let res = mgr.handle_command(CMD_PING, serde_json::Value::Null, &mut host);
+        assert!(res.handled);
+        assert_eq!(host.toasts(), ["Plugin Demo: pong"]);
+
+        // open_target → the host records an open-dialog request (the live dispatch
+        // drains open_dialogs → open_plugin_dialog).
+        mgr.handle_command(CMD_OPEN_TARGET, serde_json::Value::Null, &mut host);
+        assert_eq!(host.opened_dialogs(), [DIALOG_ID]);
+
+        // Panel Refresh button → handle_ui_event returns Some(fresh tree) the live
+        // `route_plugin_panel_event` pushes into the mounted PluginPanel; the tree
+        // reflects the bumped counter.
+        let tree = mgr
+            .handle_ui_event(
+                PANEL_ID,
+                UiEvent::Clicked(CMD_REFRESH.to_string()),
+                &mut host,
+            )
+            .expect("refresh re-renders the panel");
+        let ViewTree::Column(children) = &tree else {
+            panic!("panel root is a Column");
+        };
+        assert!(children.iter().any(|c| matches!(c, ViewTree::KeyValue(p)
+            if p.iter().any(|(k, v)| k == "Refreshes" && v == "1"))));
+        // And view_tree resolves the panel for a request_rerender drain.
+        assert!(mgr.view_tree(PANEL_ID).is_some());
+    }
+
+    #[test]
+    fn demo_dialog_attach_sets_source_and_closes_through_host() {
+        // The dialog Ui round-trip: Attach sets the data source, asks to close the
+        // dialog (the live `open_plugin_dialog` Ui handler closes the modal on that
+        // request), and returns a fresh tree.
+        use crate::plugin::demo::{BTN_ATTACH, DEMO_IDENTIFIER, DIALOG_ID};
+        use crate::plugin::UiEvent;
+        use crate::plugin::{MockPluginHost, PluginManager};
+
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        let mut host = MockPluginHost::new();
+        let tree = mgr.handle_ui_event(
+            DIALOG_ID,
+            UiEvent::Clicked(BTN_ATTACH.to_string()),
+            &mut host,
+        );
+        assert!(tree.is_some(), "Attach re-renders the dialog");
+        assert_eq!(host.closed_dialogs(), [DIALOG_ID]);
+        assert_eq!(
+            host.data_source(),
+            Some(&(DEMO_IDENTIFIER.to_string(), "1234:notepad.exe".to_string()))
+        );
     }
 }

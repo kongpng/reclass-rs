@@ -21,7 +21,9 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use crate::plugin::builtins;
-use crate::plugin::contract::{CommandResult, Contribution, DialogResult, Plugin};
+use crate::plugin::contract::{
+    CommandResult, CommandSlot, Contribution, DialogResult, DockSide, Plugin,
+};
 use crate::plugin::host::PluginHost;
 use crate::plugin::manifest::{detected_label, LoadType, Permission, PluginKind};
 use crate::plugin::provider_spec::{ProviderSpec, SharedProvider};
@@ -223,6 +225,41 @@ pub struct PluginRow {
     /// The backing artifact filename (empty for built-ins).
     pub dll_file_name: String,
     pub load: LoadType,
+}
+
+/// One enabled plugin's UI contribution, flattened for the live host to mount
+/// (design §6 Phase 2). The window enumerates these to know WHICH menu commands /
+/// panels / dialogs exist and (already) that their owning plugin is enabled — the
+/// declarative-host wiring the `handle_*` routing methods previously had no
+/// enumerator for. Built **only** for enabled plugins, so the demo-absent default
+/// path yields an empty list (the HARD PARITY guarantee). Owned + cloned out so
+/// the borrow on the manager ends before the window mounts gpui views.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiContribution {
+    /// A command surfaced in a menu/source-menu/palette slot (the window injects a
+    /// menu item for `Menu`/`SourceMenu`/`Palette` and routes the id back through
+    /// [`PluginManager::handle_command`]).
+    Command {
+        id: String,
+        title: String,
+        slot: CommandSlot,
+    },
+    /// A dockable panel (the window mounts a `PluginPanel` with `initial`, docked
+    /// on `dock`, and routes its events through
+    /// [`PluginManager::handle_ui_event`]).
+    Panel {
+        id: String,
+        title: String,
+        dock: DockSide,
+        initial: ViewTree,
+    },
+    /// A modal dialog (the window opens a `PluginDialog` with `initial` when a
+    /// plugin requests it via [`PluginHost::open_dialog`]).
+    Dialog {
+        id: String,
+        title: String,
+        initial: ViewTree,
+    },
 }
 
 /// How a loaded plugin reached the manager — needed so a ReClass.NET plugin can
@@ -519,6 +556,75 @@ impl PluginManager {
                 }
             })
             .collect()
+    }
+
+    /// Enumerate the UI contributions of every **enabled** plugin (design §6 Phase
+    /// 2 — the live declarative-host seam). The window walks this to populate the
+    /// Plugins menu, mount contributed panels, and discover dialog titles; the
+    /// `handle_*` routing methods then drive the Elm loop. Disabled plugins are
+    /// skipped (a provider plugin's enable state is the registry flag, a UI-only
+    /// plugin's is its own `non_provider_enabled` flag — the same authority
+    /// [`plugins_view`](Self::plugins_view) uses), so a manager with NO contributing
+    /// plugin (the default shipping build: just the four providers, none of which
+    /// contribute UI) returns an **empty** list — nothing is injected, the UI is
+    /// byte-identical (the HARD PARITY guarantee).
+    pub fn ui_contributions(&self) -> Vec<UiContribution> {
+        let mut out = Vec::new();
+        for (plugin, entry) in self.plugins.iter().zip(self.entries.iter()) {
+            if !self.entry_enabled(plugin.as_ref(), entry) {
+                continue;
+            }
+            for contribution in plugin.contributions() {
+                match contribution {
+                    Contribution::Command { id, title, slot } => {
+                        out.push(UiContribution::Command { id, title, slot });
+                    }
+                    Contribution::Panel {
+                        id,
+                        title,
+                        dock,
+                        initial,
+                    } => {
+                        out.push(UiContribution::Panel {
+                            id,
+                            title,
+                            dock,
+                            initial,
+                        });
+                    }
+                    Contribution::Dialog { id, title, initial } => {
+                        out.push(UiContribution::Dialog { id, title, initial });
+                    }
+                    // Providers have no UI; StatusItems are not mounted by the F3
+                    // host (intended-deferred), so neither is enumerated here.
+                    Contribution::Provider(_) | Contribution::StatusItem { .. } => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `id` is a command owned by some loaded plugin (design §6 Phase 2
+    /// routing). The window checks this to decide whether an otherwise-unmapped
+    /// menu/palette id should route through
+    /// [`handle_command`](Self::handle_command) rather than fall to its log-noop
+    /// catch-all.
+    pub fn is_plugin_command(&self, id: &str) -> bool {
+        self.command_index.contains_key(id)
+    }
+
+    /// The authoritative enabled flag for one entry, mirroring
+    /// [`plugins_view`](Self::plugins_view): a provider plugin reflects the
+    /// registry, a UI-only plugin reflects its own `non_provider_enabled` flag.
+    fn entry_enabled(&self, plugin: &dyn Plugin, entry: &PluginEntry) -> bool {
+        if entry.has_provider {
+            self.registry
+                .find(&plugin.manifest().identifier())
+                .map(|p| p.enabled)
+                .unwrap_or(entry.non_provider_enabled)
+        } else {
+            entry.non_provider_enabled
+        }
     }
 
     /// Enable or disable a plugin by identifier (design §7.A [fix] — preferred over
@@ -1278,6 +1384,73 @@ mod tests {
         let demo_mgr = PluginManager::with_builtins_and_demo();
         assert_eq!(demo_mgr.registry().enabled_providers().count(), 4);
         assert_eq!(demo_mgr.plugins().len(), 5);
+    }
+
+    // ── Phase-2 live UI-contribution enumeration (the F3 host seam) ──
+
+    #[test]
+    fn ui_contributions_empty_without_demo() {
+        // PARITY: the default shipping manager (four providers, no UI plugin)
+        // exposes ZERO UI contributions — so the live host injects nothing and the
+        // UI is byte-identical.
+        let mgr = PluginManager::with_builtins();
+        assert!(mgr.ui_contributions().is_empty());
+        assert!(!mgr.is_plugin_command(demo::CMD_PING));
+    }
+
+    #[test]
+    fn ui_contributions_enumerates_demo_command_panel_dialog() {
+        let mgr = PluginManager::with_builtins_and_demo();
+        let ui = mgr.ui_contributions();
+
+        let commands: Vec<&str> = ui
+            .iter()
+            .filter_map(|c| match c {
+                UiContribution::Command { id, slot, .. } => {
+                    assert_eq!(*slot, CommandSlot::Menu);
+                    Some(id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands, [demo::CMD_PING, demo::CMD_OPEN_TARGET]);
+
+        let panels: Vec<(&str, DockSide)> = ui
+            .iter()
+            .filter_map(|c| match c {
+                UiContribution::Panel { id, dock, .. } => Some((id.as_str(), *dock)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panels, [(demo::PANEL_ID, DockSide::Right)]);
+
+        let dialogs: Vec<&str> = ui
+            .iter()
+            .filter_map(|c| match c {
+                UiContribution::Dialog { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dialogs, [demo::DIALOG_ID]);
+
+        // The two demo commands are recognized as plugin commands (the routing
+        // gate the window uses).
+        assert!(mgr.is_plugin_command(demo::CMD_PING));
+        assert!(mgr.is_plugin_command(demo::CMD_OPEN_TARGET));
+        assert!(!mgr.is_plugin_command("file.open"));
+    }
+
+    #[test]
+    fn ui_contributions_zeroed_when_demo_disabled() {
+        // Disabling the (UI-only) demo plugin removes it from the live enumeration,
+        // so a disabled plugin contributes no menu item / panel / dialog.
+        let mut mgr = PluginManager::with_builtins_and_demo();
+        assert!(!mgr.ui_contributions().is_empty());
+        assert!(mgr.set_enabled(demo::DEMO_IDENTIFIER, false, false));
+        assert!(mgr.ui_contributions().is_empty());
+        // Re-enabling restores them.
+        assert!(mgr.set_enabled(demo::DEMO_IDENTIFIER, true, false));
+        assert_eq!(mgr.ui_contributions().len(), 4);
     }
 
     #[test]
