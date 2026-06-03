@@ -3898,3 +3898,73 @@ fn obsolete_drop_on_undo_updates_controller_modified() {
         "modified cleared after the clean_index correction"
     );
 }
+
+// ── provider() accessor + the Tools ▸ RTTI Browser wiring path ──
+//
+// `RcxController::provider()` exposes the active data source (the C++
+// `ctrl->document()->provider`, `main.cpp:1530`/`4397`) so the window handler can
+// hand it to `resolve_field_vtable` / `resolve_rtti`. It always returns a valid
+// handle — defaulting to `NullProvider`, never null.
+
+#[test]
+fn provider_accessor_defaults_to_null_provider_handle() {
+    // A fresh document attaches a NullProvider; provider() exposes that handle
+    // (the C++ `ctrl->document()->provider` is never null after construction).
+    let c = RcxController::new(RcxDocument::new());
+    // NullProvider reports zero size and is not readable anywhere.
+    assert_eq!(c.provider().size(), 0);
+    assert!(!c.provider().is_readable(0, 4));
+}
+
+#[test]
+fn provider_accessor_returns_attached_buffer_provider() {
+    // make_ctrl attaches a BufferProvider over the small buffer; provider()
+    // must hand back exactly that source (same bytes the gate would read).
+    let c = make_ctrl();
+    let prov = c.provider();
+    assert!(prov.size() > 0, "buffer provider has a non-zero size");
+    let baseline = prov.read_u32(0);
+    let _ = baseline; // exercising the read path the RTTI gate uses.
+}
+
+// End-to-end of the Tools-menu gate the window handler runs: build a Pointer64
+// field over a provider whose word at the field address is a vtable VA, then
+// resolve it through the exact accessor trio the handler uses
+// (`ctrl.tree()`, `ctrl.selected_ids()`, `ctrl.provider()`) —
+// `main.cpp:1539-1561`. The `rtti` module is gated behind the `symbols` feature
+// (`lib.rs:45`), so this end-to-end check only builds in that configuration.
+#[cfg(feature = "symbols")]
+#[test]
+fn rtti_gate_resolves_vtable_through_controller_accessors() {
+    use crate::rtti::browser::{resolve_field_vtable, RttiFieldError};
+
+    const VTABLE: u64 = 0xDEAD_BEEF;
+    // Provider: 8-byte word at offset 0 reads back VTABLE.
+    let mut data = vec![0u8; 64];
+    data[0..8].copy_from_slice(&VTABLE.to_le_bytes());
+
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    doc.tree.add_node(Node {
+        id: 7,
+        kind: NodeKind::Pointer64,
+        offset: 0,
+        ..Default::default()
+    });
+    doc.provider = Arc::new(BufferProvider::new(data, "vt"));
+    let mut c = RcxController::new(doc);
+
+    // No selection → the gate rejects with the C++ "select a field" status.
+    assert_eq!(
+        resolve_field_vtable(c.tree(), &[], c.provider().as_ref()),
+        Err(RttiFieldError::NoSingleSelection)
+    );
+
+    // Select the pointer node (the real Tools-menu path), then resolve through
+    // the same accessors `open_rtti_browser` uses.
+    c.sel_ids.insert(7);
+    let sel: Vec<u64> = c.selected_ids().iter().copied().collect();
+    let got = resolve_field_vtable(c.tree(), &sel, c.provider().as_ref())
+        .expect("pointer field resolves to its stored vtable word");
+    assert_eq!(got, VTABLE);
+}

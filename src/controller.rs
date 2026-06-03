@@ -759,6 +759,14 @@ impl RcxController {
     pub fn tree_mut(&mut self) -> &mut NodeTree {
         &mut self.doc.tree
     }
+    /// The active data source (`ctrl->document()->provider`,
+    /// `main.cpp:1530`/`4397`). Always valid — defaults to [`NullProvider`], never
+    /// null — so the Tools ▸ RTTI Browser gate can hand the provider straight to
+    /// [`resolve_field_vtable`](crate::rtti::browser::resolve_field_vtable) /
+    /// [`resolve_rtti`](crate::rtti::browser::resolve_rtti).
+    pub fn provider(&self) -> &Arc<dyn Provider + Send + Sync> {
+        &self.doc.provider
+    }
     pub fn undo_stack(&self) -> &UndoStack {
         &self.undo
     }

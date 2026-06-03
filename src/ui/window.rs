@@ -2169,15 +2169,86 @@ impl MainWindow {
 
     // ── Tools / Help ──
 
-    /// Tools ▸ RTTI Browser (Ctrl+Shift+R) — the C++ opens the vtable/RTTI browser
-    /// for the selected pointer field. No RTTI walker is wired in this port, so
-    /// report the requirement (a selected pointer + a live provider) clearly.
+    /// Tools ▸ RTTI Browser (Ctrl+Shift+R) — open the vtable/RTTI hierarchy browser
+    /// for the user's single selected hex/pointer field. Faithful port of the
+    /// Tools-menu gate (`main.cpp:1523-1561`) + `MainWindow::showRttiBrowser`
+    /// (`main.cpp:4395-4413`):
+    ///
+    /// 1. Resolve the active editor → its controller → tree + provider.
+    /// 2. The Tools-menu gate ([`resolve_field_vtable`]) masks the single selected
+    ///    id, requires a Hex32/64 or Pointer32/64 word, computes its absolute
+    ///    address, reads the stored word and rejects null — surfacing each
+    ///    rejection as the C++ `setAppStatus(...)` string.
+    /// 3. Walk RTTI at the candidate vtable ([`resolve_rtti`], MSVC first then the
+    ///    additive Itanium fallback); on failure show the walker error / the empty
+    ///    placeholder (the C++ `ThemedMessageBox::info("No RTTI Here", …)`).
+    /// 4. Otherwise open the [`RttiBrowserDialog`] modal (the C++ `dlg.exec()`).
+    ///
+    /// The C++ `showRttiBrowser` always walks with `ptrSize = 8` (the `walkRtti`
+    /// default arg); mirror that with `max(tree.pointer_size, 8)`.
     fn open_rtti_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.notify(
-            "RTTI Browser: select a pointer/vtable field with a live provider attached.",
+        use crate::rtti::browser::{
+            resolve_field_vtable, resolve_rtti, RttiBrowserDialog, RttiBrowserEvent,
+        };
+
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            self.notify("Open a document first.", window, cx);
+            return;
+        };
+
+        // Gate the selection against the live tree + provider, then walk RTTI.
+        // Both steps are pure logic on borrows of the editor's controller, so do
+        // them inside a single read borrow and surface the outcome afterwards.
+        let outcome = {
+            let ed = editor.read(cx);
+            let ctrl = ed.controller();
+            let tree = ctrl.tree();
+            let ptr_size = tree.pointer_size.max(8);
+            let sel: Vec<u64> = ctrl.selected_ids().iter().copied().collect();
+            let prov = ctrl.provider().clone();
+            match resolve_field_vtable(tree, &sel, prov.as_ref()) {
+                Err(e) => Err(e.message().to_string()),
+                Ok(vtable) => {
+                    let info = resolve_rtti(prov.as_ref(), vtable, ptr_size, 64);
+                    if !info.ok {
+                        Err(if info.error.is_empty() {
+                            format!("No RTTI structures found at 0x{vtable:x}.")
+                        } else {
+                            info.error.clone()
+                        })
+                    } else {
+                        Ok(info)
+                    }
+                }
+            }
+        };
+
+        let info = match outcome {
+            Ok(info) => info,
+            Err(msg) => {
+                self.notify(msg, window, cx);
+                return;
+            }
+        };
+
+        let dlg = cx.new(|cx| RttiBrowserDialog::new(info, window, cx));
+        let focus = dlg.read(cx).focus_handle(cx);
+        self.goto_sub = Some(cx.subscribe_in(
+            &dlg,
             window,
-            cx,
-        );
+            |_w, _dlg, ev: &RttiBrowserEvent, window, cx| match ev {
+                RttiBrowserEvent::Close => window.close_dialog(cx),
+            },
+        ));
+        let dlg_for_modal = dlg.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(720.))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dlg_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     // ── F3 live declarative-UI host (design §6 Phase 2) ──
