@@ -2383,23 +2383,33 @@ impl MainWindow {
                     }
                 }
                 super::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
-                    let toasts = {
+                    let (cmd_toast, toasts, open_dialogs, rerenders) = {
                         let mut host = super::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,
                             cx,
                         );
-                        this.plugin_manager.handle_dialog_closed(
+                        let res = this.plugin_manager.handle_dialog_closed(
                             view_id,
                             result.clone(),
                             &mut host,
                         );
-                        host.requests().take_toasts()
+                        let r = host.requests();
+                        let toasts = r.take_toasts();
+                        // Surface the plugin's `CommandResult::toast` RETURN (the
+                        // footer-Submit path — the demo's submit returns "Attached
+                        // to …" rather than calling `host.show_toast`), unless the
+                        // handler already pushed the same message through the host
+                        // (mirror of `dispatch_plugin_command`'s dedup → no
+                        // double-toast).
+                        let cmd_toast = res.toast.filter(|m| !toasts.iter().any(|t| t == m));
+                        (cmd_toast, toasts, r.take_open_dialogs(), r.take_rerenders())
                     };
-                    for msg in toasts {
+                    if let Some(msg) = cmd_toast {
                         this.notify(msg, window, cx);
                     }
+                    this.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
                     window.close_dialog(cx);
                 }
             },
