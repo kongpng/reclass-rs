@@ -1539,6 +1539,56 @@ impl RcxEditor {
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
+
+        // Picker-target interception (the C++ `beginInlineEdit` early-return,
+        // editor.cpp:3536-3558): Type / ArrayElementType / PointerTarget are
+        // driven by a popup, not an inline text edit. The mouse path already
+        // intercepts these before calling `begin_inline_edit` (mod.rs:1183-1219);
+        // the keyboard paths (Tab/Shift+Tab via `tab_to_next_field`, Enter/F2)
+        // route here, so they would otherwise fall into `resolved_span_for` and
+        // open a plain text edit over the type token. Mirror the mouse path so
+        // tab-cycling onto Type/PointerTarget/ArrayElementType opens the picker.
+        //
+        // The C++ rejects only `nodeIdx < 0` (CommandRow) and Footer rows; the
+        // Rust port additionally keeps the hex SIZE toolbar and the enum member
+        // picker (the mouse path's hex/enum affordances) so the same key lands on
+        // the same popup whether reached by click or by Tab. The routing decision
+        // is the pure `tab_cycle::edit_route` (unit-tested); a popup route sets
+        // `m_lastTabTarget` (matching the C++ `beginInlineEdit`-returns-true Tab
+        // bookkeeping) and returns before any inline-edit setup.
+        let is_enum = lm.node_idx >= 0 && self.node_is_enum(lm.node_idx as usize);
+        match tab_cycle::edit_route(
+            target,
+            lm.line_kind,
+            lm.node_kind,
+            lm.node_idx >= 0,
+            is_enum,
+        ) {
+            tab_cycle::EditRoute::EnumPicker => {
+                self.last_tab_target = Some(target);
+                self.open_enum_picker(line, lm.node_idx as usize, window, cx);
+                return;
+            }
+            tab_cycle::EditRoute::HexToolbar => {
+                self.last_tab_target = Some(target);
+                self.open_hex_toolbar(lm.node_idx as usize, window, cx);
+                return;
+            }
+            tab_cycle::EditRoute::TypeSelector(edit_target) => {
+                let ctx = ContextTarget {
+                    line,
+                    node_idx: lm.node_idx as usize,
+                    node_id: lm.node_id,
+                    kind: lm.node_kind,
+                    sub_line: lm.sub_line,
+                };
+                self.last_tab_target = Some(target);
+                self.open_type_selector_in_mode(ctx, edit_target, window, cx);
+                return;
+            }
+            tab_cycle::EditRoute::InlineEdit => {}
+        }
+
         let text = self.line_text_owned(line);
         let (type_w, name_w) = geometry::effective_widths(&lm);
         // Hex VALUE editing is a fixed-length per-byte overwrite over the byte grid

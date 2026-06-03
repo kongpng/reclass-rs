@@ -106,6 +106,60 @@ pub fn prev_tab_target(lm: &LineMeta, last: Option<EditTarget>) -> Option<EditTa
     None
 }
 
+/// Where a keyboard-initiated edit of `target` should route, given the row's
+/// kind and whether its node is an enum. This is the pure decision behind the
+/// `begin_inline_edit` picker interception (editor.cpp:3536-3558): the C++
+/// `beginInlineEdit` early-returns for Type / ArrayElementType / PointerTarget,
+/// emitting a popup request instead of starting an inline text edit. The Rust
+/// mouse path already intercepts these (mod.rs:1183-1219); the keyboard paths
+/// (Tab/Shift+Tab, Enter, F2) flow through `begin_inline_edit`, so the same
+/// routing must happen here for tab-cycling onto a type token to open the
+/// picker rather than a plain text edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditRoute {
+    /// The TypeSelector popup in the given mode-driving target (Type /
+    /// ArrayElementType / PointerTarget), on a real non-hex/non-enum node.
+    TypeSelector(EditTarget),
+    /// The hex SIZE toolbar (a hex node's Type token).
+    HexToolbar,
+    /// The enum member picker (an enum field's Value column).
+    EnumPicker,
+    /// No picker — fall through to the ordinary inline text edit.
+    InlineEdit,
+}
+
+/// Classify `target` on a row into its edit route. Mirrors the mouse-path
+/// interception order exactly: enum Value → member picker, hex Type → size
+/// toolbar, then Type/ArrayElementType/PointerTarget on a real non-hex/non-enum
+/// node → the TypeSelector popup. Everything else is a plain inline edit.
+///
+/// `has_node` is `lm.node_idx >= 0` (a real tree node; CommandRow is `< 0`) and
+/// `is_enum` is whether that node is an enum. The C++ rejects only `nodeIdx < 0`
+/// and Footer rows for the type-picker early-return; the Rust port additionally
+/// keeps the hex/enum affordances so click and Tab land on the same popup.
+pub fn edit_route(
+    target: EditTarget,
+    line_kind: LineKind,
+    node_kind: NodeKind,
+    has_node: bool,
+    is_enum: bool,
+) -> EditRoute {
+    if !has_node || line_kind == LineKind::Footer {
+        return EditRoute::InlineEdit;
+    }
+    let is_hex = is_hex_preview(node_kind);
+    match target {
+        EditTarget::Value if is_enum => EditRoute::EnumPicker,
+        EditTarget::Type if is_hex => EditRoute::HexToolbar,
+        EditTarget::Type | EditTarget::ArrayElementType | EditTarget::PointerTarget
+            if !is_hex && !is_enum =>
+        {
+            EditRoute::TypeSelector(target)
+        }
+        _ => EditRoute::InlineEdit,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +312,163 @@ mod tests {
         assert_eq!(
             prev_tab_target(&lm, Some(EditTarget::Comment)),
             Some(EditTarget::Type)
+        );
+    }
+
+    // ── edit_route: keyboard picker interception (begin_inline_edit) ──
+
+    #[test]
+    fn type_target_on_real_node_routes_to_type_selector() {
+        // Port of editor.cpp:3539-3557 + the connect() at controller.cpp:463-470:
+        // beginInlineEdit(Type) on a real node emits typePickerRequested in
+        // FieldType mode rather than starting an inline text edit.
+        let lm = field(NodeKind::Int32);
+        assert_eq!(
+            edit_route(EditTarget::Type, lm.line_kind, lm.node_kind, true, false),
+            EditRoute::TypeSelector(EditTarget::Type)
+        );
+    }
+
+    #[test]
+    fn pointer_target_routes_to_type_selector() {
+        // PointerTarget → TypeSelector (controller maps it to FieldType mode with
+        // the `*`/`**` modifier pre-selected). Tab-cycling onto it opens the picker.
+        let lm = field(NodeKind::Pointer64);
+        assert_eq!(
+            edit_route(
+                EditTarget::PointerTarget,
+                lm.line_kind,
+                lm.node_kind,
+                true,
+                false
+            ),
+            EditRoute::TypeSelector(EditTarget::PointerTarget)
+        );
+    }
+
+    #[test]
+    fn array_element_type_routes_to_type_selector() {
+        // ArrayElementType → TypeSelector in ArrayElement mode (controller.cpp:466).
+        let lm = LineMeta {
+            line_kind: LineKind::Header,
+            is_array_header: true,
+            node_kind: NodeKind::Array,
+            ..LineMeta::default()
+        };
+        assert_eq!(
+            edit_route(
+                EditTarget::ArrayElementType,
+                lm.line_kind,
+                lm.node_kind,
+                true,
+                false
+            ),
+            EditRoute::TypeSelector(EditTarget::ArrayElementType)
+        );
+    }
+
+    #[test]
+    fn tab_cycle_then_route_reaches_picker_for_type_targets() {
+        // The bug this fixes: tab-cycling onto Type/PointerTarget/ArrayElementType
+        // must open the picker, not an inline edit. Drive the real cycle and feed
+        // each landed target through edit_route — every type-token target routes
+        // to a picker, never InlineEdit.
+        // Plain field: Name, Value, Comment, Type. Only Type is a picker.
+        let lm = field(NodeKind::Int32);
+        let mut last = None;
+        let mut saw_type_picker = false;
+        for _ in 0..4 {
+            let t = next_tab_target(&lm, last).unwrap();
+            let route = edit_route(t, lm.line_kind, lm.node_kind, true, false);
+            if t == EditTarget::Type {
+                assert_eq!(route, EditRoute::TypeSelector(EditTarget::Type));
+                saw_type_picker = true;
+            } else {
+                assert_eq!(route, EditRoute::InlineEdit);
+            }
+            last = Some(t);
+        }
+        assert!(saw_type_picker, "Tab cycle must land on Type");
+
+        // Pointer field: the cycle reaches PointerTarget → picker.
+        let lm = field(NodeKind::Pointer64);
+        assert_eq!(
+            edit_route(
+                next_tab_target(&lm, Some(EditTarget::Comment)).unwrap(),
+                lm.line_kind,
+                lm.node_kind,
+                true,
+                false
+            ),
+            EditRoute::TypeSelector(EditTarget::PointerTarget)
+        );
+    }
+
+    #[test]
+    fn hex_type_routes_to_hex_toolbar_not_type_selector() {
+        // A hex node's Type token is the SIZE toolbar (mod.rs mouse path), kept
+        // intact under the keyboard path so Tab onto hex Type opens the toolbar.
+        let lm = field(NodeKind::Hex64);
+        assert_eq!(
+            edit_route(EditTarget::Type, lm.line_kind, lm.node_kind, true, false),
+            EditRoute::HexToolbar
+        );
+    }
+
+    #[test]
+    fn enum_value_routes_to_enum_picker() {
+        // An enum field's Value column opens the member picker, not a numeric edit
+        // (item 8). The enum flag — not the kind — drives this branch.
+        let lm = field(NodeKind::Int32);
+        assert_eq!(
+            edit_route(EditTarget::Value, lm.line_kind, lm.node_kind, true, true),
+            EditRoute::EnumPicker
+        );
+        // An enum node's Type token still falls through to inline edit here (the
+        // mouse path has no enum Type affordance; only Value is special).
+        assert_eq!(
+            edit_route(EditTarget::Type, lm.line_kind, lm.node_kind, true, true),
+            EditRoute::InlineEdit
+        );
+    }
+
+    #[test]
+    fn non_picker_targets_fall_through_to_inline_edit() {
+        // Name/Value/Comment on a plain node are ordinary inline edits.
+        let lm = field(NodeKind::Int32);
+        for t in [EditTarget::Name, EditTarget::Value, EditTarget::Comment] {
+            assert_eq!(
+                edit_route(t, lm.line_kind, lm.node_kind, true, false),
+                EditRoute::InlineEdit
+            );
+        }
+    }
+
+    #[test]
+    fn command_row_and_footer_never_route_to_picker() {
+        // The C++ early-return rejects nodeIdx < 0 (CommandRow) and Footer rows:
+        // a Type target there is NOT a picker (it stays an inline/no-op edit).
+        // CommandRow → has_node = false.
+        assert_eq!(
+            edit_route(
+                EditTarget::Type,
+                LineKind::CommandRow,
+                NodeKind::Struct,
+                false,
+                false
+            ),
+            EditRoute::InlineEdit
+        );
+        // Footer row with a (real) node still suppresses the picker.
+        assert_eq!(
+            edit_route(
+                EditTarget::Type,
+                LineKind::Footer,
+                NodeKind::Struct,
+                true,
+                false
+            ),
+            EditRoute::InlineEdit
         );
     }
 }
