@@ -14,7 +14,9 @@
 //! the native/`abi_stable` and ReClass.NET loaders (design §6 Phase 3/4) drop in
 //! behind the `plugins` feature without changing this registration flow.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use serde_json::Value;
 
@@ -25,6 +27,7 @@ use crate::plugin::manifest::{detected_label, LoadType, Permission, PluginKind};
 use crate::plugin::provider_spec::{ProviderSpec, SharedProvider};
 use crate::plugin::view::{UiEvent, ViewTree};
 use crate::provider::{ProviderInfo, ProviderRegistry};
+use crate::theme::SettingsStore;
 
 /// The per-plugin persistence seam (design §7.A [fix] — C++ persists nothing;
 /// the loaded set is just "DLLs in the folder", forgotten each run, cpp_reference
@@ -83,6 +86,113 @@ impl PluginPersistence for MemPluginPersistence {
     }
     fn remove_path(&mut self, path: &str) {
         self.paths.retain(|p| p != path);
+    }
+}
+
+/// The persisted-settings key spellings for plugin state (design §7.A [fix],
+/// §H "enable/disable persisted"). Kept in one place so the on-disk store and the
+/// tests agree on the spelling — mirrors `window.rs`'s `settings_keys` module.
+pub mod settings_keys {
+    /// Prefix for the per-plugin enabled flag, completed with the derived
+    /// identifier: `plugin.enabled.<identifier>` → `"true"`/`"false"`.
+    pub const ENABLED_PREFIX: &str = "plugin.enabled.";
+    /// The single `\n`-joined load-from-path list key (design §6 Phase 6 "keep
+    /// C++'s load-from-path"). Mirrors `DiskSettings::get_list`/`set_list` shape.
+    pub const LOAD_PATHS: &str = "plugin.loadPaths";
+
+    /// The full enabled-flag key for `identifier`.
+    pub fn enabled_key(identifier: &str) -> String {
+        format!("{ENABLED_PREFIX}{identifier}")
+    }
+}
+
+/// An always-compiled (**not** feature-gated) [`PluginPersistence`] backed by the
+/// shared app settings store — the production backend that makes enable/disable +
+/// the load-from-path set survive a restart (design §7.A [fix], §H).
+///
+/// It does **not** depend on the `ui` module's `DiskSettings` (this is the core
+/// crate); it backs onto the same [`SettingsStore`](crate::theme::SettingsStore)
+/// trait `DiskSettings` already implements (`window.rs`: `impl SettingsStore for
+/// DiskSettings`), holding a shared `Rc<RefCell<dyn SettingsStore>>` so the app can
+/// hand it the same `settings.json`-backed store the rest of the window uses and
+/// tests can back it with an in-memory [`MemSettings`](crate::theme::MemSettings).
+///
+/// The trait only exposes scalar `get`/`set`, so the `\n`-joined list semantics for
+/// the load-from-path set are replicated locally (matching
+/// `DiskSettings::get_list`/`set_list`: empty segments dropped, idempotent add).
+pub struct DiskPluginPersistence {
+    store: Rc<RefCell<dyn SettingsStore>>,
+}
+
+impl DiskPluginPersistence {
+    /// Wrap a shared settings store. The app passes `settings.clone() as
+    /// Rc<RefCell<dyn SettingsStore>>` (the same store backing recentFiles/font/…);
+    /// tests pass a `MemSettings`-backed handle.
+    pub fn new(store: Rc<RefCell<dyn SettingsStore>>) -> Self {
+        DiskPluginPersistence { store }
+    }
+
+    /// Parse the `\n`-joined load-path list (empty segments dropped — the
+    /// `DiskSettings::get_list` semantics replicated over the scalar trait).
+    fn read_paths(&self) -> Vec<String> {
+        self.store
+            .borrow()
+            .get(settings_keys::LOAD_PATHS)
+            .map(|s| {
+                s.split('\n')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Write the load-path list back `\n`-joined (the `set_list` semantics).
+    fn write_paths(&mut self, paths: &[String]) {
+        let joined = paths
+            .iter()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.store
+            .borrow_mut()
+            .set(settings_keys::LOAD_PATHS, &joined);
+    }
+}
+
+impl PluginPersistence for DiskPluginPersistence {
+    fn get_enabled(&self, identifier: &str) -> Option<bool> {
+        // `None` when the key is absent so the `LoadType` default still applies
+        // (the restore path only overrides when the user actually toggled it).
+        self.store
+            .borrow()
+            .get(&settings_keys::enabled_key(identifier))
+            .map(|v| v == "true" || v == "1")
+    }
+    fn set_enabled(&mut self, identifier: &str, enabled: bool) {
+        self.store.borrow_mut().set(
+            &settings_keys::enabled_key(identifier),
+            if enabled { "true" } else { "false" },
+        );
+    }
+    fn get_paths(&self) -> Vec<String> {
+        self.read_paths()
+    }
+    fn add_path(&mut self, path: &str) {
+        let mut paths = self.read_paths();
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+            self.write_paths(&paths);
+        }
+    }
+    fn remove_path(&mut self, path: &str) {
+        let mut paths = self.read_paths();
+        let before = paths.len();
+        paths.retain(|p| p != path);
+        if paths.len() != before {
+            self.write_paths(&paths);
+        }
     }
 }
 
@@ -175,6 +285,26 @@ impl PluginManager {
     /// contract instead of being wired ad hoc by the menus.
     pub fn with_builtins() -> Self {
         let mut mgr = PluginManager::new();
+        for plugin in builtins::builtin_plugins() {
+            mgr.add_plugin(plugin);
+        }
+        mgr
+    }
+
+    /// Build a manager with `persistence` installed **first**, then the four
+    /// built-ins added — so any **stored** enabled flag for a built-in is restored
+    /// at add time (design §7.A [fix] "restore stored enabled flags on startup").
+    ///
+    /// Ordering matters: [`add_plugin`](Self::add_plugin) reads persistence when the
+    /// plugin is added, so calling [`set_persistence`](Self::set_persistence) *after*
+    /// [`with_builtins`](Self::with_builtins) would NOT retro-apply stored flags to
+    /// the already-added built-ins. This is the constructor the app uses so a
+    /// previously-disabled built-in comes back disabled. With **no** stored flags the
+    /// built-ins default to `Auto = enabled`, so the registry is byte-identical to
+    /// [`with_builtins`](Self::with_builtins) (the parity guarantee).
+    pub fn with_persistence_and_builtins(persistence: Box<dyn PluginPersistence>) -> Self {
+        let mut mgr = PluginManager::new();
+        mgr.set_persistence(persistence);
         for plugin in builtins::builtin_plugins() {
             mgr.add_plugin(plugin);
         }
@@ -728,6 +858,121 @@ mod tests {
         );
         p.remove_path("/a.so");
         assert_eq!(p.get_paths(), vec!["/b.so".to_string()]);
+    }
+
+    // ── DiskPluginPersistence (the SettingsStore-backed production backend) ──
+
+    use crate::theme::MemSettings;
+
+    /// A shared `MemSettings`-backed store handle for the disk-persistence tests
+    /// (the same `Rc<RefCell<dyn SettingsStore>>` the app hands the backend, but
+    /// in-memory so no real `settings.json` is touched).
+    fn shared_mem_store() -> Rc<RefCell<dyn SettingsStore>> {
+        Rc::new(RefCell::new(MemSettings::new())) as Rc<RefCell<dyn SettingsStore>>
+    }
+
+    #[test]
+    fn disk_persistence_round_trips_enabled_none_when_unset() {
+        let store = shared_mem_store();
+        let mut p = DiskPluginPersistence::new(store.clone());
+        // Unset → None (so the LoadType default still wins — the restore path only
+        // overrides when the user actually toggled).
+        assert_eq!(p.get_enabled("file"), None);
+        p.set_enabled("file", false);
+        assert_eq!(p.get_enabled("file"), Some(false));
+        p.set_enabled("file", true);
+        assert_eq!(p.get_enabled("file"), Some(true));
+        // The flag lands under the namespaced key.
+        assert_eq!(
+            store.borrow().get("plugin.enabled.file").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn disk_persistence_path_add_dedup_remove_round_trip() {
+        let store = shared_mem_store();
+        let mut p = DiskPluginPersistence::new(store.clone());
+        assert!(p.get_paths().is_empty());
+        p.add_path("/a.so");
+        p.add_path("/a.so"); // dedup — no duplicate
+        p.add_path("/b.so");
+        assert_eq!(
+            p.get_paths(),
+            vec!["/a.so".to_string(), "/b.so".to_string()]
+        );
+        // Stored `\n`-joined under the one list key (the get_list/set_list shape).
+        assert_eq!(
+            store.borrow().get("plugin.loadPaths").as_deref(),
+            Some("/a.so\n/b.so")
+        );
+        p.remove_path("/a.so");
+        assert_eq!(p.get_paths(), vec!["/b.so".to_string()]);
+        // A second backend over the SAME store sees the persisted set (restart).
+        let p2 = DiskPluginPersistence::new(store.clone());
+        assert_eq!(p2.get_paths(), vec!["/b.so".to_string()]);
+    }
+
+    #[test]
+    fn disk_persistence_restore_overrides_load_default_on_add() {
+        // Store says a built-in-style Auto plugin is disabled → add_plugin restores
+        // it disabled, overriding the Auto=enabled default (the startup restore).
+        let store = shared_mem_store();
+        DiskPluginPersistence::new(store.clone()).set_enabled("autoreader", false);
+
+        let mut mgr = PluginManager::new();
+        mgr.set_persistence(Box::new(DiskPluginPersistence::new(store.clone())));
+        mgr.add_plugin(provider_plugin("Auto Reader", LoadType::Auto));
+        assert!(!mgr.registry().find("autoreader").unwrap().enabled);
+
+        // And toggling through the manager writes back to the SAME store.
+        assert!(mgr.set_enabled("autoreader", true, true));
+        assert_eq!(
+            store.borrow().get("plugin.enabled.autoreader").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn with_persistence_and_builtins_is_parity_when_store_empty() {
+        // With NO stored flags, the persistence-installed constructor yields the
+        // exact four-provider Auto-enabled set with_builtins() gives (parity).
+        let store = shared_mem_store();
+        let mgr = PluginManager::with_persistence_and_builtins(Box::new(
+            DiskPluginPersistence::new(store.clone()),
+        ));
+        let ids: Vec<&str> = mgr
+            .registry()
+            .providers()
+            .iter()
+            .map(|p| p.identifier.as_str())
+            .collect();
+        assert_eq!(ids, ["file", "buffer", "snapshot", "null"]);
+        assert!(mgr
+            .registry()
+            .providers()
+            .iter()
+            .all(|p| p.is_builtin && p.enabled));
+    }
+
+    #[test]
+    fn with_persistence_and_builtins_restores_a_disabled_builtin() {
+        // A previously-disabled built-in (stored) comes back disabled on startup —
+        // the whole point of installing persistence BEFORE adding the built-ins.
+        let store = shared_mem_store();
+        DiskPluginPersistence::new(store.clone()).set_enabled("null", false);
+
+        let mgr = PluginManager::with_persistence_and_builtins(Box::new(
+            DiskPluginPersistence::new(store.clone()),
+        ));
+        assert!(!mgr.registry().find("null").unwrap().enabled);
+        // The other three are still enabled (only the stored one flipped).
+        let enabled: Vec<&str> = mgr
+            .registry()
+            .enabled_providers()
+            .map(|p| p.identifier.as_str())
+            .collect();
+        assert_eq!(enabled, ["file", "buffer", "snapshot"]);
     }
 
     /// A bare provider plugin built from an arbitrary manifest, for exercising

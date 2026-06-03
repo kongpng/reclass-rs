@@ -326,6 +326,18 @@ pub struct MainWindow {
     /// persistence across launches. Shared, interior-mutable so async closures
     /// (file pickers) can persist after the borrow of `self` ends.
     settings: Rc<RefCell<DiskSettings>>,
+    /// The session-owned [`PluginManager`](crate::plugin::PluginManager) (design
+    /// §7.A [fix] / §H): the single source the source pickers + the Manage-Plugins
+    /// dialog read, replacing the throwaway `with_builtins()` managers each live
+    /// site used to build. Owned by value (not `Rc<RefCell<_>>`): every live read —
+    /// the process picker, the Manage-Plugins dialog, the dialog's enable/disable
+    /// toggle — runs inside a `&mut self` window method (synchronous), not an async
+    /// closure, so a plain field suffices. Its persistence is the
+    /// [`DiskPluginPersistence`](crate::plugin::DiskPluginPersistence) over the same
+    /// `settings.json`-backed store as [`settings`](Self::settings), so enable/disable
+    /// survives a restart; with no stored flags it is byte-identical to the four
+    /// Auto-enabled built-ins (the parity guarantee).
+    plugin_manager: crate::plugin::PluginManager,
     /// The bottom-dock memory [`ScannerPanel`] handle (the C++ summon-on-demand
     /// scanner). Held so the window can feed it the active document's provider —
     /// previously dropped (`..` in the `LayoutHandles` destructure), so the
@@ -805,6 +817,19 @@ impl MainWindow {
         // Open the disk-backed app settings store (the QSettings replacement)
         // and load the persisted across-launch state from it.
         let settings = Rc::new(RefCell::new(DiskSettings::open_default()));
+        // The session-owned plugin manager (design §7.A [fix] / §H). Built via
+        // `with_persistence_and_builtins` so the DiskSettings-backed persistence is
+        // installed BEFORE the built-ins are added — any previously-disabled
+        // built-in is restored disabled at add time (set_persistence *after*
+        // with_builtins would NOT retro-apply stored flags). The persistence shares
+        // the SAME `settings.json` store as the rest of the window (coerced to the
+        // shared `SettingsStore` trait object). With no stored flags the registry is
+        // exactly the four Auto-enabled built-ins — byte-identical to before.
+        let plugin_manager = crate::plugin::PluginManager::with_persistence_and_builtins(Box::new(
+            crate::plugin::DiskPluginPersistence::new(
+                settings.clone() as Rc<RefCell<dyn SettingsStore>>
+            ),
+        ));
         let recent_files: Vec<std::path::PathBuf> = settings
             .borrow()
             .get_list(settings_keys::RECENT_FILES)
@@ -1057,6 +1082,7 @@ impl MainWindow {
             mcp_running: auto_start_mcp,
             goto_recent,
             settings,
+            plugin_manager,
             scanner,
             options_sub: None,
             theme_editor_sub: None,
@@ -1513,12 +1539,13 @@ impl MainWindow {
     /// the (possibly stub) provider rows; a chosen row reports the selection.
     fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use super::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
-        // Build the picker's available-source rows from the real plugin registry
-        // (the in-tree File/Buffer/Snapshot/Null providers registered through the
-        // contract) instead of a throwaway empty registry — so the picker reads the
-        // same source list the rest of the app does (design §6 Phase 1 / §7.A [fix]).
-        let manager = crate::plugin::PluginManager::with_builtins();
-        let model = ProcessPickerModel::from_registry(manager.registry());
+        // Build the picker's available-source rows from the SESSION-OWNED plugin
+        // manager's registry (the in-tree File/Buffer/Snapshot/Null providers
+        // registered through the contract) — the single source the rest of the app
+        // reads, so an enable/disable in Manage-Plugins is reflected here within the
+        // session (design §6 Phase 1 / §7.A [fix] / §H). Byte-identical output to the
+        // old throwaway `with_builtins()` when no plugin has been toggled.
+        let model = ProcessPickerModel::from_registry(self.plugin_manager.registry());
         // Remember which process the user last attached to (the C++
         // `lastAttachedProcess` QSettings key; processpicker.cpp:386). The picker
         // *reads* this to pre-select the matching row in `selectPreferredProcess` —
@@ -2053,15 +2080,35 @@ impl MainWindow {
     /// note that runtime DLL/SO loading is out of scope. This replaces the bare
     /// notify with the actual (read-only) manager surface.
     fn open_plugins_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dialog = cx.new(|cx| PluginManagerDialog::new(builtin_plugins(), cx));
+        // Render the dialog from the SESSION-OWNED manager's live plugin set (design
+        // §6 Phase 6 / §7.A [fix]) — not a throwaway `with_builtins()`. An
+        // enable/disable here flips THIS manager (the same registry the source
+        // pickers read) and persists via its DiskSettings-backed store.
+        let dialog = cx.new(|cx| {
+            PluginManagerDialog::new(
+                plugin_infos_from_rows(self.plugin_manager.plugins_view()),
+                cx,
+            )
+        });
         let focus = dialog.read(cx).focus_handle(cx);
-        // Reuse the generic dialog subscription slot (Close-only, like the other
-        // single-button dialogs).
+        // The dialog reports Close + Toggle; Toggle drives the owned manager and
+        // pushes the refreshed rows back so the chip reflects the real state.
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
-            |_this, _d, _ev: &PluginManagerEvent, window, cx| {
-                window.close_dialog(cx);
+            |this, dialog, ev: &PluginManagerEvent, window, cx| match ev {
+                PluginManagerEvent::Close => window.close_dialog(cx),
+                PluginManagerEvent::Toggle {
+                    identifier,
+                    enabled,
+                } => {
+                    // Flip + persist on the session-owned manager (the single source
+                    // the pickers read), then re-render the dialog from the refreshed
+                    // view so the enabled chip + button label track reality.
+                    this.plugin_manager.set_enabled(identifier, *enabled, true);
+                    let rows = plugin_infos_from_rows(this.plugin_manager.plugins_view());
+                    dialog.update(cx, |d, cx| d.set_plugins(rows, cx));
+                }
             },
         ));
         let dialog_for_modal = dialog.clone();
@@ -5464,6 +5511,10 @@ struct PluginInfo {
     author: String,
     description: String,
     enabled: bool,
+    /// The derived routing identifier (`Name().toLower().replace(" ","")`) — the
+    /// key the dialog hands back to [`PluginManager::set_enabled`] when the user
+    /// flips this row's enabled state (design §7.A [fix] / §H).
+    identifier: String,
     /// The human-readable permission tokens (e.g. `read_memory`), for disclosure.
     permissions: Vec<String>,
 }
@@ -5475,10 +5526,22 @@ struct PluginInfo {
 /// ReClass.NET — not a second hand-kept table). The C++ `"<name> Provider"`
 /// display text is preserved for the built-in providers. Native DLL/SO loading
 /// stays out of the default build (the dialog notes it).
+/// The four-built-in row list mapped to [`PluginInfo`] — the parity baseline (the
+/// live opener reads the session-owned manager instead, but tests assert the shipped
+/// built-in set's display fields through this). `#[cfg(test)]` because the only
+/// non-test caller now reads the owned manager.
+#[cfg(test)]
 fn builtin_plugins() -> Vec<PluginInfo> {
-    crate::plugin::PluginManager::with_builtins()
-        .plugins_view()
-        .into_iter()
+    plugin_infos_from_rows(crate::plugin::PluginManager::with_builtins().plugins_view())
+}
+
+/// Map a [`PluginManager::plugins_view`](crate::plugin::PluginManager::plugins_view)
+/// row list to the dialog's [`PluginInfo`] view-model (design §6 Phase 6). The C++
+/// `"<name> Provider"` display text is preserved for built-in providers. Shared by
+/// the live opener (reading the session-owned manager) and the parity helper
+/// [`builtin_plugins`].
+fn plugin_infos_from_rows(rows: Vec<crate::plugin::PluginRow>) -> Vec<PluginInfo> {
+    rows.into_iter()
         .map(|r| PluginInfo {
             name: if r.is_builtin {
                 format!("{} Provider", r.name)
@@ -5490,6 +5553,9 @@ fn builtin_plugins() -> Vec<PluginInfo> {
             author: r.author,
             description: r.description,
             enabled: r.enabled,
+            // The derived routing identifier, so the dialog can ask the manager to
+            // flip this exact plugin's enabled flag (design §7.A [fix] / §H).
+            identifier: r.identifier,
             permissions: r
                 .permissions
                 .iter()
@@ -5499,10 +5565,19 @@ fn builtin_plugins() -> Vec<PluginInfo> {
         .collect()
 }
 
-/// The Plugins manager's outcome — Close (the only action in the read-only port).
+/// The Plugins manager's outcome. `Close` ends the dialog; `Toggle` asks the host
+/// to flip a plugin's enabled flag (design §7.A [fix] / §H — the dialog is no longer
+/// read-only: enable/disable drives the session-owned manager + persists). The
+/// dialog does not own the manager, so it reports the intent and the window applies
+/// it (then pushes the refreshed rows back via [`PluginManagerDialog::set_plugins`]).
 #[derive(Clone, Debug)]
 enum PluginManagerEvent {
     Close,
+    /// Flip `identifier` to `enabled` (the new state the user clicked toward).
+    Toggle {
+        identifier: String,
+        enabled: bool,
+    },
 }
 
 /// The read-only Plugins manager view (the C++ `showPluginsDialog`; main.cpp:8821).
@@ -5526,6 +5601,25 @@ impl PluginManagerDialog {
 
     fn close(&mut self, cx: &mut Context<Self>) {
         cx.emit(PluginManagerEvent::Close);
+    }
+
+    /// Emit the intent to flip `identifier` to `enabled` (the host owns the manager
+    /// and its persistence). The host applies it and pushes the refreshed rows back
+    /// via [`set_plugins`](Self::set_plugins), so the chip re-renders from the real
+    /// manager state rather than the dialog guessing.
+    fn toggle(&mut self, identifier: String, enabled: bool, cx: &mut Context<Self>) {
+        cx.emit(PluginManagerEvent::Toggle {
+            identifier,
+            enabled,
+        });
+    }
+
+    /// Replace the rendered rows (the host calls this after applying a toggle so the
+    /// enabled chip reflects the live [`PluginManager`](crate::plugin::PluginManager)
+    /// state).
+    fn set_plugins(&mut self, plugins: Vec<PluginInfo>, cx: &mut Context<Self>) {
+        self.plugins = plugins;
+        cx.notify();
     }
 }
 
@@ -5592,6 +5686,28 @@ impl Render for PluginManagerDialog {
                                     })
                                     .text_size(px(tokens::font::UI_SM))
                                     .child(if p.enabled { "enabled" } else { "disabled" }),
+                            )
+                            // Push the Enable/Disable control to the right edge.
+                            .child(div().flex_grow())
+                            // The Enable/Disable toggle (design §7.A [fix] / §H —
+                            // the dialog is no longer read-only; the click flips the
+                            // session-owned manager + persists). The button reports
+                            // the *target* state (`!p.enabled`); the host applies it
+                            // and pushes refreshed rows back.
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "plugin-toggle-{}",
+                                    p.identifier
+                                )))
+                                .ghost()
+                                .label(if p.enabled { "Disable" } else { "Enable" })
+                                .on_click(cx.listener({
+                                    let id = p.identifier.clone();
+                                    let target = !p.enabled;
+                                    move |this, _e, _w, cx| {
+                                        this.toggle(id.clone(), target, cx);
+                                    }
+                                })),
                             ),
                     )
                     .child(
@@ -5626,8 +5742,9 @@ impl Render for PluginManagerDialog {
             .text_color(color::text_muted(cx))
             .text_size(px(tokens::font::UI_SM))
             .child(
-                "Loading runtime plugins (DLL/SO) is not supported in this build; \
-                 the provider plugins above are compiled in.",
+                "Enable/Disable is applied to the session and persisted across \
+                 launches. Loading runtime plugins (DLL/SO) is not supported in \
+                 this build; the provider plugins above are compiled in.",
             );
 
         let body = modal::body(cx).child(
@@ -6191,6 +6308,8 @@ mod tests {
         ViewOpt, ViewOptions, ABOUT_GITHUB_URL,
     };
     use crate::theme::SettingsStore;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn temp_settings_path() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -6398,6 +6517,115 @@ mod tests {
         assert!(plugins.iter().all(|p| {
             !p.version.is_empty() && !p.author.is_empty() && !p.description.is_empty()
         }));
+        // Every row carries its routing identifier (so the dialog can toggle it).
+        assert!(plugins.iter().all(|p| !p.identifier.is_empty()));
+    }
+
+    // ── F1: session-owned PluginManager + DiskSettings-backed persistence ──
+    //
+    // These exercise the EXACT production wiring `MainWindow::new` builds — a
+    // `PluginManager::with_persistence_and_builtins` over a `DiskPluginPersistence`
+    // backed by the real `DiskSettings` (settings.json) — but at a temp path, so no
+    // GPUI window is needed to assert the enable/disable + persistence behaviour.
+
+    use crate::plugin::{DiskPluginPersistence, PluginManager};
+
+    /// Build the session manager exactly as the window does, over a DiskSettings at
+    /// `path` (coerced to the shared `SettingsStore` trait object).
+    fn session_manager_at(path: &std::path::Path) -> PluginManager {
+        let settings: Rc<RefCell<dyn SettingsStore>> =
+            Rc::new(RefCell::new(DiskSettings::open_at(path.to_path_buf())));
+        PluginManager::with_persistence_and_builtins(Box::new(DiskPluginPersistence::new(settings)))
+    }
+
+    #[test]
+    fn session_manager_parity_with_empty_settings() {
+        // PARITY: a fresh config dir → the registry is exactly the four
+        // Auto-enabled built-ins, identical order, all enabled — byte-identical to
+        // the old throwaway `with_builtins()` the live sites used.
+        let path = temp_settings_path();
+        let mgr = session_manager_at(&path);
+        let ids: Vec<&str> = mgr
+            .registry()
+            .providers()
+            .iter()
+            .map(|p| p.identifier.as_str())
+            .collect();
+        assert_eq!(ids, ["file", "buffer", "snapshot", "null"]);
+        assert!(mgr
+            .registry()
+            .providers()
+            .iter()
+            .all(|p| p.is_builtin && p.enabled));
+        assert_eq!(mgr.registry().enabled_providers().count(), 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disk_backed_enable_disable_reflected_in_view_registry_and_persisted() {
+        let path = temp_settings_path();
+        {
+            // Disable a built-in via the manager with persist=true (the dialog's
+            // Toggle path).
+            let mut mgr = session_manager_at(&path);
+            assert!(mgr.set_enabled("null", false, true));
+
+            // Reflected in plugins_view (what the dialog renders)…
+            let rows = mgr.plugins_view();
+            let null = rows.iter().find(|r| r.identifier == "null").unwrap();
+            assert!(!null.enabled);
+            // …and in the registry's enabled_providers (what the pickers read).
+            let enabled: Vec<&str> = mgr
+                .registry()
+                .enabled_providers()
+                .map(|p| p.identifier.as_str())
+                .collect();
+            assert_eq!(enabled, ["file", "buffer", "snapshot"]);
+        }
+        // The flag landed in settings.json under the namespaced key.
+        let s = DiskSettings::open_at(path.clone());
+        assert_eq!(s.get("plugin.enabled.null").as_deref(), Some("false"));
+
+        // RESTART: a brand-new session manager over the SAME file restores the
+        // disabled built-in (the persistence round-trip end-to-end).
+        let mgr2 = session_manager_at(&path);
+        assert!(!mgr2.registry().find("null").unwrap().enabled);
+        assert_eq!(mgr2.registry().enabled_providers().count(), 3);
+
+        // Re-enabling persists too, so a third session sees it back on.
+        {
+            let mut mgr3 = session_manager_at(&path);
+            assert!(mgr3.set_enabled("null", true, true));
+        }
+        let mgr4 = session_manager_at(&path);
+        assert!(mgr4.registry().find("null").unwrap().enabled);
+        assert_eq!(mgr4.registry().enabled_providers().count(), 4);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plugin_infos_from_rows_preserves_builtin_display_and_identifier() {
+        // The dialog's view-model mapper: built-ins get the C++ "<name> Provider"
+        // text, the routing identifier is carried, and the enabled flag tracks the
+        // manager (here a disabled built-in shows disabled).
+        let path = temp_settings_path();
+        let mut mgr = session_manager_at(&path);
+        assert!(mgr.set_enabled("null", false, true));
+        let infos = super::plugin_infos_from_rows(mgr.plugins_view());
+
+        let file = infos.iter().find(|i| i.identifier == "file").unwrap();
+        assert_eq!(file.name, "File Provider");
+        assert!(file.enabled);
+        assert_eq!(file.kind, "builtin");
+
+        let null = infos.iter().find(|i| i.identifier == "null").unwrap();
+        assert_eq!(null.name, "Null Provider");
+        assert!(
+            !null.enabled,
+            "disabled built-in shows disabled in the dialog"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
