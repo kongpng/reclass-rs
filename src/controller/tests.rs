@@ -3589,3 +3589,179 @@ fn new_class_on_node_embeds_populated_class_instance() {
         "target references the new class definition"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Obsolete-drop clean-index re-indexing (QUndoStack `setObsolete(true)` parity)
+//
+// When undo()/redo() drop an entry whose non-transient command failed, the
+// saved-state baseline (`clean_index`) must be re-indexed against the now
+// shorter entry list — exactly as QUndoStack does when it deletes an obsolete
+// command. The non-transient failure branch is defensive (only WriteBytes,
+// which is *transient*, ever fails through apply_command today — see
+// PORTING_compose-undo.md §B.5), so these drive the stack mechanics directly
+// via the crate-private `UndoStack` + the same drop sequence undo()/redo() run.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build an `UndoStack` with `n` cheap entries already applied (`index == n`).
+fn stack_with_applied(n: usize) -> UndoStack {
+    let mut s = UndoStack::new();
+    for i in 0..n {
+        s.entries.push(Entry::One(Command::Rename {
+            node_id: (i as u64) + 1,
+            old_name: String::new(),
+            new_name: format!("c{i}"),
+        }));
+    }
+    s.index = n;
+    s
+}
+
+#[test]
+fn obsolete_drop_on_undo_decrements_clean_index_above_removed() {
+    // Two commands pushed; clean baseline set at index 1 (after the first).
+    // undo() drops the TOP entry (array slot index-1 == 1). The clean baseline
+    // (1) sits below the removed slot, so it is untouched and survives.
+    let mut s = stack_with_applied(2);
+    s.set_clean(); // clean_index = 2
+                   // Re-set clean to index 1 to mirror "set_clean at index 1".
+    s.index = 1;
+    s.set_clean(); // clean_index = 1
+    s.index = 2;
+    assert!(!s.is_clean(), "at index 2, not clean (clean is index 1)");
+
+    // undo at index 2 → remove slot index-1 == 1, index becomes 1.
+    let removed = s.index - 1;
+    s.entries.remove(removed);
+    s.index -= 1;
+    s.adjust_clean_index_after_drop(removed);
+
+    // clean_index (1) <= removed (1): unchanged. New index is 1 → clean again.
+    assert_eq!(s.clean_index, Some(1));
+    assert!(
+        s.is_clean(),
+        "back at the clean baseline after the obsolete drop"
+    );
+}
+
+#[test]
+fn obsolete_drop_below_clean_shifts_baseline_down() {
+    // Three applied entries; clean baseline at index 3 (the top). Dropping an
+    // entry BELOW the baseline (slot 0) must shift the baseline down to 2 so it
+    // still refers to the same logical saved state.
+    let mut s = stack_with_applied(3);
+    s.set_clean(); // clean_index = 3
+
+    let removed = 0usize; // pretend slot 0's command went obsolete
+    s.entries.remove(removed);
+    s.index -= 1; // 3 → 2 (we conceptually undid down through it)
+    s.adjust_clean_index_after_drop(removed);
+
+    // clean_index (3) > removed (0) and now > entries.len() (2) → clamped None.
+    assert_eq!(
+        s.clean_index, None,
+        "baseline past the shortened list is unreachable"
+    );
+    assert!(!s.is_clean());
+}
+
+#[test]
+fn obsolete_drop_at_clean_slot_decrements_baseline() {
+    // clean baseline at index 2; drop the entry at slot 1 (ci > removed but ci
+    // still <= new len) → baseline decrements 2 → 1 and stays reachable.
+    let mut s = stack_with_applied(3);
+    s.index = 2;
+    s.set_clean(); // clean_index = 2
+    s.index = 3;
+
+    let removed = 1usize;
+    s.entries.remove(removed); // len 3 → 2
+    s.index -= 1; // 3 → 2
+    s.adjust_clean_index_after_drop(removed);
+
+    // ci (2) > removed (1) and ci (2) <= new len (2) → decrement to 1.
+    assert_eq!(s.clean_index, Some(1));
+    assert!(!s.is_clean(), "index 2 vs clean 1 → still dirty");
+    s.index = 1;
+    assert!(s.is_clean(), "reaching the shifted baseline is clean");
+}
+
+#[test]
+fn obsolete_drop_on_redo_reindexes_clean_index() {
+    // redo() removes slot at `index` (not index-1) and leaves index unchanged.
+    // Build a stack with a redo tail: 3 entries, index at 1, clean at index 1.
+    let mut s = stack_with_applied(3);
+    s.index = 1;
+    s.set_clean(); // clean_index = 1
+
+    // redo at index 1 fails non-transiently → remove slot 1, index unchanged.
+    let removed = s.index; // 1
+    s.entries.remove(removed); // len 3 → 2
+    s.adjust_clean_index_after_drop(removed);
+
+    // ci (1) <= removed (1) → unchanged; index still 1 → still clean.
+    assert_eq!(s.clean_index, Some(1));
+    assert!(s.is_clean(), "redo-drop below the baseline keeps it clean");
+
+    // Now verify the >len clamp path on the redo position. Fresh stack of 2
+    // entries with the baseline at the top (index 2). A redo-drop at slot 1
+    // (index 1, redo tail) removes a slot below the baseline, shrinking the
+    // list to len 1 so the baseline (2) is now unreachable → clamped None.
+    let mut s2 = stack_with_applied(2);
+    s2.set_clean(); // clean_index = 2
+    s2.index = 1; // a redo is pending at slot 1
+    let removed = s2.index; // 1
+    s2.entries.remove(removed); // len 2 → 1
+    s2.adjust_clean_index_after_drop(removed);
+    assert_eq!(
+        s2.clean_index, None,
+        "baseline past len clamped on redo path"
+    );
+}
+
+#[test]
+fn obsolete_drop_on_undo_updates_controller_modified() {
+    // End-to-end through the controller's public surface: a real document with
+    // two pushed commands, clean set at index 1, then the exact obsolete-drop
+    // sequence undo() runs (remove top slot + reindex + sync_modified). Asserts
+    // the corrected clean_index propagates to is_clean()/document().modified.
+    let mut c = make_ctrl();
+    let id = find_id(&c, "field_u32");
+
+    // Command 1 (becomes the clean baseline).
+    c.push_command(Command::Rename {
+        node_id: id,
+        old_name: "field_u32".into(),
+        new_name: "one".into(),
+    });
+    c.set_clean(); // clean baseline at index 1
+    assert!(c.undo_stack().is_clean(), "clean right after set_clean");
+    assert!(!c.document().modified);
+
+    // Command 2 dirties the document past the baseline.
+    c.push_command(Command::Rename {
+        node_id: id,
+        old_name: "one".into(),
+        new_name: "two".into(),
+    });
+    assert!(!c.undo_stack().is_clean(), "index 2 != clean index 1");
+    assert!(c.document().modified, "modified once past the baseline");
+
+    // Drive the obsolete-drop that undo() performs on a failed non-transient
+    // top entry: remove slot index-1, decrement index, reindex clean, resync.
+    let removed = c.undo.index - 1; // 1
+    c.undo.entries.remove(removed);
+    c.undo.index -= 1; // back to 1
+    c.undo.adjust_clean_index_after_drop(removed);
+    c.sync_modified();
+
+    // clean_index (1) <= removed (1) → unchanged; index back to 1 → clean,
+    // and document().modified must follow (cleanChanged → modified).
+    assert!(
+        c.undo_stack().is_clean(),
+        "obsolete-drop returned us to the clean baseline"
+    );
+    assert!(
+        !c.document().modified,
+        "modified cleared after the clean_index correction"
+    );
+}

@@ -580,6 +580,29 @@ impl UndoStack {
     pub fn begin_macro(&mut self, text: impl Into<String>) {
         self.macro_stack.push((text.into(), Vec::new()));
     }
+
+    /// Adjust `clean_index` after an obsolete entry was removed from
+    /// `entries` at array position `removed`.
+    ///
+    /// Mirrors `QUndoStack`'s `setObsolete(true)` handling: when a command is
+    /// dropped, the saved-state baseline is re-indexed against the shortened
+    /// list. `clean_index` is a *count* of applied entries (0..=entries.len),
+    /// so after the removal (with `entries` already shortened):
+    ///   * if it now points past the new length → unreachable → `None`;
+    ///   * else if it referenced the removed slot or anything above it
+    ///     (`ci > removed`) → it shifts down by one (`ci - 1`);
+    ///   * otherwise (`ci <= removed`) it is unaffected.
+    /// This matches the `clean_index > entries.len()` clamp on the push path
+    /// (the truncate branch of `push_command`/`end_macro`).
+    fn adjust_clean_index_after_drop(&mut self, removed: usize) {
+        if let Some(ci) = self.clean_index {
+            if ci > self.entries.len() {
+                self.clean_index = None;
+            } else if ci > removed {
+                self.clean_index = Some(ci - 1);
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -898,9 +921,13 @@ impl RcxController {
         }
         if drop_entry {
             // setObsolete(true): the entry never existed.
-            self.undo.entries.remove(self.undo.index - 1);
+            let removed = self.undo.index - 1;
+            self.undo.entries.remove(removed);
             // index stays pointing one slot lower (the dropped entry is gone).
             self.undo.index -= 1;
+            // Re-index the clean baseline against the shortened list, just like
+            // QUndoStack does when it deletes an obsolete command.
+            self.undo.adjust_clean_index_after_drop(removed);
         } else {
             self.undo.index -= 1;
         }
@@ -922,8 +949,12 @@ impl RcxController {
             }
         }
         if drop_entry {
-            self.undo.entries.remove(self.undo.index);
+            let removed = self.undo.index;
+            self.undo.entries.remove(removed);
             // index unchanged (the now-removed entry would have been applied).
+            // Re-index the clean baseline against the shortened list, just like
+            // QUndoStack does when it deletes an obsolete command.
+            self.undo.adjust_clean_index_after_drop(removed);
         } else {
             self.undo.index += 1;
         }
