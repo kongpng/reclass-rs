@@ -36,10 +36,11 @@
 //! ("Reclass" | "Code", each with its own glyph) — the selected segment lifts out
 //! of a recessed track, as in the C++ bottom view tabs.
 //!
-//! In **rendered** mode the body shows the real generated C/C++ (the
-//! [`render_cpp_tree`] codegen) as a scrollable, read-only Zed code editor with a
-//! muted line-number gutter and One Dark syntax highlighting — reclass PIC3's
-//! right pane (see [`DocumentArea::render_code_view`]).
+//! In **rendered** mode the body shows the real generated source (the
+//! [`generator::render_code_scoped`](crate::generator::render_code_scoped)
+//! codegen, honoring the persisted format/scope) as a scrollable, read-only Zed
+//! code editor with a muted line-number gutter and One Dark syntax highlighting —
+//! reclass PIC3's right pane (see [`DocumentArea::render_code_view`]).
 //!
 //! Gated behind the `ui` feature.
 
@@ -53,7 +54,7 @@ use gpui_component::{Icon, IconName, Sizable as _};
 use super::design::{color, icon, tokens};
 use super::editor::RcxEditor;
 use super::state::{DataSource, DocId, SourceKind, ViewMode};
-use crate::generator::render_cpp_tree;
+use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
 
 // ── Document-tab context-menu actions (the C++ doc-tab `QMenu`, `main.cpp:3652`)
 //
@@ -124,6 +125,23 @@ const VIEW_TOGGLE_H: f32 = 30.0;
 /// One segment's height inside the view-mode toggle.
 const SEGMENT_H: f32 = 22.0;
 
+/// The code-format options in `enum class CodeFormat` order (generator.h:11-18) —
+/// the items the C++ `fmtCombo` is filled with (main.cpp:2413-2414).
+const CODE_FORMATS: [CodeFormat; 5] = [
+    CodeFormat::CppHeader,
+    CodeFormat::RustStruct,
+    CodeFormat::DefineOffsets,
+    CodeFormat::CSharpStruct,
+    CodeFormat::PythonCtypes,
+];
+/// The code-scope options in `enum class CodeScope` order (generator.h:20-25) —
+/// the `scopeCombo` items (main.cpp:2439-2440).
+const CODE_SCOPES: [CodeScope; 3] = [
+    CodeScope::Current,
+    CodeScope::WithChildren,
+    CodeScope::FullSdk,
+];
+
 /// One open document tab in the center area — the per-tab UI state + its editor.
 ///
 /// Mirrors the C++ `TabState` (the bits the center needs; app-shell §6): the
@@ -169,6 +187,11 @@ pub enum DocAreaEvent {
     Closed(DocId),
     /// The active tab's view mode changed (the dual toggle; `setViewMode`).
     ViewModeChanged(DocId, ViewMode),
+    /// The code-view format/scope selector changed (the C++ `fmtCombo`/`scopeCombo`
+    /// `currentIndexChanged` handlers; main.cpp:2458-2475). The window persists
+    /// the new indices to the `codeFormat`/`codeScope` settings keys. Carries the
+    /// raw enum indices (`CodeFormat as i32` / `CodeScope as i32`).
+    CodeOptionsChanged { format_idx: i32, scope_idx: i32 },
 }
 
 /// The center MDI document area: a [`TabBar`] + the active editor.
@@ -186,6 +209,17 @@ pub struct DocumentArea {
     /// cursor"; `tabBar->tabAt(pos)`). Set on right-mouse-down over a tab; read by
     /// the context-menu action handlers. `None` when no tab was right-clicked.
     context_target: Option<DocId>,
+    /// The code-view output format (the C++ per-pane `fmtCombo`, synced to the
+    /// `codeFormat` setting; main.cpp:2412-2415). Drives both the live rendered
+    /// pane and the corner selector. App-wide (every pane shares it in the C++).
+    code_format: CodeFormat,
+    /// The code-view scope (the C++ `scopeCombo` / `codeScope`; main.cpp:2438-2441):
+    /// just the selected struct, that struct + its deps, or the full SDK.
+    code_scope: CodeScope,
+    /// Whether the generator emits `static_assert` lines (the C++ `generatorAsserts`
+    /// option; main.cpp:5453). Pushed in from the window's persisted setting so the
+    /// live code view honors it like the export path does.
+    generator_asserts: bool,
 }
 
 impl DocumentArea {
@@ -198,6 +232,12 @@ impl DocumentArea {
             focus_handle: cx.focus_handle(),
             next_id: 0,
             context_target: None,
+            // C++ QSettings defaults: codeFormat=0 (C++ header), codeScope=0
+            // (Current), generatorAsserts=false. The window overrides these from
+            // the persisted store right after construction.
+            code_format: CodeFormat::CppHeader,
+            code_scope: CodeScope::Current,
+            generator_asserts: false,
         };
         area.push_document("Untitled", window, cx);
         area
@@ -526,6 +566,62 @@ impl DocumentArea {
         }
     }
 
+    /// Push the persisted code-generator options into the area (the window's
+    /// equivalent of seeding `fmtCombo`/`scopeCombo` from QSettings + reading the
+    /// `generatorAsserts` value; main.cpp:2415/2441/5453). Called by the window on
+    /// startup and whenever the Generator options dialog changes the assert flag.
+    /// Re-renders so the live code view reflects the new options immediately.
+    pub fn set_generator_options(
+        &mut self,
+        format: CodeFormat,
+        scope: CodeScope,
+        emit_asserts: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.code_format = format;
+        self.code_scope = scope;
+        self.generator_asserts = emit_asserts;
+        cx.notify();
+    }
+
+    /// Update just the assert flag (the C++ Generator options-dialog round-trip
+    /// only touches `generatorAsserts`; main.cpp:5061-5062). Re-renders the live
+    /// code view so a toggled assert option is reflected without a tab switch.
+    pub fn set_generator_asserts(&mut self, emit_asserts: bool, cx: &mut Context<Self>) {
+        if self.generator_asserts != emit_asserts {
+            self.generator_asserts = emit_asserts;
+            cx.notify();
+        }
+    }
+
+    /// Select the code-view format (the C++ `fmtCombo::currentIndexChanged`;
+    /// main.cpp:2458-2466): update local state, re-render every rendered pane, and
+    /// emit [`DocAreaEvent::CodeOptionsChanged`] so the window persists `codeFormat`.
+    fn set_code_format(&mut self, format: CodeFormat, cx: &mut Context<Self>) {
+        if self.code_format != format {
+            self.code_format = format;
+            self.emit_code_options(cx);
+            cx.notify();
+        }
+    }
+
+    /// Select the code-view scope (the C++ `scopeCombo::currentIndexChanged`;
+    /// main.cpp:2467-2475).
+    fn set_code_scope(&mut self, scope: CodeScope, cx: &mut Context<Self>) {
+        if self.code_scope != scope {
+            self.code_scope = scope;
+            self.emit_code_options(cx);
+            cx.notify();
+        }
+    }
+
+    fn emit_code_options(&mut self, cx: &mut Context<Self>) {
+        cx.emit(DocAreaEvent::CodeOptionsChanged {
+            format_idx: self.code_format as i32,
+            scope_idx: self.code_scope as i32,
+        });
+    }
+
     /// Build the Zed tab bar: a flat `chrome_bg` strip with a 1px bottom border,
     /// one bespoke tab per document, then a trailing "+" new-document affordance.
     ///
@@ -823,6 +919,7 @@ impl DocumentArea {
             .h(px(VIEW_TOGGLE_H))
             .w_full()
             .items_center()
+            .justify_between()
             .px(px(tokens::space::LG))
             .bg(color::chrome_bg(cx))
             .border_t_1()
@@ -840,15 +937,96 @@ impl DocumentArea {
                     .child(segment("Reclass", icon::struct_(), ViewMode::Tree, cx))
                     .child(segment("Code", icon::function(), ViewMode::Rendered, cx)),
             )
+            // The C++ corner widget (`fmtCombo` + `scopeCombo`) is hidden until the
+            // Code tab is selected (main.cpp:2449). Mirror that: the format/scope
+            // selectors only appear in rendered mode.
+            .when(has_doc && view_mode == ViewMode::Rendered, |s| {
+                s.child(self.render_code_selectors(cx))
+            })
+    }
+
+    /// The rendered code-view corner: the **format** + **scope** selectors (the
+    /// C++ `fmtCombo` / `scopeCombo`; main.cpp:2412-2446). Two compact dropdown
+    /// buttons styled like the toggle track; each lists every enum option and a
+    /// pick re-renders the live view + persists the choice through the window
+    /// (`DocAreaEvent::CodeOptionsChanged`).
+    fn render_code_selectors(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let fmt = self.code_format;
+        let scope = self.code_scope;
+        gpui_component::h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(tokens::space::XS))
+            .child(self.code_format_selector(fmt, cx))
+            .child(self.code_scope_selector(scope, cx))
+    }
+
+    /// The `fmtCombo` dropdown — the current format name + a chevron, opening a
+    /// menu of every [`CodeFormat`].
+    fn code_format_selector(
+        &self,
+        current: CodeFormat,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use gpui_component::button::Button;
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        use gpui_component::Sizable as _;
+
+        let this = cx.entity();
+        Button::new("rcx-code-fmt")
+            .small()
+            .outline()
+            .label(format!("{}  \u{25be}", code_format_name(current)))
+            .dropdown_menu(move |mut menu, _window, _cx| {
+                for &fmt in CODE_FORMATS.iter() {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(code_format_name(fmt))
+                            .checked(fmt == current)
+                            .on_click(move |_e, _window, app| {
+                                this.update(app, |area, cx| area.set_code_format(fmt, cx));
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
+    /// The `scopeCombo` dropdown — the current scope name + a chevron, opening a
+    /// menu of every [`CodeScope`].
+    fn code_scope_selector(&self, current: CodeScope, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_component::button::Button;
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        use gpui_component::Sizable as _;
+
+        let this = cx.entity();
+        Button::new("rcx-code-scope")
+            .small()
+            .outline()
+            .label(format!("{}  \u{25be}", code_scope_name(current)))
+            .dropdown_menu(move |mut menu, _window, _cx| {
+                for &scope in CODE_SCOPES.iter() {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(code_scope_name(scope))
+                            .checked(scope == current)
+                            .on_click(move |_e, _window, app| {
+                                this.update(app, |area, cx| area.set_code_scope(scope, cx));
+                            }),
+                    );
+                }
+                menu
+            })
     }
 
     /// The body for the active tab: the editor (tree mode) or the rendered C/C++
     /// code view (rendered mode).
     ///
     /// The rendered side wires the fully-implemented codegen
-    /// ([`render_cpp_tree`]) and presents it like reclass PIC3's right pane — a
-    /// scrollable, read-only Zed code editor with a muted line-number gutter and
-    /// One Dark syntax highlighting (see [`Self::render_code_view`]).
+    /// ([`generator::render_code_scoped`](crate::generator::render_code_scoped))
+    /// and presents it like reclass PIC3's right pane — a scrollable, read-only Zed
+    /// code editor with a muted line-number gutter and One Dark syntax
+    /// highlighting (see [`Self::render_code_view`]).
     fn render_body(&self, cx: &Context<Self>) -> AnyElement {
         let Some(entry) = self.active_entry() else {
             return div()
@@ -871,12 +1049,15 @@ impl DocumentArea {
     /// read-only Zed code editor.
     ///
     /// Wires the real generator: it reads the active tab's editor → controller →
-    /// tree + view root and calls [`render_cpp_tree`] with the document's
-    /// [`TypeAliases`](crate::generator::TypeAliases) (the per-kind display-name
-    /// overrides) and `emit_asserts = false`. The output is split into lines and
-    /// rendered with a muted, right-aligned line-number gutter plus per-line One
-    /// Dark syntax highlighting (keywords magenta, types yellow, numbers orange,
-    /// strings green, trailing `// 0x..` comments dim green-gray).
+    /// tree + view root and calls
+    /// [`render_code_scoped`](crate::generator::render_code_scoped) with the
+    /// persisted [`CodeFormat`]/[`CodeScope`] (the C++ `fmtCombo`/`scopeCombo`),
+    /// the document's [`TypeAliases`](crate::generator::TypeAliases) (the per-kind
+    /// display-name overrides), and the persisted `generatorAsserts` flag — the
+    /// same dispatch the C++ live view uses (main.cpp:5469-5477). The output is
+    /// split into lines and rendered with a muted, right-aligned line-number gutter
+    /// plus per-line One Dark syntax highlighting (keywords magenta, types yellow,
+    /// numbers orange, strings green, trailing `// 0x..` comments dim green-gray).
     ///
     /// When there is no struct root (a fresh/empty document) the generator
     /// returns an empty string; we show a centered muted placeholder instead.
@@ -891,7 +1072,14 @@ impl DocumentArea {
         } else {
             Some(aliases)
         };
-        let source = render_cpp_tree(tree, root, aliases, /* emit_asserts */ false);
+        let source = generator::render_code_scoped(
+            self.code_format,
+            self.code_scope,
+            tree,
+            root,
+            aliases,
+            self.generator_asserts,
+        );
 
         // Empty (no struct root / non-struct view) → graceful placeholder.
         if source.trim().is_empty() {
@@ -1707,5 +1895,26 @@ mod tests {
         // No source → just the kind label (no trailing ": ").
         let none = DataSource::none();
         assert_eq!(source_status_label(&none), SourceKind::None.label());
+    }
+
+    /// The code-view selector option lists (`fmtCombo`/`scopeCombo` items) must be
+    /// in `enum class` discriminant order so a clicked item's
+    /// [`DocAreaEvent::CodeOptionsChanged`] index round-trips through
+    /// `CodeFormat::from_index`/`CodeScope::from_index` to the same enum value
+    /// (the persisted-index contract; main.cpp:2413-2415/2439-2441).
+    #[test]
+    fn code_selector_lists_match_enum_discriminant_order() {
+        use crate::generator::{CodeFormat, CodeScope};
+        for (i, &fmt) in super::CODE_FORMATS.iter().enumerate() {
+            assert_eq!(fmt as i32, i as i32, "fmt list out of enum order at {i}");
+            assert_eq!(CodeFormat::from_index(i as i32), fmt);
+        }
+        for (i, &scope) in super::CODE_SCOPES.iter().enumerate() {
+            assert_eq!(
+                scope as i32, i as i32,
+                "scope list out of enum order at {i}"
+            );
+            assert_eq!(CodeScope::from_index(i as i32), scope);
+        }
     }
 }

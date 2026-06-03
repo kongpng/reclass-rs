@@ -20,6 +20,23 @@ pub enum CodeFormat {
     PythonCtypes,
 }
 
+impl CodeFormat {
+    /// Decode a persisted index (the C++ `codeFormat` QSettings int → `fmtCombo`
+    /// current index; main.cpp:2415/5454). Out-of-range values fall back to the
+    /// default ([`CodeFormat::CppHeader`], index 0), matching `QComboBox`'s
+    /// clamp-to-valid behaviour for `setCurrentIndex`.
+    pub fn from_index(idx: i32) -> CodeFormat {
+        match idx {
+            0 => CodeFormat::CppHeader,
+            1 => CodeFormat::RustStruct,
+            2 => CodeFormat::DefineOffsets,
+            3 => CodeFormat::CSharpStruct,
+            4 => CodeFormat::PythonCtypes,
+            _ => CodeFormat::CppHeader,
+        }
+    }
+}
+
 /// `enum class CodeScope : int` (`generator.h:20-25`).
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -30,6 +47,20 @@ pub enum CodeScope {
     WithChildren,
     /// all root-level structs.
     FullSdk,
+}
+
+impl CodeScope {
+    /// Decode a persisted index (the C++ `codeScope` QSettings int → `scopeCombo`
+    /// current index; main.cpp:2441/5456). Out-of-range values fall back to the
+    /// default ([`CodeScope::Current`], index 0).
+    pub fn from_index(idx: i32) -> CodeScope {
+        match idx {
+            0 => CodeScope::Current,
+            1 => CodeScope::WithChildren,
+            2 => CodeScope::FullSdk,
+            _ => CodeScope::Current,
+        }
+    }
 }
 
 /// Per-`NodeKind` display-name overrides passed to the renderers.

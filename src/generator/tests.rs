@@ -2075,3 +2075,72 @@ fn scoped_honors_every_format() {
     );
     assert!(def.contains("#define"));
 }
+
+// ── CodeFormat/CodeScope index decode (the C++ `codeFormat`/`codeScope`
+//    QSettings int → combo current index; main.cpp:2415/2441/5454/5456) ──
+
+#[test]
+fn code_format_from_index_round_trips_enum_order() {
+    // Each in-range index maps to its enum discriminant (generator.h order).
+    assert_eq!(CodeFormat::from_index(0), CodeFormat::CppHeader);
+    assert_eq!(CodeFormat::from_index(1), CodeFormat::RustStruct);
+    assert_eq!(CodeFormat::from_index(2), CodeFormat::DefineOffsets);
+    assert_eq!(CodeFormat::from_index(3), CodeFormat::CSharpStruct);
+    assert_eq!(CodeFormat::from_index(4), CodeFormat::PythonCtypes);
+    // `as i32` is the inverse of `from_index`.
+    for (i, &f) in [
+        CodeFormat::CppHeader,
+        CodeFormat::RustStruct,
+        CodeFormat::DefineOffsets,
+        CodeFormat::CSharpStruct,
+        CodeFormat::PythonCtypes,
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(f as i32, i as i32);
+        assert_eq!(CodeFormat::from_index(f as i32), f);
+    }
+}
+
+#[test]
+fn code_format_from_index_clamps_out_of_range_to_default() {
+    assert_eq!(CodeFormat::from_index(-1), CodeFormat::CppHeader);
+    assert_eq!(CodeFormat::from_index(5), CodeFormat::CppHeader);
+    assert_eq!(CodeFormat::from_index(9999), CodeFormat::CppHeader);
+}
+
+#[test]
+fn code_scope_from_index_round_trips_enum_order() {
+    assert_eq!(CodeScope::from_index(0), CodeScope::Current);
+    assert_eq!(CodeScope::from_index(1), CodeScope::WithChildren);
+    assert_eq!(CodeScope::from_index(2), CodeScope::FullSdk);
+    for (i, &s) in [
+        CodeScope::Current,
+        CodeScope::WithChildren,
+        CodeScope::FullSdk,
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(s as i32, i as i32);
+        assert_eq!(CodeScope::from_index(s as i32), s);
+    }
+}
+
+#[test]
+fn code_scope_from_index_clamps_out_of_range_to_default() {
+    assert_eq!(CodeScope::from_index(-1), CodeScope::Current);
+    assert_eq!(CodeScope::from_index(3), CodeScope::Current);
+}
+
+#[test]
+fn code_format_file_filter_matches_each_format() {
+    // The C++ `codeFormatFileFilter` strings (generator.cpp:1419-1428) — used by
+    // the export save-dialog filter (window.rs `ExportKind::file_filter`).
+    assert!(code_format_file_filter(CodeFormat::CppHeader).contains("*.h"));
+    assert!(code_format_file_filter(CodeFormat::RustStruct).contains("*.rs"));
+    assert!(code_format_file_filter(CodeFormat::DefineOffsets).contains("*.h"));
+    assert!(code_format_file_filter(CodeFormat::CSharpStruct).contains("*.cs"));
+    assert!(code_format_file_filter(CodeFormat::PythonCtypes).contains("*.py"));
+}

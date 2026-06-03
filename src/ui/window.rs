@@ -200,6 +200,12 @@ mod settings_keys {
     pub const AUTO_START_MCP: &str = "autoStartMcp";
     pub const BRACE_WRAP: &str = "braceWrap";
     pub const GENERATOR_ASSERTS: &str = "generatorAsserts";
+    /// The code-view output format index (the C++ `codeFormat`; main.cpp:2415).
+    /// Stored as the `CodeFormat` enum discriminant; default `0` (C++ header).
+    pub const CODE_FORMAT: &str = "codeFormat";
+    /// The code-view scope index (the C++ `codeScope`; main.cpp:2441). Stored as
+    /// the `CodeScope` enum discriminant; default `0` (Current struct).
+    pub const CODE_SCOPE: &str = "codeScope";
     /// Title-case (vs Title-Case) for the menu-bar top-level titles (the C++
     /// `menuBarTitleCase`; main.cpp:988). Default `false` → "Title Case".
     pub const MENU_BAR_TITLE_CASE: &str = "menuBarTitleCase";
@@ -577,24 +583,47 @@ impl ExportKind {
         }
     }
 
-    /// Render the active document's tree to this format. `view_root == 0` exports
-    /// **all** top-level structs; a specific view root exports that struct + its
-    /// reachable structs (`*_tree`). Returns `None` when nothing was produced.
-    fn render(self, tree: &crate::core::NodeTree, view_root: u64) -> Option<String> {
-        use crate::generator as g;
-        let text = match (self, view_root) {
-            (ExportKind::Cpp, 0) => g::render_cpp_all(tree, None, false),
-            (ExportKind::Cpp, r) => g::render_cpp_tree(tree, r, None, false),
-            (ExportKind::Rust, 0) => g::render_rust_all(tree, None, false),
-            (ExportKind::Rust, r) => g::render_rust_tree(tree, r, None, false),
-            (ExportKind::Defines, 0) => g::render_defines_all(tree),
-            (ExportKind::Defines, r) => g::render_defines_tree(tree, r),
-            (ExportKind::CSharp, 0) => g::render_csharp_all(tree, None, false),
-            (ExportKind::CSharp, r) => g::render_csharp_tree(tree, r, None, false),
-            (ExportKind::Python, 0) => g::render_python_all(tree),
-            (ExportKind::Python, r) => g::render_python_tree(tree, r),
-            (ExportKind::Xml, _) => return Self::render_xml(tree),
+    /// The [`CodeFormat`](crate::generator::CodeFormat) this code export maps to,
+    /// or `None` for the ReClass-XML export (which goes through the importer's
+    /// file exporter, not the generator).
+    fn code_format(self) -> Option<crate::generator::CodeFormat> {
+        use crate::generator::CodeFormat;
+        Some(match self {
+            ExportKind::Cpp => CodeFormat::CppHeader,
+            ExportKind::Rust => CodeFormat::RustStruct,
+            ExportKind::Defines => CodeFormat::DefineOffsets,
+            ExportKind::CSharp => CodeFormat::CSharpStruct,
+            ExportKind::Python => CodeFormat::PythonCtypes,
+            ExportKind::Xml => return None,
+        })
+    }
+
+    /// The save-file dialog filter for this export (the C++
+    /// `codeFormatFileFilter(fmt)`; main.cpp:5758). XML uses a fixed ReClass-XML
+    /// filter; everything else routes through
+    /// [`code_format_file_filter`](crate::generator::code_format_file_filter).
+    fn file_filter(self) -> &'static str {
+        match self.code_format() {
+            Some(fmt) => crate::generator::code_format_file_filter(fmt),
+            None => "ReClass XML (*.xml);;All Files (*)",
+        }
+    }
+
+    /// Render the active document's tree to this format. Mirrors the C++
+    /// `exportToFile` (main.cpp:5752-5774), which always calls `renderCodeAll`
+    /// (the **full SDK** — every root struct, ignoring the current view root) with
+    /// the document's `typeAliases` and the persisted `generatorAsserts` flag.
+    /// Returns `None` when nothing was produced.
+    fn render(
+        self,
+        tree: &crate::core::NodeTree,
+        aliases: Option<&crate::generator::TypeAliases>,
+        emit_asserts: bool,
+    ) -> Option<String> {
+        let Some(fmt) = self.code_format() else {
+            return Self::render_xml(tree);
         };
+        let text = crate::generator::render_code_all(fmt, tree, aliases, emit_asserts);
         if text.trim().is_empty() {
             None
         } else {
@@ -952,6 +981,23 @@ impl MainWindow {
                 s.get_bool(settings_keys::SHOW_ICON, false),
             )
         };
+        // Code-view generator selectors (the C++ `codeFormat`/`codeScope`; both
+        // default index 0; main.cpp:2415/2441). Decoded into the generator enums.
+        let (code_format, code_scope) = {
+            let s = settings.borrow();
+            let fmt_idx = s
+                .get(settings_keys::CODE_FORMAT)
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(0);
+            let scope_idx = s
+                .get(settings_keys::CODE_SCOPE)
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(0);
+            (
+                crate::generator::CodeFormat::from_index(fmt_idx),
+                crate::generator::CodeScope::from_index(scope_idx),
+            )
+        };
 
         // Seed window state with the initial document tab (the C++ "never leave a
         // blank window"; app-shell §8 step 9). The center `DocumentArea` already
@@ -991,6 +1037,14 @@ impl MainWindow {
             },
         )
         .detach();
+
+        // Seed the code-view generator selectors from the persisted settings (the
+        // C++ `fmtCombo`/`scopeCombo` `setCurrentIndex(value(...))`; main.cpp:2415/
+        // 2441) plus the `generatorAsserts` flag (main.cpp:5453) so the live code
+        // view honors all three from the first paint.
+        document_area.update(cx, |area, cx| {
+            area.set_generator_options(code_format, code_scope, generator_asserts, cx);
+        });
 
         // ── Wire workspace quick-navigation (app-shell §10 "Open in Current Tab"). ──
         cx.subscribe_in(
@@ -2909,6 +2963,12 @@ impl MainWindow {
         self.settings
             .borrow_mut()
             .set_bool(settings_keys::GENERATOR_ASSERTS, self.generator_asserts);
+        // Reflect the new assert flag into the code-view so the live rendered pane
+        // updates without a tab switch (the C++ `refreshAllRendered`; main.cpp:2451).
+        let emit_asserts = self.generator_asserts;
+        self.document_area.update(cx, |area, cx| {
+            area.set_generator_asserts(emit_asserts, cx);
+        });
         // Push refresh + brace-wrap into every open controller.
         let refresh_ms = self.refresh_ms;
         let brace_wrap = self.brace_wrap;
@@ -3581,22 +3641,38 @@ impl MainWindow {
 
     /// File ▸ Export ▸ … — render the active document's tree to the chosen code
     /// format ([`crate::generator`] / the XML exporter) and prompt a save path.
-    /// Uses the editor's **view root** as the root struct (the C++ "export the
-    /// open struct"); a `0` view root exports every top-level struct (`*_all`).
+    /// Mirrors the C++ `exportToFile` (main.cpp:5752-5774): it exports the **full
+    /// SDK** (`renderCodeAll` — every root struct, ignoring the current view root)
+    /// with the document's `typeAliases` and the persisted `generatorAsserts`
+    /// flag, and offers the format's [`code_format_file_filter`] in the save
+    /// dialog (GPUI's `prompt_for_new_path` has no filter slot, so the filter
+    /// drives only the suggested extension).
     fn export_code(&mut self, kind: ExportKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             self.notify("No document to export.", window, cx);
             return;
         };
+        let emit_asserts = self.generator_asserts;
         let rendered = {
             let ed = editor.read(cx);
             let ctrl = ed.controller();
-            kind.render(ctrl.tree(), ctrl.view_root_id())
+            // The document's per-kind name overrides (the C++ `tab->doc->typeAliases`,
+            // passed as `nullptr` when empty; main.cpp:5761-5762).
+            let aliases = &ctrl.document().type_aliases;
+            let aliases = if aliases.is_empty() {
+                None
+            } else {
+                Some(aliases)
+            };
+            kind.render(ctrl.tree(), aliases, emit_asserts)
         };
         let Some(text) = rendered else {
             self.notify("Nothing to export from this document.", window, cx);
             return;
         };
+        // The C++ passes `codeFormatFileFilter(fmt)` to the save dialog; GPUI has
+        // no filter parameter, so we surface it through the suggested extension.
+        let _filter = kind.file_filter();
         let suggested = format!("export{}", kind.extension());
         let dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
@@ -4818,6 +4894,17 @@ impl MainWindow {
             }
             DocAreaEvent::ViewModeChanged(id, mode) => {
                 self.state.set_view_mode(id, mode);
+            }
+            DocAreaEvent::CodeOptionsChanged {
+                format_idx,
+                scope_idx,
+            } => {
+                // Persist the selector indices (the C++ `fmtCombo`/`scopeCombo`
+                // `currentIndexChanged` → `setValue("codeFormat"/"codeScope")`;
+                // main.cpp:2460/2469).
+                let mut s = self.settings.borrow_mut();
+                s.set(settings_keys::CODE_FORMAT, &format_idx.to_string());
+                s.set(settings_keys::CODE_SCOPE, &scope_idx.to_string());
             }
         }
         cx.notify();
@@ -7477,6 +7564,147 @@ mod tests {
         assert_eq!(ExportKind::CSharp.extension(), ".cs");
         assert_eq!(ExportKind::Python.extension(), ".py");
         assert_eq!(ExportKind::Xml.extension(), ".xml");
+    }
+
+    /// Build a tree with TWO independent top-level structs (no reference between
+    /// them) so a `*_tree`/view-root export would only emit ONE while the
+    /// full-SDK export emits BOTH — the property the C++ `exportToFile`
+    /// (`renderCodeAll`; main.cpp:5764) guarantees.
+    fn two_independent_structs() -> (crate::core::NodeTree, u64) {
+        use crate::core::{Node, NodeKind, NodeTree};
+        let mut tree = NodeTree::new();
+        let ai = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "StructA".into(),
+            struct_type_name: "StructA".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let a_id = tree.nodes[ai].id;
+        tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: "valueA".into(),
+            parent_id: a_id,
+            offset: 0,
+            ..Node::default()
+        });
+        let bi = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "StructB".into(),
+            struct_type_name: "StructB".into(),
+            parent_id: 0,
+            offset: 0x100,
+            ..Node::default()
+        });
+        let b_id = tree.nodes[bi].id;
+        tree.add_node(Node {
+            kind: NodeKind::UInt64,
+            name: "valueB".into(),
+            parent_id: b_id,
+            offset: 0,
+            ..Node::default()
+        });
+        (tree, a_id)
+    }
+
+    #[test]
+    fn export_code_format_maps_kind_to_generator_format() {
+        use crate::generator::CodeFormat;
+        assert_eq!(ExportKind::Cpp.code_format(), Some(CodeFormat::CppHeader));
+        assert_eq!(ExportKind::Rust.code_format(), Some(CodeFormat::RustStruct));
+        assert_eq!(
+            ExportKind::Defines.code_format(),
+            Some(CodeFormat::DefineOffsets)
+        );
+        assert_eq!(
+            ExportKind::CSharp.code_format(),
+            Some(CodeFormat::CSharpStruct)
+        );
+        assert_eq!(
+            ExportKind::Python.code_format(),
+            Some(CodeFormat::PythonCtypes)
+        );
+        // XML is not a generator format (routes through the importer's exporter).
+        assert_eq!(ExportKind::Xml.code_format(), None);
+    }
+
+    #[test]
+    fn export_file_filter_matches_code_format_file_filter() {
+        // Each code export's filter mirrors the generator's per-format filter
+        // (the C++ `codeFormatFileFilter`; main.cpp:5758). XML uses its own.
+        for (kind, fmt) in [
+            (ExportKind::Cpp, crate::generator::CodeFormat::CppHeader),
+            (ExportKind::Rust, crate::generator::CodeFormat::RustStruct),
+            (
+                ExportKind::Defines,
+                crate::generator::CodeFormat::DefineOffsets,
+            ),
+            (
+                ExportKind::CSharp,
+                crate::generator::CodeFormat::CSharpStruct,
+            ),
+            (
+                ExportKind::Python,
+                crate::generator::CodeFormat::PythonCtypes,
+            ),
+        ] {
+            assert_eq!(
+                kind.file_filter(),
+                crate::generator::code_format_file_filter(fmt)
+            );
+        }
+        assert!(ExportKind::Xml.file_filter().to_lowercase().contains("xml"));
+    }
+
+    #[test]
+    fn export_renders_full_sdk_regardless_of_view_root() {
+        // The C++ export always calls renderCodeAll — every root struct, ignoring
+        // the open view root. So even with a non-zero `a_id` selected, BOTH
+        // structs must appear in the output.
+        let (tree, _a_id) = two_independent_structs();
+        let out = ExportKind::Cpp
+            .render(&tree, None, false)
+            .expect("non-empty C++ export");
+        assert!(out.contains("struct StructA"), "missing StructA:\n{out}");
+        assert!(out.contains("struct StructB"), "missing StructB:\n{out}");
+    }
+
+    #[test]
+    fn export_threads_aliases_and_asserts() {
+        use crate::core::NodeKind;
+        use crate::generator::TypeAliases;
+        let (tree, _a_id) = two_independent_structs();
+
+        // emit_asserts=false → no static_assert; true → present (the persisted
+        // generatorAsserts flag, threaded through the export; main.cpp:5763).
+        let no_assert = ExportKind::Cpp.render(&tree, None, false).unwrap();
+        assert!(!no_assert.contains("static_assert"));
+        let with_assert = ExportKind::Cpp.render(&tree, None, true).unwrap();
+        assert!(with_assert.contains("static_assert"));
+
+        // type_aliases override the rendered type name (the C++ tab->doc->typeAliases
+        // passed to renderCodeAll; main.cpp:5761-5764).
+        let mut aliases: TypeAliases = TypeAliases::new();
+        aliases.insert(NodeKind::Int32, "LONG".into());
+        let aliased = ExportKind::Cpp
+            .render(&tree, Some(&aliases), false)
+            .unwrap();
+        assert!(aliased.contains("LONG"), "alias not applied:\n{aliased}");
+    }
+
+    #[test]
+    fn export_no_struct_tree_emits_header_but_no_structs() {
+        // The C++ `renderCodeAll` (and thus the export) emits the `#pragma once`
+        // header even when there are no structs (generator: full_sdk_no_structs),
+        // so the C++-header export is non-empty but struct-free — NOT `None`.
+        use crate::core::NodeTree;
+        let tree = NodeTree::new();
+        let out = ExportKind::Cpp
+            .render(&tree, None, false)
+            .expect("C++ header export is the bare header, not None");
+        assert!(out.contains("#pragma once"));
+        assert!(!out.contains("struct "));
     }
 
     #[test]
