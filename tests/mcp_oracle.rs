@@ -221,6 +221,25 @@ fn multi_client_notification_broadcast() {
 }
 
 #[test]
+fn evidence_notification_broadcast_uri() {
+    // `notifyEvidenceChanged()` (`mcp_bridge.cpp:4270-4274`) broadcasts a
+    // `notifications/resources/updated` with uri == "project://evidence".
+    let (mut bridge, name) = start_bridge();
+    let c1 = make_client(&name);
+    init_rpc(&c1);
+    std::thread::sleep(Duration::from_millis(100));
+
+    bridge.notify_evidence_changed();
+
+    let l1 = drain(&c1, 300);
+    assert!(!l1.is_empty());
+    let last = l1.last().unwrap();
+    assert_eq!(last["method"], "notifications/resources/updated");
+    assert_eq!(last["params"]["uri"], "project://evidence");
+    bridge.stop();
+}
+
+#[test]
 fn multi_client_serial_requests() {
     let (mut bridge, name) = start_bridge();
     let c1 = make_client(&name);

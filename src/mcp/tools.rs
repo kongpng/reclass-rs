@@ -163,6 +163,15 @@ pub fn tool_project_state(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
         state.insert("undoAvailable".into(), json!(tab.can_undo()));
         state.insert("redoAvailable".into(), json!(tab.can_redo()));
         state.insert("statusText".into(), json!(app_status));
+        // Evidence summary (`mcp_bridge.cpp:1488-1492`). C++ uses int QVector::size().
+        state.insert(
+            "evidence".into(),
+            json!({
+                "eventCount": tree.evidence_events.len() as i64,
+                "hypothesisCount": tree.evidence_hypotheses.len() as i64,
+                "proposalCount": tree.evidence_proposals.len() as i64,
+            }),
+        );
 
         if include_tree {
             // build child map once
@@ -547,6 +556,19 @@ pub fn tool_tree_apply(args: &Map<String, Value>, host: &mut dyn McpHost) -> Val
                         applied += 1;
                     } else {
                         skip(&mut skipped, i, "toggle_relative", op_obj, &placeholders);
+                    }
+                }
+                "change_comment" => {
+                    if let Some((tidx, node_id)) = lookup(tab, op_obj, "nodeId", &placeholders) {
+                        let old = tab.data.tree.nodes[tidx].comment.clone();
+                        tab.push_command(Command::ChangeComment {
+                            node_id,
+                            old_comment: old,
+                            new_comment: arg_str(op_obj, "comment").trim().to_string(),
+                        });
+                        applied += 1;
+                    } else {
+                        skip(&mut skipped, i, "change_comment", op_obj, &placeholders);
                     }
                 }
                 "group_into_union" => {
@@ -2797,6 +2819,10 @@ mod tests {
         assert_eq!(root["name"], "Root");
         assert_eq!(root["childCount"], 1);
         assert!(root.get("computedSize").is_some());
+        // Evidence summary defaults to 0 on a fresh tree (`mcp_bridge.cpp:1488-1492`).
+        assert_eq!(state["evidence"]["eventCount"], 0);
+        assert_eq!(state["evidence"]["hypothesisCount"], 0);
+        assert_eq!(state["evidence"]["proposalCount"], 0);
     }
 
     #[test]
@@ -2913,6 +2939,46 @@ mod tests {
             let idx = t.data.tree.index_of_id(id);
             assert_eq!(t.data.tree.nodes[idx as usize].name, "health");
             assert_eq!(t.data.tree.nodes[idx as usize].kind, NodeKind::Int32);
+        });
+    }
+
+    #[test]
+    fn tree_apply_change_comment_roundtrip() {
+        // change_comment op (`mcp_bridge.cpp:1887-1899`): trims, pushes
+        // ChangeComment, and a single undo reverts it.
+        let mut tab = TabState::new();
+        let i = tab.data.tree.add_node(Node {
+            kind: NodeKind::Hex64,
+            name: "field".into(),
+            ..Node::default()
+        });
+        let id = tab.data.tree.nodes[i].id;
+        let mut h = TestHost::with_tab(tab);
+        let ops = json!({
+            "operations": [
+                {"op": "change_comment", "nodeId": id.to_string(), "comment": "  IDA refs: sub_140001000  "}
+            ]
+        });
+        let r = tool_tree_apply(&map(ops), &mut h);
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Applied 1 operation"));
+        assert!(r.get("isError").is_none());
+        // trimmed comment applied
+        h.with_tab(0, &mut |t| {
+            let idx = t.data.tree.index_of_id(id);
+            assert_eq!(
+                t.data.tree.nodes[idx as usize].comment,
+                "IDA refs: sub_140001000"
+            );
+            assert!(t.can_undo());
+        });
+        // single undo reverts the comment back to empty
+        h.with_tab(0, &mut |t| t.undo());
+        h.with_tab(0, &mut |t| {
+            let idx = t.data.tree.index_of_id(id);
+            assert_eq!(t.data.tree.nodes[idx as usize].comment, "");
         });
     }
 

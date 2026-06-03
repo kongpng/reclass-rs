@@ -30,7 +30,7 @@ pub use dispatch::{
 };
 pub use host::{McpHost, SavedSource, TabData, TabState, TestHost, UndoStack};
 pub use schemas::{handle_tools_list, tool_descriptors, tool_names};
-pub use transport::{Event, K_MAX_READ_BUFFER, URI_DATA, URI_TREE};
+pub use transport::{Event, K_MAX_READ_BUFFER, URI_DATA, URI_EVIDENCE, URI_TREE};
 pub use wire::{
     err_reply, make_text_result, ok_reply, parse_integer, qt_number_double, qt_pretty,
     resolve_placeholder,
@@ -189,6 +189,16 @@ impl McpBridge {
     pub fn notify_data_changed(&mut self) {
         if let Some(rb) = &self.inner {
             let _ = rb.event_tx.send(transport::Event::Notify { uri: URI_DATA });
+        }
+    }
+
+    /// `notifyEvidenceChanged()` (`mcp_bridge.cpp:4270-4274`) — broadcast a
+    /// `project://evidence` update to initialized clients (no-op if not running).
+    pub fn notify_evidence_changed(&mut self) {
+        if let Some(rb) = &self.inner {
+            let _ = rb
+                .event_tx
+                .send(transport::Event::Notify { uri: URI_EVIDENCE });
         }
     }
 }

@@ -34,6 +34,7 @@ pub const K_MAX_READ_BUFFER: usize = 10 * 1024 * 1024;
 const NOTIF_METHOD: &str = "notifications/resources/updated";
 pub const URI_TREE: &str = "project://tree";
 pub const URI_DATA: &str = "project://data";
+pub const URI_EVIDENCE: &str = "project://evidence";
 
 /// Dense client id handed out on accept.
 pub type ClientId = u64;
