@@ -681,7 +681,7 @@ impl TypeModel {
         let mut scored: Vec<(i32, usize, Vec<usize>)> = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
             let mut pos = Vec::new();
-            let s = super::fuzzy::fuzzy_score(query, &e.display_name, Some(&mut pos));
+            let s = super::fuzzy::source_score(query, &e.display_name, Some(&mut pos));
             if s > 0 {
                 scored.push((s, i, pos));
             }
@@ -2293,6 +2293,42 @@ mod tests {
         assert_eq!(model.rows()[0].entry.display_name, "int32_t");
         // Match positions are populated for highlight painting.
         assert!(!model.rows()[0].match_positions.is_empty());
+    }
+
+    #[test]
+    fn filter_ranks_camelcase_boundary_above_mid_word() {
+        // The filtered list uses the branch-cap-4 recursive scorer
+        // (`fuzzy::source_score`, byte-exact to typeselectorpopup.cpp:149
+        // `fuzzyScore`). A CamelCase-boundary hit earns bonus 8; a mid-word
+        // hit earns bonus 1, so for equal-length names the boundary match
+        // ranks first. Names are equal length here so the tightness/exact
+        // bonuses cancel and only the per-char boundary bonus decides order.
+        let entries = vec![
+            // "a" hits the mid-word lowercase 'a' (index 3, prev 'o') → bonus 1.
+            TypeEntry::composite(1, "Fooabc", "struct", 16),
+            // "a" hits the upper 'A' at a CamelCase boundary (index 3, prev
+            // lower 'o') → bonus 8.
+            TypeEntry::composite(2, "FooAbc", "struct", 16),
+        ];
+        let mut model = TypeModel::new(entries);
+        model.apply_filter("a");
+        let names: Vec<&str> = model
+            .rows()
+            .iter()
+            .map(|r| r.entry.display_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["FooAbc", "Fooabc"],
+            "CamelCase-boundary match should outrank the mid-word match"
+        );
+        // And cross-check the underlying scorer directly: boundary > mid-word.
+        let boundary = super::super::fuzzy::source_score("a", "FooAbc", None);
+        let mid_word = super::super::fuzzy::source_score("a", "Fooabc", None);
+        assert!(
+            boundary > mid_word,
+            "boundary {boundary} should beat mid-word {mid_word}"
+        );
     }
 
     #[test]
