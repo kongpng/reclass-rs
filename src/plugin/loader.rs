@@ -385,7 +385,9 @@ fn provider_spec_from_module(module: PluginModRef) -> ProviderSpec {
     let spec = ProviderSpec::new(
         move |target: &str| (can_handle_fn)(RString::from(target)),
         move |target: &str| match (create_fn)(RString::from(target)) {
-            RResult::ROk(to) => Ok(Arc::new(LoadedProvider { inner: to }) as SharedProvider),
+            RResult::ROk(to) => Ok(Arc::new(LoadedProvider {
+                inner: std::sync::Mutex::new(to),
+            }) as SharedProvider),
             RResult::RErr(e) => Err(e.into()),
         },
     );
@@ -448,7 +450,11 @@ fn to_abi_dialog_result(r: DialogResult) -> AbiDialogResult {
 /// direct native vtable call into the plugin (no per-call marshalling beyond the
 /// `RSliceMut` view).
 struct LoadedProvider {
-    inner: Provider_TO_TO<'static, RBox<()>>,
+    // The ABI `Provider_TO::write` is `&mut self`, but the host `Provider::write`
+    // is `&self` (interior mutability — PORTING_providers §5), so the native
+    // handle lives behind a `Mutex` and every call locks it. (This crate is off
+    // by default; the lock is uncontended in practice.)
+    inner: std::sync::Mutex<Provider_TO_TO<'static, RBox<()>>>,
 }
 
 unsafe impl Send for LoadedProvider {}
@@ -456,34 +462,42 @@ unsafe impl Sync for LoadedProvider {}
 
 impl Provider for LoadedProvider {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
-        self.inner.read(addr, RSliceMut::from_mut_slice(buf))
+        self.inner
+            .lock()
+            .unwrap()
+            .read(addr, RSliceMut::from_mut_slice(buf))
     }
     fn size(&self) -> i32 {
-        self.inner.size()
+        self.inner.lock().unwrap().size()
     }
     fn name(&self) -> String {
-        self.inner.name().into()
+        self.inner.lock().unwrap().name().into()
     }
     fn kind(&self) -> String {
-        self.inner.kind().into()
+        self.inner.lock().unwrap().kind().into()
     }
     fn base(&self) -> u64 {
-        self.inner.base()
+        self.inner.lock().unwrap().base()
     }
     fn pointer_size(&self) -> i32 {
-        self.inner.pointer_size()
+        self.inner.lock().unwrap().pointer_size()
     }
     fn is_live(&self) -> bool {
-        self.inner.is_live()
+        self.inner.lock().unwrap().is_live()
     }
     fn is_writable(&self) -> bool {
-        self.inner.is_writable()
+        self.inner.lock().unwrap().is_writable()
     }
-    fn write(&mut self, addr: u64, data: &[u8]) -> bool {
-        self.inner.write(addr, RSlice::from_slice(data))
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .write(addr, RSlice::from_slice(data))
     }
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         self.inner
+            .lock()
+            .unwrap()
             .enumerate_regions()
             .into_iter()
             .map(|r| MemoryRegion {

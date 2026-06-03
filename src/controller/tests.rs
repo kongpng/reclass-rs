@@ -2401,7 +2401,7 @@ fn all_zero_page0_discarded() {
 
 #[test]
 fn snapshot_provider_permanent_set() {
-    let mut sp = SnapshotProvider::new(None, super::PageMap::new(), 0);
+    let sp = SnapshotProvider::new(None, super::PageMap::new(), 0);
     assert!(!sp.is_permanent(0x1000));
     sp.mark_permanent(0x1000 + 17);
     assert!(sp.is_permanent(0x1000));
@@ -2416,7 +2416,7 @@ fn snapshot_provider_merge_keeps_existing() {
     let mut initial = super::PageMap::new();
     initial.insert(0x0000, vec![0xAA; 4096]);
     initial.insert(0x1000, vec![0xBB; 4096]);
-    let mut sp = SnapshotProvider::new(None, initial, 8192);
+    let sp = SnapshotProvider::new(None, initial, 8192);
     let mut fresh = super::PageMap::new();
     fresh.insert(0x1000, vec![0xCC; 4096]);
     sp.merge_pages(&fresh, 8192);
@@ -2425,6 +2425,133 @@ fn snapshot_provider_merge_keeps_existing() {
     assert_eq!(buf[0], 0xAA);
     assert!(sp.read(0x1000, &mut buf));
     assert_eq!(buf[0], 0xCC);
+}
+
+// ── Write-through with a live snapshot (interior-mutable provider) ──
+
+/// A live + writable provider over a shared `Mutex<Vec<u8>>` — enough for the
+/// controller to build a snapshot (`is_live()`) and accept writes
+/// (`is_writable()`). Writes go through `&self` (interior mutability), so a
+/// snapshot clone of the same `Arc` does not block the write.
+struct LiveWritableProvider {
+    data: Mutex<Vec<u8>>,
+    base: u64,
+}
+impl LiveWritableProvider {
+    fn new(base: u64, len: usize) -> Self {
+        LiveWritableProvider {
+            data: Mutex::new(vec![0u8; len]),
+            base,
+        }
+    }
+    fn byte_at(&self, addr: u64) -> u8 {
+        self.data.lock().unwrap()[(addr - self.base) as usize]
+    }
+}
+impl Provider for LiveWritableProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        let d = self.data.lock().unwrap();
+        let start = match addr.checked_sub(self.base) {
+            Some(s) => s as usize,
+            None => return false,
+        };
+        if start + buf.len() > d.len() {
+            return false;
+        }
+        buf.copy_from_slice(&d[start..start + buf.len()]);
+        true
+    }
+    fn size(&self) -> i32 {
+        self.data.lock().unwrap().len() as i32
+    }
+    fn is_live(&self) -> bool {
+        true
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+    fn base(&self) -> u64 {
+        self.base
+    }
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
+        let mut d = self.data.lock().unwrap();
+        let start = match addr.checked_sub(self.base) {
+            Some(s) => s as usize,
+            None => return false,
+        };
+        if start + data.len() > d.len() {
+            return false;
+        }
+        d[start..start + data.len()].copy_from_slice(data);
+        true
+    }
+}
+
+/// Take a snapshot of a live provider, then write through the controller and
+/// assert the byte landed in the REAL provider — even though the snapshot holds
+/// a clone of the same `Arc<dyn Provider>` (the parity fix: `write(&self)` +
+/// real write-through, no more `Arc::get_mut` blocking on a shared handle).
+/// Ports the intent of the C++ `setNodeValue`/`writeBytes` write-through path
+/// while the snapshot is active.
+#[test]
+fn snapshot_write_through_lands_in_real_provider() {
+    const BASE: u64 = 0x1_0000;
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = BASE;
+    doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "T".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[0].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "v".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    });
+
+    let prov = Arc::new(LiveWritableProvider::new(BASE, 0x2000));
+    doc.provider = prov.clone();
+    let mut c = RcxController::new(doc);
+    c.set_refresh_interval(50);
+
+    // Drive a refresh tick → a snapshot is created holding a clone of `prov`.
+    assert!(c.pump_refresh(), "live provider should produce a read plan");
+    assert!(
+        c.snapshot_prov().is_some(),
+        "snapshot must exist after a tick"
+    );
+    assert!(
+        c.document().provider.is_writable(),
+        "real provider is writable"
+    );
+
+    // The Arc is shared (controller + snapshot + our `prov` clone), which the
+    // old `Arc::get_mut` path would have rejected.
+    assert!(Arc::strong_count(&prov) >= 2);
+
+    let addr = BASE + 0; // the u32 field
+    assert!(
+        c.write_memory(addr, &[0xDE, 0xAD, 0xBE, 0xEF]),
+        "write_memory must succeed through the snapshot"
+    );
+
+    // Landed in the REAL provider (write-through), not just the snapshot cache.
+    assert_eq!(prov.byte_at(addr), 0xDE);
+    assert_eq!(prov.byte_at(addr + 1), 0xAD);
+    assert_eq!(prov.byte_at(addr + 2), 0xBE);
+    assert_eq!(prov.byte_at(addr + 3), 0xEF);
+
+    // And the snapshot's cached page was patched, so compose reflects it.
+    let snap = c.snapshot_prov().unwrap();
+    let mut buf = [0u8; 4];
+    assert!(snap.read(addr, &mut buf));
+    assert_eq!(buf, [0xDE, 0xAD, 0xBE, 0xEF]);
 }
 
 #[test]

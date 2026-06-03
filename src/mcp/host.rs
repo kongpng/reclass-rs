@@ -380,14 +380,10 @@ fn apply_command(tab: &mut TabData, cmd: &Command, is_undo: bool) {
             new_bytes,
         } => {
             let bytes = if is_undo { old_bytes } else { new_bytes };
-            // The provider write goes through the Arc; obtain a mutable handle.
-            // At command-apply time the tab holds the sole owning Arc, so
-            // get_mut succeeds for the only writable in-scope provider
-            // (BufferProvider). If it is shared (read-only providers don't
-            // write), the write is a no-op — matching a non-writable provider.
-            if let Some(prov) = Arc::get_mut(&mut tab.provider) {
-                prov.write(*addr, bytes);
-            }
+            // `Provider::write` takes `&self` (interior mutability), so the write
+            // goes straight through the shared `Arc` even if it is cloned
+            // elsewhere; read-only providers reject it as a no-op.
+            tab.provider.write(*addr, bytes);
         }
     }
 }

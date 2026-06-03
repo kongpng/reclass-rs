@@ -1396,15 +1396,15 @@ impl RcxController {
     /// real provider. Mirrors the `m_snapshotProv ? ... : provider->writeBytes`
     /// branches in `applyCommand`/`setNodeValue`.
     fn write_through(&mut self, addr: u64, bytes: &[u8]) -> bool {
-        if let Some(snap) = self.snapshot.as_mut() {
-            // SnapshotProvider::write patches its own pages; the real
-            // write-through happens via the writable provider below.
-            let ok_real = write_provider(&mut self.doc.provider, addr, bytes);
-            // patch the snapshot pages too so compose reflects the change.
-            snap.patch_pages(addr, bytes);
-            ok_real
+        if let Some(snap) = self.snapshot.as_ref() {
+            // `SnapshotProvider::write` (now `&self`) does the real write-through
+            // to its `real` provider AND patches the cached pages on success, so
+            // a single call updates both — even though the snapshot holds a clone
+            // of the same `Arc<dyn Provider>` as `self.doc.provider` (interior
+            // mutability on the writable `BufferProvider`).
+            snap.write(addr, bytes)
         } else {
-            write_provider(&mut self.doc.provider, addr, bytes)
+            write_provider(&self.doc.provider, addr, bytes)
         }
     }
 
@@ -1421,19 +1421,17 @@ impl RcxController {
     }
 }
 
-/// Write through an `Arc<dyn Provider>`. Uses `Arc::get_mut` (unique handle —
-/// the headless write tests hold the only `Arc`); returns `false` when the
-/// `Arc` is shared (a snapshot/worker holds a clone) or the provider rejects
-/// the write. The C++ `shared_ptr` non-const `write` is faithfully reproduced
-/// for the unique-handle case that the tests exercise.
-fn write_provider(provider: &mut Arc<dyn Provider + Send + Sync>, addr: u64, bytes: &[u8]) -> bool {
+/// Write through an `Arc<dyn Provider>`. `Provider::write` now takes `&self`
+/// (interior mutability — PORTING_providers §5), so the write goes straight
+/// through the shared handle and succeeds even when a snapshot or refresh worker
+/// holds another clone of the same `Arc` — faithfully reproducing the C++
+/// `shared_ptr` non-const `write`. Gated by `is_writable()` (read-only providers
+/// reject the write as a no-op).
+fn write_provider(provider: &Arc<dyn Provider + Send + Sync>, addr: u64, bytes: &[u8]) -> bool {
     if !provider.is_writable() {
         return false;
     }
-    match Arc::get_mut(provider) {
-        Some(p) => p.write(addr, bytes),
-        None => false,
-    }
+    provider.write(addr, bytes)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

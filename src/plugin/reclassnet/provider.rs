@@ -293,7 +293,7 @@ impl Provider for RcNetProvider {
         }
     }
 
-    fn write(&mut self, addr: u64, data: &[u8]) -> bool {
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
         if self.handle.is_null() || data.is_empty() {
             return false;
         }
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn write_unsupported_when_fn_absent() {
         // The fake table has no WriteRemoteMemory → not writable, write fails.
-        let mut p = RcNetProvider::open(fake_table(), 1, "p", false).expect("open");
+        let p = RcNetProvider::open(fake_table(), 1, "p", false).expect("open");
         assert!(!p.is_writable());
         assert!(!p.write(0x10, &[1, 2, 3]));
     }
@@ -647,7 +647,7 @@ mod tests {
         // No section/module enumeration for this one.
         t.enumerate_sections_and_modules = None;
 
-        let mut p = RcNetProvider::open(t, 1, "p", false).expect("open");
+        let p = RcNetProvider::open(t, 1, "p", false).expect("open");
         assert!(p.is_writable());
         assert!(p.write(2, &[0xaa, 0xbb, 0xcc]));
         let mut buf = [0u8; 3];

@@ -105,7 +105,12 @@ pub trait Provider {
     fn size(&self) -> i32;
 
     // --- Optional overrides (defaults mirror the C++ virtual defaults) ---
-    fn write(&mut self, _addr: u64, _data: &[u8]) -> bool {
+    /// `write(addr, buf, len)` (`provider.h:47`). C++ is a non-const virtual; in
+    /// Rust it takes `&self` and the concrete writable sources use interior
+    /// mutability (see [`BufferProvider`](super::BufferProvider)), so the write
+    /// goes through a shared `Arc<dyn Provider>` even when a snapshot/worker
+    /// holds a clone (PORTING_providers §2.1 / §5).
+    fn write(&self, _addr: u64, _data: &[u8]) -> bool {
         false
     }
     fn is_writable(&self) -> bool {
@@ -224,8 +229,9 @@ pub trait Provider {
         buf
     }
 
-    /// `writeBytes(addr, d)` (`provider.h:150-152`).
-    fn write_bytes(&mut self, addr: u64, data: &[u8]) -> bool {
+    /// `writeBytes(addr, d)` (`provider.h:150-152`). Non-const in C++; `&self`
+    /// here (interior mutability — see [`write`](Provider::write)).
+    fn write_bytes(&self, addr: u64, data: &[u8]) -> bool {
         self.write(addr, data)
     }
 }
