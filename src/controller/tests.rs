@@ -2069,6 +2069,77 @@ fn document_load_non_json_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Port of the `loadData`/`selectSource("File")` parity assertions
+/// (`tests-catalog.md` § controller: "loadData creates valid provider … clears
+/// data path … resets snapshot"; C++ `RcxDocument::loadData(path)`,
+/// `controller.cpp:292`, which calls `undoStack.clear()` + emits
+/// `documentChanged`). The Rust undo stack lives on the controller, so
+/// [`RcxController::attach_data_file`] is the single entry point that clears
+/// undo, swaps the provider, zeroes the base, resets the snapshot, and notifies.
+#[test]
+fn attach_data_file_clears_undo_and_resets_state() {
+    let mut c = make_ctrl_zero();
+    // Give the controller undo history + a non-zero base + a stale snapshot so we
+    // can observe all four effects of attach_data_file.
+    let idx = find_idx(&c, "field_u32");
+    c.set_node_value(idx, 0, "0x11223344", false, 0);
+    assert!(c.undo_stack().can_undo(), "precondition: undo present");
+    c.document_mut().tree.base_address = 0xDEAD_0000;
+    c.pump_refresh(); // populate a snapshot to be torn down
+    assert!(
+        c.document().data_path.is_none(),
+        "precondition: no data path"
+    );
+
+    // A file whose hex region (offsets 9..16) is zero keeps compose's TypeHint
+    // pass off the typeinfer skeleton during the post-attach refresh.
+    let dir = std::env::temp_dir().join(format!("rcx_attach_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blob.bin");
+    let mut bytes = vec![0u8; 64];
+    bytes[0..4].copy_from_slice(&0x0BAD_F00Du32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    c.attach_data_file(&path);
+
+    // 1. undo stack cleared (mirrors undoStack.clear()).
+    assert_eq!(c.undo_stack().count(), 0, "undo entries cleared");
+    assert!(!c.undo_stack().can_undo(), "cannot undo after attach");
+    // 2. provider swapped to the file's bytes (not the old buffer).
+    assert_eq!(read_u32(&c, 0), 0x0BAD_F00D, "provider reads attached file");
+    assert_eq!(c.document().provider.name(), "blob.bin");
+    // 3. data path recorded; base zeroed (loadData sets tree.baseAddress = 0).
+    assert_eq!(c.document().data_path.as_deref(), Some(path.as_path()));
+    assert_eq!(c.document().tree.base_address, 0, "base reset to 0");
+    // 4. snapshot reset (no live in-flight read / stale snapshot left over).
+    assert!(c.snapshot_prov().is_none(), "snapshot torn down");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing path leaves the provider/base untouched: the document layer
+/// (`RcxDocument::loadData`, `controller.cpp:294`) returns early when the file
+/// can't be opened, so the provider swap never happens. The controller wrapper
+/// follows the spec'd order (clear undo, then load), so undo is still cleared
+/// and the snapshot reset even though the swap is skipped — the visible effect
+/// (no new provider, no data path) matches C++.
+#[test]
+fn attach_data_file_missing_path_keeps_provider() {
+    let mut c = make_ctrl_zero();
+    let idx = find_idx(&c, "field_u32");
+    c.set_node_value(idx, 0, "0x55", false, 0);
+    assert!(c.undo_stack().can_undo());
+    let before = c.document().provider.name();
+
+    let missing = std::env::temp_dir().join("rcx_attach_does_not_exist.bin");
+    let _ = std::fs::remove_file(&missing);
+    c.attach_data_file(&missing);
+
+    assert_eq!(c.undo_stack().count(), 0, "undo cleared even on miss");
+    assert!(c.document().data_path.is_none(), "no data path on miss");
+    assert_eq!(c.document().provider.name(), before, "provider unchanged");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // test_refresh_speedups.cpp ports
 // ─────────────────────────────────────────────────────────────────────────────

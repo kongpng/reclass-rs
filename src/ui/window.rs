@@ -1622,7 +1622,11 @@ impl MainWindow {
             };
             let _ = this.update_in(cx, |me, window, cx| {
                 editor.update(cx, |ed, _cx| {
-                    ed.controller_mut().document_mut().load_data_file(&path);
+                    // Route through the controller so the attach clears the undo
+                    // stack and resets the live snapshot, matching C++
+                    // `RcxDocument::loadData(path)` (controller.cpp:292). Calling
+                    // `document_mut().load_data_file` directly would bypass both.
+                    ed.controller_mut().attach_data_file(&path);
                 });
                 // Recompose against the freshly-attached provider + reflect the
                 // File source icon in the tab and window state.

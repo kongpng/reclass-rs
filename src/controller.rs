@@ -4944,6 +4944,21 @@ impl RcxController {
         self.on_document_changed();
     }
 
+    /// Attach a binary data file as the active source, mirroring C++
+    /// `RcxDocument::loadData(path)` (`controller.cpp:292`) which clears the
+    /// undo stack and emits `documentChanged`. The undo stack lives on the
+    /// controller in the Rust port, so the clear happens here; we then load the
+    /// provider, reset the snapshot (the C++ `documentChanged`→`refresh`
+    /// pipeline drops stale snapshot state), and notify listeners. This is the
+    /// path used by the toolbar/menu "Attach Data File" action so it no longer
+    /// bypasses `undo.clear()` / `reset_snapshot()`.
+    pub fn attach_data_file(&mut self, path: impl AsRef<Path>) {
+        self.undo.clear();
+        self.doc.load_data_file(path);
+        self.reset_snapshot();
+        self.on_document_changed();
+    }
+
     /// `clearSources()` (`controller.cpp:6398`).
     pub fn clear_sources(&mut self) {
         self.saved_sources.clear();
