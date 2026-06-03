@@ -147,6 +147,14 @@ pub fn handle_tools_call(
         "ui.action" => tools::tool_ui_action(&args, host),
         "tree.search" => tools::tool_tree_search(&args, host),
         "node.history" => tools::tool_node_history(&args, host),
+        // evidence.* + tree.export_header (`mcp_bridge.cpp:1312-1325`).
+        "evidence.record" => tools::tool_evidence_record(&args, host),
+        "evidence.timeline" => tools::tool_evidence_timeline(&args, host),
+        "evidence.capture_changes" => tools::tool_evidence_capture_changes(&args, host),
+        "evidence.hypothesis" => tools::tool_evidence_hypothesis(&args, host),
+        "evidence.proposal" => tools::tool_evidence_proposal(&args, host),
+        "evidence.focus_packet" => tools::tool_evidence_focus_packet(&args, host),
+        "tree.export_header" => tools::tool_tree_export_header(&args, host),
         "mcp.reconnect" => {
             // `toolReconnect` (`mcp_bridge.cpp:2432-2442`).
             if !has_current_sender {

@@ -12,8 +12,10 @@ use serde_json::{json, Map, Value};
 
 use crate::core::command::OffsetAdj;
 use crate::core::kind::{alignment_for, kind_from_string, kind_to_string};
-use crate::core::node::{BitfieldMember, Node, K_MAX_ARRAY_LEN};
-use crate::core::{Command, NodeKind};
+use crate::core::node::{
+    BitfieldMember, EvidenceEvent, EvidenceHypothesis, EvidenceProposal, Node, K_MAX_ARRAY_LEN,
+};
+use crate::core::{Command, NodeKind, NodeTree};
 use crate::provider::Provider;
 
 use super::host::{McpHost, TabState};
@@ -1347,6 +1349,1365 @@ pub fn tool_node_history(args: &Map<String, Value>, host: &mut dyn McpHost) -> V
     out
 }
 
+// ════════════════════════════════════════════════════════════════════
+// evidence.* — event-sourced reversing evidence (mcp_bridge.cpp:87-209, 2543-3087)
+// ════════════════════════════════════════════════════════════════════
+
+/// `QDateTime::currentMSecsSinceEpoch()`.
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// `stringListFromJson(value)` (`mcp_bridge.cpp:87-99`). Accepts an array of
+/// strings or a single string; drops empties.
+fn string_list_from_json(value: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    match value {
+        Some(Value::Array(arr)) => {
+            for v in arr {
+                let s = v.as_str().unwrap_or("");
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        Some(Value::String(s)) => {
+            if !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `startsWithAny(s, prefixes)` (`mcp_bridge.cpp:101-106`).
+fn starts_with_any(s: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|p| !p.is_empty() && s.starts_with(p.as_str()))
+}
+
+/// `offsetHex(offset)` (`mcp_bridge.cpp:108-112`). Negative → empty string.
+fn offset_hex(offset: i32) -> String {
+    if offset >= 0 {
+        format!("0x{:X}", offset)
+    } else {
+        String::new()
+    }
+}
+
+/// `nodeTypeName(n)` (`mcp_bridge.cpp:114-116`).
+fn node_type_name(n: &Node) -> String {
+    if n.struct_type_name.is_empty() {
+        n.name.clone()
+    } else {
+        n.struct_type_name.clone()
+    }
+}
+
+/// `rootIndexForNode(tree, idx)` (`mcp_bridge.cpp:118-127`). Walks `parentId`
+/// to the root; cycle-guarded.
+fn root_index_for_node(tree: &NodeTree, mut idx: i32) -> i32 {
+    if idx < 0 || idx as usize >= tree.nodes.len() {
+        return -1;
+    }
+    let mut seen: HashSet<u64> = HashSet::new();
+    while idx >= 0 && (idx as usize) < tree.nodes.len() && tree.nodes[idx as usize].parent_id != 0 {
+        let id = tree.nodes[idx as usize].id;
+        if seen.contains(&id) {
+            return -1;
+        }
+        seen.insert(id);
+        idx = tree.index_of_id(tree.nodes[idx as usize].parent_id);
+    }
+    idx
+}
+
+/// `nodePath(tree, nodeId)` (`mcp_bridge.cpp:129-144`). Dotted root→node path.
+fn node_path(tree: &NodeTree, node_id: u64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut cur = node_id;
+    while cur != 0 && !seen.contains(&cur) {
+        seen.insert(cur);
+        let idx = tree.index_of_id(cur);
+        if idx < 0 {
+            break;
+        }
+        let n = &tree.nodes[idx as usize];
+        let mut part = if n.name.is_empty() {
+            node_type_name(n)
+        } else {
+            n.name.clone()
+        };
+        if part.is_empty() {
+            part = "<unnamed>".to_string();
+        }
+        parts.insert(0, part);
+        cur = n.parent_id;
+    }
+    parts.join(".")
+}
+
+/// `nodeEvidenceContext(tree, nodeId)` (`mcp_bridge.cpp:146-172`).
+fn node_evidence_context(tree: &NodeTree, node_id: u64) -> Map<String, Value> {
+    let idx = tree.index_of_id(node_id);
+    if idx < 0 {
+        return Map::new();
+    }
+    let n = &tree.nodes[idx as usize];
+    let mut out = n.to_json().as_object().cloned().unwrap_or_default();
+    out.insert("path".into(), json!(node_path(tree, node_id)));
+    out.insert("kind".into(), json!(kind_to_string(n.kind)));
+    let computed_offset = tree.compute_offset(idx);
+    out.insert("computedOffset".into(), json!(computed_offset.to_string()));
+    out.insert(
+        "computedOffsetHex".into(),
+        json!(offset_hex(computed_offset as i32)),
+    );
+    out.insert("computedSize".into(), json!(tree.total_byte_size(n)));
+    let (addr, addr_ok) = tree.absolute_address(idx);
+    if addr_ok {
+        out.insert("absoluteAddress".into(), json!(format!("0x{:X}", addr)));
+    }
+    let root_idx = root_index_for_node(tree, idx);
+    if root_idx >= 0 {
+        let root = &tree.nodes[root_idx as usize];
+        out.insert("rootNodeId".into(), json!(root.id.to_string()));
+        out.insert("rootTypeName".into(), json!(node_type_name(root)));
+        let field_offset = (computed_offset - tree.compute_offset(root_idx)) as i32;
+        out.insert("fieldOffset".into(), json!(field_offset));
+        out.insert("fieldOffsetHex".into(), json!(offset_hex(field_offset)));
+    }
+    out
+}
+
+/// `targetMatches(...)` (`mcp_bridge.cpp:174-181`).
+fn target_matches(
+    have_type: &str,
+    have_node_id: u64,
+    have_offset: i32,
+    want_type: &str,
+    want_node_id: u64,
+    want_offset: i32,
+) -> bool {
+    if want_node_id != 0 && have_node_id == want_node_id {
+        return true;
+    }
+    if !want_type.is_empty()
+        && have_type == want_type
+        && (want_offset < 0 || have_offset == want_offset)
+    {
+        return true;
+    }
+    want_node_id == 0 && want_type.is_empty() && want_offset < 0
+}
+
+/// `eventMatchesFilter(e, filter)` (`mcp_bridge.cpp:183-200`).
+fn event_matches_filter(e: &EvidenceEvent, filter: &Map<String, Value>) -> bool {
+    let source = arg_str(filter, "source");
+    let kind = arg_str(filter, "kind");
+    let kind_prefixes = string_list_from_json(filter.get("kindPrefix"));
+    let type_name = arg_str(filter, "typeName");
+    let node_id = to_u64(&arg_str_default(filter, "nodeId", "0"));
+    let field_offset = if filter.contains_key("fieldOffset") {
+        parse_integer(filter.get("fieldOffset"), -1) as i32
+    } else {
+        -1
+    };
+    let since_timestamp = arg_str_default(filter, "sinceTimestamp", "0")
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(0);
+
+    if !source.is_empty() && e.source != source {
+        return false;
+    }
+    if !kind.is_empty() && e.kind != kind {
+        return false;
+    }
+    if !kind_prefixes.is_empty() && !starts_with_any(&e.kind, &kind_prefixes) {
+        return false;
+    }
+    if !type_name.is_empty() && e.type_name != type_name {
+        return false;
+    }
+    if node_id != 0 && e.node_id != node_id {
+        return false;
+    }
+    if field_offset >= 0 && e.field_offset != field_offset {
+        return false;
+    }
+    if since_timestamp > 0 && e.timestamp <= since_timestamp {
+        return false;
+    }
+    true
+}
+
+/// `eventJsonForPacket(e, includeData)` (`mcp_bridge.cpp:202-209`).
+fn event_json_for_packet(e: &EvidenceEvent, include_data: bool) -> Value {
+    let mut o = e.to_json().as_object().cloned().unwrap_or_default();
+    if !include_data {
+        o.remove("data");
+    }
+    if e.field_offset >= 0 {
+        o.insert("fieldOffsetHex".into(), json!(offset_hex(e.field_offset)));
+    }
+    Value::Object(o)
+}
+
+/// `toolEvidenceRecord` (`mcp_bridge.cpp:2543-2595`).
+pub fn tool_evidence_record(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab.", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let mut event = EvidenceEvent::default();
+        event.id = arg_str(args, "id");
+        event.timestamp = arg_str_default(args, "timestamp", "0")
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+        event.source = arg_str_default(args, "source", "reclass");
+        event.kind = arg_str(args, "kind").trim().to_string();
+        event.summary = arg_str(args, "summary").trim().to_string();
+        event.type_name = arg_str(args, "typeName");
+        event.node_id = to_u64(&arg_str_default(args, "nodeId", "0"));
+        event.field_offset = if args.contains_key("fieldOffset") {
+            parse_integer(arg(args, "fieldOffset"), -1) as i32
+        } else {
+            -1
+        };
+        event.address = arg_str(args, "address");
+        event.function_name = arg_str(args, "functionName");
+        event.function_address = arg_str(args, "functionAddress");
+        event.instruction = arg_str(args, "instruction");
+        event.confidence = if args.contains_key("confidence") {
+            arg(args, "confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(-1.0)
+        } else {
+            -1.0
+        };
+        event.tags = string_list_from_json(args.get("tags"));
+        event.data = arg(args, "data")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if event.kind.is_empty() {
+            out = make_text_result("kind is required.", true);
+            return;
+        }
+
+        let tree = &tab.data.tree;
+        let node_idx = if event.node_id != 0 {
+            tree.index_of_id(event.node_id)
+        } else {
+            -1
+        };
+        if node_idx >= 0 {
+            let ctx = node_evidence_context(tree, event.node_id);
+            if event.type_name.is_empty() {
+                event.type_name = ctx
+                    .get("rootTypeName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+            }
+            if event.field_offset < 0 {
+                if let Some(fo) = ctx.get("fieldOffset").and_then(Value::as_i64) {
+                    event.field_offset = fo as i32;
+                }
+            }
+            if event.summary.is_empty() {
+                let label = ctx.get("path").and_then(Value::as_str).unwrap_or("");
+                event.summary = if label.is_empty() {
+                    event.kind.clone()
+                } else {
+                    format!("{}: {}", event.kind, label)
+                };
+            }
+        }
+
+        let stored = tab.data.tree.append_evidence_event(event, now_ms());
+        tab.data.modified = true;
+
+        let mut o = Map::new();
+        o.insert("event".into(), event_json_for_packet(&stored, true));
+        o.insert(
+            "eventCount".into(),
+            json!(tab.data.tree.evidence_events.len() as i64),
+        );
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab.", true);
+    }
+    out
+}
+
+/// `toolEvidenceTimeline` (`mcp_bridge.cpp:2601-2633`).
+pub fn tool_evidence_timeline(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab.", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let events = &tab.data.tree.evidence_events;
+        let limit = parse_integer(arg(args, "limit"), 50).clamp(1, 500) as usize;
+        let include_data = match arg(args, "includeData") {
+            Some(v) => v.as_bool().unwrap_or(true),
+            None => true,
+        };
+        let since_id = arg_str(args, "sinceId");
+
+        let mut arr: Vec<Value> = Vec::new();
+        let mut matched = 0i64;
+        let mut after_since_id = since_id.is_empty();
+        for event in events {
+            if !after_since_id {
+                if event.id == since_id {
+                    after_since_id = true;
+                }
+                continue;
+            }
+            if !event_matches_filter(event, args) {
+                continue;
+            }
+            matched += 1;
+            arr.push(event_json_for_packet(event, include_data));
+            if arr.len() > limit {
+                arr.remove(0);
+            }
+        }
+
+        let mut o = Map::new();
+        let last_id = arr
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let returned = arr.len() as i64;
+        o.insert("events".into(), Value::Array(arr));
+        o.insert("returned".into(), json!(returned));
+        o.insert("matched".into(), json!(matched));
+        o.insert("total".into(), json!(events.len() as i64));
+        if let Some(id) = last_id {
+            o.insert("lastEventId".into(), json!(id));
+        }
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab.", true);
+    }
+    out
+}
+
+/// `toolEvidenceCaptureChanges` (`mcp_bridge.cpp:2639-2721`).
+pub fn tool_evidence_capture_changes(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab.", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        // requested node-id set: explicit nodeIds → selection → all history keys.
+        let mut requested: HashSet<u64> = HashSet::new();
+        if let Some(arr) = arg(args, "nodeIds").and_then(Value::as_array) {
+            for v in arr {
+                let id = to_u64(v.as_str().unwrap_or(""));
+                if id != 0 {
+                    requested.insert(id);
+                }
+            }
+        }
+        if requested.is_empty() {
+            // The C++ masks footer/array-elem/member sub-id bits off selection.
+            // resolve_tab selection holds plain node ids here, so insert as-is.
+            for &sid in &tab.data.selected_ids {
+                if sid != 0 {
+                    requested.insert(sid);
+                }
+            }
+        }
+        if requested.is_empty() {
+            for &k in tab.data.value_history.keys() {
+                requested.insert(k);
+            }
+        }
+
+        let marker = arg_str(args, "marker");
+        let kind = arg_str_default(args, "kind", "field_value_history");
+        let include_unchanged = arg_bool(args, "includeUnchanged");
+        let since_timestamp = arg_str_default(args, "sinceTimestamp", "0")
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+
+        // Sort the requested ids for deterministic output ordering.
+        let mut req_sorted: Vec<u64> = requested.into_iter().collect();
+        req_sorted.sort_unstable();
+
+        let mut events_to_store: Vec<EvidenceEvent> = Vec::new();
+        for node_id in req_sorted {
+            let Some(hist) = tab.data.value_history.get(&node_id) else {
+                continue;
+            };
+            if !include_unchanged && hist.unique_count() <= 1 {
+                continue;
+            }
+            let mut entries: Vec<Value> = Vec::new();
+            hist.for_each_with_time(|val, msec| {
+                if since_timestamp > 0 && msec <= since_timestamp {
+                    return;
+                }
+                entries.push(json!({"value": val, "timestamp": msec.to_string()}));
+            });
+            if entries.is_empty() {
+                continue;
+            }
+
+            let ctx = node_evidence_context(&tab.data.tree, node_id);
+            let path = ctx
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| node_id.to_string());
+            let unique_count = hist.unique_count();
+            let heat_level = hist.heat_level();
+
+            let mut event = EvidenceEvent {
+                source: "reclass".into(),
+                kind: kind.clone(),
+                type_name: ctx
+                    .get("rootTypeName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                node_id,
+                field_offset: ctx.get("fieldOffset").and_then(Value::as_i64).unwrap_or(-1) as i32,
+                address: ctx
+                    .get("absoluteAddress")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                confidence: 0.7,
+                summary: format!("{path} changed {unique_count} time(s)"),
+                ..EvidenceEvent::default()
+            };
+            event.tags = vec!["runtime".to_string(), "value-history".to_string()];
+            if !marker.is_empty() {
+                event.tags.push(marker.clone());
+            }
+            event.data = json!({
+                "marker": marker,
+                "entries": Value::Array(entries),
+                "heatLevel": heat_level,
+                "uniqueCount": unique_count,
+                "node": Value::Object(ctx),
+            });
+            events_to_store.push(event);
+        }
+
+        let mut captured: Vec<Value> = Vec::new();
+        for event in events_to_store {
+            let stored = tab.data.tree.append_evidence_event(event, now_ms());
+            captured.push(event_json_for_packet(&stored, true));
+        }
+
+        if !captured.is_empty() {
+            tab.data.modified = true;
+        }
+
+        let count = captured.len() as i64;
+        let mut o = Map::new();
+        o.insert("captured".into(), Value::Array(captured));
+        o.insert("count".into(), json!(count));
+        o.insert("marker".into(), json!(marker));
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab.", true);
+    }
+    out
+}
+
+/// `toolEvidenceHypothesis` (`mcp_bridge.cpp:2727-2838`).
+pub fn tool_evidence_hypothesis(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab.", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let action = arg_str_default(args, "action", "list");
+
+        let find_idx = |tab: &TabState, id: &str| -> i32 {
+            tab.data
+                .tree
+                .evidence_hypotheses
+                .iter()
+                .position(|h| h.id == id)
+                .map_or(-1, |p| p as i32)
+        };
+
+        if action == "create" {
+            let mut h = EvidenceHypothesis {
+                claim: arg_str(args, "claim").trim().to_string(),
+                label: arg_str(args, "label"),
+                status: arg_str_default(args, "status", "open"),
+                type_name: arg_str(args, "typeName"),
+                node_id: to_u64(&arg_str_default(args, "nodeId", "0")),
+                field_offset: if args.contains_key("fieldOffset") {
+                    parse_integer(arg(args, "fieldOffset"), -1) as i32
+                } else {
+                    -1
+                },
+                confidence: arg(args, "confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                supporting_evidence_ids: string_list_from_json(args.get("supportingEvidenceIds")),
+                contradicting_evidence_ids: string_list_from_json(
+                    args.get("contradictingEvidenceIds"),
+                ),
+                recommended_validation: string_list_from_json(args.get("recommendedValidation")),
+                notes: arg_str(args, "notes"),
+                data: arg(args, "data")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                ..EvidenceHypothesis::default()
+            };
+
+            if h.claim.is_empty() {
+                out = make_text_result("claim is required for hypothesis create.", true);
+                return;
+            }
+            if h.node_id != 0 {
+                let ctx = node_evidence_context(&tab.data.tree, h.node_id);
+                if h.type_name.is_empty() {
+                    h.type_name = ctx
+                        .get("rootTypeName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if h.field_offset < 0 {
+                    h.field_offset =
+                        ctx.get("fieldOffset").and_then(Value::as_i64).unwrap_or(-1) as i32;
+                }
+            }
+            let stored = tab.data.tree.append_evidence_hypothesis(h, now_ms());
+            tab.data.modified = true;
+            out = make_text_result(&qt_pretty(&stored.to_json()), false);
+            return;
+        }
+
+        if action == "update" {
+            let id = arg_str(args, "id");
+            let i = find_idx(tab, &id);
+            if i < 0 {
+                out = make_text_result(&format!("Hypothesis not found: {id}"), true);
+                return;
+            }
+            let h = &mut tab.data.tree.evidence_hypotheses[i as usize];
+            if args.contains_key("status") {
+                h.status = arg_str(args, "status");
+            }
+            if args.contains_key("claim") {
+                h.claim = arg_str(args, "claim");
+            }
+            if args.contains_key("label") {
+                h.label = arg_str(args, "label");
+            }
+            if args.contains_key("typeName") {
+                h.type_name = arg_str(args, "typeName");
+            }
+            if args.contains_key("nodeId") {
+                h.node_id = to_u64(&arg_str_default(args, "nodeId", "0"));
+            }
+            if args.contains_key("fieldOffset") {
+                h.field_offset = parse_integer(arg(args, "fieldOffset"), -1) as i32;
+            }
+            if args.contains_key("confidence") {
+                h.confidence = arg(args, "confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(h.confidence);
+            }
+            if args.contains_key("supportingEvidenceIds") {
+                h.supporting_evidence_ids =
+                    string_list_from_json(args.get("supportingEvidenceIds"));
+            }
+            if args.contains_key("contradictingEvidenceIds") {
+                h.contradicting_evidence_ids =
+                    string_list_from_json(args.get("contradictingEvidenceIds"));
+            }
+            if args.contains_key("addSupportingEvidenceIds") {
+                for eid in string_list_from_json(args.get("addSupportingEvidenceIds")) {
+                    h.supporting_evidence_ids.push(eid);
+                }
+            }
+            if args.contains_key("addContradictingEvidenceIds") {
+                for eid in string_list_from_json(args.get("addContradictingEvidenceIds")) {
+                    h.contradicting_evidence_ids.push(eid);
+                }
+            }
+            remove_duplicates(&mut h.supporting_evidence_ids);
+            remove_duplicates(&mut h.contradicting_evidence_ids);
+            if args.contains_key("recommendedValidation") {
+                h.recommended_validation = string_list_from_json(args.get("recommendedValidation"));
+            }
+            if args.contains_key("notes") {
+                h.notes = arg_str(args, "notes");
+            }
+            if args.contains_key("data") {
+                h.data = arg(args, "data")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            h.updated_at = now_ms();
+            let json = h.to_json();
+            tab.data.modified = true;
+            out = make_text_result(&qt_pretty(&json), false);
+            return;
+        }
+
+        if action == "get" {
+            let id = arg_str(args, "id");
+            let i = find_idx(tab, &id);
+            if i < 0 {
+                out = make_text_result(&format!("Hypothesis not found: {id}"), true);
+                return;
+            }
+            out = make_text_result(
+                &qt_pretty(&tab.data.tree.evidence_hypotheses[i as usize].to_json()),
+                false,
+            );
+            return;
+        }
+
+        if action != "list" {
+            out = make_text_result(&format!("Unknown hypothesis action: {action}"), true);
+            return;
+        }
+
+        let status = arg_str(args, "status");
+        let type_name = arg_str(args, "typeName");
+        let node_id = to_u64(&arg_str_default(args, "nodeId", "0"));
+        let field_offset = if args.contains_key("fieldOffset") {
+            parse_integer(arg(args, "fieldOffset"), -1) as i32
+        } else {
+            -1
+        };
+        let limit = parse_integer(arg(args, "limit"), 50).clamp(1, 500) as usize;
+        let mut arr: Vec<Value> = Vec::new();
+        let mut matched = 0i64;
+        for h in &tab.data.tree.evidence_hypotheses {
+            if !status.is_empty() && h.status != status {
+                continue;
+            }
+            if !target_matches(
+                &h.type_name,
+                h.node_id,
+                h.field_offset,
+                &type_name,
+                node_id,
+                field_offset,
+            ) {
+                continue;
+            }
+            matched += 1;
+            arr.push(h.to_json());
+            if arr.len() > limit {
+                arr.remove(0);
+            }
+        }
+        let returned = arr.len() as i64;
+        let mut o = Map::new();
+        o.insert("hypotheses".into(), Value::Array(arr));
+        o.insert("returned".into(), json!(returned));
+        o.insert("matched".into(), json!(matched));
+        o.insert(
+            "total".into(),
+            json!(tab.data.tree.evidence_hypotheses.len() as i64),
+        );
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab.", true);
+    }
+    out
+}
+
+/// `toolEvidenceProposal` (`mcp_bridge.cpp:2844-2960`). The `apply` action
+/// re-invokes `tool_tree_apply` with the stored operations.
+pub fn tool_evidence_proposal(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab.", true);
+    };
+
+    let action = arg_str_default(args, "action", "list");
+
+    // `apply` needs to call tool_tree_apply (which itself borrows the host),
+    // so it is handled outside the with_tab borrow below.
+    if action == "apply" {
+        let id = arg_str(args, "id");
+        // Look up the proposal + its operations.
+        let mut found = Value::Null; // holds either operations array or error result
+        host.with_tab(idx, &mut |tab: &mut TabState| {
+            let i = tab
+                .data
+                .tree
+                .evidence_proposals
+                .iter()
+                .position(|p| p.id == id);
+            let Some(i) = i else {
+                found = make_text_result(&format!("Proposal not found: {id}"), true);
+                return;
+            };
+            let p = &tab.data.tree.evidence_proposals[i];
+            let ops_empty = !p.operations.as_array().is_some_and(|a| !a.is_empty());
+            if ops_empty {
+                found = make_text_result(
+                    &format!("Proposal has no tree.apply operations: {id}"),
+                    true,
+                );
+                return;
+            }
+            // Stash the operations for the apply call.
+            found = json!({ "__ops": p.operations.clone() });
+        });
+        if found.is_null() {
+            return make_text_result("No active tab.", true);
+        }
+        if found.get("isError").and_then(Value::as_bool) == Some(true) {
+            return found;
+        }
+        let ops = found
+            .get("__ops")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+
+        // Build tree.apply args.
+        let mut apply_args = Map::new();
+        apply_args.insert("operations".into(), ops);
+        apply_args.insert(
+            "macroName".into(),
+            json!(format!("Apply evidence proposal {id}")),
+        );
+        if let Some(ti) = args.get("tabIndex") {
+            apply_args.insert("tabIndex".into(), ti.clone());
+        }
+        let applied = tool_tree_apply(&apply_args, host);
+        if applied.get("isError").and_then(Value::as_bool) == Some(true) {
+            return applied;
+        }
+
+        // Mark the proposal applied and emit it.
+        let mut out = Value::Null;
+        host.with_tab(idx, &mut |tab: &mut TabState| {
+            let Some(i) = tab
+                .data
+                .tree
+                .evidence_proposals
+                .iter()
+                .position(|p| p.id == id)
+            else {
+                out = make_text_result(&format!("Proposal not found: {id}"), true);
+                return;
+            };
+            let p = &mut tab.data.tree.evidence_proposals[i];
+            p.status = "applied".to_string();
+            p.updated_at = now_ms();
+            let mut o = p.to_json().as_object().cloned().unwrap_or_default();
+            tab.data.modified = true;
+            o.insert(
+                "applyResult".into(),
+                applied
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            );
+            out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+        });
+        if out.is_null() {
+            return make_text_result("No active tab.", true);
+        }
+        return out;
+    }
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let find_idx = |tab: &TabState, id: &str| -> i32 {
+            tab.data
+                .tree
+                .evidence_proposals
+                .iter()
+                .position(|p| p.id == id)
+                .map_or(-1, |p| p as i32)
+        };
+
+        if action == "create" {
+            let mut p = EvidenceProposal {
+                title: arg_str(args, "title").trim().to_string(),
+                action: arg_str(args, "proposalAction"),
+                status: arg_str_default(args, "status", "pending"),
+                type_name: arg_str(args, "typeName"),
+                node_id: to_u64(&arg_str_default(args, "nodeId", "0")),
+                field_offset: if args.contains_key("fieldOffset") {
+                    parse_integer(arg(args, "fieldOffset"), -1) as i32
+                } else {
+                    -1
+                },
+                confidence: arg(args, "confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                evidence_ids: string_list_from_json(args.get("evidenceIds")),
+                operations: arg(args, "operations")
+                    .filter(|v| v.is_array())
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                data: arg(args, "data")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                ..EvidenceProposal::default()
+            };
+            if p.title.is_empty() {
+                out = make_text_result("title is required for proposal create.", true);
+                return;
+            }
+            if p.node_id != 0 {
+                let ctx = node_evidence_context(&tab.data.tree, p.node_id);
+                if p.type_name.is_empty() {
+                    p.type_name = ctx
+                        .get("rootTypeName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if p.field_offset < 0 {
+                    p.field_offset =
+                        ctx.get("fieldOffset").and_then(Value::as_i64).unwrap_or(-1) as i32;
+                }
+            }
+            let stored = tab.data.tree.append_evidence_proposal(p, now_ms());
+            tab.data.modified = true;
+            out = make_text_result(&qt_pretty(&stored.to_json()), false);
+            return;
+        }
+
+        if action == "update" {
+            let id = arg_str(args, "id");
+            let i = find_idx(tab, &id);
+            if i < 0 {
+                out = make_text_result(&format!("Proposal not found: {id}"), true);
+                return;
+            }
+            let p = &mut tab.data.tree.evidence_proposals[i as usize];
+            if args.contains_key("status") {
+                p.status = arg_str(args, "status");
+            }
+            if args.contains_key("title") {
+                p.title = arg_str(args, "title");
+            }
+            if args.contains_key("proposalAction") {
+                p.action = arg_str(args, "proposalAction");
+            }
+            if args.contains_key("typeName") {
+                p.type_name = arg_str(args, "typeName");
+            }
+            if args.contains_key("nodeId") {
+                p.node_id = to_u64(&arg_str_default(args, "nodeId", "0"));
+            }
+            if args.contains_key("fieldOffset") {
+                p.field_offset = parse_integer(arg(args, "fieldOffset"), -1) as i32;
+            }
+            if args.contains_key("confidence") {
+                p.confidence = arg(args, "confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(p.confidence);
+            }
+            if args.contains_key("evidenceIds") {
+                p.evidence_ids = string_list_from_json(args.get("evidenceIds"));
+            }
+            if args.contains_key("operations") {
+                p.operations = arg(args, "operations")
+                    .filter(|v| v.is_array())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            if args.contains_key("data") {
+                p.data = arg(args, "data")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            p.updated_at = now_ms();
+            let json = p.to_json();
+            tab.data.modified = true;
+            out = make_text_result(&qt_pretty(&json), false);
+            return;
+        }
+
+        if action == "get" {
+            let id = arg_str(args, "id");
+            let i = find_idx(tab, &id);
+            if i < 0 {
+                out = make_text_result(&format!("Proposal not found: {id}"), true);
+                return;
+            }
+            out = make_text_result(
+                &qt_pretty(&tab.data.tree.evidence_proposals[i as usize].to_json()),
+                false,
+            );
+            return;
+        }
+
+        if action != "list" {
+            out = make_text_result(&format!("Unknown proposal action: {action}"), true);
+            return;
+        }
+
+        let status = arg_str(args, "status");
+        let type_name = arg_str(args, "typeName");
+        let node_id = to_u64(&arg_str_default(args, "nodeId", "0"));
+        let field_offset = if args.contains_key("fieldOffset") {
+            parse_integer(arg(args, "fieldOffset"), -1) as i32
+        } else {
+            -1
+        };
+        let limit = parse_integer(arg(args, "limit"), 50).clamp(1, 500) as usize;
+        let mut arr: Vec<Value> = Vec::new();
+        let mut matched = 0i64;
+        for p in &tab.data.tree.evidence_proposals {
+            if !status.is_empty() && p.status != status {
+                continue;
+            }
+            if !target_matches(
+                &p.type_name,
+                p.node_id,
+                p.field_offset,
+                &type_name,
+                node_id,
+                field_offset,
+            ) {
+                continue;
+            }
+            matched += 1;
+            arr.push(p.to_json());
+            if arr.len() > limit {
+                arr.remove(0);
+            }
+        }
+        let returned = arr.len() as i64;
+        let mut o = Map::new();
+        o.insert("proposals".into(), Value::Array(arr));
+        o.insert("returned".into(), json!(returned));
+        o.insert("matched".into(), json!(matched));
+        o.insert(
+            "total".into(),
+            json!(tab.data.tree.evidence_proposals.len() as i64),
+        );
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab.", true);
+    }
+    out
+}
+
+/// `toolEvidenceFocusPacket` (`mcp_bridge.cpp:2966-3087`).
+pub fn tool_evidence_focus_packet(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab.", true);
+    };
+    let tab_index = idx as i64;
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let tree = &tab.data.tree;
+        let mut node_id = to_u64(&arg_str_default(args, "nodeId", "0"));
+        if node_id == 0 {
+            // Pick the first selected node that still exists.
+            let mut sel: Vec<u64> = tab.data.selected_ids.iter().copied().collect();
+            sel.sort_unstable();
+            for sid in sel {
+                if tree.index_of_id(sid) >= 0 {
+                    node_id = sid;
+                    break;
+                }
+            }
+        }
+
+        let mut type_name = arg_str(args, "typeName");
+        let mut field_offset = if args.contains_key("fieldOffset") {
+            parse_integer(arg(args, "fieldOffset"), -1) as i32
+        } else {
+            -1
+        };
+        let mut node_ctx: Map<String, Value> = Map::new();
+        if node_id != 0 {
+            node_ctx = node_evidence_context(tree, node_id);
+            if node_ctx.is_empty() {
+                out = make_text_result(&format!("nodeId not found: {node_id}"), true);
+                return;
+            }
+            if type_name.is_empty() {
+                type_name = node_ctx
+                    .get("rootTypeName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+            }
+            if field_offset < 0 {
+                field_offset = node_ctx
+                    .get("fieldOffset")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1) as i32;
+            }
+        }
+
+        let function_name = arg_str(args, "functionName");
+        let function_address = arg_str(args, "functionAddress");
+        let limit = parse_integer(arg(args, "limit"), 40).clamp(1, 200) as usize;
+        let include_data = match arg(args, "includeData") {
+            Some(v) => v.as_bool().unwrap_or(true),
+            None => true,
+        };
+
+        let mut relevant_events: Vec<Value> = Vec::new();
+        let mut events_by_kind: Map<String, Value> = Map::new();
+        let mut events_by_source: Map<String, Value> = Map::new();
+        for e in &tree.evidence_events {
+            let mut matches = false;
+            if node_id != 0 && e.node_id == node_id {
+                matches = true;
+            }
+            if !type_name.is_empty()
+                && e.type_name == type_name
+                && (field_offset < 0 || e.field_offset == field_offset)
+            {
+                matches = true;
+            }
+            if !function_name.is_empty() && e.function_name == function_name {
+                matches = true;
+            }
+            if !function_address.is_empty() && e.function_address == function_address {
+                matches = true;
+            }
+            if !matches {
+                continue;
+            }
+            relevant_events.push(event_json_for_packet(e, include_data));
+            if relevant_events.len() > limit {
+                relevant_events.remove(0);
+            }
+            let kc = events_by_kind
+                .get(&e.kind)
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                + 1;
+            events_by_kind.insert(e.kind.clone(), json!(kc));
+            let sc = events_by_source
+                .get(&e.source)
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                + 1;
+            events_by_source.insert(e.source.clone(), json!(sc));
+        }
+
+        let has_field_target = node_id != 0 || !type_name.is_empty() || field_offset >= 0;
+        let mut hypotheses: Vec<Value> = Vec::new();
+        for h in &tree.evidence_hypotheses {
+            if has_field_target
+                && target_matches(
+                    &h.type_name,
+                    h.node_id,
+                    h.field_offset,
+                    &type_name,
+                    node_id,
+                    field_offset,
+                )
+            {
+                hypotheses.push(h.to_json());
+            }
+        }
+
+        let mut proposals: Vec<Value> = Vec::new();
+        for p in &tree.evidence_proposals {
+            if p.status != "pending" {
+                continue;
+            }
+            if has_field_target
+                && target_matches(
+                    &p.type_name,
+                    p.node_id,
+                    p.field_offset,
+                    &type_name,
+                    node_id,
+                    field_offset,
+                )
+            {
+                proposals.push(p.to_json());
+            }
+        }
+
+        let mut history_obj: Map<String, Value> = Map::new();
+        if node_id != 0 {
+            let mut entries: Vec<Value> = Vec::new();
+            if let Some(h) = tab.data.value_history.get(&node_id) {
+                h.for_each_with_time(|val, msec| {
+                    entries.push(json!({"value": val, "timestamp": msec.to_string()}));
+                });
+                history_obj.insert("heatLevel".into(), json!(h.heat_level()));
+                history_obj.insert("uniqueCount".into(), json!(h.unique_count()));
+            } else {
+                history_obj.insert("heatLevel".into(), json!(0));
+                history_obj.insert("uniqueCount".into(), json!(0));
+            }
+            history_obj.insert("entries".into(), Value::Array(entries));
+        }
+
+        let mut suggested: Vec<Value> = Vec::new();
+        if node_id != 0 {
+            suggested.push(json!("node.history"));
+        }
+        if type_name.is_empty() {
+            suggested.push(json!("tree.search"));
+        } else {
+            suggested.push(json!("evidence.timeline(typeName, fieldOffset)"));
+        }
+        suggested.push(json!("evidence.hypothesis(create/update)"));
+        suggested.push(json!(
+            "evidence.proposal(create pending tree.apply operations)"
+        ));
+
+        let mut focus = Map::new();
+        focus.insert("tabIndex".into(), json!(tab_index));
+        if node_id != 0 {
+            focus.insert("nodeId".into(), json!(node_id.to_string()));
+        }
+        if !type_name.is_empty() {
+            focus.insert("typeName".into(), json!(type_name));
+        }
+        if field_offset >= 0 {
+            focus.insert("fieldOffset".into(), json!(field_offset));
+            focus.insert("fieldOffsetHex".into(), json!(offset_hex(field_offset)));
+        }
+        if !function_name.is_empty() {
+            focus.insert("functionName".into(), json!(function_name));
+        }
+        if !function_address.is_empty() {
+            focus.insert("functionAddress".into(), json!(function_address));
+        }
+
+        let event_count = relevant_events.len() as i64;
+        let hypothesis_count = hypotheses.len() as i64;
+        let pending_proposal_count = proposals.len() as i64;
+
+        let mut o = Map::new();
+        o.insert("focus".into(), Value::Object(focus));
+        if !node_ctx.is_empty() {
+            o.insert("node".into(), Value::Object(node_ctx));
+        }
+        if !history_obj.is_empty() {
+            o.insert("valueHistory".into(), Value::Object(history_obj));
+        }
+        o.insert("recentEvidence".into(), Value::Array(relevant_events));
+        o.insert("hypotheses".into(), Value::Array(hypotheses));
+        o.insert("pendingProposals".into(), Value::Array(proposals));
+        o.insert(
+            "summary".into(),
+            json!({
+                "eventCount": event_count,
+                "hypothesisCount": hypothesis_count,
+                "pendingProposalCount": pending_proposal_count,
+                "eventsByKind": Value::Object(events_by_kind),
+                "eventsBySource": Value::Object(events_by_source),
+            }),
+        );
+        o.insert("suggestedNextTools".into(), Value::Array(suggested));
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab.", true);
+    }
+    out
+}
+
+/// `QStringList::removeDuplicates()` — drop later duplicates, preserve order.
+fn remove_duplicates(v: &mut Vec<String>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    v.retain(|s| seen.insert(s.clone()));
+}
+
+// ════════════════════════════════════════════════════════════════════
+// tree.export_header (mcp_bridge.cpp:3436-3542)
+// ════════════════════════════════════════════════════════════════════
+
+/// `toolTreeExportHeader` (`mcp_bridge.cpp:3436-3542`).
+pub fn tool_tree_export_header(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let tree = &tab.data.tree;
+        let node_id_str = arg_str(args, "nodeId");
+        let type_name = arg_str(args, "typeName");
+        let with_children = match arg(args, "withChildren") {
+            Some(v) => v.as_bool().unwrap_or(true),
+            None => true,
+        };
+
+        let mut root_idx: i32 = -1;
+        if !node_id_str.is_empty() {
+            root_idx = root_index_for_node(tree, tree.index_of_id(to_u64(&node_id_str)));
+        } else if !type_name.is_empty() {
+            for (i, n) in tree.nodes.iter().enumerate() {
+                if n.parent_id != 0 || n.kind != NodeKind::Struct {
+                    continue;
+                }
+                let n_type = if n.struct_type_name.is_empty() {
+                    &n.name
+                } else {
+                    &n.struct_type_name
+                };
+                if *n_type == type_name || n.name == type_name || n.struct_type_name == type_name {
+                    root_idx = i as i32;
+                    break;
+                }
+            }
+        } else {
+            // First selected node whose root is a Struct.
+            let mut sel: Vec<u64> = tab.data.selected_ids.iter().copied().collect();
+            sel.sort_unstable();
+            for sid in sel {
+                root_idx = root_index_for_node(tree, tree.index_of_id(sid));
+                if root_idx >= 0 && tree.nodes[root_idx as usize].kind == NodeKind::Struct {
+                    break;
+                }
+            }
+        }
+
+        if root_idx < 0 {
+            for (i, n) in tree.nodes.iter().enumerate() {
+                if n.parent_id == 0 && n.kind == NodeKind::Struct {
+                    root_idx = i as i32;
+                    break;
+                }
+            }
+        }
+
+        if root_idx < 0 || tree.nodes[root_idx as usize].kind != NodeKind::Struct {
+            out = make_text_result("No root struct/union/enum found to export", true);
+            return;
+        }
+
+        let root_id = tree.nodes[root_idx as usize].id;
+        let aliases = if tab.data.type_aliases.is_empty() {
+            None
+        } else {
+            Some(&tab.data.type_aliases)
+        };
+        let header = if with_children {
+            crate::generator::render_cpp_tree(tree, root_id, aliases, false)
+        } else {
+            crate::generator::render_cpp(tree, root_id, aliases, false)
+        };
+
+        // Breadth-first collect of the root subtree + referenced (refId) subtrees.
+        let mut collected: HashSet<u64> = HashSet::new();
+        let mut queue: Vec<u64> = Vec::new();
+        let enqueue_subtree = |id: u64, collected: &mut HashSet<u64>, queue: &mut Vec<u64>| {
+            for si in tree.subtree_indices(id) {
+                let nid = tree.nodes[si].id;
+                if collected.insert(nid) {
+                    queue.push(nid);
+                }
+            }
+        };
+        enqueue_subtree(root_id, &mut collected, &mut queue);
+        let mut qi = 0;
+        while qi < queue.len() {
+            let nid = queue[qi];
+            qi += 1;
+            let nidx = tree.index_of_id(nid);
+            if nidx < 0 {
+                continue;
+            }
+            let ref_id = tree.nodes[nidx as usize].ref_id;
+            if with_children && ref_id != 0 && !collected.contains(&ref_id) {
+                enqueue_subtree(ref_id, &mut collected, &mut queue);
+            }
+        }
+
+        // Emit collected nodes in queue order (insertion order, like the C++
+        // QSet-then-iterate; we keep a deterministic insertion order).
+        let mut node_arr: Vec<Value> = Vec::new();
+        for &nid in &queue {
+            let nidx = tree.index_of_id(nid);
+            if nidx < 0 {
+                continue;
+            }
+            let n = &tree.nodes[nidx as usize];
+            let mut nj = n.to_json().as_object().cloned().unwrap_or_default();
+            nj.insert(
+                "computedOffset".into(),
+                json!(tree.compute_offset(nidx).to_string()),
+            );
+            if matches!(n.kind, NodeKind::Struct | NodeKind::Array) {
+                nj.insert("computedSize".into(), json!(tree.struct_span(n.id)));
+            } else {
+                nj.insert("computedSize".into(), json!(n.byte_size()));
+            }
+            node_arr.push(Value::Object(nj));
+        }
+
+        let root = &tree.nodes[root_idx as usize];
+        let exported_type_name = if root.struct_type_name.is_empty() {
+            root.name.clone()
+        } else {
+            root.struct_type_name.clone()
+        };
+        let node_count = node_arr.len() as i64;
+        let mut o = Map::new();
+        o.insert("nodeId".into(), json!(root.id.to_string()));
+        o.insert("typeName".into(), json!(exported_type_name));
+        o.insert("classKeyword".into(), json!(root.resolved_class_keyword()));
+        o.insert("pointerSize".into(), json!(tree.pointer_size));
+        o.insert("withChildren".into(), json!(with_children));
+        o.insert("header".into(), json!(header));
+        o.insert("nodes".into(), Value::Array(node_arr));
+        o.insert("nodeCount".into(), json!(node_count));
+        out = make_text_result(&qt_pretty(&Value::Object(o)), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab", true);
+    }
+    out
+}
+
 // Keep OffsetAdj referenced (documents the command's helper POD).
 const _: fn() = || {
     let _ = std::mem::size_of::<OffsetAdj>();
@@ -1921,5 +3282,354 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("out of range"));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // evidence.*  (mcp_bridge.cpp:2543-3087)
+    // ════════════════════════════════════════════════════════════════
+
+    /// A host with a Player struct → health Int32 field for evidence tests.
+    fn evidence_host() -> (TestHost, u64, u64) {
+        let mut tab = TabState::new();
+        let ri = tab.data.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Player".into(),
+            ..Node::default()
+        });
+        let rid = tab.data.tree.nodes[ri].id;
+        let ci = tab.data.tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: "health".into(),
+            parent_id: rid,
+            offset: 8,
+            ..Node::default()
+        });
+        let cid = tab.data.tree.nodes[ci].id;
+        (TestHost::with_tab(tab), rid, cid)
+    }
+
+    // ── evidence.record ──
+    #[test]
+    fn evidence_record_requires_kind() {
+        let (mut h, _rid, _cid) = evidence_host();
+        let r = tool_evidence_record(&map(json!({"summary": "no kind here"})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        assert_eq!(r["content"][0]["text"], "kind is required.");
+    }
+
+    #[test]
+    fn evidence_record_enriches_from_node_and_sets_modified() {
+        let (mut h, _rid, cid) = evidence_host();
+        let r = tool_evidence_record(
+            &map(json!({"kind": "marker", "nodeId": cid.to_string()})),
+            &mut h,
+        );
+        assert!(r.get("isError").is_none());
+        let out = parse_text(&r);
+        let ev = &out["event"];
+        // id assigned, source defaulted, typeName + fieldOffset from node ctx.
+        assert_eq!(ev["id"], "ev_1");
+        assert_eq!(ev["source"], "reclass");
+        assert_eq!(ev["typeName"], "Player");
+        assert_eq!(ev["fieldOffset"], 8);
+        assert_eq!(ev["fieldOffsetHex"], "0x8");
+        // summary synthesized "kind: path"
+        assert_eq!(ev["summary"], "marker: Player.health");
+        assert_eq!(out["eventCount"], 1);
+        h.with_tab(0, &mut |t| {
+            assert!(t.data.modified);
+            assert_eq!(t.data.tree.evidence_events.len(), 1);
+        });
+    }
+
+    // ── evidence.timeline ──
+    #[test]
+    fn evidence_timeline_filters_and_paginates() {
+        let (mut h, _rid, cid) = evidence_host();
+        tool_evidence_record(&map(json!({"kind": "marker", "source": "user"})), &mut h);
+        tool_evidence_record(
+            &map(json!({"kind": "writer_hit", "source": "debugger", "nodeId": cid.to_string()})),
+            &mut h,
+        );
+
+        // no filter → both, total 2
+        let r = tool_evidence_timeline(&map(json!({})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["total"], 2);
+        assert_eq!(out["returned"], 2);
+        assert_eq!(out["lastEventId"], "ev_2");
+
+        // filter by kind
+        let r = tool_evidence_timeline(&map(json!({"kind": "writer_hit"})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["returned"], 1);
+        assert_eq!(out["events"][0]["kind"], "writer_hit");
+
+        // filter by source
+        let r = tool_evidence_timeline(&map(json!({"source": "user"})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["returned"], 1);
+        assert_eq!(out["events"][0]["source"], "user");
+
+        // sinceId skips up to and including that id
+        let r = tool_evidence_timeline(&map(json!({"sinceId": "ev_1"})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["returned"], 1);
+        assert_eq!(out["events"][0]["id"], "ev_2");
+    }
+
+    // ── evidence.capture_changes ──
+    #[test]
+    fn evidence_capture_changes_promotes_value_history() {
+        let (mut h, _rid, cid) = evidence_host();
+        h.with_tab(0, &mut |t| {
+            let mut vh = ValueHistory::new();
+            vh.record("100");
+            vh.record("80");
+            vh.record("60");
+            t.data.value_history.insert(cid, vh);
+        });
+        let r = tool_evidence_capture_changes(
+            &map(json!({"nodeIds": [cid.to_string()], "marker": "after_damage"})),
+            &mut h,
+        );
+        let out = parse_text(&r);
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["marker"], "after_damage");
+        let ev = &out["captured"][0];
+        assert_eq!(ev["kind"], "field_value_history");
+        assert_eq!(ev["typeName"], "Player");
+        assert!(ev["summary"]
+            .as_str()
+            .unwrap()
+            .contains("changed 3 time(s)"));
+        // marker is appended as a tag.
+        let tags: Vec<String> = ev["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(tags.contains(&"after_damage".to_string()));
+        h.with_tab(0, &mut |t| assert!(t.data.modified));
+    }
+
+    #[test]
+    fn evidence_capture_changes_skips_unchanged_by_default() {
+        let (mut h, _rid, cid) = evidence_host();
+        h.with_tab(0, &mut |t| {
+            let mut vh = ValueHistory::new();
+            vh.record("5"); // single unique value
+            t.data.value_history.insert(cid, vh);
+        });
+        let r = tool_evidence_capture_changes(&map(json!({"nodeIds": [cid.to_string()]})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["count"], 0);
+    }
+
+    // ── evidence.hypothesis ──
+    #[test]
+    fn evidence_hypothesis_create_requires_claim() {
+        let (mut h, _rid, _cid) = evidence_host();
+        let r = tool_evidence_hypothesis(&map(json!({"action": "create"})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        assert_eq!(
+            r["content"][0]["text"],
+            "claim is required for hypothesis create."
+        );
+    }
+
+    #[test]
+    fn evidence_hypothesis_create_get_list_roundtrip() {
+        let (mut h, _rid, cid) = evidence_host();
+        let r = tool_evidence_hypothesis(
+            &map(json!({
+                "action": "create",
+                "claim": "health is Int32 at +8",
+                "nodeId": cid.to_string(),
+                "confidence": 0.8
+            })),
+            &mut h,
+        );
+        let created = parse_text(&r);
+        assert_eq!(created["id"], "hyp_1");
+        assert_eq!(created["status"], "open");
+        assert_eq!(created["typeName"], "Player"); // enriched from node
+        assert_eq!(created["fieldOffset"], 8);
+
+        // get
+        let r = tool_evidence_hypothesis(&map(json!({"action": "get", "id": "hyp_1"})), &mut h);
+        let got = parse_text(&r);
+        assert_eq!(got["claim"], "health is Int32 at +8");
+
+        // get missing
+        let r = tool_evidence_hypothesis(&map(json!({"action": "get", "id": "hyp_99"})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+
+        // list
+        let r = tool_evidence_hypothesis(&map(json!({"action": "list"})), &mut h);
+        let listed = parse_text(&r);
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["returned"], 1);
+
+        // update + dedup of supporting evidence ids
+        let r = tool_evidence_hypothesis(
+            &map(json!({
+                "action": "update",
+                "id": "hyp_1",
+                "status": "confirmed",
+                "supportingEvidenceIds": ["ev_1", "ev_1", "ev_2"]
+            })),
+            &mut h,
+        );
+        let updated = parse_text(&r);
+        assert_eq!(updated["status"], "confirmed");
+        assert_eq!(
+            updated["supportingEvidenceIds"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    // ── evidence.proposal ──
+    #[test]
+    fn evidence_proposal_create_requires_title() {
+        let (mut h, _rid, _cid) = evidence_host();
+        let r = tool_evidence_proposal(&map(json!({"action": "create"})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        assert_eq!(
+            r["content"][0]["text"],
+            "title is required for proposal create."
+        );
+    }
+
+    #[test]
+    fn evidence_proposal_apply_runs_tree_apply() {
+        let (mut h, _rid, cid) = evidence_host();
+        // a proposal that renames + retypes the health field
+        let ops = json!([
+            {"op": "rename", "nodeId": cid.to_string(), "name": "hp"},
+            {"op": "change_kind", "nodeId": cid.to_string(), "kind": "UInt32"}
+        ]);
+        let r = tool_evidence_proposal(
+            &map(json!({"action": "create", "title": "Rename health", "operations": ops})),
+            &mut h,
+        );
+        let created = parse_text(&r);
+        assert_eq!(created["id"], "prop_1");
+        assert_eq!(created["status"], "pending");
+
+        // apply re-invokes tree.apply
+        let r = tool_evidence_proposal(&map(json!({"action": "apply", "id": "prop_1"})), &mut h);
+        let applied = parse_text(&r);
+        assert_eq!(applied["status"], "applied");
+        assert!(applied.get("applyResult").is_some());
+        h.with_tab(0, &mut |t| {
+            let idx = t.data.tree.index_of_id(cid);
+            assert_eq!(t.data.tree.nodes[idx as usize].name, "hp");
+            assert_eq!(t.data.tree.nodes[idx as usize].kind, NodeKind::UInt32);
+        });
+    }
+
+    #[test]
+    fn evidence_proposal_apply_no_operations_is_error() {
+        let (mut h, _rid, _cid) = evidence_host();
+        tool_evidence_proposal(&map(json!({"action": "create", "title": "empty"})), &mut h);
+        let r = tool_evidence_proposal(&map(json!({"action": "apply", "id": "prop_1"})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no tree.apply operations"));
+    }
+
+    // ── evidence.focus_packet ──
+    #[test]
+    fn evidence_focus_packet_compiles_context() {
+        let (mut h, _rid, cid) = evidence_host();
+        // record one matching event + create a hypothesis on the same node
+        tool_evidence_record(
+            &map(json!({"kind": "marker", "nodeId": cid.to_string()})),
+            &mut h,
+        );
+        tool_evidence_hypothesis(
+            &map(json!({"action": "create", "claim": "is hp", "nodeId": cid.to_string()})),
+            &mut h,
+        );
+
+        let r = tool_evidence_focus_packet(&map(json!({"nodeId": cid.to_string()})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["focus"]["nodeId"], cid.to_string());
+        assert_eq!(out["focus"]["typeName"], "Player");
+        assert_eq!(out["focus"]["fieldOffset"], 8);
+        assert_eq!(out["node"]["path"], "Player.health");
+        assert_eq!(out["summary"]["eventCount"], 1);
+        assert_eq!(out["summary"]["hypothesisCount"], 1);
+        // suggested next tools always include node.history when a node is set
+        let suggested: Vec<String> = out["suggestedNextTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(suggested.contains(&"node.history".to_string()));
+    }
+
+    #[test]
+    fn evidence_focus_packet_missing_node_is_error() {
+        let (mut h, _rid, _cid) = evidence_host();
+        let r = tool_evidence_focus_packet(&map(json!({"nodeId": "99999"})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nodeId not found"));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // tree.export_header  (mcp_bridge.cpp:3436-3542)
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn export_header_by_node_id_emits_header_and_nodes() {
+        let (mut h, rid, _cid) = evidence_host();
+        let r = tool_tree_export_header(&map(json!({"nodeId": rid.to_string()})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["nodeId"], rid.to_string());
+        assert_eq!(out["typeName"], "Player");
+        assert_eq!(out["withChildren"], json!(true));
+        assert_eq!(out["pointerSize"], 8);
+        // header text contains the struct + the field name
+        let header = out["header"].as_str().unwrap();
+        assert!(header.contains("Player"));
+        assert!(header.contains("health"));
+        // nodes array covers the root + child (2 nodes)
+        assert_eq!(out["nodeCount"], 2);
+    }
+
+    #[test]
+    fn export_header_by_type_name_resolves_root() {
+        let (mut h, rid, _cid) = evidence_host();
+        let r = tool_tree_export_header(&map(json!({"typeName": "Player"})), &mut h);
+        let out = parse_text(&r);
+        assert_eq!(out["nodeId"], rid.to_string());
+        assert_eq!(out["typeName"], "Player");
+    }
+
+    #[test]
+    fn export_header_no_root_is_error() {
+        let mut tab = TabState::new();
+        // only a non-struct top-level node
+        tab.data.tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: "lonely".into(),
+            ..Node::default()
+        });
+        let mut h = TestHost::with_tab(tab);
+        let r = tool_tree_export_header(&map(json!({})), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("No root struct/union/enum found"));
     }
 }

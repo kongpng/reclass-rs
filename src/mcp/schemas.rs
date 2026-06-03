@@ -35,6 +35,12 @@ pub fn tool_descriptors() -> Vec<Value> {
         tool_ui_action(),
         tool_tree_search(),
         tool_node_history(),
+        tool_evidence_record(),
+        tool_evidence_timeline(),
+        tool_evidence_capture_changes(),
+        tool_evidence_hypothesis(),
+        tool_evidence_proposal(),
+        tool_evidence_focus_packet(),
         tool_scanner_scan(),
         tool_scanner_scan_pattern(),
         tool_mcp_reconnect(),
@@ -45,12 +51,8 @@ pub fn tool_descriptors() -> Vec<Value> {
         tool_node_read_value(),
         tool_analysis_infer_types(),
         tool_analysis_import_header(),
+        tool_tree_export_header(),
         tool_analysis_pointer_chain(),
-        tool_analysis_find_overlaps(),
-        tool_analysis_tree_summary(),
-        tool_analysis_field_path(),
-        tool_ui_byte_selection(),
-        tool_ui_set_byte_selection(),
         tool_ui_inspect(),
         tool_theme_get(),
         tool_theme_set(),
@@ -125,7 +127,7 @@ fn tool_source_switch() -> Value {
 fn tool_source_modules() -> Value {
     json!({
         "name": "source.modules",
-        "description": "List modules for the current data source. Returns name, base (hex), and size for each module. Only available when the provider reports module info (e.g. after attaching to a process). Use these names in baseAddressFormula for tree base, e.g. '<Module.exe> + 0x1000'.",
+        "description": "List modules for the current data source. Returns name, fullPath when available, base (hex), and size for each module. Only available when the provider reports module info (e.g. after attaching to a process). Use these names in baseAddressFormula for tree base, e.g. '<Module.exe> + 0x1000'.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -290,6 +292,150 @@ fn tool_node_history() -> Value {
     })
 }
 
+fn tool_evidence_record() -> Value {
+    json!({
+        "name": "evidence.record",
+        "description": "Append a structured reversing evidence event to the active project. Use this for user experiment markers, IDA access summaries, write-breakpoint hits, field changes, signatures, pointer paths, and LLM observations. Events are persisted in the .rcx file and keep provenance instead of silently mutating names/types.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabIndex": {"type": "integer"},
+                "source": {"type": "string", "description": "ida, reclass, user, llm, debugger, scanner, etc."},
+                "kind": {"type": "string", "description": "marker, field_changed, ida.field_access, ida.function_context, writer_hit, ..."},
+                "summary": {"type": "string"},
+                "typeName": {"type": "string"},
+                "nodeId": {"type": "string"},
+                "fieldOffset": {"type": "integer"},
+                "address": {"type": "string"},
+                "functionName": {"type": "string"},
+                "functionAddress": {"type": "string"},
+                "instruction": {"type": "string"},
+                "confidence": {"type": "number"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "data": {"type": "object"}
+            },
+            "required": ["kind"]
+        }
+    })
+}
+
+fn tool_evidence_timeline() -> Value {
+    json!({
+        "name": "evidence.timeline",
+        "description": "Query recent evidence events with filters. Use this as the live event stream for an LLM: filter by nodeId, typeName+fieldOffset, source, kind, kindPrefix, or sinceTimestamp.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabIndex": {"type": "integer"},
+                "source": {"type": "string"},
+                "kind": {"type": "string"},
+                "kindPrefix": {"type": "array", "items": {"type": "string"}},
+                "typeName": {"type": "string"},
+                "nodeId": {"type": "string"},
+                "fieldOffset": {"type": "integer"},
+                "sinceTimestamp": {"type": "string"},
+                "sinceId": {"type": "string"},
+                "limit": {"type": "integer"},
+                "includeData": {"type": "boolean"}
+            }
+        }
+    })
+}
+
+fn tool_evidence_capture_changes() -> Value {
+    json!({
+        "name": "evidence.capture_changes",
+        "description": "Convert current Reclass value histories into evidence events. Use after an experiment marker or after ui.action reset_tracking + in-game action. Emits one compact field_value_history event per selected/requested node, rather than streaming every refresh tick.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabIndex": {"type": "integer"},
+                "nodeIds": {"type": "array", "items": {"type": "string"}},
+                "marker": {"type": "string", "description": "Experiment label to attach, e.g. after_damage."},
+                "kind": {"type": "string", "description": "Event kind to emit. Default field_value_history."},
+                "sinceTimestamp": {"type": "string"},
+                "includeUnchanged": {"type": "boolean", "description": "If false, skip histories with <=1 unique value. Default false."}
+            }
+        }
+    })
+}
+
+fn tool_evidence_hypothesis() -> Value {
+    json!({
+        "name": "evidence.hypothesis",
+        "description": "Create, update, get, or list field/type hypotheses. A hypothesis is an explicit claim with confidence, supporting/contradicting evidence IDs, and recommended validation steps.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabIndex": {"type": "integer"},
+                "action": {"type": "string", "enum": ["create", "update", "get", "list"]},
+                "id": {"type": "string"},
+                "status": {"type": "string"},
+                "claim": {"type": "string"},
+                "label": {"type": "string"},
+                "typeName": {"type": "string"},
+                "nodeId": {"type": "string"},
+                "fieldOffset": {"type": "integer"},
+                "confidence": {"type": "number"},
+                "supportingEvidenceIds": {"type": "array", "items": {"type": "string"}},
+                "contradictingEvidenceIds": {"type": "array", "items": {"type": "string"}},
+                "recommendedValidation": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "string"},
+                "data": {"type": "object"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["action"]
+        }
+    })
+}
+
+fn tool_evidence_proposal() -> Value {
+    json!({
+        "name": "evidence.proposal",
+        "description": "Create, update, list, or apply reviewable LLM proposals. Proposals can carry tree.apply operations but remain pending until accepted/applied by the user or client.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabIndex": {"type": "integer"},
+                "action": {"type": "string", "enum": ["create", "update", "get", "list", "apply"]},
+                "id": {"type": "string"},
+                "status": {"type": "string"},
+                "title": {"type": "string"},
+                "proposalAction": {"type": "string"},
+                "typeName": {"type": "string"},
+                "nodeId": {"type": "string"},
+                "fieldOffset": {"type": "integer"},
+                "confidence": {"type": "number"},
+                "evidenceIds": {"type": "array", "items": {"type": "string"}},
+                "operations": {"type": "array", "items": {"type": "object"}},
+                "data": {"type": "object"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["action"]
+        }
+    })
+}
+
+fn tool_evidence_focus_packet() -> Value {
+    json!({
+        "name": "evidence.focus_packet",
+        "description": "Compile an LLM-sized focus packet for the selected/current node or explicit target. Includes node/root context, value history, relevant evidence, open hypotheses, pending proposals, and suggested next tools. This is the preferred real-time LLM input.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabIndex": {"type": "integer"},
+                "nodeId": {"type": "string"},
+                "typeName": {"type": "string"},
+                "fieldOffset": {"type": "integer"},
+                "functionName": {"type": "string"},
+                "functionAddress": {"type": "string"},
+                "limit": {"type": "integer"},
+                "includeData": {"type": "boolean"}
+            }
+        }
+    })
+}
+
 fn tool_scanner_scan() -> Value {
     json!({
         "name": "scanner.scan",
@@ -443,6 +589,22 @@ fn tool_analysis_import_header() -> Value {
     })
 }
 
+fn tool_tree_export_header() -> Value {
+    json!({
+        "name": "tree.export_header",
+        "description": "Export a Reclass root struct/union/enum as C/C++ declarations plus node metadata. Use nodeId for a specific root or typeName to find by structTypeName/name. If both are omitted, the first selected root struct is exported.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "nodeId": {"type": "string"},
+                "typeName": {"type": "string"},
+                "withChildren": {"type": "boolean", "description": "If true, include referenced child types. Default true."},
+                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
+            }
+        }
+    })
+}
+
 fn tool_analysis_pointer_chain() -> Value {
     json!({
         "name": "analysis.pointer_chain",
@@ -457,76 +619,6 @@ fn tool_analysis_pointer_chain() -> Value {
                 "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
             },
             "required": ["address"]
-        }
-    })
-}
-
-fn tool_analysis_find_overlaps() -> Value {
-    json!({
-        "name": "analysis.find_overlaps",
-        "description": "Detect sibling-overlap bugs in the active tree: pairs of non-static, non-union sibling fields whose [offset, offset+size) byte ranges intersect. This is the most common bug introduced by manual offset edits. Returns pairs as {parentId, parentName, aId, aName, aOffset, aSize, bId, bName, bOffset, bSize}.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
-            }
-        }
-    })
-}
-
-fn tool_analysis_tree_summary() -> Value {
-    json!({
-        "name": "analysis.tree_summary",
-        "description": "One-shot health snapshot of the active tree: total nodes, top-level classes (parentId=0 Struct/Class), maximum depth, total bytes (sum of top-level class spans), and overlap count from findOverlaps(). Faster than enumerating every node via separate tools.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
-            }
-        }
-    })
-}
-
-fn tool_analysis_field_path() -> Value {
-    json!({
-        "name": "analysis.field_path",
-        "description": "Bidirectional path/id resolver. Pass nodeId to get the dot-separated path from the root class (e.g. \"Player.Stats.Health\"); pass path to get back the node id. Exactly one of nodeId / path is required.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "nodeId": {"type": "string", "description": "Node id as a decimal or hex string. Returns {path}."},
-                "path": {"type": "string", "description": "Dot-path like \"Player.Stats.Health\". Returns {nodeId}. Matching is exact, case-sensitive."},
-                "separator": {"type": "string", "description": "Path separator character. Default: \".\""},
-                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
-            }
-        }
-    })
-}
-
-fn tool_ui_byte_selection() -> Value {
-    json!({
-        "name": "ui.byte_selection",
-        "description": "Return the active byte selection on the active editor pane: {lo, hi, size} as hex address strings, or {active:false} if no selection is active. Useful for AI agents that want to know which byte range the user is currently inspecting (e.g. before suggesting an interpretation, copying bytes, or referencing the range in chat).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
-            }
-        }
-    })
-}
-
-fn tool_ui_set_byte_selection() -> Value {
-    json!({
-        "name": "ui.set_byte_selection",
-        "description": "Set the active editor's byte selection to [lo, hi) so the user sees the same range you do. Pass lo and hi as hex address strings (0x prefix accepted) or decimals. Omit both lo and hi to clear the selection. Half-open: hi is exclusive, must be > lo.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "lo": {"type": "string", "description": "Inclusive start address (decimal or 0x-hex)."},
-                "hi": {"type": "string", "description": "Exclusive end address (decimal or 0x-hex)."},
-                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
-            }
         }
     })
 }
@@ -590,7 +682,7 @@ mod tests {
     #[test]
     fn names_in_registration_order() {
         let names = tool_names();
-        assert_eq!(names.len(), 35);
+        assert_eq!(names.len(), 37);
         assert_eq!(names[0], "project.state");
         assert_eq!(names[1], "tree.apply");
         assert_eq!(names[2], "source.switch");
@@ -610,8 +702,44 @@ mod tests {
         assert_eq!(names[11], "ui.action");
         assert_eq!(names[12], "tree.search");
         assert_eq!(names[13], "node.history");
+        // The 6 evidence.* tools are appended after node.history.
+        assert_eq!(
+            &names[14..20],
+            &[
+                "evidence.record",
+                "evidence.timeline",
+                "evidence.capture_changes",
+                "evidence.hypothesis",
+                "evidence.proposal",
+                "evidence.focus_packet"
+            ]
+        );
+        assert_eq!(names[20], "scanner.scan");
+        assert_eq!(names[21], "scanner.scan_pattern");
+        // mcp.reconnect shifted from 16 -> 22 by the 6 evidence inserts.
+        assert_eq!(names[22], "mcp.reconnect");
+        // tree.export_header is registered right after analysis.import_header.
+        let import_idx = names
+            .iter()
+            .position(|n| n == "analysis.import_header")
+            .unwrap();
+        assert_eq!(names[import_idx + 1], "tree.export_header");
+        assert_eq!(names[import_idx + 2], "analysis.pointer_chain");
         assert_eq!(names.last().unwrap(), "theme.revert");
-        assert_eq!(names[16], "mcp.reconnect");
+
+        // The 5 phantom tools that never existed in the C++ set must NOT appear.
+        for phantom in [
+            "analysis.find_overlaps",
+            "analysis.tree_summary",
+            "analysis.field_path",
+            "ui.byte_selection",
+            "ui.set_byte_selection",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == phantom),
+                "phantom tool {phantom} must not be advertised"
+            );
+        }
     }
 
     #[test]
@@ -628,7 +756,44 @@ mod tests {
         let r = handle_tools_list(&json!(2));
         assert_eq!(r["id"], json!(2));
         let arr = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(arr.len(), 35);
+        assert_eq!(arr.len(), 37);
         assert_eq!(arr[0]["name"], "project.state");
+    }
+
+    /// Parity guard: every advertised tool must be dispatchable — either a
+    /// real handler or one of the genuinely out-of-scope stubs. No advertised
+    /// name may be absent from the dispatch surface (matches the C++ set, where
+    /// `tools/list` and `handleToolsCall` enumerate identical names).
+    #[test]
+    fn advertised_set_has_no_phantom() {
+        use crate::mcp::stubs::STUB_TOOLS;
+
+        // The 7 evidence/export tools dispatched to real handlers + the 9
+        // in-scope handlers (project.state, tree.apply, source.switch, hex.read,
+        // hex.write, status.set, ui.action, tree.search, node.history) +
+        // mcp.reconnect. Everything else is a stub.
+        let real: &[&str] = &[
+            "project.state",
+            "tree.apply",
+            "source.switch",
+            "hex.read",
+            "hex.write",
+            "status.set",
+            "ui.action",
+            "tree.search",
+            "node.history",
+            "evidence.record",
+            "evidence.timeline",
+            "evidence.capture_changes",
+            "evidence.hypothesis",
+            "evidence.proposal",
+            "evidence.focus_packet",
+            "tree.export_header",
+            "mcp.reconnect",
+        ];
+        for name in tool_names() {
+            let dispatched = real.contains(&name.as_str()) || STUB_TOOLS.contains(&name.as_str());
+            assert!(dispatched, "advertised tool {name} is not dispatched");
+        }
     }
 }

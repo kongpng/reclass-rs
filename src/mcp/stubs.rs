@@ -28,11 +28,6 @@ pub const STUB_TOOLS: &[&str] = &[
     "analysis.infer_types",
     "analysis.import_header",
     "analysis.pointer_chain",
-    "analysis.find_overlaps",
-    "analysis.field_path",
-    "analysis.tree_summary",
-    "ui.byte_selection",
-    "ui.set_byte_selection",
     "ui.inspect",
     "theme.get",
     "theme.set",
@@ -57,5 +52,38 @@ mod tests {
             r["content"][0]["text"],
             "scanner.scan is not available in this build"
         );
+    }
+
+    #[test]
+    fn stub_set_excludes_phantoms() {
+        // 25 -> 20 after dropping the 5 phantom advertisements.
+        assert_eq!(STUB_TOOLS.len(), 20);
+        for phantom in [
+            "analysis.find_overlaps",
+            "analysis.tree_summary",
+            "analysis.field_path",
+            "ui.byte_selection",
+            "ui.set_byte_selection",
+        ] {
+            assert!(
+                !STUB_TOOLS.contains(&phantom),
+                "phantom tool {phantom} must not be a stub"
+            );
+        }
+        // The evidence/export tools are real handlers, not stubs.
+        for real in [
+            "evidence.record",
+            "evidence.timeline",
+            "evidence.capture_changes",
+            "evidence.hypothesis",
+            "evidence.proposal",
+            "evidence.focus_packet",
+            "tree.export_header",
+        ] {
+            assert!(
+                !STUB_TOOLS.contains(&real),
+                "{real} must not be a stub (it has a real handler)"
+            );
+        }
     }
 }
