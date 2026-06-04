@@ -4121,10 +4121,11 @@ impl MainWindow {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _e, _w, cx| {
-                        // Only toggle when switching modes (clicking the active
-                        // segment is a no-op, like the C++ exclusive combo).
+                        // Land exactly on this segment's mode (a 3-mode control
+                        // can't blindly toggle). Clicking the active segment is a
+                        // no-op, like the C++ exclusive combo.
                         if this.split_panes.get(pane_ix).copied() != Some(this_mode) {
-                            this.toggle_split_pane_mode(pane_ix, cx);
+                            this.set_split_pane_mode(pane_ix, this_mode, cx);
                         }
                     }),
                 )
@@ -4144,7 +4145,8 @@ impl MainWindow {
                 gpui_component::h_flex()
                     .gap(px(tokens::space::XXS))
                     .child(segment("Tree", ViewMode::Tree, cx))
-                    .child(segment("Code", ViewMode::Rendered, cx)),
+                    .child(segment("Code", ViewMode::Rendered, cx))
+                    .child(segment("Debug", ViewMode::Debug, cx)),
             )
             .child(
                 div()
@@ -4249,10 +4251,12 @@ impl MainWindow {
 
     /// The read-only Debug projection for a split pane (the C++ `SplitPane`
     /// `VM_Debug` view): the [`generate_debug_text`](crate::core::generate_debug_text)
-    /// dump of the editor's last composed line/`LineMeta` model, shown as
-    /// monospaced read-only lines. A developer view of the existing structure —
-    /// no live process, no editing — mirroring `render_split_tree` so the split
-    /// never re-renders the live `RcxEditor` entity.
+    /// dump of the editor's last composed line/`LineMeta` model, **styled** per
+    /// the C++ `styleDebugText` segmentation via the shared
+    /// [`debug_styled_spans`](super::tabs::debug_styled_spans) helper so the split
+    /// and primary debug panes agree exactly. A developer view of the existing
+    /// structure — no live process, no editing — mirroring `render_split_tree` so
+    /// the split never re-renders the live `RcxEditor` entity.
     fn render_split_debug(
         &self,
         editor: &Entity<super::editor::RcxEditor>,
@@ -4277,12 +4281,12 @@ impl MainWindow {
         let rows: Vec<AnyElement> = text
             .lines()
             .map(|line| {
-                div()
+                gpui_component::h_flex()
                     .h(line_h)
                     .px(px(tokens::space::SM))
+                    .items_center()
                     .whitespace_nowrap()
-                    .text_color(color::text(cx))
-                    .child(line.to_string())
+                    .children(super::tabs::debug_styled_spans(line, cx))
                     .into_any_element()
             })
             .collect();
@@ -4573,12 +4577,28 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// Toggle the view mode of a split pane (its own segmented Tree/Code control;
-    /// the C++ per-`SplitPane` view-mode combo). No-op if `pane_ix` is stale.
+    /// Toggle the view mode of a split pane (the C++ per-`SplitPane` view-mode
+    /// cycle). Retained for any non-segment caller; the segmented header uses
+    /// [`set_split_pane_mode`](Self::set_split_pane_mode) so a click lands on its
+    /// exact mode (a 3-mode control can't blindly toggle). No-op if `pane_ix` is
+    /// stale.
+    #[allow(dead_code)]
     fn toggle_split_pane_mode(&mut self, pane_ix: usize, cx: &mut Context<Self>) {
         if let Some(mode) = self.split_panes.get_mut(pane_ix) {
             *mode = mode.toggled();
             cx.notify();
+        }
+    }
+
+    /// Set a split pane's view mode to an explicit target (the per-segment setter
+    /// the split header's segmented control wires). Lands exactly on `mode`
+    /// rather than cycling. No-op if `pane_ix` is stale or the mode is unchanged.
+    fn set_split_pane_mode(&mut self, pane_ix: usize, mode: ViewMode, cx: &mut Context<Self>) {
+        if let Some(slot) = self.split_panes.get_mut(pane_ix) {
+            if *slot != mode {
+                *slot = mode;
+                cx.notify();
+            }
         }
     }
 

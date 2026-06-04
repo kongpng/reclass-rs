@@ -579,14 +579,35 @@ impl DocumentArea {
         }
     }
 
-    /// Toggle the active tab's view mode (the dual tree/rendered toggle). Emits
-    /// [`DocAreaEvent::ViewModeChanged`].
+    /// Toggle the active tab's view mode (the dual tree/rendered/debug cycle).
+    /// Emits [`DocAreaEvent::ViewModeChanged`]. Retained for any non-segment
+    /// caller; the segmented control uses [`select_view_mode`](Self::select_view_mode)
+    /// so a click lands on its exact mode rather than blindly cycling.
+    #[allow(dead_code)]
     fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
         if let Some(entry) = self.tabs.get_mut(self.active) {
             entry.view_mode = entry.view_mode.toggled();
             let (id, mode) = (entry.id, entry.view_mode);
             cx.emit(DocAreaEvent::ViewModeChanged(id, mode));
             cx.notify();
+        }
+    }
+
+    /// Set the active tab's view mode to an explicit target (the per-segment
+    /// setter the segmented control wires). Mirrors [`toggle_view_mode`]'s event
+    /// + notify so a click lands exactly on `this_mode` instead of cycling, and
+    /// the window persists the choice via [`DocAreaEvent::ViewModeChanged`].
+    /// No-op when the mode is unchanged (no spurious re-render/event).
+    ///
+    /// [`toggle_view_mode`]: Self::toggle_view_mode
+    fn select_view_mode(&mut self, this_mode: ViewMode, cx: &mut Context<Self>) {
+        if let Some(entry) = self.tabs.get_mut(self.active) {
+            if entry.view_mode != this_mode {
+                entry.view_mode = this_mode;
+                let id = entry.id;
+                cx.emit(DocAreaEvent::ViewModeChanged(id, this_mode));
+                cx.notify();
+            }
         }
     }
 
@@ -938,8 +959,8 @@ impl DocumentArea {
                         }
                     })
                     .when(has_doc && !selected, |s| {
-                        s.on_click(cx.listener(|this, _e, _window, cx| {
-                            this.toggle_view_mode(cx);
+                        s.on_click(cx.listener(move |this, _e, _window, cx| {
+                            this.select_view_mode(this_mode, cx);
                         }))
                     })
             };
@@ -969,7 +990,11 @@ impl DocumentArea {
                     .border_color(color::border(cx))
                     .bg(color::content_bg(cx))
                     .child(segment("Reclass", icon::struct_(), ViewMode::Tree, cx))
-                    .child(segment("Code", icon::function(), ViewMode::Rendered, cx)),
+                    .child(segment("Code", icon::function(), ViewMode::Rendered, cx))
+                    // The third surface: the read-only developer dump (the C++
+                    // `SplitPane` `VM_Debug`). A ✓/verified glyph reads as the
+                    // "inspect the composed model" affordance.
+                    .child(segment("Debug", icon::check(), ViewMode::Debug, cx)),
             )
             // The C++ corner widget (`fmtCombo` + `scopeCombo`) is hidden until the
             // Code tab is selected (main.cpp:2449). Mirror that: the format/scope
@@ -1082,10 +1107,17 @@ impl DocumentArea {
 
     /// The read-only Debug developer view (the C++ `SplitPane` `VM_Debug`
     /// surface): the [`generate_debug_text`](crate::core::generate_debug_text)
-    /// dump of the editor's last composed line/`LineMeta` model. Rendered as
-    /// monospaced read-only lines — the same projection styling as the split
-    /// Tree mirror, never a live editor entity. There is NO live process and NO
-    /// editing; it reflects the existing structure only.
+    /// dump of the editor's last composed line/`LineMeta` model, now **styled**
+    /// per the C++ `styleDebugText` segmentation (each line → an `h_flex` row of
+    /// coloured spans, the same shape as [`render_code_view`](Self::render_code_view)).
+    /// Never a live editor entity — there is NO live process and NO editing; it
+    /// reflects the existing structure only.
+    ///
+    /// **Refresh equivalence:** the C++ re-ran `generateDebugText` +
+    /// `styleDebugText` on every model change (`updateAllDebugPanes`). Here the
+    /// window observes every editor (`observe_editors`) and re-renders the whole
+    /// document area on change, so this pull-on-render path reads the editor's
+    /// latest `last_result()` each frame — equivalent freshness, no push needed.
     fn render_debug_view(&self, entry: &DocEntry, cx: &Context<Self>) -> AnyElement {
         let text = crate::core::generate_debug_text(entry.editor.read(cx).last_result());
         if text.trim().is_empty() {
@@ -1106,12 +1138,12 @@ impl DocumentArea {
         let rows: Vec<AnyElement> = text
             .lines()
             .map(|line| {
-                div()
+                gpui_component::h_flex()
                     .h(line_h)
                     .px(px(tokens::space::SM))
+                    .items_center()
                     .whitespace_nowrap()
-                    .text_color(color::text(cx))
-                    .child(line.to_string())
+                    .children(debug_styled_spans(line, cx))
                     .into_any_element()
             })
             .collect();
@@ -1356,6 +1388,65 @@ fn tok_color(tok: CodeTok, cx: &gpui::App) -> Hsla {
         CodeTok::String => color::syntax_string(cx),
         CodeTok::Plain => color::text(cx),
     }
+}
+
+/// Map a [`DebugStyle`](crate::core::DebugStyle) class to its Zed theme colour
+/// (foreground only — no font-weight changes, matching the C++ `applyDebugStyles`
+/// which set only `SCI_STYLESETFORE`). The C++ used a 9-entry `QColor` table
+/// (`main.cpp:5359-5370`); we substitute Zed theme colours **by intent**:
+///
+/// | C++ style              | C++ QColor                | Zed colour            | intent  |
+/// |------------------------|---------------------------|-----------------------|---------|
+/// | 0 `Text`               | `theme.text`              | `text`                | normal  |
+/// | 1 `Offset`             | `theme.textDim`           | `text_muted`          | DIM     |
+/// | 2 `Pipe`               | `theme.border.lighter`    | `border`              | margin  |
+/// | 3 `Bracket`            | `theme.syntaxPreproc`     | `accent`              | marker  |
+/// | 4 `MiddleDot`          | `theme.textFaint`         | `text_disabled`       | faint   |
+/// | 5 `MetaComment`        | `theme.syntaxComment`     | `syntax_comment`      | comment |
+/// | 6 `MetaKey`            | `theme.textDim`           | `text_muted`          | DIM     |
+/// | 7 `MetaValue`          | `theme.syntaxNumber`      | `syntax_number`       | value   |
+/// | 8 `Flag`               | `theme.syntaxKeyword`     | `syntax_keyword`      | keyword |
+///
+/// Shared by the primary [`render_debug_view`](DocumentArea::render_debug_view)
+/// and the split mirror (`window::render_split_debug`) so both agree.
+pub(crate) fn debug_style_color(style: crate::core::DebugStyle, cx: &gpui::App) -> Hsla {
+    use crate::core::DebugStyle as S;
+    match style {
+        S::Text => color::text(cx),
+        S::Offset => color::text_muted(cx),
+        S::Pipe => color::border(cx),
+        S::Bracket => color::accent(cx),
+        S::MiddleDot => color::text_disabled(cx),
+        S::MetaComment => color::syntax_comment(cx),
+        S::MetaKey => color::text_muted(cx),
+        S::MetaValue => color::syntax_number(cx),
+        S::Flag => color::syntax_keyword(cx),
+    }
+}
+
+/// Build the styled spans for one debug-view line — the segmentation from
+/// [`style_debug_line`](crate::core::style_debug_line) sliced into per-run
+/// coloured `div`s (the gpui equivalent of the C++ per-byte Scintilla styling).
+/// Each run is a `flex_none`, `whitespace_nowrap` span so the line stays on one
+/// row and columns survive. Shared by the primary and split debug panes.
+pub(crate) fn debug_styled_spans(line: &str, cx: &gpui::App) -> Vec<AnyElement> {
+    let chars: Vec<char> = line.chars().collect();
+    let runs = crate::core::style_debug_line(line);
+    if runs.is_empty() {
+        // A blank line: a single space keeps the row from collapsing to 0 height.
+        return vec![div().flex_none().child(" ").into_any_element()];
+    }
+    runs.into_iter()
+        .map(|(range, style)| {
+            let slice: String = chars[range].iter().collect();
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(debug_style_color(style, cx))
+                .child(slice)
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// A simple per-line C/C++ tokenizer → colored spans (One Dark).

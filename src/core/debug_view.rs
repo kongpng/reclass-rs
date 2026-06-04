@@ -181,6 +181,209 @@ pub fn generate_debug_text(result: &ComposeResult) -> String {
     out.join("\n")
 }
 
+/// The nine debug-view styling classes — a 1:1 port of the style IDs the C++
+/// `styleDebugText` writes into its per-byte buffer (`main.cpp:5616-5736`),
+/// later mapped to `QColor`s by `applyDebugStyles` (`main.cpp:5341-5380`).
+///
+/// `D2` keeps the **segmentation** (which character ranges get which class) but
+/// drops the per-byte Scintilla buffer: the UI maps each class to a Zed theme
+/// colour and emits one styled span per range. The discriminants match the C++
+/// style IDs exactly (`0=text … 8=flags`) so the mapping table stays auditable.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DebugStyle {
+    /// Style 0 — default body text (the C++ `theme.text`).
+    Text = 0,
+    /// Style 1 — the offset margin before the first `|` (`theme.textDim`).
+    Offset = 1,
+    /// Style 2 — the `|` margin separator (`theme.border.lighter(150)`).
+    Pipe = 2,
+    /// Style 3 — bracketed glyph markers `[>] [v] [|] [+] [L] [..] [->] [.]`
+    /// (`theme.syntaxPreproc`).
+    Bracket = 3,
+    /// Style 4 — the visible-space middle dot `·` (`theme.textFaint`).
+    MiddleDot = 4,
+    /// Style 5 — the `## ` meta prefix, meta whitespace, and unknown meta tokens
+    /// (`theme.syntaxComment`).
+    MetaComment = 5,
+    /// Style 6 — a meta key up to and including its `=` (`theme.textDim`).
+    MetaKey = 6,
+    /// Style 7 — a meta value after `=`, or a standalone `LineKind` token
+    /// (`theme.syntaxNumber`).
+    MetaValue = 7,
+    /// Style 8 — a standalone flag token (`static`/`cont`/`member`/`arrElem`/
+    /// `fold+`/`fold-`) (`theme.syntaxKeyword`).
+    Flag = 8,
+}
+
+/// The standalone `LineKind` meta tokens (`main.cpp:5712-5714`) — styled as a
+/// value ([`DebugStyle::MetaValue`]). These are the abbreviated names from
+/// [`LINE_KIND_NAMES`].
+const META_LINE_KINDS: [&str; 7] = [
+    "CmdRow", "Blank", "Header", "Field", "Cont", "Footer", "ArrSep",
+];
+
+/// The standalone flag meta tokens (`main.cpp:5718-5719`) — styled as a keyword
+/// ([`DebugStyle::Flag`]).
+const META_FLAGS: [&str; 6] = ["static", "cont", "member", "arrElem", "fold+", "fold-"];
+
+/// Faithful port of the per-line `styleDebugText` state machine
+/// (`main.cpp:5616-5736`) for a **single** debug-view line, returning the style
+/// segmentation as contiguous, non-overlapping `char`-index ranges that fully
+/// cover the line (so the caller can slice spans 1:1). The C++ operated on a
+/// UTF-8 byte buffer purely because Scintilla styles bytes; the only multi-byte
+/// concern was the middle-dot `·`, which we match directly here.
+///
+/// The three phases mirror the original exactly:
+/// 1. **Offset / pipe** — everything before the first `|` is [`Offset`], the
+///    `|` itself is [`Pipe`]. With no `|`, the whole line is [`Text`].
+/// 2. **Content** (after `|`, before the `  ##` marker) — `·` → [`MiddleDot`],
+///    a `[..]`-style bracket run (closing `]` within 4 chars) → [`Bracket`],
+///    everything else → [`Text`].
+/// 3. **Meta** (from the `  ##` marker) — the `## ` prefix (4 chars) +
+///    inter-token spaces → [`MetaComment`]; `key=value` → key incl. `=`
+///    [`MetaKey`] / value [`MetaValue`]; a standalone `LineKind` → [`MetaValue`];
+///    a standalone flag → [`Flag`]; any other standalone token → [`MetaComment`].
+///
+/// [`Offset`]: DebugStyle::Offset
+/// [`Pipe`]: DebugStyle::Pipe
+/// [`Text`]: DebugStyle::Text
+/// [`MiddleDot`]: DebugStyle::MiddleDot
+/// [`Bracket`]: DebugStyle::Bracket
+/// [`MetaComment`]: DebugStyle::MetaComment
+/// [`MetaKey`]: DebugStyle::MetaKey
+/// [`MetaValue`]: DebugStyle::MetaValue
+/// [`Flag`]: DebugStyle::Flag
+pub fn style_debug_line(line: &str) -> Vec<(core::ops::Range<usize>, DebugStyle)> {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Per-char style buffer (the C++ `QByteArray styles`, but in char units),
+    // default [`DebugStyle::Text`] (style 0).
+    let mut styles = vec![DebugStyle::Text; n];
+
+    // ── Phase 1: offset region (before first '|'). ──
+    let pipe_pos = chars.iter().position(|&c| c == '|');
+
+    if let Some(pipe) = pipe_pos {
+        for s in styles.iter_mut().take(pipe) {
+            *s = DebugStyle::Offset;
+        }
+        styles[pipe] = DebugStyle::Pipe;
+
+        // ── Phase 2: content after pipe, before "  ##". ──
+        // Search for the "  ##" marker (two spaces + "##"); C++ bound is
+        // `lineEnd - 4`, i.e. only positions with room for all four chars.
+        let mut meta_pos: Option<usize> = None;
+        if n >= 4 {
+            for j in (pipe + 1)..(n - 3) {
+                if chars[j] == ' '
+                    && chars[j + 1] == ' '
+                    && chars[j + 2] == '#'
+                    && chars[j + 3] == '#'
+                {
+                    meta_pos = Some(j);
+                    break;
+                }
+            }
+        }
+        let content_end = meta_pos.unwrap_or(n);
+
+        let mut j = pipe + 1;
+        while j < content_end {
+            let ch = chars[j];
+            if ch == '\u{00B7}' {
+                // Middle dot · (visible space).
+                styles[j] = DebugStyle::MiddleDot;
+            } else if ch == '[' {
+                // Bracket marker: find the closing ']' within the next 4 chars
+                // (the C++ `qMin(j + 5, contentEnd)` window).
+                let limit = (j + 5).min(content_end);
+                let mut close_b: Option<usize> = None;
+                for (k, &c) in chars.iter().enumerate().take(limit).skip(j + 1) {
+                    if c == ']' {
+                        close_b = Some(k);
+                        break;
+                    }
+                }
+                if let Some(close) = close_b {
+                    for s in styles.iter_mut().take(close + 1).skip(j) {
+                        *s = DebugStyle::Bracket;
+                    }
+                    j = close;
+                }
+            }
+            // else: stays DebugStyle::Text.
+            j += 1;
+        }
+
+        // ── Phase 3: metadata region (from "  ##"). ──
+        if let Some(meta) = meta_pos {
+            // The "  ##" prefix (4 chars).
+            for s in styles.iter_mut().take((meta + 4).min(n)).skip(meta) {
+                *s = DebugStyle::MetaComment;
+            }
+
+            // Parse key=value pairs / keyword tokens in the meta region.
+            let mut j = meta + 4;
+            while j < n {
+                // Skip a space (styled as meta-comment).
+                if chars[j] == ' ' {
+                    styles[j] = DebugStyle::MetaComment;
+                    j += 1;
+                    continue;
+                }
+
+                // Token spans `j..tok_end` (up to the next space).
+                let mut tok_end = j;
+                while tok_end < n && chars[tok_end] != ' ' {
+                    tok_end += 1;
+                }
+                let eq_pos = (j..tok_end).find(|&k| chars[k] == '=');
+
+                if let Some(eq) = eq_pos {
+                    // Key part (through '=').
+                    for s in styles.iter_mut().take(eq + 1).skip(j) {
+                        *s = DebugStyle::MetaKey;
+                    }
+                    // Value part (after '=').
+                    for s in styles.iter_mut().take(tok_end).skip(eq + 1) {
+                        *s = DebugStyle::MetaValue;
+                    }
+                } else {
+                    let tok: String = chars[j..tok_end].iter().collect();
+                    let style = if META_LINE_KINDS.contains(&tok.as_str()) {
+                        DebugStyle::MetaValue
+                    } else if META_FLAGS.contains(&tok.as_str()) {
+                        DebugStyle::Flag
+                    } else {
+                        DebugStyle::MetaComment
+                    };
+                    for s in styles.iter_mut().take(tok_end).skip(j) {
+                        *s = style;
+                    }
+                }
+                j = tok_end;
+            }
+        }
+    }
+    // else: no pipe → whole line stays DebugStyle::Text.
+
+    // Coalesce the per-char buffer into contiguous runs.
+    let mut runs: Vec<(core::ops::Range<usize>, DebugStyle)> = Vec::new();
+    let mut start = 0usize;
+    for k in 1..=n {
+        if k == n || styles[k] != styles[start] {
+            runs.push((start..k, styles[start]));
+            start = k;
+        }
+    }
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +632,197 @@ mod tests {
             !body_before_tail.contains(' '),
             "annotated body should have no raw spaces: {body_before_tail}"
         );
+    }
+
+    // ── style_debug_line (D2) ──────────────────────────────────────────────
+
+    /// Lookup the style at a given char index from the coalesced runs.
+    fn style_at(runs: &[(core::ops::Range<usize>, DebugStyle)], idx: usize) -> DebugStyle {
+        runs.iter()
+            .find(|(r, _)| r.contains(&idx))
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("no run covers char index {idx}: {runs:?}"))
+    }
+
+    /// The runs must be contiguous, non-overlapping, and cover `[0, len)`.
+    fn assert_covers(runs: &[(core::ops::Range<usize>, DebugStyle)], len: usize) {
+        let mut next = 0usize;
+        for (r, _) in runs {
+            assert_eq!(r.start, next, "gap/overlap before {r:?} in {runs:?}");
+            assert!(r.end > r.start, "empty/backwards run {r:?} in {runs:?}");
+            next = r.end;
+        }
+        assert_eq!(next, len, "runs do not cover the whole line: {runs:?}");
+    }
+
+    #[test]
+    fn style_empty_line_yields_no_runs() {
+        assert!(style_debug_line("").is_empty());
+    }
+
+    #[test]
+    fn style_offset_and_pipe_split() {
+        // "0010 |x" — offset margin (incl. trailing space) is Offset, '|' is
+        // Pipe, body is Text.
+        let line = "0010 |x";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        for i in 0..5 {
+            assert_eq!(style_at(&runs, i), DebugStyle::Offset, "char {i}");
+        }
+        assert_eq!(style_at(&runs, 5), DebugStyle::Pipe); // '|'
+        assert_eq!(style_at(&runs, 6), DebugStyle::Text); // 'x'
+    }
+
+    #[test]
+    fn style_no_pipe_is_all_text() {
+        // Without a '|' the whole line is the default Text style (style 0).
+        let line = "no pipe here";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1, DebugStyle::Text);
+    }
+
+    #[test]
+    fn style_bracket_marker() {
+        // "|[..]x" — the bracket run "[..]" is Bracket, trailing 'x' is Text.
+        let line = "|[..]x";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        assert_eq!(style_at(&runs, 0), DebugStyle::Pipe);
+        for i in 1..=4 {
+            assert_eq!(style_at(&runs, i), DebugStyle::Bracket, "char {i} of [..]");
+        }
+        assert_eq!(style_at(&runs, 5), DebugStyle::Text); // 'x'
+    }
+
+    #[test]
+    fn style_middle_dot() {
+        // "|a\u{00B7}b" — the middle dot is MiddleDot, the letters are Text.
+        let line = "|a\u{00B7}b";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        assert_eq!(style_at(&runs, 0), DebugStyle::Pipe);
+        assert_eq!(style_at(&runs, 1), DebugStyle::Text); // 'a'
+        assert_eq!(style_at(&runs, 2), DebugStyle::MiddleDot); // ·
+        assert_eq!(style_at(&runs, 3), DebugStyle::Text); // 'b'
+    }
+
+    #[test]
+    fn style_meta_prefix_and_key_value() {
+        // The "  ## " meta prefix is MetaComment; "L=0" splits into key "L="
+        // (MetaKey) and value "0" (MetaValue).
+        let line = "|x  ## L=0";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        // "|x" = Pipe, Text.
+        assert_eq!(style_at(&runs, 0), DebugStyle::Pipe);
+        assert_eq!(style_at(&runs, 1), DebugStyle::Text);
+        // Indices: 2=' ' 3=' ' 4='#' 5='#' — the 4-char "  ##" prefix.
+        for i in 2..=5 {
+            assert_eq!(
+                style_at(&runs, i),
+                DebugStyle::MetaComment,
+                "prefix char {i}"
+            );
+        }
+        assert_eq!(style_at(&runs, 6), DebugStyle::MetaComment); // space after ##
+                                                                 // "L=" → key (incl. '='), "0" → value.
+        assert_eq!(style_at(&runs, 7), DebugStyle::MetaKey); // 'L'
+        assert_eq!(style_at(&runs, 8), DebugStyle::MetaKey); // '='
+        assert_eq!(style_at(&runs, 9), DebugStyle::MetaValue); // '0'
+    }
+
+    #[test]
+    fn style_linekind_token_is_value() {
+        // A standalone LineKind token ("Field") in the meta region → MetaValue.
+        let line = "|x  ## Field";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        // "Field" starts at index 7 (after "|x  ## ").
+        for i in 7..line.chars().count() {
+            assert_eq!(style_at(&runs, i), DebugStyle::MetaValue, "Field char {i}");
+        }
+    }
+
+    #[test]
+    fn style_flag_token_is_flag() {
+        // A standalone flag token ("static") in the meta region → Flag.
+        let line = "|x  ## static";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        // "static" starts at index 7.
+        for i in 7..line.chars().count() {
+            assert_eq!(style_at(&runs, i), DebugStyle::Flag, "static char {i}");
+        }
+    }
+
+    #[test]
+    fn style_unknown_meta_token_is_comment() {
+        // An unrecognised standalone meta token (neither LineKind nor flag)
+        // falls back to MetaComment (the C++ `else` branch).
+        let line = "|x  ## hint@12";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        // "hint@12" has no '=', is not a LineKind/flag → MetaComment.
+        for i in 7..line.chars().count() {
+            assert_eq!(
+                style_at(&runs, i),
+                DebugStyle::MetaComment,
+                "token char {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn style_full_line_smoke() {
+        // A representative composed+annotated line exercising every phase:
+        // offset margin, bracket glyph, middle dot, meta prefix, key=value,
+        // LineKind value, and a flag.
+        let line = "0000 |[+][->]\u{00B7}health  ## L=3 Field nKind=Int32 static";
+        let runs = style_debug_line(line);
+        assert_covers(&runs, line.chars().count());
+        // Sanity: every style class that should appear, appears.
+        let seen: std::collections::HashSet<DebugStyle> = runs.iter().map(|(_, s)| *s).collect();
+        for want in [
+            DebugStyle::Offset,
+            DebugStyle::Pipe,
+            DebugStyle::Bracket,
+            DebugStyle::MiddleDot,
+            DebugStyle::Text,
+            DebugStyle::MetaComment,
+            DebugStyle::MetaKey,
+            DebugStyle::MetaValue,
+            DebugStyle::Flag,
+        ] {
+            assert!(seen.contains(&want), "style {want:?} missing in {runs:?}");
+        }
+    }
+
+    #[test]
+    fn style_segmentation_aligns_with_generated_text() {
+        // Cross-check: style every line of a real generated dump and assert the
+        // runs cover each line exactly (no panics, full coverage) — proves the
+        // segmenter stays consistent with `generate_debug_text` output.
+        let mut tree = NodeTree::new();
+        tree.base_address = 0;
+        let ri = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "T".into(),
+            ..Node::default()
+        });
+        let root_id = tree.nodes[ri].id;
+        tree.add_node(child(root_id, NodeKind::Int32, 0, "a"));
+        tree.add_node(child(root_id, NodeKind::Float, 4, "b"));
+        let prov = NullProvider;
+        let r = compose(
+            &tree, &prov, root_id, false, false, false, false, true, true, true,
+        );
+        let dump = generate_debug_text(&r);
+        for line in dump.lines() {
+            let runs = style_debug_line(line);
+            assert_covers(&runs, line.chars().count());
+        }
     }
 }
