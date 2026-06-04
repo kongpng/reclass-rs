@@ -4981,6 +4981,47 @@ impl RcxEditor {
                     );
                 }
             }
+
+            // Type-keyword (`struct`/`class`) hitbox: a SHAPED-position overlay so a
+            // click on the PAINTED keyword is not mis-routed by the command row's
+            // cell-grid drift (the `▸`/`▾`/source-chip glyphs advance ≠ the cell, so
+            // a click on `struct` resolved to a column over the base address — it
+            // opened the address edit on left-click and missed Convert on right).
+            // Left-click is swallowed (the keyword has no left action); right-click
+            // opens Convert to Struct/Class DIRECTLY — and only here, so the option
+            // never appears for the name / source chip / gaps (the `dispatch` path
+            // for those gives the no-node menu, never converting).
+            let kts = crate::compose::command_row_root_type_span(&text);
+            if kts.valid && kts.end > kts.start {
+                let (kw_left, kw_w) = self.shaped_span_px(&text, kts.start, kts.end, window);
+                let kw_word = text
+                    .get(
+                        geometry::utf16_to_byte(&text, kts.start)
+                            ..geometry::utf16_to_byte(&text, kts.end),
+                    )
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                text_region = text_region.child(
+                    div()
+                        .id(("rcx-keyword-hover", idx))
+                        .absolute()
+                        .top_0()
+                        .left(px(kw_left))
+                        .h(px(self.metrics.line_height))
+                        .w(px(kw_w.max(cell)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+                            cx.stop_propagation()
+                        })
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_root_convert_menu(&kw_word, e.position, window, cx);
+                            }),
+                        ),
+                );
+            }
         }
 
         // Footer add-bytes / Trim / Top pills: transparent SHAPED-position hitboxes
@@ -5817,7 +5858,7 @@ impl RcxEditor {
     pub(crate) fn dispatch_row_context_menu(
         &mut self,
         line: usize,
-        rel_x: f32,
+        _rel_x: f32,
         pos: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5828,32 +5869,19 @@ impl RcxEditor {
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
         };
-        // Item 6 / B4: right-click on the command-row root struct/class KEYWORD
-        // opens a "Convert to Struct" / "Convert to Class" menu (the C++ intended
-        // replacement for the removed left-click keyword edit). enum has no
-        // conversion. The keyword span is resolved from the composed command-row
-        // text; `rel_x` is text-local (the RowElement's origin == text origin).
+        // Item 6 / B4: the command-row header gets the no-node menu (Insert 4 / 8
+        // bytes, Append bytes, Add Static Field, Fold / Copy / Tracking). "Convert
+        // to Struct" / "Convert to Class" is NOT decided here — it is bound to a
+        // dedicated shaped-position hitbox over the `struct`/`class` KEYWORD
+        // (`rcx-keyword-hover`), which opens the convert menu directly. Routing it
+        // there (instead of by `rel_x` → column here) is what makes the option
+        // appear ONLY when the keyword is right-clicked: a right-click on the name /
+        // source chip / gaps reaches this branch, and the command row's `▸`/`▾`/chip
+        // glyph drift would otherwise pull the painted name's column back into the
+        // keyword span and convert by mistake.
         if lm.line_kind == LineKind::CommandRow && lm.node_id == K_COMMAND_ROW_ID {
-            let text = self.line_text_owned(line);
-            let col = self.metrics.col_containing_x(rel_x);
-            let rts = crate::compose::command_row_root_type_span(&text);
-            if rts.valid && col >= rts.start && col < rts.end {
-                let kw = text
-                    .get(
-                        geometry::utf16_to_byte(&text, rts.start)
-                            ..geometry::utf16_to_byte(&text, rts.end),
-                    )
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                self.open_root_convert_menu(&kw, pos, window, cx);
-            } else {
-                // Item 17: a command-row click OFF the keyword falls through to the
-                // no-node Insert menu (the C++ no-node menu: Insert 4 / Insert 8 /
-                // Append bytes…), instead of returning with no menu at all.
-                self.context_target = None;
-                self.open_empty_area_menu(pos, window, cx);
-            }
+            self.context_target = None;
+            self.open_empty_area_menu(pos, window, cx);
             return;
         }
         // Only real node rows get the node menu (command/footer/synthetic rows
