@@ -7042,6 +7042,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     bindings.extend(super::startpage::start_page_key_bindings());
     bindings.extend(super::commandpalette::command_palette_key_bindings());
     bindings.extend(super::findbar::find_bar_key_bindings());
+    bindings.extend(super::scannerpanel::scanner_panel_key_bindings());
     // Global trigger to OPEN the palette (Zed: ctrl-shift-p / f1; cmd-shift-p on mac).
     bindings.push(KeyBinding::new(
         "ctrl-shift-p",

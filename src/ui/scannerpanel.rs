@@ -239,6 +239,25 @@ impl ScannerForm {
         }
     }
 
+    /// Smart filter defaults per scan **mode**, mirroring `onModeChanged(int)`
+    /// (`scannerpanel.cpp:1135-1149`). In C++ the (hidden) mode-combo index
+    /// drives this: index 0 = Signature → executable-only; index 1 = Value →
+    /// writable-only; the private / skip-system / user-mode toggles always reset
+    /// to off. In the Rust model the mode is *derived* from the condition entry
+    /// (see [`mode`](ScannerForm::mode)), so there is no separate mode signal to
+    /// hook — [`set_scan_mode`](self) applies these five defaults explicitly when
+    /// the user picks a scan type from the dropdown. `struct_only` and
+    /// `alignment` are deliberately left untouched (the C++ handler does not
+    /// touch them either).
+    pub fn apply_mode_defaults(&mut self, mode: ScanMode) {
+        let is_sig = mode == ScanMode::Signature;
+        self.filter_executable = is_sig;
+        self.filter_writable = !is_sig;
+        self.private_only = false;
+        self.skip_system_modules = false;
+        self.user_mode_only = false;
+    }
+
     /// `onConditionChanged` field-visibility logic (`scannerpanel.cpp:1151-1203`).
     pub fn field_visibility(&self) -> FieldVisibility {
         let is_sig = self.mode() == ScanMode::Signature;
@@ -742,6 +761,38 @@ pub fn split_address_dim(text: &str) -> (&str, &str) {
     text.split_at(dim_end)
 }
 
+/// Which scan the Ctrl+Return shortcut should dispatch, given the panel state.
+///
+/// Encodes the C++ `scanShortcut` preference (`scannerpanel.cpp:832-838`):
+/// `if (m_updateBtn->isEnabled() && !isRunning()) onUpdateClicked(); else
+/// onScanClicked();`. The Next-Scan ("Update") button is enabled exactly when a
+/// scan has already produced results, so Ctrl+Return prefers a Next Scan once
+/// there are results, falls back to a First Scan otherwise, and does nothing
+/// while a scan is already running (the `onScanClicked` else-branch would abort
+/// in C++, but the panel handles abort/cancel via Esc instead, so the keyboard
+/// scan trigger is a no-op mid-scan).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScanShortcut {
+    /// Start a First Scan (`onScanClicked` / `run_scan`).
+    RunScan,
+    /// Start a Next Scan (`onUpdateClicked` / `next_scan`).
+    NextScan,
+    /// Do nothing (a scan is already running).
+    None,
+}
+
+/// Decide what Ctrl+Return does (the C++ `scanShortcut` lambda,
+/// `scannerpanel.cpp:832-838`). Pure so the dispatch decision is unit-testable.
+pub fn shortcut_scan_target(scanning: bool, has_results: bool) -> ScanShortcut {
+    if scanning {
+        ScanShortcut::None
+    } else if has_results {
+        ScanShortcut::NextScan
+    } else {
+        ScanShortcut::RunScan
+    }
+}
+
 /// Format an address the way the result table shows it: 16 hex digits with a
 /// backtick between the high and low dwords (`"00007FF6`12340000"`), uppercase —
 /// matching the C++ column width hint `"00000000`00000000"`.
@@ -1235,7 +1286,8 @@ fn deserialize_result_rows(json: &str) -> Vec<ScanResult> {
 
 #[cfg(feature = "ui")]
 pub use view::{
-    ScannerAddNodes, ScannerBatchEdit, ScannerDragAddress, ScannerEdit, ScannerNav, ScannerPanel,
+    scanner_panel_key_bindings, ScannerAddNodes, ScannerBatchEdit, ScannerDragAddress, ScannerEdit,
+    ScannerNav, ScannerPanel,
 };
 
 #[cfg(feature = "ui")]
@@ -1267,16 +1319,45 @@ mod view {
             ScCopyAddress,
             ScCopyValue,
             ScSetBaseAddress,
-            ScChangeAllValues
+            ScChangeAllValues,
+            // ── Panel-scoped keyboard shortcuts (scannerpanel.cpp:830-870) ──
+            // Ctrl+Return: First Scan, or Next Scan when results exist.
+            ScScanOrRescan,
+            // F5: Next Scan (re-scan), enabled only when results exist.
+            ScRescan,
+            // Ctrl+Z: Undo Scan, enabled only when the undo stack is non-empty.
+            ScUndo,
+            // Ctrl+L: focus + select-all the result filter.
+            ScFocusFilter
         ]
     );
 
     use super::{
         compute_delta, format_addresses_for_clipboard, parse_change_all_bytes, previous_delta_text,
-        rescan_status, serialize_results_json, split_address_dim, stage_breadcrumb,
-        truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow, ScannerForm,
-        FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
+        rescan_status, serialize_results_json, shortcut_scan_target, split_address_dim,
+        stage_breadcrumb, truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow,
+        ScanShortcut, ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
+
+    /// The scanner panel's keyboard shortcuts, bound in the `RcxScanner` context
+    /// (the C++ panel-scoped `QShortcut`s, scannerpanel.cpp:830-868). Registered
+    /// once at startup via `window::collect_key_bindings`. Both the Ctrl and Cmd
+    /// variants are bound so the muscle memory works on macOS too.
+    pub fn scanner_panel_key_bindings() -> Vec<KeyBinding> {
+        vec![
+            // Ctrl+Return — First Scan / Next Scan (the C++ `scanShortcut`).
+            KeyBinding::new("ctrl-enter", ScScanOrRescan, Some("RcxScanner")),
+            KeyBinding::new("cmd-enter", ScScanOrRescan, Some("RcxScanner")),
+            // F5 — Next Scan (the C++ `rescanShortcut`).
+            KeyBinding::new("f5", ScRescan, Some("RcxScanner")),
+            // Ctrl+Z — Undo Scan (the C++ `undoShortcut`).
+            KeyBinding::new("ctrl-z", ScUndo, Some("RcxScanner")),
+            KeyBinding::new("cmd-z", ScUndo, Some("RcxScanner")),
+            // Ctrl+L — focus the result filter (the C++ `focusFilter`).
+            KeyBinding::new("ctrl-l", ScFocusFilter, Some("RcxScanner")),
+            KeyBinding::new("cmd-l", ScFocusFilter, Some("RcxScanner")),
+        ]
+    }
     use crate::provider::Provider;
     use crate::scanner::{
         run_rescan, run_scan, serialize_value, value_size_for_type, NullObserver, ScanCondition,
@@ -1913,6 +1994,12 @@ mod view {
                 ScanMode::Signature => CondEntry::Signature,
                 ScanMode::Value => CondEntry::Value(ScanCondition::ExactValue),
             };
+            // Smart filter defaults per mode (the C++ `onModeChanged`,
+            // scannerpanel.cpp:1135-1149). This is the only mode-change call site
+            // (the scan-type dropdown); picking a *condition* (`set_condition`)
+            // must NOT re-apply filter defaults — it only re-derives field
+            // visibility, which `field_visibility()` recomputes each render.
+            self.form.apply_mode_defaults(mode);
             self.mode_open = false;
             cx.notify();
         }
@@ -2475,6 +2562,58 @@ mod view {
 
         /// Context menu ▸ Copy Address — copy the right-clicked row's address as
         /// `0xUPPER` (the C++ `copyAddr` action, scannerpanel.cpp:917-921).
+        /// Ctrl+Return — First Scan, or Next Scan once results exist (the C++
+        /// `scanShortcut`, scannerpanel.cpp:832-838). A no-op while a scan runs.
+        fn act_scan_or_rescan(
+            &mut self,
+            _: &ScScanOrRescan,
+            _w: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            match shortcut_scan_target(self.scanning, !self.results.is_empty()) {
+                ScanShortcut::NextScan => self.next_scan(cx),
+                ScanShortcut::RunScan => self.run_scan(cx),
+                ScanShortcut::None => {}
+            }
+        }
+
+        /// F5 — Next Scan (re-scan). Enabled only when not scanning and results
+        /// exist (the C++ `rescanShortcut` guarded by `m_updateBtn->isEnabled()`,
+        /// scannerpanel.cpp:840-843).
+        fn act_rescan(&mut self, _: &ScRescan, _w: &mut Window, cx: &mut Context<Self>) {
+            if !self.scanning && !self.results.is_empty() {
+                self.next_scan(cx);
+            }
+        }
+
+        /// Ctrl+Z — Undo Scan. Enabled only when the undo stack is non-empty (the
+        /// C++ `undoShortcut` guarded by `m_undoBtn->isEnabled()`,
+        /// scannerpanel.cpp:864-868).
+        fn act_undo(&mut self, _: &ScUndo, _w: &mut Window, cx: &mut Context<Self>) {
+            if !self.undo_stack.is_empty() {
+                self.undo_scan(cx);
+            }
+        }
+
+        /// Ctrl+L — focus + select-all the result filter (the C++ `focusFilter`
+        /// shortcut, scannerpanel.cpp:850-855).
+        fn act_focus_filter(
+            &mut self,
+            _: &ScFocusFilter,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.filter_input
+                .update(cx, |input, cx| input.focus(window, cx));
+            // `InputState::select_all` is not public, so dispatch the input's own
+            // SelectAll (ctrl-a) keystroke to the now-focused field (mirrors the
+            // C++ `m_resultFilter->selectAll()`).
+            if let Ok(ks) = Keystroke::parse("ctrl-a") {
+                window.dispatch_keystroke(ks, cx);
+            }
+            cx.notify();
+        }
+
         fn ctx_copy_address(&mut self, _: &ScCopyAddress, _w: &mut Window, cx: &mut Context<Self>) {
             if let Some((address, _)) = self.context_row(cx) {
                 cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{address:X}")));
@@ -3186,13 +3325,30 @@ mod view {
             gpui_component::v_flex()
                 .id("rcx-scanner-panel")
                 .track_focus(&self.focus_handle)
+                // Key context so the panel-scoped `RcxScanner` KeyBindings
+                // (Ctrl+Return / F5 / Ctrl+Z / Ctrl+L) dispatch here.
+                .key_context("RcxScanner")
                 .size_full()
                 .bg(color::panel_bg(cx))
                 .text_color(color::text(cx))
-                // Esc cancels a running scan (the C++ Cancel shortcut).
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
-                    if ev.keystroke.key == "escape" && this.scanning {
+                // Esc resolution (the C++ filter-Esc + panel-Esc shortcuts,
+                // scannerpanel.cpp:845-863): a running scan cancels first; else a
+                // non-empty result filter is cleared. Done in `on_key_down` (not a
+                // bound action) so it never shadows the input's own Esc handling.
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key != "escape" {
+                        return;
+                    }
+                    if this.scanning {
                         this.cancel_scan(cx);
+                    } else if !this.filter_text(cx).is_empty() {
+                        // `set_value` suppresses the input's Change event, so the
+                        // filter-recompute subscription won't fire — call
+                        // `apply_filter` explicitly (the C++ `clear()` triggers
+                        // `textChanged` which re-runs `applyFilter`).
+                        this.filter_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        this.apply_filter(cx);
                     }
                 }))
                 // Result-row context-menu actions (the C++ row right-click menu).
@@ -3203,6 +3359,11 @@ mod view {
                 .on_action(cx.listener(Self::ctx_copy_value))
                 .on_action(cx.listener(Self::ctx_set_base_address))
                 .on_action(cx.listener(Self::ctx_change_all_values))
+                // Panel-scoped keyboard shortcuts (scannerpanel.cpp:830-868).
+                .on_action(cx.listener(Self::act_scan_or_rescan))
+                .on_action(cx.listener(Self::act_rescan))
+                .on_action(cx.listener(Self::act_undo))
+                .on_action(cx.listener(Self::act_focus_filter))
                 // ── Panel header (uppercase muted title strip) ──
                 .child(crate::ui::design::panel_header("Scanner", cx))
                 .child(
@@ -3582,12 +3743,80 @@ mod tests {
     use super::{
         compute_delta, delete_rows, deserialize_results_json, filter_rows,
         format_addresses_for_clipboard, format_float, format_value, parse_change_all_bytes,
-        previous_delta_text, rescan_status, serialize_results_json, split_address_dim,
-        stage_breadcrumb, truncation_banner, value_type_entries, CondEntry, ScanMode, ScanRow,
-        ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
+        previous_delta_text, rescan_status, serialize_results_json, shortcut_scan_target,
+        split_address_dim, stage_breadcrumb, truncation_banner, value_type_entries, CondEntry,
+        ScanMode, ScanRow, ScanShortcut, ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
     use crate::scanner::{ScanCondition, ScanResult, ValueType};
     use crate::theme::manager::MemSettings;
+
+    // ── Smart filter defaults per scan mode (onModeChanged) ──
+
+    /// Entering Value mode applies the C++ `onModeChanged(1)` defaults
+    /// (scannerpanel.cpp:1135-1149): exec off, write on, and the three
+    /// scope toggles reset to off. `struct_only` and `alignment` are untouched.
+    #[test]
+    fn apply_mode_defaults_value() {
+        let mut form = ScannerForm::new();
+        // Dirty every filter + the untouched fields so we prove the reset.
+        form.filter_executable = true;
+        form.filter_writable = false;
+        form.private_only = true;
+        form.skip_system_modules = true;
+        form.user_mode_only = true;
+        form.struct_only = true;
+        form.alignment = 32;
+
+        form.apply_mode_defaults(ScanMode::Value);
+
+        assert!(!form.filter_executable, "Value mode: exec off");
+        assert!(form.filter_writable, "Value mode: write on");
+        assert!(!form.private_only);
+        assert!(!form.skip_system_modules);
+        assert!(!form.user_mode_only);
+        // Not touched by onModeChanged.
+        assert!(form.struct_only, "struct_only untouched");
+        assert_eq!(form.alignment, 32, "alignment untouched");
+    }
+
+    /// Entering Signature mode applies the C++ `onModeChanged(0)` defaults:
+    /// exec on, write off, scope toggles off; struct_only/alignment untouched.
+    #[test]
+    fn apply_mode_defaults_signature() {
+        let mut form = ScannerForm::new();
+        form.filter_executable = false;
+        form.filter_writable = true;
+        form.private_only = true;
+        form.skip_system_modules = true;
+        form.user_mode_only = true;
+        form.struct_only = true;
+        form.alignment = 16;
+
+        form.apply_mode_defaults(ScanMode::Signature);
+
+        assert!(form.filter_executable, "Signature mode: exec on");
+        assert!(!form.filter_writable, "Signature mode: write off");
+        assert!(!form.private_only);
+        assert!(!form.skip_system_modules);
+        assert!(!form.user_mode_only);
+        assert!(form.struct_only, "struct_only untouched");
+        assert_eq!(form.alignment, 16, "alignment untouched");
+    }
+
+    // ── Ctrl+Return scan-target preference (scanShortcut) ──
+
+    /// The C++ `scanShortcut` truth table (scannerpanel.cpp:832-838): mid-scan is
+    /// a no-op; with results a Next Scan; otherwise a First Scan.
+    #[test]
+    fn shortcut_scan_target_truth_table() {
+        // Running → no-op regardless of results.
+        assert_eq!(shortcut_scan_target(true, false), ScanShortcut::None);
+        assert_eq!(shortcut_scan_target(true, true), ScanShortcut::None);
+        // Idle with results → Next Scan.
+        assert_eq!(shortcut_scan_target(false, true), ScanShortcut::NextScan);
+        // Idle without results → First Scan.
+        assert_eq!(shortcut_scan_target(false, false), ScanShortcut::RunScan);
+    }
 
     // ── Delta / narrowed-count / breadcrumb / truncation / JSON helpers ──
 
