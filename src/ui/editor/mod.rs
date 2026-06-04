@@ -2884,46 +2884,59 @@ impl RcxEditor {
         // an auto-numbered enum member, then MOVES the selection to the new node.
         // Plain Up-at-top (dir < 0) is a silent no-op.
         if dir > 0 {
-            // Item 25: pass the last visible LEAF's OWN id to `append_single_field`
-            // (controller.rs:1835), which ALREADY walks up to the enclosing
-            // Struct/Array/Enum container. The prior code pre-walked to the leaf's
-            // PARENT, which appended as a SIBLING after a container-tail row instead
-            // of INSIDE the container the C++ targets (`appendSingleFieldRequested(
-            // lm.nodeId)` with the leaf's own id). With no last row, fall back to
-            // the view root.
-            let last_node_id = self
+            self.append_tail_field(cx);
+        }
+    }
+
+    /// Append ONE Hex64 field to the enclosing container of the last visible data
+    /// row (the C++ `appendSingleFieldRequested` → `append_single_field`), select
+    /// the new node, and scroll to it. Shared by plain Down-at-end
+    /// ([`navigate_node_mode`]) AND modifier Down-at-end (Shift/Ctrl via
+    /// [`navigate_node_extend`]) so the editor grows on the last address
+    /// regardless of held modifiers (the reported "shift+down won't expand" gap).
+    fn append_tail_field(&mut self, cx: &mut Context<Self>) {
+        // Pass the last visible LEAF's OWN id (controller.rs:1835 walks UP to the
+        // enclosing Struct/Array/Enum container, appending a Hex64 at its aligned
+        // tail / an auto-numbered enum member). With no last row, fall back to the
+        // view root.
+        let last_node_id = self
+            .controller
+            .last_result()
+            .meta
+            .iter()
+            .rev()
+            .find(|lm| {
+                lm.node_id != 0
+                    && lm.node_id != K_COMMAND_ROW_ID
+                    && lm.line_kind != LineKind::Footer
+                    && !lm.is_continuation
+            })
+            .map(|lm| lm.node_id);
+        let view_root = self.controller.view_root_id();
+        let target = last_node_id.unwrap_or(view_root);
+        if target == 0 {
+            return;
+        }
+        if let Some(new_id) = self.controller.append_single_field(target) {
+            self.apply_document(cx);
+            // Scroll to the freshly-selected new field's line so the cursor chases
+            // the new tail (the next Down grows again).
+            if let Some(line) = self
                 .controller
                 .last_result()
                 .meta
                 .iter()
-                .rev()
-                .find(|lm| {
-                    lm.node_id != 0
-                        && lm.node_id != K_COMMAND_ROW_ID
-                        && lm.line_kind != LineKind::Footer
-                        && !lm.is_continuation
-                })
-                .map(|lm| lm.node_id);
-            let view_root = self.controller.view_root_id();
-            let target = last_node_id.unwrap_or(view_root);
-            if target != 0 {
-                if let Some(new_id) = self.controller.append_single_field(target) {
-                    self.apply_document(cx);
-                    // Scroll to the freshly-selected new field's line so the cursor
-                    // chases the new tail (the next Down grows again).
-                    if let Some(line) = self
-                        .controller
-                        .last_result()
-                        .meta
-                        .iter()
-                        .position(|lm| lm.node_id == new_id && !lm.is_continuation)
-                    {
-                        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
-                    }
-                } else {
-                    self.apply_document(cx);
-                }
+                .position(|lm| lm.node_id == new_id && !lm.is_continuation)
+            {
+                // Park the caret on the freshly-appended field so the NEXT Down
+                // (plain or modifier) sees the caret at the new last row and grows
+                // again — otherwise a stale caret on the old tail makes the second
+                // modifier-Down merely extend the selection instead of growing.
+                self.caret_line = Some(line);
+                self.scroll.scroll_to_item(line, ScrollStrategy::Center);
             }
+        } else {
+            self.apply_document(cx);
         }
     }
 
@@ -3158,6 +3171,33 @@ impl RcxEditor {
             .or_else(|| self.first_selected_line())
             .map(|l| l as i64)
             .unwrap_or(if dir > 0 { 0 } else { count as i64 });
+        // Modifier Down (Shift/Ctrl) at the LAST address grows the class — the same
+        // auto-append as plain Down — so held modifiers don't block expansion (the
+        // reported "shift+down won't expand the last address" gap). Detect "caret
+        // already at the last navigable data row + moving down" and append instead
+        // of clamping in place.
+        if dir > 0 {
+            let last_nav = self
+                .controller
+                .last_result()
+                .meta
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, lm)| {
+                    lm.node_id != 0
+                        && lm.node_id != K_COMMAND_ROW_ID
+                        && lm.line_kind != LineKind::Footer
+                        && !lm.is_continuation
+                })
+                .map(|(idx, _)| idx as i64);
+            if let Some(last) = last_nav {
+                if start >= last {
+                    self.append_tail_field(cx);
+                    return;
+                }
+            }
+        }
         let mut i = start + dir as i64 * step.max(1) as i64;
         // Clamp into range so a big page-step still lands on the nearest node.
         if i < 0 {
