@@ -9006,18 +9006,36 @@ impl Render for RcxEditor {
                         .flex()
                         .flex_row()
                         .child(
-                            uniform_list(
-                                "rcx-rows",
-                                count,
-                                cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                                    range
-                                        .map(|ix| this.render_row(ix, window, cx))
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .flex_grow()
-                            .h_full()
-                            .track_scroll(&self.scroll),
+                            // The scrollable text column with a draggable vertical
+                            // scrollbar overlaid on its right edge. The editor used to
+                            // expose only the wheel and the optional minimap; a real
+                            // scrollbar is the standard affordance and gives a
+                            // position/extent indicator. `Scrollbar` lays out
+                            // absolutely over this `relative()` column and paints a
+                            // thin bar at the right edge (it hides itself when the
+                            // content fits and only intercepts clicks on that strip,
+                            // so row clicks pass straight through), reading the same
+                            // `self.scroll` handle the list tracks.
+                            div()
+                                .relative()
+                                .flex_grow()
+                                .h_full()
+                                .child(
+                                    uniform_list(
+                                        "rcx-rows",
+                                        count,
+                                        cx.processor(
+                                            |this, range: std::ops::Range<usize>, window, cx| {
+                                                range
+                                                    .map(|ix| this.render_row(ix, window, cx))
+                                                    .collect::<Vec<_>>()
+                                            },
+                                        ),
+                                    )
+                                    .size_full()
+                                    .track_scroll(&self.scroll),
+                                )
+                                .child(gpui_component::scroll::Scrollbar::vertical(&self.scroll)),
                         )
                         .when(self.minimap, |this| {
                             this.child(self.build_minimap(palette, cx))
