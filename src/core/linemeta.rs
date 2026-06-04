@@ -151,6 +151,12 @@ pub struct LineMeta {
     pub offset_text: String,
     pub offset_addr: u64,
     pub ptr_base: u64,
+    /// Whether this row sits inside an expanded pointer's target (a pointer-deref
+    /// child). Distinct from `ptr_base != 0`: a NULL/unreadable pointer target has
+    /// `ptr_base == 0` yet its children are still pointer-relative, so the offset
+    /// gutter must measure them from the pointer target base (`ptr_base`, even 0)
+    /// rather than falling back to the struct base.
+    pub under_ptr: bool,
     pub marker_mask: u32,
     pub data_changed: bool,
     pub heat_level: i32,
@@ -189,6 +195,7 @@ impl Default for LineMeta {
             offset_text: String::new(),
             offset_addr: 0,
             ptr_base: 0,
+            under_ptr: false,
             marker_mask: 0,
             data_changed: false,
             heat_level: 0,

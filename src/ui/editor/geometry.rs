@@ -1034,6 +1034,7 @@ pub fn fmt_margin_text(
     hex_digits: i32,
     is_continuation: bool,
     relative: bool,
+    under_ptr: bool,
 ) -> String {
     if hex_digits <= 0 {
         return String::new();
@@ -1050,7 +1051,13 @@ pub fn fmt_margin_text(
         // target base (`lm.ptrBase`), not the struct base, so a deref'd field
         // shows the correct offset from the pointee. The C++ `reformatMargins`
         // uses `rvaBase = lm.ptrBase ? lm.ptrBase : base`.
-        let rva_base = if ptr_base != 0 {
+        // Pointer-deref children measure from the pointer TARGET base — even when
+        // that base is 0 (a null/unreadable target). `under_ptr` distinguishes them
+        // from plain struct fields (which also have `ptr_base == 0` but measure from
+        // the struct base); without it a null pointer's children underflowed to a
+        // giant `+FFFF…` offset that the gutter clipped to a garbage absolute-looking
+        // address.
+        let rva_base = if under_ptr || ptr_base != 0 {
             ptr_base
         } else {
             base_address
@@ -1607,9 +1614,9 @@ mod tests {
         // carries a distinct address, so the gutter must differ per row (the bug
         // was every row repeating the base address).
         let base = 0xFFFF_8000_0000_0000u64;
-        let r0 = fmt_margin_text(base, base, 0, 8, false, true);
-        let r8 = fmt_margin_text(base + 0x8, base, 0, 8, false, true);
-        let r10 = fmt_margin_text(base + 0x10, base, 0, 8, false, true);
+        let r0 = fmt_margin_text(base, base, 0, 8, false, true, false);
+        let r8 = fmt_margin_text(base + 0x8, base, 0, 8, false, true, false);
+        let r10 = fmt_margin_text(base + 0x10, base, 0, 8, false, true, false);
         assert!(r0.trim_start().ends_with("+0"), "got {r0:?}");
         assert!(r8.trim_start().ends_with("+8"), "got {r8:?}");
         assert!(r10.trim_start().ends_with("+10"), "got {r10:?}");
@@ -1625,8 +1632,8 @@ mod tests {
     fn margin_absolute_addresses_when_source_attached() {
         // PIC1: a live source → full uppercase hex address, distinct per row.
         let base = 0x7FF6_0BF0_2B80u64;
-        let a0 = fmt_margin_text(base, base, 0, 12, false, false);
-        let a8 = fmt_margin_text(base + 0x8, base, 0, 12, false, false);
+        let a0 = fmt_margin_text(base, base, 0, 12, false, false, false);
+        let a8 = fmt_margin_text(base + 0x8, base, 0, 12, false, false, false);
         assert_eq!(a0, "7FF60BF02B80");
         assert_eq!(a8, "7FF60BF02B88");
         assert_ne!(a0, a8);
@@ -1634,14 +1641,14 @@ mod tests {
 
     #[test]
     fn margin_continuation_is_the_dot_marker() {
-        assert_eq!(fmt_margin_text(0x40, 0, 0, 8, true, true), "·");
-        assert_eq!(fmt_margin_text(0x40, 0, 0, 8, true, false), "·");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, 8, true, true, false), "·");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, 8, true, false, false), "·");
     }
 
     #[test]
     fn margin_empty_when_no_digits() {
-        assert_eq!(fmt_margin_text(0x40, 0, 0, 0, false, true), "");
-        assert_eq!(fmt_margin_text(0x40, 0, 0, -1, false, false), "");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, 0, false, true, false), "");
+        assert_eq!(fmt_margin_text(0x40, 0, 0, -1, false, false, false), "");
     }
 
     #[test]
@@ -1652,12 +1659,19 @@ mod tests {
         let struct_base = 0x1000u64;
         let ptr_base = 0x9000u64;
         let child_addr = ptr_base + 0x18;
-        // With ptr_base set, the relative offset is child - ptr_base = +18.
-        let with_ptr = fmt_margin_text(child_addr, struct_base, ptr_base, 8, false, true);
+        // A pointer child (`under_ptr`) with a real target base → child - ptr_base.
+        let with_ptr = fmt_margin_text(child_addr, struct_base, ptr_base, 8, false, true, true);
         assert!(with_ptr.trim_start().ends_with("+18"), "got {with_ptr:?}");
-        // With ptr_base == 0, it falls back to the struct base (child - base).
-        let no_ptr = fmt_margin_text(child_addr, struct_base, 0, 8, false, true);
-        assert!(no_ptr.trim_start().ends_with("+8018"), "got {no_ptr:?}");
+        // A pointer child with a NULL/unreadable target (`ptr_base == 0`): still
+        // measure from the (null) target base 0, NOT the struct base — the child at
+        // 0+0x18 reads "+18", not the giant underflowed offset the old code clipped
+        // to a garbage absolute-looking address.
+        let null_child = fmt_margin_text(0x18, struct_base, 0, 8, false, true, true);
+        assert!(null_child.trim_start().ends_with("+18"), "got {null_child:?}");
+        // A PLAIN struct field (NOT under a pointer) with `ptr_base == 0` keeps
+        // measuring from the struct base (child - base).
+        let plain = fmt_margin_text(child_addr, struct_base, 0, 8, false, true, false);
+        assert!(plain.trim_start().ends_with("+8018"), "got {plain:?}");
     }
 
     #[test]

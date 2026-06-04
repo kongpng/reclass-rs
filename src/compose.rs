@@ -247,6 +247,7 @@ pub fn compose_with_symbols(
         symbol_lookup,
         sibling_stack: Vec::new(),
         current_ptr_base: 0,
+        current_under_ptr: false,
         child_map: HashMap::new(),
         child_map_sorted: HashSet::new(),
         abs_offsets: Vec::new(),
@@ -731,6 +732,10 @@ struct ComposeState<'a> {
     symbol_lookup: SymbolLookupFn<'a>,
     sibling_stack: Vec<bool>,
     current_ptr_base: u64,
+    /// True while composing inside an expanded pointer's target — stamped onto each
+    /// emitted row's [`LineMeta::under_ptr`] so the gutter measures pointer-deref
+    /// children from the pointer target base even when that base is 0 (null target).
+    current_under_ptr: bool,
     child_map: HashMap<u64, Vec<i32>>,
     child_map_sorted: HashSet<u64>,
     abs_offsets: Vec<i64>,
@@ -796,6 +801,10 @@ impl ComposeState<'_> {
 
     /// `emitLine(lineText, LineMeta&&)` (`compose.cpp:128-193`).
     fn emit_line(&mut self, line_text: &U16Str, lm: &mut LineMeta) {
+        // Stamp the pointer-deref scope onto every row (single choke point) so the
+        // gutter can tell a pointer child from a plain field even when the pointer
+        // target base is 0.
+        lm.under_ptr = self.current_under_ptr;
         if self.current_line > 0 {
             self.text.push_char('\n');
         }
@@ -2289,7 +2298,9 @@ fn compose_static_fields(
                         if ref_node.kind == NodeKind::Struct || ref_node.kind == NodeKind::Array {
                             let ref_id = ref_node.id;
                             let saved = state.current_ptr_base;
+                            let saved_under = state.current_under_ptr;
                             state.current_ptr_base = p_base;
+                            state.current_under_ptr = true;
                             compose_parent(
                                 state,
                                 tree,
@@ -2304,6 +2315,7 @@ fn compose_static_fields(
                                 0,
                             );
                             state.current_ptr_base = saved;
+                            state.current_under_ptr = saved_under;
                         }
                     }
                 }
@@ -2561,7 +2573,9 @@ fn compose_node(
             }
 
             let saved_ptr_base = state.current_ptr_base;
+            let saved_under_ptr = state.current_under_ptr;
             state.current_ptr_base = p_base;
+            state.current_under_ptr = true;
 
             if has_materialized {
                 let n = ptr_children.len();
@@ -2607,6 +2621,7 @@ fn compose_node(
             }
 
             state.current_ptr_base = saved_ptr_base;
+            state.current_under_ptr = saved_under_ptr;
 
             // Footer for pointer fold. A typed pointer to a class shows the same
             // add-bytes pills as a struct footer (`+1 +10h +100h +1000h Trim Top`)

@@ -4736,6 +4736,7 @@ impl RcxEditor {
                     addr_cols,
                     lm.is_continuation,
                     relative,
+                    lm.under_ptr,
                 )
             };
             row = row.child(
@@ -9479,6 +9480,7 @@ mod tests {
                     digits,
                     lm.is_continuation,
                     true,
+                    lm.under_ptr,
                 ));
             }
         }
