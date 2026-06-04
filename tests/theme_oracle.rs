@@ -57,8 +57,8 @@ fn built_in_themes() {
     assert!(warm.background.is_some());
     assert!(warm.text.is_some());
     assert_eq!(warm.background, Color::parse("#212121"));
-    // ORACLE FIX (test_theme FAIL line 37): shipped JSON selection is "#3a2a3a".
-    assert_eq!(warm.selection, Color::parse("#3a2a3a"));
+    // Shipped warm.json selection matches C++ test_theme.cpp:37.
+    assert_eq!(warm.selection, Color::parse("#21213A"));
     assert_eq!(warm.syntax_keyword, Color::parse("#AA9565"));
     assert_eq!(warm.syntax_type, Color::parse("#6B959F"));
 }
@@ -105,10 +105,11 @@ fn from_json_missing_fields() {
     assert_eq!(t.background, Color::parse("#ff0000"));
     assert!(t.text.is_none());
     assert!(t.syntax_keyword.is_none());
-    // ORACLE FIX (test_theme FAIL line 89): from_json makes all markers valid.
-    assert_eq!(t.marker_error, Color::parse("#5a1d1d"));
-    assert_eq!(t.marker_ptr, Color::parse("#f44747"));
-    assert_eq!(t.marker_cycle, Color::parse("#e8a35c"));
+    // C++ has no marker fallbacks: a sparse theme leaves all three markers
+    // invalid (test_theme.cpp:89 `QVERIFY(!t.markerError.isValid())`).
+    assert!(t.marker_error.is_none());
+    assert!(t.marker_ptr.is_none());
+    assert!(t.marker_cycle.is_none());
 }
 
 #[test]

@@ -401,7 +401,7 @@ impl Theme {
     ///
     /// Lenient (never fails): bad / missing values become `None`, a bad `name`
     /// becomes `"Untitled"`. Then applies the §2.4 derivation pipeline (heat
-    /// gradient, focusGlow, RTTI hint, marker fallbacks, hover-distinctness).
+    /// gradient, focusGlow, RTTI hint, hover-distinctness).
     pub fn from_json(o: &Value) -> Theme {
         let mut t = Theme::default();
 
@@ -423,16 +423,20 @@ impl Theme {
 
         // ── Derivation pipeline (theme.cpp:59-106) ──
 
-        // 1. Heat amber gradient (theme.cpp:69-80).
+        // 1. Heat amber gradient (theme.cpp:62-74).
+        //    cold = dim nudged 30% toward warm gold; warm = dim nudged 60%
+        //    toward orange; hot = the theme's markerPtr (copied directly — may
+        //    be None for a sparse theme, mirroring `t.indHeatHot = t.markerPtr`
+        //    where markerPtr is an invalid QColor).
         let dim = t.text_dim.unwrap_or(Color::rgb(133, 133, 133));
         if t.ind_heat_cold.is_none() {
-            t.ind_heat_cold = Some(lerp_rgb(dim, Color::rgb(220, 180, 120), 0.35));
+            t.ind_heat_cold = Some(lerp_rgb(dim, Color::rgb(210, 170, 100), 0.30));
         }
         if t.ind_heat_warm.is_none() {
-            t.ind_heat_warm = Some(Color::rgb(225, 170, 90)); // clear amber
+            t.ind_heat_warm = Some(lerp_rgb(dim, Color::rgb(235, 145, 50), 0.60));
         }
         if t.ind_heat_hot.is_none() {
-            t.ind_heat_hot = Some(Color::rgb(232, 165, 92)); // saturated amber, not red
+            t.ind_heat_hot = t.marker_ptr;
         }
 
         // 2. focusGlow (theme.cpp:82-83).
@@ -448,20 +452,7 @@ impl Theme {
             t.ind_rtti_hint = Some(Color::parse("#d19a66").unwrap());
         }
 
-        // 4. Marker fallbacks (theme.cpp:95-97). After from_json all three
-        //    markers are ALWAYS Some — the behaviour the oracle confirms (the
-        //    stale C++ test wrongly asserts markerError invalid).
-        if t.marker_ptr.is_none() {
-            t.marker_ptr = Some(Color::parse("#f44747").unwrap());
-        }
-        if t.marker_cycle.is_none() {
-            t.marker_cycle = Some(Color::parse("#e8a35c").unwrap());
-        }
-        if t.marker_error.is_none() {
-            t.marker_error = Some(Color::parse("#5a1d1d").unwrap());
-        }
-
-        // 5. Hover-distinctness guard (theme.cpp:99-106): only if BOTH hover
+        // 4. Hover-distinctness guard (theme.cpp:86-92): only if BOTH hover
         //    and background are Some.
         if let (Some(h), Some(bg)) = (t.hover, t.background) {
             let dist = (h.r as i32 - bg.r as i32).abs()
@@ -531,38 +522,54 @@ mod tests {
         // No fallback for text / syntaxKeyword → stay None.
         assert!(t.text.is_none());
         assert!(t.syntax_keyword.is_none());
-        // ORACLE FIX: the stale C++ test asserts `!markerError.isValid()`, but
-        // from_json step 4 makes all markers valid. The oracle records this
-        // (test_theme FAIL at line 89). Assert the CORRECT current behaviour.
-        assert_eq!(t.marker_error, Color::parse("#5a1d1d"));
-        assert_eq!(t.marker_ptr, Color::parse("#f44747"));
-        assert_eq!(t.marker_cycle, Color::parse("#e8a35c"));
+        // C++ has no marker fallbacks: a sparse theme leaves all three markers
+        // invalid (test_theme.cpp:89 `QVERIFY(!t.markerError.isValid())`).
+        assert!(t.marker_error.is_none());
+        assert!(t.marker_ptr.is_none());
+        assert!(t.marker_cycle.is_none());
     }
 
     #[test]
     fn heat_derivation() {
-        // text_dim = Long Night's #7F7E74 → ind_heat_cold = lerp(dim, 220,180,120, 0.35).
-        let v = serde_json::json!({ "name": "T", "textDim": "#7F7E74" });
+        // C++ theme.cpp:62-74. With Long Night's textDim #7F7E74 and an explicit
+        // markerPtr: cold = lerp(dim, (210,170,100), 0.30), warm = lerp(dim,
+        // (235,145,50), 0.60), hot = markerPtr.
+        let v = serde_json::json!({ "name": "T", "textDim": "#7F7E74", "markerPtr": "#FF5370" });
         let t = Theme::from_json(&v);
         let dim = Color::rgb(0x7f, 0x7e, 0x74);
         assert_eq!(
             t.ind_heat_cold,
-            Some(lerp_rgb(dim, Color::rgb(220, 180, 120), 0.35))
+            Some(lerp_rgb(dim, Color::rgb(210, 170, 100), 0.30))
         );
-        assert_eq!(t.ind_heat_warm, Some(Color::rgb(225, 170, 90)));
-        assert_eq!(t.ind_heat_hot, Some(Color::rgb(232, 165, 92)));
+        assert_eq!(t.ind_heat_cold, Color::parse("#978b70")); // golden value
+        assert_eq!(
+            t.ind_heat_warm,
+            Some(lerp_rgb(dim, Color::rgb(235, 145, 50), 0.60))
+        );
+        assert_eq!(t.ind_heat_warm, Color::parse("#bf894d")); // golden value
+                                                              // hot = the theme's markerPtr, copied directly.
+        assert_eq!(t.ind_heat_hot, Color::parse("#FF5370"));
 
-        // Absent text_dim → lerp uses #858585 (133,133,133).
+        // markerPtr absent → ind_heat_hot stays None (`t.indHeatHot = t.markerPtr`
+        // where markerPtr is an invalid QColor).
+        let v = serde_json::json!({ "name": "T", "textDim": "#7F7E74" });
+        let t = Theme::from_json(&v);
+        assert!(t.ind_heat_hot.is_none());
+
+        // Absent textDim → dim = (133,133,133): cold #9c907c, warm #c28c54.
         let v = serde_json::json!({ "name": "T" });
         let t = Theme::from_json(&v);
+        let dim = Color::rgb(133, 133, 133);
         assert_eq!(
             t.ind_heat_cold,
-            Some(lerp_rgb(
-                Color::rgb(133, 133, 133),
-                Color::rgb(220, 180, 120),
-                0.35
-            ))
+            Some(lerp_rgb(dim, Color::rgb(210, 170, 100), 0.30))
         );
+        assert_eq!(t.ind_heat_cold, Color::parse("#9c907c"));
+        assert_eq!(
+            t.ind_heat_warm,
+            Some(lerp_rgb(dim, Color::rgb(235, 145, 50), 0.60))
+        );
+        assert_eq!(t.ind_heat_warm, Color::parse("#c28c54"));
     }
 
     #[test]

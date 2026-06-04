@@ -539,9 +539,8 @@ mod tests {
         assert!(warm.background.is_some());
         assert!(warm.text.is_some());
         assert_eq!(warm.background, Color::parse("#212121"));
-        // ORACLE FIX: shipped JSON has selection "#3a2a3a" (NOT the stale test's
-        // "#21213A"). The oracle records test_theme FAIL at line 37.
-        assert_eq!(warm.selection, Color::parse("#3a2a3a"));
+        // Shipped warm.json selection matches C++ test_theme.cpp:37.
+        assert_eq!(warm.selection, Color::parse("#21213A"));
         assert_eq!(warm.syntax_keyword, Color::parse("#AA9565"));
         assert_eq!(warm.syntax_type, Color::parse("#6B959F"));
     }
