@@ -7981,7 +7981,11 @@ impl RcxEditor {
         let popup_for_modal = popup.clone();
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
-                .w(px(360.))
+                // Wide enough for the longest "Name  (libXxxPlugin.dll)" row so the
+                // trailing dll hint + footer keep their right padding instead of
+                // clipping against the card's right edge (the "right side match
+                // left" gap — the 360px card cut the dll hints + the footer Esc).
+                .w(px(520.))
                 .margin_top(px(80.))
                 .close_button(false)
                 .child(popup_for_modal.clone())
