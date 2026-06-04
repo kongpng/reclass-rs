@@ -257,7 +257,16 @@ actions!(
         // and QKeySequence(Ctrl|Shift|F) for the Performance Profiler
         // (main.cpp:1565). Each routes back through `run_menu_command`.
         RttiAction,
-        ProfilerAction
+        ProfilerAction,
+        // Alt+letter menu-bar mnemonics (the C++ `QMenuBar` Alt accelerators):
+        // Alt+F File, Alt+E Edit, Alt+V View, Alt+T Tools, Alt+P Plugins, Alt+H
+        // Help. Each toggles the matching top-level menu open/closed.
+        OpenMenuFile,
+        OpenMenuEdit,
+        OpenMenuView,
+        OpenMenuTools,
+        OpenMenuPlugins,
+        OpenMenuHelp
     ]
 );
 
@@ -1573,6 +1582,15 @@ impl MainWindow {
     fn on_split_editor(&mut self, _: &SplitEditor, window: &mut Window, cx: &mut Context<Self>) {
         self.run_menu_command(&"view.split".to_string(), window, cx);
     }
+    /// Toggle the top-level menu-bar menu whose Alt-mnemonic is `letter` (the
+    /// Alt+letter accelerators, e.g. Alt+F ⇒ File). Opening it focuses its dropdown
+    /// (via `MenuBar::render`), so Esc then closes it.
+    fn toggle_menu_mnemonic(&mut self, letter: char, cx: &mut Context<Self>) {
+        self.menubar.update(cx, |mb, cx| {
+            mb.activate_mnemonic(letter, cx);
+        });
+    }
+
     fn on_unsplit_editor(
         &mut self,
         _: &UnsplitEditor,
@@ -7248,6 +7266,25 @@ impl Render for MainWindow {
             // in the menu but previously unbound.
             .on_action(cx.listener(Self::on_rtti))
             .on_action(cx.listener(Self::on_profiler))
+            // Alt+letter menu-bar mnemonics → toggle the matching top-level menu.
+            .on_action(cx.listener(|this, _: &OpenMenuFile, _w, cx| {
+                this.toggle_menu_mnemonic('f', cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMenuEdit, _w, cx| {
+                this.toggle_menu_mnemonic('e', cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMenuView, _w, cx| {
+                this.toggle_menu_mnemonic('v', cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMenuTools, _w, cx| {
+                this.toggle_menu_mnemonic('t', cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMenuPlugins, _w, cx| {
+                this.toggle_menu_mnemonic('p', cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMenuHelp, _w, cx| {
+                this.toggle_menu_mnemonic('h', cx)
+            }))
             // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
             // Dimmed in Presentation Mode (chrome fade).
             .child(div().opacity(chrome_opacity).child(titlebar))
@@ -7452,6 +7489,14 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // F1 opens Help ▸ Keyboard Shortcuts (the C++ QKeySequence(Qt::Key_F1);
     // main.cpp:1580). The command palette keeps Ctrl+Shift+P / Ctrl+K.
     bindings.push(KeyBinding::new("f1", ShortcutsAction, Some("RcxWindow")));
+    // Alt+letter menu-bar mnemonics (the C++ `QMenuBar` Alt accelerators): open the
+    // matching top-level menu from anywhere in the window.
+    bindings.push(KeyBinding::new("alt-f", OpenMenuFile, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("alt-e", OpenMenuEdit, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("alt-v", OpenMenuView, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("alt-t", OpenMenuTools, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("alt-p", OpenMenuPlugins, Some("RcxWindow")));
+    bindings.push(KeyBinding::new("alt-h", OpenMenuHelp, Some("RcxWindow")));
     // Toggle the memory-scanner pop-out (the C++ summoned-on-demand scanner;
     // closed by default). Ctrl+Shift+M shows/hides the bottom scanner dock.
     bindings.push(KeyBinding::new(

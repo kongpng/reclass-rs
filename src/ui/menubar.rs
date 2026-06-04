@@ -155,8 +155,9 @@ impl MenuBar {
 
     /// Toggle the top-level menu at `index` open/closed (the C++ title click). If
     /// a *different* menu is open it switches to this one; clicking the open menu's
-    /// title again closes it. Always collapses any open fly-out chain.
-    fn toggle_menu(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// title again closes it. Always collapses any open fly-out chain. `pub` so the
+    /// host window can drive it from the Alt+letter menu mnemonics.
+    pub fn toggle_menu(&mut self, index: usize, cx: &mut Context<Self>) {
         self.open_index = if self.open_index == Some(index) {
             None
         } else {
@@ -164,6 +165,25 @@ impl MenuBar {
         };
         self.open_submenu.clear();
         cx.notify();
+    }
+
+    /// Toggle the top-level menu whose `&`-mnemonic matches `letter`
+    /// (case-insensitive) — the Alt+letter accelerator (`Alt+F` ⇒ `&File`). Returns
+    /// whether a menu matched. Resolved by scanning the live menu labels so it
+    /// tracks the menu order rather than hard-coding indices.
+    pub fn activate_mnemonic(&mut self, letter: char, cx: &mut Context<Self>) -> bool {
+        let want = letter.to_ascii_lowercase();
+        let idx = self.menus.iter().position(|n| match n {
+            MenuNode::Submenu { label, .. } => mnemonic_of(label) == Some(want),
+            _ => false,
+        });
+        match idx {
+            Some(i) => {
+                self.toggle_menu(i, cx);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Switch the open menu to `index` *only while a menu is already open* — the
@@ -236,6 +256,13 @@ impl MenuBar {
 /// etc. for the palette's mnemonic handling; the bar shows the bare word).
 fn clean_title(label: &str) -> String {
     label.replace('&', "")
+}
+
+/// The lowercase Alt-mnemonic character of a `&`-marked title (`"&File"` ⇒ `'f'`),
+/// or `None` if the label has no `&`. Drives the Alt+letter menu accelerators.
+fn mnemonic_of(label: &str) -> Option<char> {
+    let pos = label.find('&')?;
+    label[pos + 1..].chars().next().map(|c| c.to_ascii_lowercase())
 }
 
 /// Apply the C++ `applyMenuBarTitleCase` transform to a `&`-stripped title
