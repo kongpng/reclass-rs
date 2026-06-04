@@ -9305,6 +9305,52 @@ mod tests {
     }
 
     #[test]
+    fn new_class_command_row_colors_full_class_name() {
+        // Regression: the command row is painted from the LIVE `build_command_row()`
+        // string, but `lm.brace_col` was measured on the composed line-0 stub
+        // ("[▸] source▾  0x0  struct Untitled {") whose `{` sits at a different
+        // column (34) than the live brace (38). The stale brace-dim used to punch a
+        // one-column Dim hole INTO the class name ("NewClass" rendered as colored
+        // "NewCl" + dim "a" + colored "ss"). After the fix the full name reads as
+        // one contiguous ClassName run and the REAL trailing `{` is the dimmed col.
+        use crate::compose::command_row_root_name_span;
+        use crate::ui::editor::geometry::{self, SpanRole};
+        let doc = RcxDocument::new();
+        let mut c = RcxController::new(doc);
+        let (root_id, _name) = c.create_new_class_struct();
+        c.set_view_root_id(root_id);
+        c.refresh();
+        let row = c.build_command_row();
+        let name = command_row_root_name_span(&row);
+        assert!(name.valid, "name span must resolve on the live command row");
+        let lm = c.last_result().meta[0].clone();
+        assert_eq!(lm.line_kind, LineKind::CommandRow);
+        let (type_w, name_w) = geometry::effective_widths(&lm);
+        let runs = geometry::style_runs(&lm, &row, type_w, name_w);
+        let role_at = |col: i32| {
+            runs.iter()
+                .find(|r| r.start <= col && col < r.end)
+                .map(|r| r.role)
+        };
+        // Every column inside the name span resolves to ClassName — no Dim hole.
+        for col in name.start..name.end {
+            assert_eq!(
+                role_at(col),
+                Some(SpanRole::ClassName),
+                "col {col} of the class name must be ClassName; runs={runs:?}"
+            );
+        }
+        // The dimmed brace is the REAL trailing `{`, after the name (not inside it).
+        let brace_col = row.chars().position(|ch| ch == '{').unwrap() as i32;
+        assert!(brace_col >= name.end, "brace must follow the class name");
+        assert_eq!(
+            role_at(brace_col),
+            Some(SpanRole::Dim),
+            "the trailing `{{` must be the dimmed column"
+        );
+    }
+
+    #[test]
     fn relative_offsets_default_on_and_margin_increments() {
         // Issue 2: the margin must increment per row (not repeat the base) and
         // default to relative "+<HEX>" offsets. We test the pure formatter against

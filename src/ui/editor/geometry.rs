@@ -399,13 +399,26 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
         }
     }
 
-    // Brace dimming (trailing `{` on header lines, `braceCol`).
-    if lm.brace_col >= 0 && lm.brace_col < n {
+    // Brace dimming (trailing `{` on header lines, `braceCol`). The command row is
+    // painted from the LIVE `build_command_row()` string, whose `{` sits at a
+    // different column than the composed line-0 stub that `lm.brace_col` was
+    // measured against (the live source / base-address / keyword / class-name
+    // lengths differ from the `0x0`/`struct Untitled` placeholder). Trusting the
+    // stale precomputed column dimmed a glyph INSIDE the class name (the stub
+    // brace col 34 landed on `NewClass`'s 6th char). Every other command-row span
+    // is re-derived from `text`, so re-scan the live text for the trailing `{`
+    // here too and keep them all in lock-step.
+    let brace_col = if lm.line_kind == LineKind::CommandRow {
+        text.rfind('{').map(|b| col_for_byte(text, b)).unwrap_or(-1)
+    } else {
+        lm.brace_col
+    };
+    if brace_col >= 0 && brace_col < n {
         push(
             &mut layers,
             ColumnSpan {
-                start: lm.brace_col,
-                end: lm.brace_col + 1,
+                start: brace_col,
+                end: brace_col + 1,
                 valid: true,
             },
             SpanRole::Dim,
