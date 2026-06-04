@@ -261,6 +261,27 @@ actions!(
     ]
 );
 
+/// One entry in the window's custom centered-modal stack — a focused popup
+/// rendered OVER the whole window by [`MainWindow::render_modal_layer`] with NO
+/// competing `focus_trap`. This is the in-house replacement for gpui-component's
+/// `window.open_dialog` for our keyboard-driven popups (command palette, type /
+/// enum / source pickers): `open_dialog`'s `Dialog` installs a `focus_trap` on
+/// its OWN focus handle (dialog.rs:526) that swallows the inner popup's
+/// `capture_key_down`, so Enter hit the dialog's `ConfirmDialog`→close and the
+/// arrow keys did nothing. Here the popup's own input handle is focused and
+/// nothing competes, so the popup's key handling (list nav + Enter-apply) fires.
+struct ModalEntry {
+    /// The popup view to render centered (already a self-styled elevated card).
+    view: AnyView,
+    /// The popup's own focus handle (delegates to its query input) — focused on
+    /// open and whenever it becomes the top entry, so keystrokes reach the popup.
+    focus: FocusHandle,
+    /// Optional fixed card width. `Some` for a popup that sizes via `w_full` + a
+    /// `max_w` cap (the command palette → 600); `None` for a self-sizing popup
+    /// (the type selector sets its own `w(380)`).
+    width: Option<Pixels>,
+}
+
 /// The application's root view — the C++ `MainWindow` (app-shell §6).
 pub struct MainWindow {
     /// Window-level application state (open docs, active doc, source, selection,
@@ -291,6 +312,13 @@ pub struct MainWindow {
     /// Live subscription to the currently-open command-palette modal — kept so its
     /// Trigger/Cancel events fire while shown (a dropped subscription stops them).
     palette_sub: Option<Subscription>,
+    /// The custom centered-modal overlay stack (command palette / type selector /
+    /// enum + source pickers), rendered by [`render_modal_layer`](Self::render_modal_layer)
+    /// OVER the window. Replaces `window.open_dialog` for keyboard-driven popups
+    /// whose inner key handling the dialog's `focus_trap` used to swallow (the
+    /// #1/#2 fix). Topmost is last; the top entry owns click-outside-to-dismiss and
+    /// holds focus.
+    modal_stack: Vec<ModalEntry>,
     /// Observations of the open editors — one per tab. The editor entities own
     /// the selection; they `cx.notify()` themselves on a row click but do NOT
     /// emit up to us, so without these the bottom status bar (computed in
@@ -1269,6 +1297,7 @@ impl MainWindow {
             layout_preset,
             theme_manager,
             palette_sub: None,
+            modal_stack: Vec::new(),
             editor_observers: Vec::new(),
             goto_sub: None,
             // Not closing yet (the C++ `m_closingAll` starts false).
@@ -1368,6 +1397,103 @@ impl MainWindow {
     /// the Help ▸ Keyboard Shortcuts accelerator). Builds a fresh palette over the
     /// menu tree, shows it in the gpui-component dialog layer, and routes its
     /// Trigger/Cancel back here (close, then dispatch the command).
+    /// Push `view` onto the centered-modal stack and focus its `focus` handle, then
+    /// re-render so [`render_modal_layer`](Self::render_modal_layer) paints it OVER
+    /// the window. The in-house replacement for `window.open_dialog` for our
+    /// keyboard-driven popups: no `focus_trap` competes, so the popup's own
+    /// `capture_key_down` (list nav + Enter-apply) actually fires (the #1/#2 fix).
+    /// `width` is `Some` for popups that size via `w_full` + a `max_w` cap (the
+    /// palette), `None` for self-sizing popups (the type selector).
+    pub fn open_centered_modal(
+        &mut self,
+        view: AnyView,
+        focus: FocusHandle,
+        width: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal_stack.push(ModalEntry {
+            view,
+            focus: focus.clone(),
+            width,
+        });
+        // Focus the popup's OWN input handle so the first keystroke reaches it (no
+        // dialog focus_trap pulls focus back, unlike `open_dialog`).
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Pop the topmost centered modal, restoring focus to the next modal (if the
+    /// stack is still non-empty) or the active editor surface. Mirrors
+    /// `window.close_dialog` for the in-house stack.
+    pub fn close_top_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_stack.pop().is_none() {
+            return;
+        }
+        if let Some(top) = self.modal_stack.last() {
+            window.focus(&top.focus, cx);
+        } else if let Some(editor) = self.document_area.read(cx).active_editor() {
+            let fh = editor.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+        cx.notify();
+    }
+
+    /// Render the centered-modal stack as a full-window overlay: a dimming scrim
+    /// (the top entry owns click-outside-to-dismiss) with each popup card centered
+    /// horizontally near the top third (the Zed-picker placement). NO `focus_trap`
+    /// — the focused popup owns key dispatch. `None` when no modal is open.
+    fn render_modal_layer(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.modal_stack.is_empty() {
+            return None;
+        }
+        let top_ix = self.modal_stack.len() - 1;
+        let layers: Vec<AnyElement> = self
+            .modal_stack
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let is_top = ix == top_ix;
+                let card = div()
+                    .occlude()
+                    .mt(px(120.))
+                    // A fixed-width popup (palette / source / enum / hex sets only a
+                    // `min_w`) is stretched to fill the card, exactly as the dialog's
+                    // `v_flex` used to. A `None`-width popup self-sizes (type selector
+                    // sets its own `w(380)`), so leave the card content-sized.
+                    .when_some(entry.width, |this, w| {
+                        this.flex().flex_col().items_stretch().w(w)
+                    })
+                    // Clicks INSIDE the card must not bubble to the scrim's
+                    // close-on-press (selecting a row would otherwise dismiss it).
+                    .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+                        cx.stop_propagation()
+                    })
+                    .child(entry.view.clone());
+                div()
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .when(is_top, |this| {
+                        this.occlude()
+                            .bg(gpui::hsla(0., 0., 0., 0.45))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e: &MouseDownEvent, window, cx| {
+                                    this.close_top_modal(window, cx)
+                                }),
+                            )
+                    })
+                    .child(card)
+                    .into_any_element()
+            })
+            .collect();
+        Some(div().absolute().inset_0().children(layers))
+    }
+
     fn open_command_palette(
         &mut self,
         _: &OpenCommandPalette,
@@ -1383,30 +1509,18 @@ impl MainWindow {
             |this, _p, ev: &PaletteEvent, window, cx| match ev {
                 PaletteEvent::Trigger(cmd) => {
                     let cmd = cmd.clone();
-                    window.close_dialog(cx);
+                    this.close_top_modal(window, cx);
                     this.run_menu_command(&cmd, window, cx);
                 }
-                PaletteEvent::Cancel => window.close_dialog(cx),
+                PaletteEvent::Cancel => this.close_top_modal(window, cx),
             },
         ));
-        let palette_for_modal = palette.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            // Center a Zed-style picker: a ~600px card anchored in the top third
-            // over a dimming scrim (the dialog's default `overlay`). The palette
-            // renders its own elevated card + header, so suppress the dialog's
-            // chrome (close button + inner padding) and let it size the card.
-            dialog
-                .w(px(600.))
-                .margin_top(px(120.))
-                .close_button(false)
-                .child(palette_for_modal.clone())
-        });
-        // Focus the palette's query input (its `Focusable` handle delegates to the
-        // input) so the first keystroke types into the palette instead of falling
-        // through to the window's global shortcuts. `open_dialog` focuses its own
-        // handle first, so this runs last and wins.
-        window.focus(&focus, cx);
-        cx.notify();
+        // Render the palette in our OWN centered-modal overlay, not
+        // `window.open_dialog` — whose `Dialog` focus_trap swallowed the palette's
+        // Up/Down/Enter (the keyboard-nav-dead bug; see [`ModalEntry`]). The palette
+        // sizes via `w_full` + `max_w(600)`, so give the card the 600px width the
+        // dialog used to provide, and focus the palette's query input.
+        self.open_centered_modal(palette.into(), focus, Some(px(600.)), window, cx);
     }
 
     // ── Global-key-binding action handlers (route to `run_menu_command`) ──────
@@ -5144,6 +5258,26 @@ impl MainWindow {
                         };
                         this.set_view_option_value(opt, *value, cx);
                     }
+                    // Editor-owned keyboard popup (type / enum / source pickers):
+                    // render it in OUR centered-modal overlay (no dialog focus_trap)
+                    // and focus its input. The editor keeps its own outcome
+                    // subscription; on Chosen/Cancel it emits `CloseModal` back.
+                    super::editor::RcxEditorEvent::OpenModal {
+                        view,
+                        focus,
+                        width,
+                    } => {
+                        this.open_centered_modal(
+                            view.clone(),
+                            focus.clone(),
+                            *width,
+                            window,
+                            cx,
+                        );
+                    }
+                    super::editor::RcxEditorEvent::CloseModal => {
+                        this.close_top_modal(window, cx);
+                    }
                 },
             ));
         }
@@ -6884,6 +7018,11 @@ impl Render for MainWindow {
         // tab's controller); lay them side-by-side to the right of the dock area.
         let split_panes = self.render_split_panes(cx);
 
+        // Our in-house centered-modal overlay (command palette / type+enum+source
+        // pickers), painted OVER the content with no `focus_trap` so the focused
+        // popup owns key dispatch. `None` when no modal is open.
+        let modal_layer = self.render_modal_layer(cx);
+
         div()
             .id("reclass-main-window")
             .key_context("RcxWindow")
@@ -6961,6 +7100,9 @@ impl Render for MainWindow {
             // Overlay layers.
             .children(sheet_layer)
             .children(dialog_layer)
+            // Our centered-modal stack sits above Root sheets/dialogs but below
+            // notifications (a toast must stay visible over an open modal).
+            .children(modal_layer)
             .children(notification_layer)
     }
 }

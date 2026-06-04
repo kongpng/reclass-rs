@@ -34,7 +34,7 @@ pub mod tab_cycle;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{ActiveTheme, IconName, WindowExt as _};
+use gpui_component::{ActiveTheme, IconName};
 
 use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
@@ -370,6 +370,26 @@ pub enum RcxEditorEvent {
         option: EditorViewOption,
         value: bool,
     },
+    /// Open an editor-owned keyboard popup (type / enum / source picker) in the
+    /// host's centered-modal overlay ([`MainWindow::open_centered_modal`]) instead
+    /// of gpui-component's `window.open_dialog`, whose `Dialog` `focus_trap`
+    /// swallowed the popup's Enter/arrow keys (dialog.rs:526). The host renders +
+    /// focuses the popup; this editor keeps the popup's own outcome subscription,
+    /// so on Chosen/Cancel it applies the choice and emits [`CloseModal`] back.
+    ///
+    /// [`MainWindow::open_centered_modal`]: crate::ui::window::MainWindow
+    /// [`CloseModal`]: RcxEditorEvent::CloseModal
+    OpenModal {
+        view: AnyView,
+        focus: FocusHandle,
+        /// Fixed card width for popups that only set a `min_w` and relied on the
+        /// dialog's `.w(..)` (source chooser 520 / enum 360 / hex 320). `None` for
+        /// a self-sizing popup (the type selector sets its own `w(380)`).
+        width: Option<Pixels>,
+    },
+    /// Dismiss the topmost host centered modal — the editor's popup signalled a
+    /// Chosen / Cancel / close. Replaces the editor's old `window.close_dialog`.
+    CloseModal,
 }
 
 /// Item 12: the editor-originated View options that can be toggled from within the
@@ -7671,8 +7691,9 @@ impl RcxEditor {
     /// [`Chosen`](crate::ui::typeselectorpopup::TypeSelectorEvent::Chosen) apply the
     /// kind via `change_node_kind` then the chosen [`Modifier`]
     /// (pointer/array/etc.) via the matching controller ops + `apply_document`; on
-    /// Cancel close the dialog. Opened through `window.open_dialog` (the same
-    /// pattern window.rs uses for the command palette).
+    /// Cancel close the modal. Opened through the host's centered-modal overlay
+    /// ([`RcxEditorEvent::OpenModal`]) — the same path window.rs uses for the
+    /// command palette — NOT `window.open_dialog`, whose focus_trap broke Enter.
     fn open_type_selector(
         &mut self,
         target: ContextTarget,
@@ -7788,8 +7809,8 @@ impl RcxEditor {
     }
 
     /// Shared opener: build the [`TypeSelectorPopup`] over `entries`, set `mode`,
-    /// subscribe to its outcome (apply via [`apply_type_choice`]), and float it
-    /// through `window.open_dialog`.
+    /// subscribe to its outcome (apply via [`apply_type_choice`]), and float it in
+    /// the host's centered-modal overlay via [`RcxEditorEvent::OpenModal`].
     fn spawn_type_selector(
         &mut self,
         entries: Vec<crate::ui::typeselectorpopup::TypeEntry>,
@@ -7843,7 +7864,7 @@ impl RcxEditor {
         self._type_selector_sub = Some(cx.subscribe_in(
             &popup,
             window,
-            move |this, _p, ev: &TypeSelectorEvent, window, cx| match ev {
+            move |this, _p, ev: &TypeSelectorEvent, _window, cx| match ev {
                 TypeSelectorEvent::Chosen {
                     kind,
                     modifier,
@@ -7852,7 +7873,7 @@ impl RcxEditor {
                     struct_id,
                     display_name,
                 } => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._type_selector_sub = None;
                     if *create_new {
                         // "+ New": create a populated NewClass[_N] (8×Hex64) and
@@ -7874,20 +7895,21 @@ impl RcxEditor {
                     }
                 }
                 TypeSelectorEvent::Cancel => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._type_selector_sub = None;
                 }
             },
         ));
-        let popup_for_modal = popup.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                .w(px(420.))
-                .margin_top(px(120.))
-                .close_button(false)
-                .child(popup_for_modal.clone())
+        // Open the picker in the HOST's centered-modal overlay (no gpui-component
+        // `Dialog` focus_trap, so Enter applies the picked type + arrows navigate —
+        // the #1 fix). The host renders + focuses the popup's own input handle; the
+        // outcome subscription above stays on this editor.
+        cx.emit(RcxEditorEvent::OpenModal {
+            view: popup.into(),
+            focus,
+            // The type selector sets its own `w(380)`, so no card width is needed.
+            width: None,
         });
-        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -7977,7 +7999,8 @@ impl RcxEditor {
     /// `ClearRequested` → `clear_sources`. Provider selection needs the app shell's
     /// file/attach dialogs (out of the editor's ownership), so it closes cleanly
     /// (the documented stub the controller itself uses for plugin sources). Opened
-    /// through `window.open_dialog`, mirroring the type selector + command palette.
+    /// in the host's centered-modal overlay ([`RcxEditorEvent::OpenModal`]),
+    /// mirroring the type selector + command palette.
     fn open_source_chooser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Build the `(name, kind_label, active)` recent tuples from the controller's
         // saved sources, flagging the active one with its checkmark (PIC4).
@@ -7994,9 +8017,9 @@ impl RcxEditor {
         self._source_chooser_sub = Some(cx.subscribe_in(
             &popup,
             window,
-            move |this, _p, ev: &SourceChooserEvent, window, cx| {
+            move |this, _p, ev: &SourceChooserEvent, _window, cx| {
                 use crate::ui::sourcechooser::SourcePick;
-                window.close_dialog(cx);
+                cx.emit(RcxEditorEvent::CloseModal);
                 this._source_chooser_sub = None;
                 match ev {
                     SourceChooserEvent::Pick(SourcePick::SavedSource(idx)) => {
@@ -8018,19 +8041,15 @@ impl RcxEditor {
                 }
             },
         ));
-        let popup_for_modal = popup.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                // Wide enough for the longest "Name  (libXxxPlugin.dll)" row so the
-                // trailing dll hint + footer keep their right padding instead of
-                // clipping against the card's right edge (the "right side match
-                // left" gap — the 360px card cut the dll hints + the footer Esc).
-                .w(px(520.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(popup_for_modal.clone())
+        // Open in the host's centered-modal overlay (no dialog focus_trap, so the
+        // chooser's own key handling works). It sets only a `min_w`, so carry the
+        // 520px card width the dialog used to provide — wide enough for the longest
+        // "Name  (libXxxPlugin.dll)" row so the dll hints + footer don't clip.
+        cx.emit(RcxEditorEvent::OpenModal {
+            view: popup.into(),
+            focus,
+            width: Some(px(520.)),
         });
-        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -8081,9 +8100,9 @@ impl RcxEditor {
         self._enum_picker_sub = Some(cx.subscribe_in(
             &popup,
             window,
-            move |this, _p, ev: &EnumPickerEvent, window, cx| match ev {
+            move |this, _p, ev: &EnumPickerEvent, _window, cx| match ev {
                 EnumPickerEvent::Chosen(value) => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._enum_picker_sub = None;
                     this.controller.set_node_value(
                         idx,
@@ -8095,20 +8114,19 @@ impl RcxEditor {
                     this.after_mutation(cx);
                 }
                 EnumPickerEvent::Dismissed => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._enum_picker_sub = None;
                 }
             },
         ));
-        let popup_for_modal = popup.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                .w(px(360.))
-                .margin_top(px(120.))
-                .close_button(false)
-                .child(popup_for_modal.clone())
+        // Open in the host's centered-modal overlay (no dialog focus_trap, so
+        // Up/Down/Enter drive the member list). The picker sets only a `min_w`, so
+        // carry the 360px card width the dialog used to provide.
+        cx.emit(RcxEditorEvent::OpenModal {
+            view: popup.into(),
+            focus,
+            width: Some(px(360.)),
         });
-        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -8172,15 +8190,15 @@ impl RcxEditor {
         self._hex_toolbar_sub = Some(cx.subscribe_in(
             &popup,
             window,
-            move |this, _p, ev: &HexToolbarEvent, window, cx| match ev {
+            move |this, _p, ev: &HexToolbarEvent, _window, cx| match ev {
                 HexToolbarEvent::SizeSelected(id, kind)
                 | HexToolbarEvent::SuggestKind(id, kind) => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
                     this.apply_hex_size(*id, *kind, cx);
                 }
                 HexToolbarEvent::InsertAbove(id) => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
                     let i = this.controller.tree().index_of_id(*id);
                     if i >= 0 {
@@ -8190,7 +8208,7 @@ impl RcxEditor {
                     }
                 }
                 HexToolbarEvent::InsertBelow(id) => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
                     let i = this.controller.tree().index_of_id(*id);
                     if i >= 0 {
@@ -8206,33 +8224,32 @@ impl RcxEditor {
                     // anchor's size plus its consecutive same-parent hex siblings,
                     // pick the largest hex kind that fits the total, and join. The
                     // anchor is `node_id` captured when the toolbar opened.
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
                     this.join_hex_run(node_id, cx);
                 }
                 HexToolbarEvent::FillToOffset(id, offset) => {
                     // Item 11: actually FILL the gap from the node's end up to the
                     // typed offset with padding hex nodes (was a close-only no-op).
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
                     this.fill_to_offset(*id, *offset, cx);
                 }
                 HexToolbarEvent::Dismissed => {
-                    window.close_dialog(cx);
+                    cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
                     cx.notify();
                 }
             },
         ));
-        let popup_for_modal = popup.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog
-                .w(px(320.))
-                .margin_top(px(140.))
-                .close_button(false)
-                .child(popup_for_modal.clone())
+        // Open in the host's centered-modal overlay (no dialog focus_trap). The
+        // hex toolbar sets only a `min_w`, so carry the 320px card width the dialog
+        // used to provide.
+        cx.emit(RcxEditorEvent::OpenModal {
+            view: popup.into(),
+            focus,
+            width: Some(px(320.)),
         });
-        window.focus(&focus, cx);
         cx.notify();
     }
 
