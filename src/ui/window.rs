@@ -3625,6 +3625,48 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Open a two-button confirm whose DEFAULT button is honoured — Enter triggers
+    /// the spec's `default` (Cancel for destructive confirms, so a stray Enter can't
+    /// destroy work), Esc cancels, and `on_accept` runs only on an explicit accept.
+    /// Used in place of [`messagebox::open_confirm`](super::messagebox) (the
+    /// gpui-component `AlertDialog`) for destructive confirms, which it cannot make
+    /// safe (no per-button focus hook; Enter is hard-bound to OK).
+    fn open_confirm_dialog<F>(
+        &mut self,
+        spec: super::messagebox::MessageSpec,
+        on_accept: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let dialog = cx.new(|cx| RcxConfirmDialog::new(spec, cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        let on_accept = Rc::new(on_accept);
+        // Reuse the shared modal-subscription slot (a confirm and the unsaved guard
+        // are never open at once).
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            move |this, _d, choice: &ConfirmChoice, window, cx| match choice {
+                ConfirmChoice::Cancel => window.close_dialog(cx),
+                ConfirmChoice::Accept => {
+                    window.close_dialog(cx);
+                    on_accept(this, window, cx);
+                }
+            },
+        ));
+        let dialog_for_modal = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(super::messagebox::MSG_MAX_WIDTH))
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(dialog_for_modal.clone())
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     /// Persist each editor's document to its known path (the C++
     /// `project_save(dock,false)` per dirty doc). Returns `true` only if every doc
     /// was written; a doc with NO file path can't be saved synchronously here, so
@@ -5504,33 +5546,31 @@ impl MainWindow {
                     "Delete",
                     true,
                 );
-                let this = cx.entity().downgrade();
-                super::messagebox::open_confirm(
+                // Destructive: route through the hand-built confirm so Enter defaults
+                // to Cancel (the AlertDialog would fire Delete on Enter).
+                self.open_confirm_dialog(
                     spec,
-                    move |window, app| {
-                        let _ = this.update(app, |me, cx| {
-                            editor.update(cx, |ed, cx| {
-                                let idx = ed.controller().tree().index_of_id(node_id);
-                                if idx < 0 {
-                                    return;
-                                }
-                                let node = ed.controller().tree().nodes[idx as usize].clone();
-                                // A top-level struct uses `deleteRootStruct` (it
-                                // also rebinds refs + the view root); a member field
-                                // uses `removeNode`.
-                                if node.parent_id == 0 && node.kind == crate::core::NodeKind::Struct
-                                {
-                                    ed.controller_mut().delete_root_struct(node_id);
-                                } else {
-                                    ed.controller_mut().remove_node(idx as usize);
-                                }
-                                ed.apply_document(cx);
-                            });
-                            me.rebuild_workspace(cx);
-                            me.sync_dirty_state(cx);
-                            me.notify("Deleted type", window, cx);
-                            cx.notify();
+                    move |me, window, cx| {
+                        editor.update(cx, |ed, cx| {
+                            let idx = ed.controller().tree().index_of_id(node_id);
+                            if idx < 0 {
+                                return;
+                            }
+                            let node = ed.controller().tree().nodes[idx as usize].clone();
+                            // A top-level struct uses `deleteRootStruct` (it also
+                            // rebinds refs + the view root); a member field uses
+                            // `removeNode`.
+                            if node.parent_id == 0 && node.kind == crate::core::NodeKind::Struct {
+                                ed.controller_mut().delete_root_struct(node_id);
+                            } else {
+                                ed.controller_mut().remove_node(idx as usize);
+                            }
+                            ed.apply_document(cx);
                         });
+                        me.rebuild_workspace(cx);
+                        me.sync_dirty_state(cx);
+                        me.notify("Deleted type", window, cx);
+                        cx.notify();
                     },
                     window,
                     cx,
@@ -6137,6 +6177,130 @@ impl Render for RcxUnsavedDialog {
                     }
                     "escape" => {
                         this.choose(0, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .w(card_w)
+            .child(modal::header(self.spec.title.clone(), cx))
+            .child(body)
+            .child(footer)
+    }
+}
+
+/// The outcome of an [`RcxConfirmDialog`].
+#[derive(Clone, Copy, Debug)]
+enum ConfirmChoice {
+    Accept,
+    Cancel,
+}
+
+/// A hand-built two-button confirm dialog used in place of the gpui-component
+/// `AlertDialog` when the **default button must be honoured** — chiefly
+/// destructive confirms, where the C++ parks initial focus on Cancel so a stray
+/// Enter can't destroy work (`themed_messagebox.cpp:181-203`). The AlertDialog
+/// hard-binds Enter→OK with no per-button focus hook, so we render the footer
+/// ourselves and map Enter to the spec's `default` button (Cancel for
+/// destructive) and Esc to Cancel. The destructive action is reachable only by an
+/// explicit click on its button.
+struct RcxConfirmDialog {
+    spec: super::messagebox::MessageSpec,
+    focus_handle: FocusHandle,
+}
+
+impl RcxConfirmDialog {
+    fn new(spec: super::messagebox::MessageSpec, cx: &mut Context<Self>) -> Self {
+        Self {
+            spec,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Index of the accept button — the last one (confirm specs build
+    /// `[Cancel, Accept]`).
+    fn accept_index(&self) -> usize {
+        self.spec.buttons.len().saturating_sub(1)
+    }
+
+    /// Emit Accept iff `button_index` is the accept button, else Cancel.
+    fn emit_for(&mut self, button_index: usize, cx: &mut Context<Self>) {
+        let choice = if self.spec.buttons.len() > 1 && button_index == self.accept_index() {
+            ConfirmChoice::Accept
+        } else {
+            ConfirmChoice::Cancel
+        };
+        cx.emit(choice);
+    }
+}
+
+impl Focusable for RcxConfirmDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<ConfirmChoice> for RcxConfirmDialog {}
+
+impl Render for RcxConfirmDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use super::dialogs::modal;
+        use super::messagebox::{ButtonVariant, DefaultButton, DetailLayout};
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let card_w = modal::clamp_width(super::messagebox::MSG_MAX_WIDTH, window);
+
+        let mut body = modal::body(cx).child(
+            div()
+                .text_size(px(super::design::tokens::font::UI_MD))
+                .text_color(super::design::color::text(cx))
+                .child(self.spec.text.clone()),
+        );
+        if let DetailLayout::Label(s) = super::messagebox::format_detail(&self.spec.detail) {
+            body = body.child(
+                div()
+                    .pl(px(super::design::tokens::space::MD))
+                    .text_size(px(super::design::tokens::font::UI_SM))
+                    .text_color(super::design::color::text_muted(cx))
+                    .child(s),
+            );
+        }
+
+        // Footer: spec order [Cancel, Accept], each with its variant (the accept of
+        // a destructive confirm is `.danger()` / red).
+        let mut footer = modal::footer(cx);
+        for (i, b) in self.spec.buttons.iter().enumerate() {
+            let btn = Button::new(("confirm-btn", i))
+                .label(b.label.clone())
+                .map(|btn| match b.variant {
+                    ButtonVariant::Primary => btn.primary(),
+                    ButtonVariant::Secondary => btn,
+                    ButtonVariant::Destructive => btn.danger(),
+                })
+                .on_click(cx.listener(move |this, _e, _w, cx| this.emit_for(i, cx)));
+            footer = footer.child(btn);
+        }
+
+        // Enter → the spec's DEFAULT button (Cancel for destructive confirms, so a
+        // stray Enter can't destroy work); Esc → Cancel (index 0). The destructive
+        // action fires only on an explicit click of its button.
+        let enter_index = match self.spec.default {
+            DefaultButton::Accept => self.accept_index(),
+            DefaultButton::Cancel => 0,
+        };
+
+        modal::card(cx)
+            .id("rcx-confirm-dialog")
+            .track_focus(&self.focus_handle)
+            .key_context("RcxConfirm")
+            .capture_key_down(cx.listener(move |this, ev: &KeyDownEvent, _w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "enter" => {
+                        this.emit_for(enter_index, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        this.emit_for(0, cx);
                         cx.stop_propagation();
                     }
                     _ => {}
