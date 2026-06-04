@@ -637,6 +637,19 @@ pub fn apply_theme(theme: &Theme, window: &mut gpui::Window, cx: &mut gpui::App)
     } else {
         gpui_component::ThemeMode::Light
     };
+    // Start EVERY gpui-component color from the mode-matched preset before
+    // overriding with our palette. Our `apply_entry` maps ~50 fields but NOT the
+    // `table_*` surfaces a `DataTable` paints (table/table_head/table_row/…), so
+    // without this reset those kept gpui-component's light init default and the
+    // process-picker table rendered as white rows on the dark dialog ("extremely
+    // ugly"). Resetting to dark()/light() themes the table (and any other unmapped
+    // widget) for the mode; the palette loop then re-applies our specific colors.
+    gtheme.colors = (*if dark {
+        gpui_component::ThemeColor::dark()
+    } else {
+        gpui_component::ThemeColor::light()
+    })
+    .clone();
     for entry in &palette {
         apply_entry(&mut gtheme.colors, entry);
     }
