@@ -2904,7 +2904,8 @@ impl RcxEditor {
         // an auto-numbered enum member, then MOVES the selection to the new node.
         // Plain Up-at-top (dir < 0) is a silent no-op.
         if dir > 0 {
-            self.append_tail_field(cx);
+            // Plain Down MOVES the selection onto the new field (no extend).
+            self.append_tail_field(false, cx);
         }
     }
 
@@ -2914,7 +2915,13 @@ impl RcxEditor {
     /// ([`navigate_node_mode`]) AND modifier Down-at-end (Shift/Ctrl via
     /// [`navigate_node_extend`]) so the editor grows on the last address
     /// regardless of held modifiers (the reported "shift+down won't expand" gap).
-    fn append_tail_field(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `extend` mirrors the held modifier: plain Down (`false`) MOVES the selection
+    /// onto the new field; Shift/Ctrl Down (`true`) instead RE-EXTENDS the
+    /// multi-selection from the original anchor down to the grown row, so every
+    /// address from the anchor stays highlighted as the class expands (otherwise
+    /// `append_single_field` collapses the highlight to the lone new field).
+    fn append_tail_field(&mut self, extend: bool, cx: &mut Context<Self>) {
         // Pass the last visible LEAF's OWN id (controller.rs:1835 walks UP to the
         // enclosing Struct/Array/Enum container, appending a Hex64 at its aligned
         // tail / an auto-numbered enum member). With no last row, fall back to the
@@ -2937,6 +2944,14 @@ impl RcxEditor {
         if target == 0 {
             return;
         }
+        // For a Shift/Ctrl grow, remember the multi-selection anchor BEFORE the
+        // append (`append_single_field` resets it to `-1`) so we can re-extend the
+        // range to the grown row afterwards.
+        let prev_anchor = if extend {
+            self.controller.anchor_line()
+        } else {
+            -1
+        };
         if let Some(new_id) = self.controller.append_single_field(target) {
             self.apply_document(cx);
             // Scroll to the freshly-selected new field's line so the cursor chases
@@ -2953,6 +2968,14 @@ impl RcxEditor {
                 // again — otherwise a stale caret on the old tail makes the second
                 // modifier-Down merely extend the selection instead of growing.
                 self.caret_line = Some(line);
+                // Shift/Ctrl grow: re-extend the highlight from the original anchor
+                // down to the new row so ALL addresses stay selected (consistent
+                // with extending across existing rows). With no prior anchor we keep
+                // the plain single-select `append_single_field` already applied.
+                if extend && prev_anchor >= 0 {
+                    self.controller
+                        .extend_selection_from(prev_anchor, line as i64);
+                }
                 self.scroll.scroll_to_item(line, ScrollStrategy::Center);
             }
         } else {
@@ -3213,7 +3236,9 @@ impl RcxEditor {
                 .map(|(idx, _)| idx as i64);
             if let Some(last) = last_nav {
                 if start >= last {
-                    self.append_tail_field(cx);
+                    // Modifier grow: EXTEND the highlight to the new row (keep the
+                    // anchor) so all addresses stay selected as the class expands.
+                    self.append_tail_field(true, cx);
                     return;
                 }
             }
@@ -7978,8 +8003,28 @@ impl RcxEditor {
         // apply) so a subsequent open surfaces it in the "Recent" section.
         self.push_recent_type(&base_name);
 
-        self.controller
-            .apply_type_popup_result(cmode, node_id, choice);
+        // Multi-selection Change-Type (`t` over a highlighted RANGE): apply the SAME
+        // pick to EVERY selected node, not just the one the cursor is over. Only
+        // FieldType batches — Root re-roots a single view, and Array/PointerTarget
+        // are single-node contextual edits. With no (or a single) selection this is
+        // the plain single-node apply on `node_id`.
+        let batch_ids: Vec<u64> = if cmode == CMode::FieldType
+            && self.controller.selected_ids().len() > 1
+        {
+            self.selected_node_indices_ordered()
+                .iter()
+                .filter_map(|&idx| self.controller.tree().nodes.get(idx).map(|n| n.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if batch_ids.len() > 1 {
+            self.controller
+                .apply_type_popup_result_batch(cmode, &batch_ids, choice);
+        } else {
+            self.controller
+                .apply_type_popup_result(cmode, node_id, choice);
+        }
         self.apply_document(cx);
     }
 

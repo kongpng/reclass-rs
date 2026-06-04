@@ -783,6 +783,12 @@ impl RcxController {
     pub fn selected_ids(&self) -> &HashSet<u64> {
         &self.sel_ids
     }
+    /// The current multi-selection anchor line (the origin a Shift-range extends
+    /// from), or `-1` when there is no anchor. Read by the editor's Shift+Down
+    /// grow so it can re-extend the range to the freshly-appended tail row.
+    pub fn anchor_line(&self) -> i64 {
+        self.anchor_line
+    }
     pub fn view_root_id(&self) -> u64 {
         self.view_root_id
     }
@@ -2421,6 +2427,50 @@ impl RcxController {
         self.apply_type_popup_inner(mode, node_id, choice);
         self.end_macro();
         self.suppress_refresh = was;
+        if !self.suppress_refresh {
+            self.refresh();
+        }
+    }
+
+    /// Apply a TypeSelector pick to MANY nodes at once — the editor's
+    /// multi-selection Change-Type (`t` over a highlighted range): the SAME
+    /// [`TypePopupChoice`] is applied to every id in `node_ids`, collapsed into one
+    /// undo macro with a single recompose at the end (mirroring
+    /// [`batch_change_kind`](Self::batch_change_kind)). The selection is preserved
+    /// (a type change keeps the same rows selected). Single-id lists fall through to
+    /// [`apply_type_popup_result`]. Only `FieldType` batches — `Root` re-roots a
+    /// single view and `ArrayElement`/`PointerTarget` are single-node contextual
+    /// edits, so the caller passes those straight to the single-node path.
+    pub fn apply_type_popup_result_batch(
+        &mut self,
+        mode: TypePopupMode,
+        node_ids: &[u64],
+        choice: TypePopupChoice,
+    ) {
+        if node_ids.len() <= 1 {
+            if let Some(&id) = node_ids.first() {
+                self.apply_type_popup_result(mode, id, choice);
+            }
+            return;
+        }
+        let saved_sel = self.sel_ids.clone();
+        let saved_anchor = self.anchor_line;
+        let was = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro(format!("Change type of {} nodes", node_ids.len()));
+        // Resolve each node by id every iteration: applying a kind change can shift
+        // sibling offsets / insert padding, but ids are stable, so the next target
+        // still resolves. `apply_type_popup_inner` is the raw (already-tree-based)
+        // work; its own macro folds into this one.
+        for &id in node_ids {
+            if self.doc.tree.index_of_id(id) >= 0 {
+                self.apply_type_popup_inner(mode, id, choice.clone());
+            }
+        }
+        self.end_macro();
+        self.suppress_refresh = was;
+        self.sel_ids = saved_sel;
+        self.anchor_line = saved_anchor;
         if !self.suppress_refresh {
             self.refresh();
         }
@@ -4402,6 +4452,20 @@ impl RcxController {
                 self.emit(ControllerEvent::NodeSelected(idx));
             }
         }
+    }
+
+    /// Re-extend the multi-selection to cover `[anchor, to_line]`, restoring
+    /// `anchor` as the range origin. Used by the editor's Shift+Down grow: after
+    /// [`append_single_field`](Self::append_single_field) appends a tail row it
+    /// collapses the selection to that one new field (the plain-Down behavior), so
+    /// the extend path calls this to re-highlight every row from the original
+    /// anchor down to the grown row (keeping the Shift-range consistent as the
+    /// class expands).
+    pub fn extend_selection_from(&mut self, anchor: i64, to_line: i64) {
+        self.anchor_line = anchor;
+        self.sel_ids.clear();
+        self.insert_range(anchor, to_line);
+        self.update_command_row();
     }
 
     fn insert_range(&mut self, a: i64, b: i64) {

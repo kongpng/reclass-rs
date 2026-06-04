@@ -1038,6 +1038,129 @@ fn append_single_field_walks_up_leaf_to_struct() {
 }
 
 #[test]
+fn apply_type_popup_result_batch_changes_all_selected_nodes() {
+    // Regression (#8): multi-selection Change-Type (`t` over a highlighted range)
+    // applies the picked type to EVERY selected node, not just the cursor's one,
+    // and the whole batch is a SINGLE undo step. Uses a same-size change
+    // (Int32 → Float, both 4 bytes) so the apply is in-place — no sibling cascade
+    // that would complicate the id bookkeeping.
+    let mut doc = RcxDocument::new();
+    let s = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "S".into(),
+        struct_type_name: "S".into(),
+        ..Node::default()
+    });
+    let sid = doc.tree.nodes[s].id;
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let n = doc.tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: format!("f{i}"),
+            parent_id: sid,
+            offset: (i * 4) as i32,
+            ..Node::default()
+        });
+        ids.push(doc.tree.nodes[n].id);
+    }
+    let mut c = RcxController::new(doc);
+    c.set_view_root_id(sid);
+    c.set_suppress_refresh(true);
+
+    let choice = TypePopupChoice::primitive(NodeKind::Float, "float");
+    c.apply_type_popup_result_batch(TypePopupMode::FieldType, &ids, choice);
+
+    // Every targeted field — not just one — is now Float.
+    for id in &ids {
+        let idx = c.tree().index_of_id(*id);
+        assert!(idx >= 0, "node {id} survives");
+        assert_eq!(
+            c.tree().nodes[idx as usize].kind,
+            NodeKind::Float,
+            "node {id} must be changed to Float"
+        );
+    }
+
+    // One undo reverts the WHOLE batch (atomic macro), not just the last node.
+    c.undo();
+    for id in &ids {
+        let idx = c.tree().index_of_id(*id);
+        assert!(idx >= 0, "node {id} survives undo");
+        assert_eq!(
+            c.tree().nodes[idx as usize].kind,
+            NodeKind::Int32,
+            "undo reverts node {id} to Int32"
+        );
+    }
+}
+
+#[test]
+fn shift_down_grow_re_extends_the_selection_range() {
+    // Regression (#6): the Shift+Down grow appends a tail field — which collapses
+    // the selection onto that lone new field (the plain-Down behavior) — then
+    // RE-EXTENDS the multi-selection from the original anchor down to the grown
+    // row, so every address stays highlighted as the class expands (instead of the
+    // highlight jumping to only the new field).
+    let mut c = make_ctrl();
+    c.set_suppress_refresh(false);
+    c.refresh();
+    let data: Vec<(usize, u64)> = c
+        .last_result()
+        .meta
+        .iter()
+        .enumerate()
+        .filter(|(_, lm)| {
+            lm.node_id != 0
+                && lm.node_id != K_COMMAND_ROW_ID
+                && lm.line_kind != LineKind::Footer
+                && !lm.is_continuation
+        })
+        .map(|(i, lm)| (i, lm.node_id))
+        .collect();
+    assert!(data.len() >= 2, "need >=2 data rows, got {}", data.len());
+    let (anchor_line, anchor_id) = data[0];
+    let (_last_line, last_id) = *data.last().unwrap();
+
+    // Anchor on the first field (a plain click).
+    c.handle_node_click(anchor_line as i64, anchor_id, Modifiers::NONE);
+    assert_eq!(c.selected_ids().len(), 1);
+    let saved_anchor = c.anchor_line();
+    assert_eq!(saved_anchor, anchor_line as i64);
+
+    // Grow: append a tail field — append_single_field collapses the selection to
+    // the new field alone.
+    let new_id = c.append_single_field(last_id).expect("appended");
+    c.refresh();
+    assert_eq!(
+        c.selected_ids().len(),
+        1,
+        "append collapses the selection to the new field"
+    );
+    let new_line = c
+        .last_result()
+        .meta
+        .iter()
+        .position(|lm| lm.node_id == new_id && !lm.is_continuation)
+        .expect("new field has a line");
+
+    // The fix: re-extend from the preserved anchor to the grown row.
+    c.extend_selection_from(saved_anchor, new_line as i64);
+
+    // The whole range — the anchor, the original last field, and the new field —
+    // is selected again, and the anchor is preserved for the next Shift+Down.
+    let selected = |id: u64| c.selected_ids().iter().any(|s| strip_sel(*s) == id);
+    assert!(selected(anchor_id), "anchor row stays selected");
+    assert!(selected(last_id), "original last row stays selected");
+    assert!(selected(new_id), "grown row is selected");
+    assert!(
+        c.selected_ids().len() >= 3,
+        "the full range is reselected, got {}",
+        c.selected_ids().len()
+    );
+    assert_eq!(c.anchor_line(), anchor_line as i64, "anchor preserved");
+}
+
+#[test]
 fn append_single_field_grows_past_array_child() {
     // A struct whose last child is an Array[4] of Hex32 (16 bytes @ off 16).
     // Appending must land PAST the array footprint (off 32), not overlap it.
