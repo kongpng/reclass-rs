@@ -2780,3 +2780,93 @@ fn typed_pointer_header_drops_comment_chip() {
         r.text
     );
 }
+
+// ── The LIVE compose path renders floats/doubles via `crate::format` (F1) ──
+//
+// `mod render` used to carry its OWN copy of the scalar formatters; that copy
+// used Rust's built-in round-HALF-TO-EVEN (`format!("{:.*}")`) and a `%g` that
+// missed the exponent carry, so it diverged from `fmt::fmtFloat`/`fmtDouble`
+// (Qt `QString::number`, round-HALF-AWAY-from-zero, post-rounding `%g` exp).
+// The C++ original has exactly ONE render layer (`format.cpp`), so the live
+// editor lines MUST equal `fmt::*`. These goldens lock in the previously
+// divergent cases plus a spread of normal values to prove no regression.
+//
+// Goldens (verified against `crate::format`, which ports `format.cpp`):
+//   fmtFloat(37428.5)  = "37429.f"   (half-AWAY; half-even gives "37428.f")
+//   fmtDouble(999999.5)= "1e+06"     (%g 6-sig carry bumps the exponent)
+//   fmtFloat(-0.0)     = "-0.000f"   (signed-zero preserved, leading '-')
+//   fmtFloat(3.5)      = "3.5000f"   (normal)
+//   fmtDouble(1.5)     = "1.5"       (normal)
+#[test]
+fn live_compose_float_double_routes_through_format() {
+    // f32 37428.5 = [0x80,0x34,0x12,0x47]; f32 -0.0 = [0,0,0,0x80];
+    // f32 3.5 = [0,0,0x60,0x40]; f64 999999.5 = [0,0,0,0,0x7F,0x84,0x2E,0x41];
+    // f64 1.5 = [0,0,0,0,0,0,0xF8,0x3F].
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    // Layout: f_half_away@0 (4), f_neg_zero@4 (4), f_normal@8 (4),
+    //         d_carry@16 (8), d_normal@24 (8).
+    tree.add_node(child(root_id, NodeKind::Float, 0, "f_half_away"));
+    tree.add_node(child(root_id, NodeKind::Float, 4, "f_neg_zero"));
+    tree.add_node(child(root_id, NodeKind::Float, 8, "f_normal"));
+    tree.add_node(child(root_id, NodeKind::Double, 16, "d_carry"));
+    tree.add_node(child(root_id, NodeKind::Double, 24, "d_normal"));
+
+    let mut data = vec![0u8; (K_STRUCT_BASE + 64) as usize];
+    let base = K_STRUCT_BASE as usize;
+    data[base..base + 4].copy_from_slice(&37428.5_f32.to_le_bytes());
+    data[base + 4..base + 8].copy_from_slice(&(-0.0_f32).to_le_bytes());
+    data[base + 8..base + 12].copy_from_slice(&3.5_f32.to_le_bytes());
+    data[base + 16..base + 24].copy_from_slice(&999999.5_f64.to_le_bytes());
+    data[base + 24..base + 32].copy_from_slice(&1.5_f64.to_le_bytes());
+    let prov = BufferProvider::new(data, "synthetic");
+
+    let r = compose_default(&tree, &prov);
+    let find = |needle: &str| -> String {
+        lines(&r)
+            .into_iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("line for {needle:?} present:\n{}", r.text))
+    };
+
+    let half = find("f_half_away");
+    assert!(
+        half.contains("37429.f") && !half.contains("37428.f"),
+        "half-AWAY rounding (not half-even) on the live path: {half:?}"
+    );
+
+    let neg = find("f_neg_zero");
+    // Value column is right of the name; the rendered float value itself must
+    // carry the leading '-' from signed-zero preservation.
+    assert!(
+        neg.contains("-0.000f"),
+        "negative-zero float preserves its sign: {neg:?}"
+    );
+
+    let fnorm = find("f_normal");
+    assert!(
+        fnorm.contains("3.5000f"),
+        "normal float unchanged: {fnorm:?}"
+    );
+
+    let dcarry = find("d_carry");
+    assert!(
+        dcarry.contains("1e+06"),
+        "%g exponent carry on the live path: {dcarry:?}"
+    );
+
+    let dnorm = find("d_normal");
+    // Match the standalone value token (avoid matching e.g. "1.5000"); the
+    // value sits at the end of the line after the name column.
+    assert!(
+        dnorm.split_whitespace().any(|tok| tok == "1.5"),
+        "normal double unchanged: {dnorm:?}"
+    );
+}

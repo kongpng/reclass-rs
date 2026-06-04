@@ -3245,349 +3245,37 @@ pub fn array_next_span_for(lm: &LineMeta, line_text: &str) -> ColumnSpan {
 // module owns the display-side column geometry it shares with the renderer.
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Live-editor rendering facade.
+///
+/// In the C++ original there is exactly ONE render layer (`src/format.cpp`,
+/// the `rcx::fmt` namespace); `src/compose.cpp` performs no independent value
+/// rendering — it calls `fmt::*` ~64 times. This module mirrors that: every
+/// function here is a thin delegation to [`crate::format`], so the live-editor
+/// path and the pure presentation layer can never diverge again (the previous
+/// duplicate copy rounded half-to-even and dropped the `%g` exponent carry).
+///
+/// The four `U16Str`-returning fns wrap `format`'s `String` output; the rest
+/// re-export or forward directly. Signatures are kept byte-for-byte identical
+/// to the previous copy so the ~40 `render::` call-sites in this file are
+/// untouched.
 mod render {
-    use super::{u16_len, U16Str};
-    use crate::core::{
-        is_hex_preview, is_valid_primitive_ptr_target, kind_meta, size_for_kind, Node, NodeKind,
-    };
+    use super::U16Str;
+    use crate::core::{Node, NodeKind};
     use crate::provider::Provider;
 
-    const COL_VALUE: i32 = 96; // kColValue
-    const COL_COMMENT: i32 = 28;
-
-    /// Qt `QString::leftJustified(w, ' ')` over UTF-16 width.
-    fn left_justified(s: &str, w: i32) -> String {
-        let len = u16_len(s);
-        if len >= w {
-            s.to_string()
-        } else {
-            format!("{}{}", s, " ".repeat((w - len) as usize))
-        }
-    }
-
-    /// `fit(s, w)` (`format.cpp:67-74`) — truncate w/ ellipsis then left-justify.
-    fn fit(s: &str, w: i32) -> String {
-        if w <= 0 {
-            return String::new();
-        }
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let mut out = s.to_string();
-        if (units.len() as i32) > w {
-            if w >= 2 {
-                let head: Vec<u16> = units[..(w - 1) as usize].to_vec();
-                out = String::from_utf16_lossy(&head);
-                out.push('\u{2026}');
-            } else {
-                let head: Vec<u16> = units[..w as usize].to_vec();
-                out = String::from_utf16_lossy(&head);
-            }
-        }
-        left_justified(&out, w)
-    }
-
-    /// `fitOverflow(s, w)` (`format.cpp:77-82`).
-    fn fit_overflow(s: &str, w: i32) -> String {
-        if w <= 0 {
-            return String::new();
-        }
-        if u16_len(s) <= w {
-            left_justified(s, w)
-        } else {
-            s.to_string()
-        }
-    }
-
-    /// `typeNameRaw(kind)` (`format.cpp:92-96`).
-    pub fn type_name_raw(kind: NodeKind) -> String {
-        kind_meta(kind)
-            .map(|m| m.type_name.to_string())
-            .unwrap_or_else(|| "???".to_string())
-    }
-
-    /// `typeName(kind, colType)` (`format.cpp:98-102`).
-    fn type_name_fit(kind: NodeKind, col_type: i32) -> String {
-        let raw = kind_meta(kind).map(|m| m.type_name).unwrap_or("???");
-        fit(raw, col_type)
-    }
-
-    /// `arrayTypeName(elemKind, count, structName)` (`format.cpp:105-114`).
-    pub fn array_type_name(elem_kind: NodeKind, count: i32, struct_name: &str) -> String {
-        let elem = if elem_kind == NodeKind::Struct && !struct_name.is_empty() {
-            struct_name.to_string()
-        } else {
-            kind_meta(elem_kind)
-                .map(|m| m.type_name.to_string())
-                .unwrap_or_else(|| "???".to_string())
-        };
-        format!("{elem}[{count}]")
-    }
+    pub use crate::format::{
+        array_type_name, extract_bits, fmt_offset_margin, indent, struct_type_name, type_name_raw,
+    };
 
     /// `pointerTypeName(kind, targetName)` (`format.cpp:117-121`) — for width.
+    /// The C++ `kind` arg is unused; pass `Pointer64` to match the facade.
     pub fn pointer_type_name(target_name: String) -> String {
-        let target = if target_name.is_empty() {
-            "void".to_string()
-        } else {
-            target_name
-        };
-        format!("{target}*")
+        crate::format::pointer_type_name(NodeKind::Pointer64, &target_name)
     }
 
     /// Alias matching the static-field call site (`compose.cpp:1041`).
     pub fn pointer_type_name_kind(target_name: String) -> String {
         pointer_type_name(target_name)
-    }
-
-    fn hex_val(v: u64) -> String {
-        format!("0x{v:x}")
-    }
-
-    fn fmt_int8(v: i8) -> String {
-        v.to_string()
-    }
-    fn fmt_int16(v: i16) -> String {
-        v.to_string()
-    }
-    fn fmt_int32(v: i32) -> String {
-        v.to_string()
-    }
-    fn fmt_int64(v: i64) -> String {
-        v.to_string()
-    }
-    fn fmt_bool(v: u8) -> String {
-        if v != 0 {
-            "true".to_string()
-        } else {
-            "false".to_string()
-        }
-    }
-    fn fmt_pointer32(v: u32) -> String {
-        if v == 0 {
-            "nullptr".to_string()
-        } else {
-            hex_val(v as u64)
-        }
-    }
-    fn fmt_pointer64(v: u64) -> String {
-        if v == 0 {
-            "nullptr".to_string()
-        } else {
-            hex_val(v)
-        }
-    }
-
-    /// IEEE half→float (`format.cpp:13-32`).
-    fn half_to_float(h: u16) -> f32 {
-        let s = ((h & 0x8000) as u32) << 16;
-        let mut e = ((h >> 10) & 0x1f) as u32;
-        let mut m = (h & 0x3ff) as u32;
-        let b;
-        if e == 0 {
-            if m == 0 {
-                b = s;
-            } else {
-                while (m & 0x400) == 0 {
-                    m <<= 1;
-                    e = e.wrapping_sub(1);
-                }
-                e = e.wrapping_add(1);
-                m &= 0x3ff;
-                b = s | ((e + 112) << 23) | (m << 13);
-            }
-        } else if e == 0x1f {
-            b = s | 0x7f80_0000 | (m << 13);
-        } else {
-            b = s | ((e + 112) << 23) | (m << 13);
-        }
-        f32::from_bits(b)
-    }
-
-    /// `fmtFloat16(bits)` (`format.cpp:142-149`).
-    fn fmt_float16(bits: u16) -> String {
-        let f = half_to_float(bits);
-        if f.is_nan() {
-            return "NaN".to_string();
-        }
-        if f.is_infinite() {
-            return if f > 0.0 {
-                "infh".to_string()
-            } else {
-                "-infh".to_string()
-            };
-        }
-        format!("{}h", fmt_g(f as f64, 4))
-    }
-
-    /// `fmtFloat(v)` (`format.cpp:184-208`) — fixed 7-char body + 'f'.
-    fn fmt_float(v: f32) -> String {
-        if v.is_nan() {
-            return "NaN".to_string();
-        }
-        if v.is_infinite() {
-            return if v > 0.0 {
-                "inff".to_string()
-            } else {
-                "-inff".to_string()
-            };
-        }
-        if v == 0.0 && v.is_sign_negative() {
-            return "-0.000f".to_string();
-        }
-        let av = v.abs();
-        if av >= 100000.0 {
-            return if v < 0.0 {
-                "-99999+f".to_string()
-            } else {
-                "99999+f".to_string()
-            };
-        }
-        for dec in (0..=4).rev() {
-            let mut body = format!("{av:.*}", dec as usize);
-            if dec == 0 {
-                body.push_str(".f");
-            } else {
-                body.push('f');
-            }
-            if u16_len(&body) == 7 {
-                if v < 0.0 {
-                    return format!("-{body}");
-                }
-                return body;
-            }
-        }
-        if v < 0.0 {
-            "-99999+f".to_string()
-        } else {
-            "99999+f".to_string()
-        }
-    }
-
-    /// `fmtDouble(v)` (`format.cpp:209-216`).
-    fn fmt_double(v: f64) -> String {
-        if v.is_nan() {
-            return "NaN".to_string();
-        }
-        if v.is_infinite() {
-            return if v > 0.0 {
-                "inf".to_string()
-            } else {
-                "-inf".to_string()
-            };
-        }
-        let mut s = fmt_g(v, 6);
-        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-            s.push_str(".0");
-        }
-        s
-    }
-
-    /// Qt `QString::number(v, 'g', prec)` — shortest of %e/%f with `prec`
-    /// significant digits, trailing zeros stripped.
-    fn fmt_g(v: f64, prec: i32) -> String {
-        if v == 0.0 {
-            return "0".to_string();
-        }
-        let prec = prec.max(1);
-        let exp = v.abs().log10().floor() as i32;
-        // Qt/printf %g rule: use %e if exp < -4 or exp >= precision.
-        if exp < -4 || exp >= prec {
-            // Scientific.
-            let mut s = format!("{:.*e}", (prec - 1) as usize, v);
-            s = strip_sci_zeros(&s);
-            s
-        } else {
-            let decimals = (prec - 1 - exp).max(0);
-            let s = format!("{:.*}", decimals as usize, v);
-            strip_trailing_zeros(&s)
-        }
-    }
-
-    fn strip_trailing_zeros(s: &str) -> String {
-        if s.contains('.') {
-            let t = s.trim_end_matches('0');
-            let t = t.trim_end_matches('.');
-            t.to_string()
-        } else {
-            s.to_string()
-        }
-    }
-
-    fn strip_sci_zeros(s: &str) -> String {
-        // Split mantissa and exponent.
-        if let Some(epos) = s.find('e') {
-            let (mant, exp) = s.split_at(epos);
-            let mant = strip_trailing_zeros(mant);
-            // Normalize exponent to Qt style: e+NN / e-NN with at least 2 digits.
-            let exp_body = &exp[1..]; // skip 'e'
-            let (sign, digits) = if let Some(rest) = exp_body.strip_prefix('-') {
-                ('-', rest)
-            } else if let Some(rest) = exp_body.strip_prefix('+') {
-                ('+', rest)
-            } else {
-                ('+', exp_body)
-            };
-            let digits = digits.trim_start_matches('0');
-            let digits = if digits.is_empty() { "0" } else { digits };
-            let padded = if digits.len() < 2 {
-                format!("0{digits}")
-            } else {
-                digits.to_string()
-            };
-            format!("{mant}e{sign}{padded}")
-        } else {
-            strip_trailing_zeros(s)
-        }
-    }
-
-    fn fmt_uint128_impl(v: u128) -> String {
-        v.to_string()
-    }
-    fn fmt_int128(data: &[u8]) -> String {
-        let mut arr = [0u8; 16];
-        arr.copy_from_slice(&data[..16]);
-        let v = i128::from_le_bytes(arr);
-        if v < 0 {
-            let u = (!(v as u128)).wrapping_add(1);
-            format!("-{}", fmt_uint128_impl(u))
-        } else {
-            fmt_uint128_impl(v as u128)
-        }
-    }
-    fn fmt_uint128(data: &[u8]) -> String {
-        let mut arr = [0u8; 16];
-        arr.copy_from_slice(&data[..16]);
-        fmt_uint128_impl(u128::from_le_bytes(arr))
-    }
-
-    /// `indent(depth)` (`format.cpp:224-226`).
-    pub fn indent(depth: i32) -> String {
-        " ".repeat((depth * super::K_TREE_INDENT).max(0) as usize)
-    }
-
-    /// `fmtOffsetMargin(addr, isCont, hexDigits)` (`format.cpp:230-234`).
-    pub fn fmt_offset_margin(
-        absolute_offset: u64,
-        is_continuation: bool,
-        hex_digits: i32,
-    ) -> String {
-        if is_continuation {
-            return "  \u{00B7} ".to_string();
-        }
-        let s = format!("{absolute_offset:X}");
-        let padded = if (s.len() as i32) < hex_digits {
-            format!("{}{}", "0".repeat((hex_digits as usize) - s.len()), s)
-        } else {
-            s
-        };
-        format!("{padded} ")
-    }
-
-    /// `structTypeName(node)` (`format.cpp:238-244`).
-    pub fn struct_type_name(node: &Node) -> String {
-        if !node.struct_type_name.is_empty() {
-            node.struct_type_name.clone()
-        } else {
-            node.resolved_class_keyword().to_string()
-        }
     }
 
     /// `fmtStructHeader(...)` (`format.cpp:248-259`).
@@ -3596,57 +3284,41 @@ mod render {
         depth: i32,
         collapsed: bool,
         col_type: i32,
-        _col_name: i32,
+        col_name: i32,
         compact: bool,
     ) -> U16Str {
-        let ind = indent(depth);
-        let raw_type = struct_type_name(node);
-        let suffix = if collapsed { "" } else { "{" };
-        if node.name.is_empty() {
-            return U16Str::from_str(&format!("{ind}{raw_type} {suffix}"));
-        }
-        let ty = if compact {
-            fit_overflow(&raw_type, col_type)
-        } else {
-            fit(&raw_type, col_type)
-        };
-        U16Str::from_str(&format!("{ind}{ty} {} {suffix}", node.name))
+        U16Str::from_str(&crate::format::fmt_struct_header(
+            node, depth, collapsed, col_type, col_name, compact,
+        ))
     }
 
     /// `fmtStructFooter(node, depth, totalSize)` (`format.cpp:261-272`).
     pub fn fmt_struct_footer(node: &Node, depth: i32, total_size: i32) -> U16Str {
-        let mut footer = format!("{}}};", indent(depth));
-        if node.is_enum() {
-            footer.push_str("  +1 +10 Top");
-        } else {
-            footer.push_str("  +1 +10h +100h +1000h Trim Top");
-        }
-        if total_size > 0 {
-            footer.push_str(&format!("  // 0x{:X} ({})", total_size, total_size));
-        }
-        U16Str::from_str(&footer)
+        U16Str::from_str(&crate::format::fmt_struct_footer(node, depth, total_size))
     }
 
-    /// `fmtArrayHeader(...)` (`format.cpp:276-282`).
+    /// `fmtArrayHeader(...)` (`format.cpp:276-282`). The C++ `viewIdx` arg does
+    /// not affect output; pass `0`.
     #[allow(clippy::too_many_arguments)]
     pub fn fmt_array_header(
         node: &Node,
         depth: i32,
         collapsed: bool,
         col_type: i32,
-        _col_name: i32,
+        col_name: i32,
         elem_struct_name: &str,
         compact: bool,
     ) -> U16Str {
-        let ind = indent(depth);
-        let raw_type = array_type_name(node.element_kind, node.array_len, elem_struct_name);
-        let ty = if compact {
-            fit_overflow(&raw_type, col_type)
-        } else {
-            fit(&raw_type, col_type)
-        };
-        let suffix = if collapsed { "" } else { "{" };
-        U16Str::from_str(&format!("{ind}{ty} {} {suffix}", node.name))
+        U16Str::from_str(&crate::format::fmt_array_header(
+            node,
+            depth,
+            0,
+            collapsed,
+            col_type,
+            col_name,
+            elem_struct_name,
+            compact,
+        ))
     }
 
     /// `fmtPointerHeader(...)` (`format.cpp:286-304`).
@@ -3662,308 +3334,17 @@ mod render {
         col_name: i32,
         compact: bool,
     ) -> U16Str {
-        let ind = indent(depth);
-        let overflow = compact && u16_len(ptr_type_name) > col_type;
-        let ty = if compact {
-            fit_overflow(ptr_type_name, col_type)
-        } else {
-            fit(ptr_type_name, col_type)
-        };
-        if collapsed {
-            if overflow {
-                return U16Str::from_str(&format!(
-                    "{ind}{ty} {} {}",
-                    node.name,
-                    read_value(node, prov, addr, 0)
-                ));
-            }
-            let name = fit(&node.name, col_name);
-            let val = fit(&read_value(node, prov, addr, 0), COL_VALUE);
-            return U16Str::from_str(&format!("{ind}{ty} {name} {val}"));
-        }
-        U16Str::from_str(&format!("{ind}{ty} {} {{", node.name))
-    }
-
-    fn is_ascii_printable(c: u8) -> bool {
-        (0x20..=0x7E).contains(&c)
-    }
-
-    /// `sanitizeString` (`format.cpp:311-323`).
-    fn sanitize_string(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 8);
-        for c in s.chars() {
-            match c {
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\\' => out.push_str("\\\\"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// `bytesToAscii(b, slot)` (`format.cpp:325-333`).
-    fn bytes_to_ascii(b: &[u8], slot: i32) -> String {
-        let mut out = String::with_capacity(slot as usize);
-        for i in 0..slot as usize {
-            let c = b.get(i).copied().unwrap_or(0);
-            out.push(if is_ascii_printable(c) {
-                c as char
-            } else {
-                '.'
-            });
-        }
-        out
-    }
-
-    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-
-    /// `bytesToHex(b, slot)` (`format.cpp:337-347`).
-    fn bytes_to_hex(b: &[u8], slot: i32) -> String {
-        let mut out = String::new();
-        for i in 0..slot as usize {
-            let c = b.get(i).copied().unwrap_or(0);
-            out.push(HEX_DIGITS[(c >> 4) as usize] as char);
-            out.push(HEX_DIGITS[(c & 0xF) as usize] as char);
-            if (i as i32) + 1 < slot {
-                out.push(' ');
-            }
-        }
-        out
-    }
-
-    fn bswap16(v: u16) -> u16 {
-        v.swap_bytes()
-    }
-    fn bswap32(v: u32) -> u32 {
-        v.swap_bytes()
-    }
-    fn bswap64(v: u64) -> u64 {
-        v.swap_bytes()
-    }
-
-    /// `readValueImpl(node, prov, addr, subLine, Display)` (`format.cpp:362-503`).
-    pub fn read_value(node: &Node, prov: &dyn Provider, addr: u64, sub_line: i32) -> String {
-        let be = node.big_endian;
-        let r_u16 = |a: u64| {
-            let v = prov.read_u16(a);
-            if be {
-                bswap16(v)
-            } else {
-                v
-            }
-        };
-        let r_u32 = |a: u64| {
-            let v = prov.read_u32(a);
-            if be {
-                bswap32(v)
-            } else {
-                v
-            }
-        };
-        let r_u64 = |a: u64| {
-            let v = prov.read_u64(a);
-            if be {
-                bswap64(v)
-            } else {
-                v
-            }
-        };
-        let r_f32 = |a: u64| {
-            let mut v = prov.read_u32(a);
-            if be {
-                v = bswap32(v);
-            }
-            f32::from_bits(v)
-        };
-        let r_f64 = |a: u64| {
-            let mut v = prov.read_u64(a);
-            if be {
-                v = bswap64(v);
-            }
-            f64::from_bits(v)
-        };
-        match node.kind {
-            NodeKind::Hex8 => hex_val(prov.read_u8(addr) as u64),
-            NodeKind::Hex16 => hex_val(r_u16(addr) as u64),
-            NodeKind::Hex32 => hex_val(r_u32(addr) as u64),
-            NodeKind::Hex64 => hex_val(r_u64(addr)),
-            NodeKind::Hex128 => {
-                let mut b = prov.read_bytes(addr, 16);
-                if b.len() < 16 {
-                    b.resize(16, 0);
-                }
-                if be {
-                    b.reverse();
-                }
-                let mut lo_arr = [0u8; 8];
-                let mut hi_arr = [0u8; 8];
-                lo_arr.copy_from_slice(&b[0..8]);
-                hi_arr.copy_from_slice(&b[8..16]);
-                let lo = u64::from_le_bytes(lo_arr);
-                let hi = u64::from_le_bytes(hi_arr);
-                if hi == 0 {
-                    hex_val(lo)
-                } else {
-                    format!("0x{:X}{}", hi, {
-                        let s = format!("{lo:X}");
-                        if s.len() >= 16 {
-                            s
-                        } else {
-                            format!("{}{}", "0".repeat(16 - s.len()), s)
-                        }
-                    })
-                }
-            }
-            NodeKind::Int8 => fmt_int8(prov.read_u8(addr) as i8),
-            NodeKind::Int16 => fmt_int16(r_u16(addr) as i16),
-            NodeKind::Int32 => fmt_int32(r_u32(addr) as i32),
-            NodeKind::Int64 => fmt_int64(r_u64(addr) as i64),
-            NodeKind::Int128 | NodeKind::UInt128 => {
-                let mut b = prov.read_bytes(addr, 16);
-                if b.len() < 16 {
-                    b.resize(16, 0);
-                }
-                if be {
-                    b.reverse();
-                }
-                if node.kind == NodeKind::Int128 {
-                    fmt_int128(&b)
-                } else {
-                    fmt_uint128(&b)
-                }
-            }
-            NodeKind::UInt8 => hex_val(prov.read_u8(addr) as u64),
-            NodeKind::UInt16 => hex_val(r_u16(addr) as u64),
-            NodeKind::UInt32 => hex_val(r_u32(addr) as u64),
-            NodeKind::UInt64 => hex_val(r_u64(addr)),
-            NodeKind::Float16 => fmt_float16(r_u16(addr)),
-            NodeKind::Float => fmt_float(r_f32(addr)),
-            NodeKind::Double => fmt_double(r_f64(addr)),
-            NodeKind::Bool => fmt_bool(prov.read_u8(addr)),
-            NodeKind::Pointer32 => {
-                let val = prov.read_u32(addr);
-                let mut s = fmt_pointer32(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:425-426`).
-                let sym = prov.get_symbol(u64::from(val));
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
-            NodeKind::Pointer64 => {
-                let val = prov.read_u64(addr);
-                if node.ptr_depth > 0
-                    && is_valid_primitive_ptr_target(node.element_kind)
-                    && val != 0
-                {
-                    let mut target = val;
-                    let mut d = 1;
-                    while d < node.ptr_depth && target != 0 {
-                        target = if prov.is_readable(target, 8) {
-                            prov.read_u64(target)
-                        } else {
-                            0
-                        };
-                        d += 1;
-                    }
-                    if target != 0 && prov.is_readable(target, size_for_kind(node.element_kind)) {
-                        let tmp = Node {
-                            kind: node.element_kind,
-                            str_len: node.str_len,
-                            ..Node::default()
-                        };
-                        let deref_val = read_value(&tmp, prov, target, 0);
-                        // Arrow to deref target value + symbol on the pointer's
-                        // own value (`format.cpp:443-449`).
-                        let sym = prov.get_symbol(val);
-                        if !sym.is_empty() {
-                            return format!("-> {deref_val}  // {sym}");
-                        }
-                        return format!("-> {deref_val}");
-                    }
-                    return fmt_pointer64(val);
-                }
-                let mut s = fmt_pointer64(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:457-458`).
-                let sym = prov.get_symbol(val);
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
-            NodeKind::FuncPtr32 => {
-                let val = prov.read_u32(addr);
-                let mut s = fmt_pointer32(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:465-466`).
-                let sym = prov.get_symbol(u64::from(val));
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
-            NodeKind::FuncPtr64 => {
-                let val = prov.read_u64(addr);
-                let mut s = fmt_pointer64(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:473-474`).
-                let sym = prov.get_symbol(val);
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
-            NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => {
-                let count = size_for_kind(node.kind) / 4;
-                let mut parts: Vec<String> = Vec::new();
-                for i in 0..count {
-                    parts.push(fmt_float(prov.read_f32(addr + (i as u64) * 4)));
-                }
-                parts.join(", ")
-            }
-            NodeKind::Mat4x4 => {
-                if !(0..4).contains(&sub_line) {
-                    return "?".to_string();
-                }
-                let mut line = format!("row{sub_line} [");
-                for c in 0..4 {
-                    if c > 0 {
-                        line.push_str(", ");
-                    }
-                    line.push_str(&fmt_float(
-                        prov.read_f32(addr + ((sub_line * 4 + c) as u64) * 4),
-                    ));
-                }
-                line.push(']');
-                line
-            }
-            NodeKind::UTF8 => {
-                let mut bytes = prov.read_bytes(addr, node.str_len);
-                if let Some(end) = bytes.iter().position(|&b| b == 0) {
-                    bytes.truncate(end);
-                }
-                let s = sanitize_string(&String::from_utf8_lossy(&bytes));
-                format!("\"{s}\"")
-            }
-            NodeKind::UTF16 => {
-                let bytes = prov.read_bytes(addr, node.str_len * 2);
-                let mut us: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                if let Some(end) = us.iter().position(|&u| u == 0) {
-                    us.truncate(end);
-                }
-                let s = sanitize_string(&String::from_utf16_lossy(&us));
-                format!("L\"{s}\"")
-            }
-            _ => String::new(),
-        }
+        U16Str::from_str(&crate::format::fmt_pointer_header(
+            node,
+            depth,
+            collapsed,
+            prov,
+            addr,
+            ptr_type_name,
+            col_type,
+            col_name,
+            compact,
+        ))
     }
 
     /// `fmtNodeLine(...)` (`format.cpp:512-556`).
@@ -3980,94 +3361,23 @@ mod render {
         type_override: &str,
         compact: bool,
     ) -> U16Str {
-        let ind = indent(depth);
-
-        let raw_type = if type_override.is_empty() {
-            type_name_raw(node.kind)
-        } else {
-            type_override.to_string()
-        };
-        let overflow = compact && u16_len(&raw_type) > col_type;
-
-        let ty = if overflow {
-            fit_overflow(&raw_type, col_type)
-        } else if type_override.is_empty() {
-            type_name_fit(node.kind, col_type)
-        } else {
-            fit(type_override, col_type)
-        };
-        let name = fit(&node.name, col_name);
-
-        let effective_col_type = if overflow {
-            u16_len(&raw_type)
-        } else {
-            col_type
-        };
-        let prefix_w = effective_col_type + col_name + 2 * super::K_SEP_WIDTH;
-
-        let cmt_suffix = if comment.is_empty() {
-            String::new()
-        } else {
-            fit(comment, COL_COMMENT)
-        };
-
-        // Mat4x4.
-        if node.kind == NodeKind::Mat4x4 {
-            let val = read_value(node, prov, addr, sub_line);
-            if sub_line == 0 {
-                return U16Str::from_str(&format!("{ind}{ty} {name} {val}{cmt_suffix}"));
-            }
-            return U16Str::from_str(&format!(
-                "{ind}{}{val}{cmt_suffix}",
-                " ".repeat(prefix_w.max(0) as usize)
-            ));
-        }
-
-        // Hex nodes: hex byte preview.
-        if is_hex_preview(node.kind) {
-            let sz = size_for_kind(node.kind);
-            let b = if prov.is_readable(addr, sz) {
-                prov.read_bytes(addr, sz)
-            } else {
-                vec![0u8; sz as usize]
-            };
-            let ascii = left_justified(&bytes_to_ascii(&b, sz), col_name);
-            let hex = left_justified(&bytes_to_hex(&b, sz), (sz * 3 - 1).max(23));
-            return U16Str::from_str(&format!("{ind}{ty} {ascii} {hex}{cmt_suffix}"));
-        }
-
-        let val = if overflow {
-            read_value(node, prov, addr, sub_line)
-        } else {
-            fit(&read_value(node, prov, addr, sub_line), COL_VALUE)
-        };
-        U16Str::from_str(&format!("{ind}{ty} {name} {val}{cmt_suffix}"))
+        U16Str::from_str(&crate::format::fmt_node_line(
+            node,
+            prov,
+            addr,
+            depth,
+            sub_line,
+            comment,
+            col_type,
+            col_name,
+            type_override,
+            compact,
+        ))
     }
 
     /// `fmtEnumMember(name, value, depth, nameW)` (`format.cpp:907-910`).
     pub fn fmt_enum_member(name: &str, value: i64, depth: i32, name_w: i32) -> U16Str {
-        let ind = indent(depth);
-        U16Str::from_str(&format!("{ind}{} = {value}", left_justified(name, name_w)))
-    }
-
-    /// `extractBits(...)` (`format.cpp:914-927`).
-    pub fn extract_bits(
-        prov: &dyn Provider,
-        addr: u64,
-        container_kind: NodeKind,
-        bit_offset: u8,
-        bit_width: u8,
-    ) -> u64 {
-        let container = match container_kind {
-            NodeKind::Hex8 => prov.read_u8(addr) as u64,
-            NodeKind::Hex16 => prov.read_u16(addr) as u64,
-            NodeKind::Hex32 => prov.read_u32(addr) as u64,
-            _ => prov.read_u64(addr),
-        };
-        if bit_width >= 64 {
-            return container >> bit_offset;
-        }
-        (container >> bit_offset) & ((1u64 << bit_width) - 1)
+        U16Str::from_str(&crate::format::fmt_enum_member(name, value, depth, name_w))
     }
 
     /// `fmtBitfieldMember(...)` (`format.cpp:929-934`).
@@ -4078,10 +3388,8 @@ mod render {
         depth: i32,
         name_w: i32,
     ) -> U16Str {
-        let ind = indent(depth);
-        U16Str::from_str(&format!(
-            "{ind}{} : {bit_width} = {value}",
-            left_justified(name, name_w)
+        U16Str::from_str(&crate::format::fmt_bitfield_member(
+            name, bit_width, value, depth, name_w,
         ))
     }
 }
