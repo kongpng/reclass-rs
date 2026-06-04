@@ -85,13 +85,22 @@ pub struct MenuBar {
     /// ([`MainWindow`](super::window::MainWindow)) pushes the persisted preference
     /// via [`set_title_case`](Self::set_title_case).
     title_case: bool,
+    /// Focus handle the open dropdown holds while a menu is up, so the keyboard
+    /// (Escape, bound on the dropdown) can dismiss it. A C++ `QMenu` runs a modal
+    /// loop that catches Escape; here the dropdown is a `deferred` overlay, so it
+    /// must explicitly take focus to receive keys.
+    dropdown_focus: FocusHandle,
+    /// Who held focus when the menu opened — restored on Escape / click-out so the
+    /// editor keeps the keyboard after the menu is *cancelled* (a chosen command
+    /// instead lets its own handler decide focus).
+    restore_focus: Option<WeakFocusHandle>,
 }
 
 impl EventEmitter<MenuCommand> for MenuBar {}
 
 impl MenuBar {
     /// Build the menu bar over the default Reclass menu tree (app-shell §7).
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         MenuBar {
             menus: default_menu_tree(),
             open_index: None,
@@ -99,6 +108,8 @@ impl MenuBar {
             checked: HashSet::new(),
             // The C++ default is Title-Case (`menuBarTitleCase = false`).
             title_case: false,
+            dropdown_focus: cx.focus_handle(),
+            restore_focus: None,
         }
     }
 
@@ -197,11 +208,25 @@ impl MenuBar {
         }
     }
 
+    /// Close all menus and hand the keyboard back to whoever held it when the menu
+    /// opened (Escape / click-outside — the *cancel* paths). The editor would
+    /// otherwise be left with no focused element, since the dropdown's focus handle
+    /// stops rendering the moment it closes.
+    fn close_menus_restoring(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menus(cx);
+        if let Some(handle) = self.restore_focus.take().and_then(|w| w.upgrade()) {
+            window.focus(&handle, cx);
+        }
+    }
+
     /// Emit a chosen command to the host (the C++ `action->trigger()` →
     /// `MainWindow` slot) and close the menus. Called from a dropdown item's click.
     fn choose_command(&mut self, command: CommandId, cx: &mut Context<Self>) {
         self.open_index = None;
         self.open_submenu.clear();
+        // The command (host slot) decides where focus goes; don't restore the
+        // opener's focus over it. Just drop the saved handle.
+        self.restore_focus = None;
         cx.emit(MenuCommand(command));
         cx.notify();
     }
@@ -243,7 +268,16 @@ fn cased_title(clean: &str, title_case: bool) -> String {
 }
 
 impl Render for MenuBar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // While a top-level menu is open, hold focus in its deferred dropdown so the
+        // keyboard can dismiss it (Escape, bound on the dropdown). Save the opener's
+        // focus the first time we grab it so the cancel paths can hand it back.
+        if self.open_index.is_some() && !self.dropdown_focus.contains_focused(window, cx) {
+            if self.restore_focus.is_none() {
+                self.restore_focus = window.focused(cx).map(|h| h.downgrade());
+            }
+            window.focus(&self.dropdown_focus, cx);
+        }
         // One top-level menu per submenu, in declaration order
         // (File · Edit · View · Tools · Plugins · Help).
         let menus = self.menus.clone();
@@ -254,6 +288,7 @@ impl Render for MenuBar {
         // the dropdown builders don't re-`read` this same entity mid-render.
         let checked = self.checked.clone();
         let title_case = self.title_case;
+        let dropdown_focus = self.dropdown_focus.clone();
 
         gpui_component::h_flex()
             .id("rcx-menubar")
@@ -269,6 +304,7 @@ impl Render for MenuBar {
                         open_index == Some(i),
                         open_submenu.clone(),
                         checked.clone(),
+                        dropdown_focus.clone(),
                         cx,
                     )),
                     // Top-level leaves/separators don't appear in the C++ bar.
@@ -294,6 +330,7 @@ fn render_top_level(
     open: bool,
     open_submenu: Vec<usize>,
     checked: HashSet<CommandId>,
+    dropdown_focus: FocusHandle,
     cx: &mut Context<MenuBar>,
 ) -> AnyElement {
     // The clickable title — Zed chrome: muted text, hover overlay, MD radius. It
@@ -333,12 +370,25 @@ fn render_top_level(
                     .snap_to_window_with_margin(px(tokens::space::MD))
                     .child(
                         div()
+                            // Hold focus so Escape reaches the dropdown; the parent
+                            // `MenuBar::render` focuses this handle while open.
+                            .track_focus(&dropdown_focus)
+                            // Escape dismisses the menu (the C++ QMenu modal-loop
+                            // Escape) and hands the keyboard back to the editor.
+                            .on_key_down(cx.listener(
+                                |this, ev: &KeyDownEvent, window, cx| {
+                                    if ev.keystroke.key == "escape" {
+                                        cx.stop_propagation();
+                                        this.close_menus_restoring(window, cx);
+                                    }
+                                },
+                            ))
                             .occlude()
                             .top(px(tokens::space::XS))
                             // Dismiss when the user clicks anywhere outside the
                             // dropdown (the C++ menu loses focus → closes).
-                            .on_mouse_down_out(cx.listener(|this, _ev, _window, cx| {
-                                this.close_menus(cx);
+                            .on_mouse_down_out(cx.listener(|this, _ev, window, cx| {
+                                this.close_menus_restoring(window, cx);
                             }))
                             // The whole cascading chain (this menu + any open
                             // fly-outs) is rendered relative to the top-level
