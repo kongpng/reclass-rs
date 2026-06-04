@@ -11,6 +11,7 @@
 pub mod clipboard;
 pub mod command;
 pub mod commontypes;
+pub mod debug_view;
 pub mod kind;
 pub mod linemeta;
 pub mod node;
@@ -21,6 +22,7 @@ pub mod value_history;
 // ── Flat re-exports so callers can `use reclass::core::Node` etc. ──
 pub use command::{Command, OffsetAdj, ViewState};
 pub use commontypes::{find_common_type, CommonField, CommonType, K_COMMON_TYPES};
+pub use debug_view::generate_debug_text;
 pub use kind::{
     alignment_for, all_type_names_for_ui, flags_for, is_container_kind, is_func_ptr, is_hex_node,
     is_hex_preview, is_matrix_kind, is_pointer_kind, is_string_kind, is_valid_primitive_ptr_target,

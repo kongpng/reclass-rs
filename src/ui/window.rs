@@ -1640,6 +1640,7 @@ impl MainWindow {
             // is reachable from the command palette via these synthetic ids.
             "view.tree" => self.set_active_view_mode(ViewMode::Tree, window, cx),
             "view.rendered" => self.set_active_view_mode(ViewMode::Rendered, window, cx),
+            "view.debug" => self.set_active_view_mode(ViewMode::Debug, window, cx),
 
             // Theme by name (`view.theme.<NAME>`) — switch the active theme.
             other if other.starts_with("view.theme.") => {
@@ -4178,6 +4179,7 @@ impl MainWindow {
         let body = match (editor, mode) {
             (Some(ed), ViewMode::Tree) => self.render_split_tree(ed, cx),
             (Some(ed), ViewMode::Rendered) => self.render_split_code(ed, cx),
+            (Some(ed), ViewMode::Debug) => self.render_split_debug(ed, cx),
             (None, _) => div()
                 .size_full()
                 .flex()
@@ -4235,6 +4237,57 @@ impl MainWindow {
             .collect();
         gpui_component::v_flex()
             .id("rcx-split-tree-view")
+            .size_full()
+            .bg(color::content_bg(cx))
+            .overflow_scroll()
+            .font_family(tokens::font::mono_family())
+            .text_size(px(tokens::font::EDITOR_SIZE))
+            .py(px(tokens::space::SM))
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// The read-only Debug projection for a split pane (the C++ `SplitPane`
+    /// `VM_Debug` view): the [`generate_debug_text`](crate::core::generate_debug_text)
+    /// dump of the editor's last composed line/`LineMeta` model, shown as
+    /// monospaced read-only lines. A developer view of the existing structure —
+    /// no live process, no editing — mirroring `render_split_tree` so the split
+    /// never re-renders the live `RcxEditor` entity.
+    fn render_split_debug(
+        &self,
+        editor: &Entity<super::editor::RcxEditor>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use super::design::{color, tokens};
+        let text = crate::core::generate_debug_text(editor.read(cx).last_result());
+        if text.trim().is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(color::content_bg(cx))
+                .text_color(color::text_muted(cx))
+                .font_family(tokens::font::mono_family())
+                .text_size(px(tokens::font::EDITOR_SIZE))
+                .child("// empty document")
+                .into_any_element();
+        }
+        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let rows: Vec<AnyElement> = text
+            .lines()
+            .map(|line| {
+                div()
+                    .h(line_h)
+                    .px(px(tokens::space::SM))
+                    .whitespace_nowrap()
+                    .text_color(color::text(cx))
+                    .child(line.to_string())
+                    .into_any_element()
+            })
+            .collect();
+        gpui_component::v_flex()
+            .id("rcx-split-debug-view")
             .size_full()
             .bg(color::content_bg(cx))
             .overflow_scroll()

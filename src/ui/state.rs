@@ -126,6 +126,11 @@ pub enum ViewMode {
     Tree,
     /// `VM_Rendered` — the generated C/C++ source for the viewed struct.
     Rendered,
+    /// `VM_Debug` — the read-only developer dump of the composed line/`LineMeta`
+    /// model (the C++ `SplitPane` debug surface; main.cpp `generateDebugText`).
+    /// Reached via the 3-way [`ViewMode::toggled`] cycle, not the dual titlebar
+    /// toggle.
+    Debug,
 }
 
 impl ViewMode {
@@ -134,14 +139,17 @@ impl ViewMode {
         match self {
             ViewMode::Tree => "Tree",
             ViewMode::Rendered => "C/C++",
+            ViewMode::Debug => "Debug",
         }
     }
 
-    /// The other mode (the dual toggle flips between exactly two states).
+    /// The next mode in the C++ 3-way cycle: `VM_Reclass`→`VM_Rendered`→`VM_Debug`
+    /// →`VM_Reclass` (the SplitPane view index `0`→`1`→`2`→`0`).
     pub fn toggled(self) -> Self {
         match self {
             ViewMode::Tree => ViewMode::Rendered,
-            ViewMode::Rendered => ViewMode::Tree,
+            ViewMode::Rendered => ViewMode::Debug,
+            ViewMode::Debug => ViewMode::Tree,
         }
     }
 }
@@ -546,10 +554,14 @@ mod tests {
     fn view_mode_defaults_to_tree_and_toggles() {
         // The C++ default per-pane mode is VM_Reclass (the structured grid).
         assert_eq!(ViewMode::default(), ViewMode::Tree);
+        // The 3-way cycle mirrors the C++ SplitPane view index 0→1→2→0
+        // (VM_Reclass → VM_Rendered → VM_Debug → VM_Reclass).
         assert_eq!(ViewMode::Tree.toggled(), ViewMode::Rendered);
-        assert_eq!(ViewMode::Rendered.toggled(), ViewMode::Tree);
+        assert_eq!(ViewMode::Rendered.toggled(), ViewMode::Debug);
+        assert_eq!(ViewMode::Debug.toggled(), ViewMode::Tree);
         assert_eq!(ViewMode::Tree.label(), "Tree");
         assert_eq!(ViewMode::Rendered.label(), "C/C++");
+        assert_eq!(ViewMode::Debug.label(), "Debug");
     }
 
     #[test]

@@ -1076,7 +1076,55 @@ impl DocumentArea {
         match entry.view_mode {
             ViewMode::Tree => entry.editor.clone().into_any_element(),
             ViewMode::Rendered => self.render_code_view(entry, cx),
+            ViewMode::Debug => self.render_debug_view(entry, cx),
         }
+    }
+
+    /// The read-only Debug developer view (the C++ `SplitPane` `VM_Debug`
+    /// surface): the [`generate_debug_text`](crate::core::generate_debug_text)
+    /// dump of the editor's last composed line/`LineMeta` model. Rendered as
+    /// monospaced read-only lines — the same projection styling as the split
+    /// Tree mirror, never a live editor entity. There is NO live process and NO
+    /// editing; it reflects the existing structure only.
+    fn render_debug_view(&self, entry: &DocEntry, cx: &Context<Self>) -> AnyElement {
+        let text = crate::core::generate_debug_text(entry.editor.read(cx).last_result());
+        if text.trim().is_empty() {
+            return div()
+                .id("rcx-debug-view-empty")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(color::content_bg(cx))
+                .text_color(color::text_muted(cx))
+                .font_family(tokens::font::mono_family())
+                .text_size(px(tokens::font::EDITOR_SIZE))
+                .child("// empty document")
+                .into_any_element();
+        }
+        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let rows: Vec<AnyElement> = text
+            .lines()
+            .map(|line| {
+                div()
+                    .h(line_h)
+                    .px(px(tokens::space::SM))
+                    .whitespace_nowrap()
+                    .text_color(color::text(cx))
+                    .child(line.to_string())
+                    .into_any_element()
+            })
+            .collect();
+        gpui_component::v_flex()
+            .id("rcx-debug-view")
+            .size_full()
+            .bg(color::content_bg(cx))
+            .overflow_scroll()
+            .font_family(tokens::font::mono_family())
+            .text_size(px(tokens::font::EDITOR_SIZE))
+            .py(px(tokens::space::SM))
+            .children(rows)
+            .into_any_element()
     }
 
     /// The rendered C/C++ pane (reclass PIC3, right side) — a scrollable,
