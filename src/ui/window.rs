@@ -6442,7 +6442,18 @@ impl Render for TypeAliasesDialog {
                             .text_color(cx.theme().muted_foreground)
                             .child(SharedString::from(*name)),
                     )
-                    .child(Input::new(input).w_full().font_family(mono.clone()))
+                    // The input fills the REMAINING width after the fixed label via
+                    // a `flex_1` wrapper (the palette/enum/source pattern). Using
+                    // `Input::new(..).w_full()` DIRECTLY as a flex child sized it to
+                    // 100% of the row, so it overran the 110px label + gap and the
+                    // card's `overflow_hidden` clipped its right edge (the cut-off
+                    // right side). `min_w_0` lets it shrink within the row.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(input).w_full().font_family(mono.clone())),
+                    )
                     .into_any_element()
             })
             .collect();
