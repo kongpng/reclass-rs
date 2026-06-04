@@ -4982,6 +4982,51 @@ impl RcxEditor {
             }
         }
 
+        // Footer add-bytes / Trim / Top pills: transparent SHAPED-position hitboxes
+        // so the click box lands exactly on each painted pill. The pill backgrounds
+        // are drawn at shaped-glyph x (element.rs), but the row's `col * cell` hit
+        // test drifts from them (the editor font's advance ≠ the cell metric), so a
+        // click near the right of the footer missed or hit the wrong pill. Each
+        // overlay forwards a span-centered synthetic X back through the normal row
+        // routing so the col-based `on_footer_click` resolves the SAME pill —
+        // exactly the trick the command-row token hitboxes use above. Suppressed
+        // while this footer row is inline-edited (the field owns the hitbox then).
+        if lm.line_kind == LineKind::Footer && !editing_this_row {
+            let text = self.line_text_owned(idx);
+            for span in geometry::footer_pill_spans(&text) {
+                if span.end <= span.start {
+                    continue;
+                }
+                let (sl, sw) = self.shaped_span_px(&text, span.start, span.end, window);
+                let left = px(sl);
+                let width = px(sw.max(cell));
+                // A col-centered synthetic X: fed back through `hit_test_row` →
+                // `col_containing_x` it floors to `span.start`, which lands inside
+                // `[span.start, span.end)`, so `on_footer_click` picks THIS pill.
+                let click_x = (span.start.max(0) as f32 + 0.5) * cell;
+                text_region = text_region.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "rcx-footer-pill-{idx}-{}",
+                            span.start
+                        )))
+                        .absolute()
+                        .top_0()
+                        .left(left)
+                        .h(px(self.metrics.line_height))
+                        .w(width)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.on_row_mouse_down(idx, click_x, e.modifiers, window, cx);
+                            }),
+                        ),
+                );
+            }
+        }
+
         // Inline-edit overlay positioned EXACTLY over the edited column.
         //
         // The field lives inside `text_region`, whose absolute origin coincides
