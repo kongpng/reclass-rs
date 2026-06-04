@@ -783,6 +783,11 @@ mod view {
                     cx.emit(PaletteEvent::Cancel);
                     true
                 }
+                // Trap Tab / Shift+Tab inside the palette so focus can't escape to a
+                // widget behind the modal scrim (the key arrives as "tab" with shift
+                // in the modifiers; there is a single input, so there is nowhere to
+                // tab to anyway).
+                "tab" => true,
                 _ => false,
             }
         }

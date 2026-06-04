@@ -1402,6 +1402,14 @@ mod view {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> bool {
+            // Trap Tab / Shift+Tab inside the popup so focus can't leave it for a
+            // widget behind the modal scrim. The popup is self-contained (filter +
+            // category row + list), driven by the keys handled below — never Tab —
+            // so swallowing it costs nothing. (Shift+Tab arrives as key "tab" with
+            // shift in the modifiers.)
+            if key == "tab" {
+                return true;
+            }
             // Ctrl+F focuses the filter from anywhere AND selects all its text so
             // typing replaces the query (item 12; the C++ `selectAll()` on focus).
             if key == "f" && modifiers.control {
