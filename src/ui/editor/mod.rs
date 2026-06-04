@@ -4857,6 +4857,13 @@ impl RcxEditor {
                     .border_1()
                     .border_color(palette.accent)
                     .rounded_sm()
+                    // Vertically CENTER the field text in the row box. The static
+                    // row text + the offset gutter are `items_center` (line ~4599),
+                    // but the `FieldInput` element paints its shaped line at
+                    // `bounds.origin` (top-aligned), so without this the edit text
+                    // rode high vs the surrounding text (the "off-center selector").
+                    .flex()
+                    .items_center()
                     // The field entity's own `Render` carries the focus/key-context
                     // wrapper (`.track_focus` + `.key_context("RcxFieldInput")` +
                     // every `.on_action(..)` field handler). Embedding the entity —
