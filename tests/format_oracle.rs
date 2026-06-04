@@ -107,12 +107,15 @@ fn fmt_struct_footer() {
     assert!(!s.contains("sizeof"));
 }
 
-// testIndent (test_format.cpp:125-129)
+// testIndent (test_format.cpp:125-129) — INTENTIONALLY DIVERGES from the C++
+// oracle (which used kTreeIndent=2). The tree indent was widened to 3 cols/level
+// so nested structs / pointer-to-class expansions read as clear code-like steps;
+// `indent(n)` is therefore `n * 3` spaces. Mirrors the unit test in `format.rs`.
 #[test]
 fn indent() {
     assert_eq!(fmt::indent(0), "");
-    assert_eq!(fmt::indent(1), "  ");
-    assert_eq!(fmt::indent(3), "      ");
+    assert_eq!(fmt::indent(1), "   ");
+    assert_eq!(fmt::indent(3), "         ");
 }
 
 // testParseValueInt32 (test_format.cpp:131-139)

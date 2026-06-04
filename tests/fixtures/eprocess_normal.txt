@@ -1,6 +1,6 @@
 [▸] source▾  0x0  struct Untitled {
-     uint32_t  Data_0     0x0                                                                                             
-     uint32_t  Data_1     0x0                                                                                             
+      uint32_t  Data_0     0x0                                                                                             
+      uint32_t  Data_1     0x0                                                                                             
 };  +1 +10h +100h +1000h Trim Top  // 0x8 (8)
  ▸ _EPROCESS eprocess 
  ▸ _KPROCESS kprocess 
