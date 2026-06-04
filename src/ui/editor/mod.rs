@@ -4904,12 +4904,17 @@ impl RcxEditor {
                                 this.on_row_mouse_down(idx, addr_click_x, e.modifiers, window, cx);
                             }),
                         )
-                        .tooltip(move |_window, cx| {
-                            cx.new(|_| AddressFormatTooltip {
-                                base_address,
-                                module: module.clone(),
+                        // Suppress the tooltip while a context menu is open (it
+                        // would otherwise pop over/behind the menu — gpui only
+                        // occludes hover for the strip directly under the menu rect).
+                        .when(self.context_menu.is_none(), |el| {
+                            el.tooltip(move |_window, cx| {
+                                cx.new(|_| AddressFormatTooltip {
+                                    base_address,
+                                    module: module.clone(),
+                                })
+                                .into()
                             })
-                            .into()
                         }),
                 );
             }
@@ -4973,10 +4978,12 @@ impl RcxEditor {
                                     this.on_row_mouse_down(idx, click_x, e.modifiers, window, cx);
                                 }),
                             )
-                            .tooltip(move |_window, cx| {
-                                let title = title.clone();
-                                let body = body.clone();
-                                cx.new(|_| TitledTooltip { title, body }).into()
+                            .when(self.context_menu.is_none(), |el| {
+                                el.tooltip(move |_window, cx| {
+                                    let title = title.clone();
+                                    let body = body.clone();
+                                    cx.new(|_| TitledTooltip { title, body }).into()
+                                })
                             }),
                     );
                 }
@@ -5373,6 +5380,15 @@ impl RcxEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // No hover tracking while a context menu is open. The C++ context menus run
+        // a nested modal loop (QMenu::exec), so the editor viewport sees no
+        // mouse-move and hover dwell never fires. Here the menu is a non-occluding
+        // anchored overlay, so without this guard a move over any row the menu does
+        // not physically cover keeps re-spawning hover cards / tooltips behind it —
+        // the leak the menu-open state must suppress.
+        if self.context_menu.is_some() {
+            return;
+        }
         // Item 9: track the hovered NODE id (not just the row) so the hover band
         // lights every line of a multi-line node. Chrome rows (node_id 0) fall back
         // to single-row hover.
@@ -5700,6 +5716,12 @@ impl RcxEditor {
     /// the cursor, using [`design`] tokens (no ad-hoc hex). Value-history lists the
     /// changed values newest-first; the title/body card shows disasm / hex-dump.
     fn render_hover_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Belt-and-suspenders with the `dispatch_row_hover` guard: never paint a
+        // hover card while a context menu is up, regardless of how `hover_popup`
+        // came to be set.
+        if self.context_menu.is_some() {
+            return None;
+        }
         let state = self.hover_popup.as_ref()?;
         let palette = EditorPalette::from_theme(cx);
         let card = match &state.kind {
@@ -6741,6 +6763,10 @@ impl RcxEditor {
             }));
         self.context_menu_pos = pos;
         self.context_menu = Some(menu);
+        // Dismiss any live hover card the instant the menu opens so it does not
+        // linger behind / over the menu (the row under a right-click usually has a
+        // hover card pending from the move that preceded the click).
+        self.hover_popup = None;
         // Keep editor focus so the menu's dispatched actions land in the
         // `RcxEditor` key context (the menu builds its actions to dispatch up the
         // focus tree; the editor is the focused element).
