@@ -1803,40 +1803,12 @@ impl RcxEditor {
                 cx.notify();
             });
 
-        // PIXEL-accurate overlay placement: SHAPE the real line prefix + span with
-        // the editor font (same font/size/shaper the row painter uses) instead of
-        // `col * cell_width`. The cell grid only matches ASCII glyphs; the command
-        // row's `▸`/`▾`/chip glyphs (and tree connectors) advance differently, so a
-        // cell estimate put the edit box right of the painted token.
-        let (left_px, width_px) = {
-            let chars: Vec<char> = text.chars().collect();
-            let cs = (span.start.max(0) as usize).min(chars.len());
-            let ce = (span.end.max(span.start) as usize).min(chars.len());
-            let prefix: String = chars[..cs].iter().collect();
-            let span_str: String = chars[cs..ce].iter().collect();
-            let ff = self.editor_font_family();
-            let fs = px(self.editor_font_size());
-            let mut shape_w = |s: &str, window: &mut Window| -> f32 {
-                if s.is_empty() {
-                    return 0.0;
-                }
-                let run = TextRun {
-                    len: s.len(),
-                    font: gpui::font(ff.clone()),
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                f32::from(
-                    window
-                        .text_system()
-                        .shape_line(s.to_string().into(), fs, std::slice::from_ref(&run), None)
-                        .width(),
-                )
-            };
-            (shape_w(&prefix, window), shape_w(&span_str, window))
-        };
+        // PIXEL-accurate overlay placement: SHAPE the real line prefix + span (the
+        // same glyph advances the row painter uses) instead of `col * cell_width`,
+        // so the edit box lands exactly on the painted token even on the command
+        // row (source chip + `▸`/`▾` glyphs) or tree-connector rows. Shared with the
+        // command-row hover hitboxes via [`shaped_span_px`].
+        let (left_px, width_px) = self.shaped_span_px(&text, span.start, span.end, window);
 
         self.last_tab_target = Some(target);
         self.editing = Some(EditingField {
@@ -4492,10 +4464,52 @@ impl RcxEditor {
             .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
     }
 
+    /// Pixel `(left, width)` of the char span `[start, end)` within `text`,
+    /// measured by SHAPING the prefix `[0, start)` and the span with the editor
+    /// font — the same glyph advances the row painter's `shape_line` uses — rather
+    /// than `col * cell_width`. The cell grid only matches plain mono ASCII; the
+    /// command row's source chip + `▸`/`▾` glyphs (and tree connectors) advance
+    /// differently, so cell-based hitboxes/edit-boxes drifted right of the painted
+    /// token (worst at high columns, e.g. the class name + address). Uses the
+    /// window text system's `shape_line` (the same call the row painter + the cell
+    /// metric use), so it tracks the live font/zoom exactly.
+    fn shaped_span_px(&self, text: &str, start: i32, end: i32, window: &Window) -> (f32, f32) {
+        let chars: Vec<char> = text.chars().collect();
+        let s = (start.max(0) as usize).min(chars.len());
+        let e = (end.max(start) as usize).min(chars.len());
+        let measure = |slice: &str, window: &Window| -> f32 {
+            if slice.is_empty() {
+                return 0.0;
+            }
+            let run = TextRun {
+                len: slice.len(),
+                font: gpui::font(self.editor_font_family()),
+                color: gpui::transparent_black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(
+                        slice.to_string().into(),
+                        px(self.editor_font_size()),
+                        std::slice::from_ref(&run),
+                        None,
+                    )
+                    .width(),
+            )
+        };
+        let prefix: String = chars[..s].iter().collect();
+        let span: String = chars[s..e].iter().collect();
+        (measure(&prefix, window), measure(&span, window))
+    }
+
     /// Render one row: background (selection/hover) + text element, with the row
     /// element handling row-local click routing. Editable rows embed the field
     /// overlay positioned at the edited column.
-    fn render_row(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, idx: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = EditorPalette::from_theme(cx);
         let lm = self.line_meta(idx).cloned().unwrap_or_default();
         let mut selected = self.is_row_selected(&lm);
@@ -4762,8 +4776,11 @@ impl RcxEditor {
                 // margin/border/gutter term. The wrapper's absolute origin == the
                 // text origin, so this lands exactly on the painted address span
                 // (the same alignment the inline-edit field uses).
-                let left = px(addr.start.max(0) as f32 * cell);
-                let width = px(((addr.end - addr.start).max(1) as f32) * cell);
+                // Shaped pixel span so the hitbox covers the WHOLE painted address
+                // (the cell grid drifted it right of the glyphs).
+                let (al, aw) = self.shaped_span_px(&text, addr.start, addr.end, window);
+                let left = px(al);
+                let width = px(aw.max(cell));
                 let base_address = self.controller.last_result().layout.base_address;
                 let module: SharedString = self.controller.document().provider.name().into();
                 // Forward a left mouse-down on the overlay back into the normal row
@@ -4840,8 +4857,12 @@ impl RcxEditor {
                 ),
             ] {
                 if span.valid && span.end > span.start {
-                    let left = px(span.start.max(0) as f32 * cell);
-                    let width = px(((span.end - span.start).max(1) as f32) * cell);
+                    // Shaped pixel span so the hover/click hitbox covers the WHOLE
+                    // painted token — the entire class name / source chip / chevron
+                    // is clickable, exactly aligned with the glyphs (not col*cell).
+                    let (sl, sw) = self.shaped_span_px(&text, span.start, span.end, window);
+                    let left = px(sl);
+                    let width = px(sw.max(cell));
                     let title: SharedString = title.into();
                     let body: SharedString = body.into();
                     // The hover hitbox occludes the row-text element, so forward its
@@ -8763,8 +8784,10 @@ impl Render for RcxEditor {
                             uniform_list(
                                 "rcx-rows",
                                 count,
-                                cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                                    range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
+                                cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                                    range
+                                        .map(|ix| this.render_row(ix, window, cx))
+                                        .collect::<Vec<_>>()
                                 }),
                             )
                             .flex_grow()
