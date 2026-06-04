@@ -153,8 +153,6 @@ impl Element for RowElement {
     ) -> Self::PrepaintState {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        let cell = self.row.metrics.cell_width;
-
         // Per-column hover (items 1/2/3): when the cursor is over this row, resolve
         // the cursor shape (IBeam / PointingHand / Arrow) and the hovered token's
         // column span to recolor link-blue (the C++ `applyHoverCursor` /
@@ -171,36 +169,13 @@ impl Element for RowElement {
             }
         }
 
-        // Rounded pill backgrounds (footer / command-row chips). Built whether or
-        // not the line has text so an empty pill list is cheap; inset vertically
-        // a touch so the chip reads as a Zed button, not a full-height block.
-        let mut pills = Vec::with_capacity(self.row.pills.len());
-        let pill_inset = (f32::from(bounds.bottom() - bounds.top()) * 0.14).clamp(1.0, 4.0);
-        for pill in &self.row.pills {
-            if pill.end <= pill.start {
-                continue;
-            }
-            let x0 = bounds.left() + px(pill.start.max(0) as f32 * cell);
-            let x1 = bounds.left() + px(pill.end.max(0) as f32 * cell);
-            let pb = Bounds::from_corners(
-                point(x0, bounds.top() + px(pill_inset)),
-                point(x1, bounds.bottom() - px(pill_inset)),
-            );
-            pills.push(quad(
-                pb,
-                px(crate::ui::design::tokens::radius::MD),
-                pill.fill,
-                px(crate::ui::design::tokens::border::THIN),
-                pill.border,
-                BorderStyle::Solid,
-            ));
-        }
-
         let text = self.row.text.clone();
+        // An empty row has no glyphs, so it can carry no pills/overlays (both are
+        // spans OVER the row text). Bail before shaping.
         if text.is_empty() {
             return RowPrepaint {
                 line: None,
-                pills,
+                pills: Vec::new(),
                 overlays: Vec::new(),
                 hitbox: Some(hitbox),
                 cursor: hover_cursor,
@@ -217,19 +192,52 @@ impl Element for RowElement {
             &font,
             hover_recolor,
         );
+        // Shape the line FIRST: pill backgrounds and inline overlays must anchor to
+        // the SAME shaped-glyph x-positions the glyphs paint at, not the `col * cell`
+        // mono grid. The grid drifts from the natural glyph advances (the editor
+        // paints with `shape_line`, items 0ee4eea/bfc6a4e), so over a long row it
+        // accumulated enough error that the footer add-bytes pills ran together and
+        // bled over the trailing `// 0x80` comment. Map each char column through
+        // `line.x_for_index(byte_for_col(..))` — the inverse the painter uses.
         let line = window
             .text_system()
-            .shape_line(text, font_size, &runs, None);
+            .shape_line(text.clone(), font_size, &runs, None);
+        let x_at = |col: i32| -> Pixels {
+            bounds.left() + line.x_for_index(geometry::byte_for_col(&text, col.max(0)))
+        };
+
+        // Rounded pill backgrounds (footer / command-row chips). Inset vertically a
+        // touch so the chip reads as a Zed button, not a full-height block.
+        let pill_inset = (f32::from(bounds.bottom() - bounds.top()) * 0.14).clamp(1.0, 4.0);
+        let mut pills = Vec::with_capacity(self.row.pills.len());
+        for pill in &self.row.pills {
+            if pill.end <= pill.start {
+                continue;
+            }
+            let pb = Bounds::from_corners(
+                point(x_at(pill.start), bounds.top() + px(pill_inset)),
+                point(x_at(pill.end), bounds.bottom() - px(pill_inset)),
+            );
+            pills.push(quad(
+                pb,
+                px(crate::ui::design::tokens::radius::MD),
+                pill.fill,
+                px(crate::ui::design::tokens::border::THIN),
+                pill.border,
+                BorderStyle::Solid,
+            ));
+        }
 
         let mut overlays = Vec::with_capacity(self.row.overlays.len());
         for &(start, end, color) in &self.row.overlays {
             if end <= start {
                 continue;
             }
-            let x0 = bounds.left() + px(start.max(0) as f32 * cell);
-            let x1 = bounds.left() + px(end.max(0) as f32 * cell);
             overlays.push(fill(
-                Bounds::from_corners(point(x0, bounds.top()), point(x1, bounds.bottom())),
+                Bounds::from_corners(
+                    point(x_at(start), bounds.top()),
+                    point(x_at(end), bounds.bottom()),
+                ),
                 color,
             ));
         }
