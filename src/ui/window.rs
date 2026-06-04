@@ -280,6 +280,11 @@ struct ModalEntry {
     /// `max_w` cap (the command palette → 600); `None` for a self-sizing popup
     /// (the type selector sets its own `w(380)`).
     width: Option<Pixels>,
+    /// Whoever held focus when this modal opened — restored when it closes (and the
+    /// stack empties) so focus returns to the true opener, not unconditionally to
+    /// the active editor. Matters when a modal is opened from a side panel / sidebar
+    /// control rather than the editor.
+    restore: Option<WeakFocusHandle>,
 }
 
 /// The application's root view — the C++ `MainWindow` (app-shell §6).
@@ -1412,10 +1417,15 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Remember who held focus so closing the modal hands it back to the opener
+        // (only meaningful for the bottom entry; nested modals restore to the entry
+        // beneath them). Capture BEFORE focusing the popup.
+        let restore = window.focused(cx).map(|h| h.downgrade());
         self.modal_stack.push(ModalEntry {
             view,
             focus: focus.clone(),
             width,
+            restore,
         });
         // Focus the popup's OWN input handle so the first keystroke reaches it (no
         // dialog focus_trap pulls focus back, unlike `open_dialog`).
@@ -1427,12 +1437,18 @@ impl MainWindow {
     /// stack is still non-empty) or the active editor surface. Mirrors
     /// `window.close_dialog` for the in-house stack.
     pub fn close_top_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal_stack.pop().is_none() {
+        let Some(closed) = self.modal_stack.pop() else {
             return;
-        }
+        };
         if let Some(top) = self.modal_stack.last() {
+            // A modal is still open beneath — hand focus back to it.
             window.focus(&top.focus, cx);
+        } else if let Some(handle) = closed.restore.and_then(|w| w.upgrade()) {
+            // Return focus to whoever opened the modal (the editor in the common
+            // case, but a side-panel control if that is what was focused).
+            window.focus(&handle, cx);
         } else if let Some(editor) = self.document_area.read(cx).active_editor() {
+            // Fall back to the active editor if the opener is gone.
             let fh = editor.read(cx).focus_handle(cx);
             window.focus(&fh, cx);
         }
