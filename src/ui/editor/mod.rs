@@ -6762,15 +6762,20 @@ impl RcxEditor {
                 cx.notify();
             }));
         self.context_menu_pos = pos;
-        self.context_menu = Some(menu);
         // Dismiss any live hover card the instant the menu opens so it does not
         // linger behind / over the menu (the row under a right-click usually has a
         // hover card pending from the move that preceded the click).
         self.hover_popup = None;
-        // Keep editor focus so the menu's dispatched actions land in the
-        // `RcxEditor` key context (the menu builds its actions to dispatch up the
-        // focus tree; the editor is the focused element).
-        window.focus(&self.focus_handle, cx);
+        // Focus the MENU (not the editor) so the keyboard drives it: Up/Down move
+        // the highlight, Enter activates the highlighted item, and Esc closes the
+        // menu — instead of Esc falling through to the editor and clearing the row
+        // selection behind it. Every editor menu is built with
+        // `.action_context(editor_focus)`, so a chosen action still dispatches into
+        // the `RcxEditor` key context, and dismissing the menu (Esc / click-away /
+        // pick) restores editor focus via `PopupMenu::dismiss` (popup_menu.rs:959).
+        let menu_focus = menu.focus_handle(cx);
+        self.context_menu = Some(menu);
+        window.focus(&menu_focus, cx);
         cx.notify();
     }
 
@@ -8743,6 +8748,20 @@ impl EventEmitter<RcxEditorEvent> for RcxEditor {}
 
 impl Render for RcxEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep the open context menu focused so the keyboard drives it (Up/Down
+        // highlight, Enter activates, Esc closes). The editor renders the menu as a
+        // hand-rolled deferred overlay (below) instead of via `ContextMenuExt`,
+        // which would otherwise re-assert menu focus every frame (the upstream
+        // pattern at menu/context_menu.rs:196-201). A one-shot focus in
+        // `show_context_menu_at` is stolen back by the right-click's mouse-up, so
+        // re-assert it here each render while a menu is up. The `contains_focused`
+        // guard makes this idempotent once focus has landed (no re-render churn).
+        if let Some(menu) = self.context_menu.clone() {
+            let fh = menu.focus_handle(cx);
+            if !fh.contains_focused(window, cx) {
+                window.focus(&fh, cx);
+            }
+        }
         // Measure the monospace cell once per frame so hit-test/overlay column math
         // matches the painted glyph grid EXACTLY. Two things were wrong before and
         // each shifted the inline-edit box / mouse hit-test right of the painted
