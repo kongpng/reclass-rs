@@ -12,7 +12,7 @@
 use super::{
     array_elem_count_span_for, array_elem_type_span_for, command_row_root_name_span,
     command_row_src_span, compose, compose_default, format_preview, pointer_kind_span_for,
-    pointer_target_span_for, ComposeResult, LineGeometry, K_FOLD_COL,
+    pointer_target_span_for, ComposeResult, LineGeometry, K_FOLD_COL, K_TREE_INDENT,
 };
 use crate::core::linemeta::{find_chip, K_COMMAND_ROW_ID};
 use crate::core::{ChipKind, LineKind, LineMeta, Node, NodeKind, NodeTree};
@@ -2164,11 +2164,15 @@ fn line_geometry_for_field_line() {
         ..Default::default()
     };
     let g = LineGeometry::for_line(&lm);
+    // depth 1 → indent_width == K_TREE_INDENT.
     assert_eq!(g.prefix_width, K_FOLD_COL);
-    assert_eq!(g.indent_width, 2);
-    assert_eq!(g.type_start(), K_FOLD_COL + 2);
-    assert_eq!(g.name_start(), K_FOLD_COL + 2 + 14 + 1);
-    assert_eq!(g.value_start(), K_FOLD_COL + 2 + 14 + 1 + 22 + 1);
+    assert_eq!(g.indent_width, K_TREE_INDENT);
+    assert_eq!(g.type_start(), K_FOLD_COL + K_TREE_INDENT);
+    assert_eq!(g.name_start(), K_FOLD_COL + K_TREE_INDENT + 14 + 1);
+    assert_eq!(
+        g.value_start(),
+        K_FOLD_COL + K_TREE_INDENT + 14 + 1 + 22 + 1
+    );
     assert_eq!(g.document_column(5), K_FOLD_COL + 5);
 }
 

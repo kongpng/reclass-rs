@@ -38,8 +38,9 @@ const COL_COMMENT: i32 = 28; // "// Enter=Save Esc=Cancel" fits
 /// `SEP = QStringLiteral(" ")` (`format.cpp:65`).
 const SEP: &str = " ";
 
-/// `kTreeIndent = 2` (`core.h:1131`).
-const K_TREE_INDENT: i32 = 2;
+/// `kTreeIndent` — ReClass uses 2; widened to 3 for clearer nested indentation
+/// (kept in sync with [`crate::core::linemeta::K_TREE_INDENT`]).
+const K_TREE_INDENT: i32 = 3;
 /// `kSepWidth = 1` (`core.h:1136`).
 const K_SEP_WIDTH: i32 = 1;
 
@@ -1985,8 +1986,8 @@ mod tests {
     #[test]
     fn test_indent() {
         assert_eq!(indent(0), "");
-        assert_eq!(indent(1), "  ");
-        assert_eq!(indent(3), "      ");
+        assert_eq!(indent(1), "   ");
+        assert_eq!(indent(3), "         ");
     }
 
     // ── testParseValueInt32 (test_format.cpp:131-139) ──
@@ -2390,7 +2391,7 @@ mod tests {
 
     #[test]
     fn test_fmt_enum_and_bitfield_member() {
-        assert_eq!(fmt_enum_member("A", 5, 1, 4), "  A    = 5");
+        assert_eq!(fmt_enum_member("A", 5, 1, 4), "   A    = 5");
         assert_eq!(fmt_bitfield_member("flag", 3, 7, 0, 6), "flag   : 3 = 7");
     }
 

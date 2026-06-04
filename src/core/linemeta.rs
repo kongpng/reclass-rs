@@ -22,7 +22,10 @@ pub const M_FOCUS: u32 = 10;
 
 // ── Column constants (`core.h:1130-1148`). ──
 pub const K_FOLD_COL: i32 = 3;
-pub const K_TREE_INDENT: i32 = 2;
+// Columns of indent per nesting level. ReClass uses 2; widened to 3 so nested
+// structs / pointer-to-class expansions read as clear code-like steps (the prior
+// 2-col step was too subtle to see deep nesting).
+pub const K_TREE_INDENT: i32 = 3;
 pub const K_COL_TYPE: i32 = 14;
 pub const K_COL_NAME: i32 = 22;
 pub const K_COL_VALUE: i32 = 96;

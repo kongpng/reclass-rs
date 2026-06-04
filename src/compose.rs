@@ -49,8 +49,9 @@ struct RttiInfo {
 
 /// 3-char fold indicator prefix per line (`core.h:1130`).
 pub const K_FOLD_COL: i32 = 3;
-/// chars per nesting-level indent (`core.h:1131`).
-pub const K_TREE_INDENT: i32 = 2;
+/// chars per nesting-level indent (ReClass `core.h:1131` uses 2; widened to 3 for
+/// clearer nested indentation — kept in sync with the `linemeta`/`format` copies).
+pub const K_TREE_INDENT: i32 = 3;
 /// Max type column width (`core.h:1132`).
 pub const K_COL_TYPE: i32 = 14;
 pub const K_COL_NAME: i32 = 22;
@@ -816,19 +817,32 @@ impl ComposeState<'_> {
             self.text.push_str16(&U16Str::from_str("   "));
         }
 
-        // Replace leading indent spaces with Unicode tree connectors.
+        // Replace leading indent spaces with Unicode tree connectors. Each level
+        // occupies `K_TREE_INDENT` columns: the connector glyph (`│`/`├`/`└`, or a
+        // space for an inactive ancestor) followed by `K_TREE_INDENT - 1` spaces, so
+        // the connectors scale with the indent width and stay aligned with the
+        // `K_TREE_INDENT`-spaced indent the rest of the layout assumes.
         if self.tree_lines && lm.depth > 0 {
             let mut tree_indent = U16Str::new();
             let big_d = lm.depth;
             let is_footer = lm.line_kind == LineKind::Footer;
+            let pad = " ".repeat((K_TREE_INDENT - 1).max(0) as usize);
             for d in 0..big_d {
                 let active =
                     (d as usize) < self.sibling_stack.len() && self.sibling_stack[d as usize];
-                if is_footer || d < big_d - 1 {
-                    tree_indent.push_str(if active { "\u{2502} " } else { "  " });
+                let glyph = if is_footer || d < big_d - 1 {
+                    if active {
+                        "\u{2502}"
+                    } else {
+                        " "
+                    }
+                } else if active {
+                    "\u{251C}"
                 } else {
-                    tree_indent.push_str(if active { "\u{251C} " } else { "\u{2514} " });
-                }
+                    "\u{2514}"
+                };
+                tree_indent.push_str(glyph);
+                tree_indent.push_str(&pad);
             }
             self.text.push_str16(&tree_indent);
             // lineText.mid(D * kTreeIndent) — slice off the leading indent.
