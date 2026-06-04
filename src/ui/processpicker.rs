@@ -627,6 +627,18 @@ mod view {
                     self.attach_selected(cx);
                     true
                 }
+                // Up/Down drive the result list straight from the (focused) filter,
+                // like the command palette. The C++ left Up/Down inert in the
+                // QLineEdit, but a keyboard-navigable filter+list is the standard
+                // affordance.
+                "up" | "pageup" => {
+                    self.move_selection(-1, cx);
+                    true
+                }
+                "down" | "pagedown" => {
+                    self.move_selection(1, cx);
+                    true
+                }
                 "escape" => {
                     if self.row_menu.take().is_some() {
                         cx.notify();
@@ -637,6 +649,26 @@ mod view {
                 }
                 _ => false,
             }
+        }
+
+        /// Move the table selection by `delta` rows (clamped) and scroll it into
+        /// view, without moving focus off the filter input. With no current
+        /// selection, Down selects the first row and Up the last.
+        fn move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+            let len = self.table.read(cx).delegate().rows.len();
+            if len == 0 {
+                return;
+            }
+            let next = match self.table.read(cx).selected_row() {
+                Some(cur) => (cur as i32 + delta).clamp(0, len as i32 - 1) as usize,
+                None if delta > 0 => 0,
+                None => len - 1,
+            };
+            self.table.update(cx, |state, cx| {
+                state.set_selected_row(next, cx);
+                state.scroll_to_row(next, cx);
+            });
+            cx.notify();
         }
 
         /// Render the open right-click row menu as a deferred, anchored elevated
