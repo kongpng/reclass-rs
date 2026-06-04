@@ -1772,17 +1772,17 @@ impl MainWindow {
         // old throwaway `with_builtins()` when no plugin has been toggled.
         let model = ProcessPickerModel::from_registry(self.plugin_manager.registry());
         // Remember which process the user last attached to (the C++
-        // `lastAttachedProcess` QSettings key; processpicker.cpp:386). The picker
-        // *reads* this to pre-select the matching row in `selectPreferredProcess` —
-        // that read lives inside the picker (it owns the row table + selection), so
-        // here we only own the WRITE side (on a successful attach, below). The read
-        // is loaded so a future picker that consumes it sees a populated value.
-        let _last_attached = self
+        // `lastAttachedProcess` QSettings key; processpicker.cpp:386-403). The
+        // picker READS this to pre-select the matching row by name in
+        // `selectPreferredProcess`; we thread the loaded value in so that read→
+        // pre-select half is wired (the WRITE side is the `set(...)` on a
+        // successful attach, below). `None`/empty → first-attachable preference.
+        let last_attached = self
             .settings
             .borrow()
             .get(settings_keys::LAST_ATTACHED_PROCESS)
             .filter(|s| !s.is_empty());
-        let picker = cx.new(|cx| ProcessPicker::new(model, window, cx));
+        let picker = cx.new(|cx| ProcessPicker::new(model, last_attached, window, cx));
         self.goto_sub = Some(cx.subscribe_in(
             &picker,
             window,

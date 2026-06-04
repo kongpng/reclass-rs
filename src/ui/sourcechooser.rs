@@ -957,6 +957,31 @@ mod view {
                                         .when(e.is_active, |d| d.font_weight(FontWeight::SEMIBOLD))
                                         .child(e.display_name.clone()),
                                 )
+                                // PID pill (the C++ row-2 "PID <n>" badge,
+                                // `sourcechooserpopup.cpp:253-257`): drawn ONLY when the
+                                // entry is a SavedSource AND its pid is non-zero. The C++
+                                // guard is `!e.pid.isEmpty()` on a QString pid; the Rust
+                                // analogue of "empty" is `pid == 0`, so a non-process /
+                                // File source (pid 0) shows no pill (the pid==0 rule).
+                                // Rendered as a small dim/muted pill before the existing
+                                // dll/kind hint slot (Zed substitution for the Qt rounded
+                                // badge); single-line + flex_none so it never wraps.
+                                .when(
+                                    e.entry_kind == SourceEntryKind::SavedSource && e.pid != 0,
+                                    |d| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .whitespace_nowrap()
+                                                .px(px(tokens::space::XS))
+                                                .rounded(px(tokens::radius::SM))
+                                                .bg(color::hover_overlay(cx))
+                                                .text_size(px(tokens::font::UI_SM))
+                                                .text_color(color::text_muted(cx))
+                                                .child(format!("PID {}", e.pid)),
+                                        )
+                                    },
+                                )
                                 // Trailing dim slot: the plugin dll filename (or the
                                 // saved-source kind/stale note). Single-line and
                                 // non-shrinking so it stays on the same row as the
@@ -1222,6 +1247,40 @@ mod model_tests {
         assert!(s.contains("notepad.exe"));
         assert!(s.contains("Process"));
         assert!(s.contains("1234"));
+    }
+
+    #[test]
+    fn searchable_omits_pid_when_zero() {
+        // The pid==0 rule (`sourcechooserpopup.cpp` `!e.pid.isEmpty()` guard):
+        // a saved source with pid 0 is a non-process/File source, so the pid is
+        // NOT appended to the searchable string. The view PID pill is guarded by
+        // the same `pid != 0` condition (see `render`), so a pid-0 row also paints
+        // no pill. `game.bin` has pid 0 + a file path; its searchable must carry
+        // the name/kind/path but no "0" pid token.
+        let model = SourceModel::new(entries());
+        let file_src = model
+            .entries()
+            .iter()
+            .find(|e| e.display_name == "game.bin")
+            .unwrap();
+        assert_eq!(file_src.pid, 0);
+        let s = file_src.searchable();
+        assert!(s.contains("game.bin"));
+        assert!(s.contains("File"));
+        assert!(s.contains("/tmp/game.bin"));
+        // No stray " 0" pid token appended (the pid==0 omission).
+        assert!(!s.contains(" 0"));
+    }
+
+    #[test]
+    fn searchable_includes_pid_when_nonzero() {
+        // The complement of the pid==0 rule: a non-zero pid IS appended as a
+        // space-separated token (and the view paints the "PID <n>" pill).
+        let mut e = SourceEntry::saved(0, "svc.exe", "Process");
+        e.pid = 4321;
+        let s = e.searchable();
+        assert!(s.contains("svc.exe"));
+        assert!(s.contains(" 4321"));
     }
 
     #[test]

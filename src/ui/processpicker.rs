@@ -190,9 +190,11 @@ impl ProcessPickerModel {
         &self.rows
     }
 
-    /// `filterProcesses(text)` / `applyFilter` (`processpicker.cpp`): keep rows
-    /// whose **name** OR **PID** contains the (case-insensitive) query. An empty
-    /// query keeps everything. Returns borrowed rows in display order.
+    /// `filterProcesses(text)` / `applyFilter` (`processpicker.cpp:362-384`): keep
+    /// rows whose **name** OR **PID** OR **path** contains the (case-insensitive)
+    /// query. An empty query keeps everything. Returns borrowed rows in display
+    /// order. The path match mirrors the C++ `proc.path.toLower().contains(...)`
+    /// (cpp:378), which was previously omitted here.
     pub fn filtered(&self, query: &str) -> Vec<&ProcessRow> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
@@ -200,7 +202,11 @@ impl ProcessPickerModel {
         }
         self.rows
             .iter()
-            .filter(|r| r.name.to_lowercase().contains(&q) || r.pid_text().contains(&q))
+            .filter(|r| {
+                r.name.to_lowercase().contains(&q)
+                    || r.pid_text().contains(&q)
+                    || r.path.to_lowercase().contains(&q)
+            })
             .collect()
     }
 
@@ -221,6 +227,23 @@ pub fn preferred_row_index(rows: &[ProcessRow]) -> Option<usize> {
         return None;
     }
     Some(rows.iter().position(ProcessRow::is_attachable).unwrap_or(0))
+}
+
+/// The pre-selected row index honoring the remembered last-attached process name,
+/// the full `selectPreferredProcess` (`processpicker.cpp:386-403`): if
+/// `last_attached` is `Some(non-empty)`, return the index of the FIRST row whose
+/// **original** `name` (not the `(32-bit)`-suffixed display name) matches it
+/// case-insensitively — the C++ compares against the `Qt::UserRole` original name
+/// with `compare(..., Qt::CaseInsensitive) == 0`. When there is no remembered name
+/// (or it does not match any row), fall back to [`preferred_row_index`] (first
+/// attachable row, else the first row), so Attach/Enter always act on some row.
+pub fn preferred_row_index_for(rows: &[ProcessRow], last_attached: Option<&str>) -> Option<usize> {
+    if let Some(last) = last_attached.filter(|s| !s.is_empty()) {
+        if let Some(ix) = rows.iter().position(|r| r.name.eq_ignore_ascii_case(last)) {
+            return Some(ix);
+        }
+    }
+    preferred_row_index(rows)
 }
 
 impl ProcessRow {
@@ -250,6 +273,7 @@ mod view {
     use gpui_component::table::{
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
+    use gpui_component::tooltip::Tooltip;
     use gpui_component::Sizable as _;
 
     use super::{ProcessPickerModel, ProcessRow, SourceAvailability};
@@ -337,7 +361,7 @@ mod view {
             cx: &mut Context<TableState<Self>>,
         ) -> impl IntoElement {
             let Some(row) = self.rows.get(row_ix) else {
-                return div();
+                return div().into_any_element();
             };
             // Stub rows render dimmed to signal they are not attachable.
             let fg = if row.availability == SourceAvailability::Stub {
@@ -352,11 +376,26 @@ mod view {
             };
             // PID + Path columns read as monospace addresses/paths; the name is UI.
             let mono = matches!(col_ix, COL_PID | COL_PATH);
-            div()
+            let cell = div()
                 .text_color(fg)
                 .text_size(px(tokens::font::UI_SM))
-                .when(mono, |d| d.font_family(tokens::font::mono_family()))
-                .child(text)
+                .when(mono, |d| d.font_family(tokens::font::mono_family()));
+            if col_ix == COL_PATH && !text.is_empty() {
+                // The C++ Path column elides (Qt::ElideLeft, cpp:61) and carries a
+                // tooltip with the full path (`pathItem->setToolTip(proc.path)`,
+                // cpp:349). gpui truncates trailing rather than leading — an
+                // accepted Zed substitution for ElideLeft — and the full path is
+                // surfaced on hover via the managed Tooltip so nothing is lost.
+                let full = SharedString::from(text.clone());
+                cell.id(("process-path", row_ix))
+                    .w_full()
+                    .truncate()
+                    .child(text)
+                    .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+                    .into_any_element()
+            } else {
+                cell.child(text).into_any_element()
+            }
         }
 
         fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
@@ -380,6 +419,10 @@ mod view {
         model: ProcessPickerModel,
         filter: Entity<InputState>,
         table: Entity<TableState<ProcessDelegate>>,
+        /// The remembered last-attached process name (the C++ `lastAttachedProcess`
+        /// QSettings key, read in `selectPreferredProcess`). `None`/empty → fall
+        /// back to the first-attachable preference. Used by [`select_preferred`].
+        last_attached: Option<String>,
         /// The open right-click menu (row + anchor), if any.
         row_menu: Option<RowMenu>,
         /// The last cursor position seen on a right mouse-down over the table, used
@@ -391,8 +434,15 @@ mod view {
     }
 
     impl ProcessPicker {
-        /// Build the picker over the given model.
-        pub fn new(model: ProcessPickerModel, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        /// Build the picker over the given model, pre-selecting the row whose name
+        /// matches `last_attached` (the C++ `lastAttachedProcess`) when set; pass
+        /// `None` for the plain first-attachable preference.
+        pub fn new(
+            model: ProcessPickerModel,
+            last_attached: Option<String>,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
             let filter =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name or PID..."));
             let table = cx
@@ -430,6 +480,7 @@ mod view {
                 model,
                 filter,
                 table,
+                last_attached: last_attached.filter(|s| !s.is_empty()),
                 row_menu: None,
                 last_right_click: Point::default(),
                 focus_handle: cx.focus_handle(),
@@ -451,9 +502,16 @@ mod view {
             this
         }
 
-        /// Construct over a model as an [`Entity`].
-        pub fn view(model: ProcessPickerModel, window: &mut Window, cx: &mut App) -> Entity<Self> {
-            cx.new(|cx| ProcessPicker::new(model, window, cx))
+        /// Construct over a model as an [`Entity`], honoring the remembered
+        /// last-attached process name (the C++ `lastAttachedProcess`); pass `None`
+        /// for the plain first-attachable preference.
+        pub fn view(
+            model: ProcessPickerModel,
+            last_attached: Option<String>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Entity<Self> {
+            cx.new(|cx| ProcessPicker::new(model, last_attached, window, cx))
         }
 
         /// The backing model (for tests / external wiring).
@@ -480,11 +538,16 @@ mod view {
             cx.notify();
         }
 
-        /// Select the preferred (first attachable, else first) row in the current
-        /// table and scroll it into view (the C++ `selectPreferredProcess` +
-        /// `scrollToItem`), so Attach / Enter act on a real row immediately.
+        /// Select the preferred row in the current table and scroll it into view
+        /// (the C++ `selectPreferredProcess` + `scrollToItem`): the remembered
+        /// last-attached process by name if present, else the first attachable
+        /// row, else the first row — so Attach / Enter act on a real row
+        /// immediately.
         fn select_preferred(&mut self, cx: &mut Context<Self>) {
-            let ix = super::preferred_row_index(&self.table.read(cx).delegate().rows);
+            let ix = super::preferred_row_index_for(
+                &self.table.read(cx).delegate().rows,
+                self.last_attached.as_deref(),
+            );
             if let Some(ix) = ix {
                 self.table.update(cx, |state, cx| {
                     state.set_selected_row(ix, cx);
@@ -735,7 +798,10 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{preferred_row_index, ProcessPickerModel, ProcessRow, SourceAvailability};
+    use super::{
+        preferred_row_index, preferred_row_index_for, ProcessPickerModel, ProcessRow,
+        SourceAvailability,
+    };
     use crate::provider::ProviderRegistry;
 
     fn available(pid: u32, name: &str) -> ProcessRow {
@@ -813,9 +879,19 @@ mod tests {
         assert_eq!(m.rows()[0].name, "aaa");
     }
 
+    fn available_with_path(pid: u32, name: &str, path: &str) -> ProcessRow {
+        ProcessRow {
+            path: path.to_string(),
+            ..available(pid, name)
+        }
+    }
+
     #[test]
-    fn filter_matches_name_or_pid() {
-        let rows = vec![available(1234, "notepad.exe"), available(5678, "game.exe")];
+    fn filter_matches_name_pid_or_path() {
+        let rows = vec![
+            available_with_path(1234, "notepad.exe", "C:/Windows/notepad.exe"),
+            available_with_path(5678, "game.exe", "/opt/games/game.exe"),
+        ];
         let m = ProcessPickerModel::from_rows(rows);
 
         // By name substring.
@@ -827,6 +903,15 @@ mod tests {
         let by_pid = m.filtered("5678");
         assert_eq!(by_pid.len(), 1);
         assert_eq!(by_pid[0].name, "game.exe");
+
+        // By PATH substring (case-insensitive) — the C++ cpp:378 path match that
+        // was previously omitted. "/opt" only appears in game.exe's path.
+        let by_path = m.filtered("/OPT/games");
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].name, "game.exe");
+
+        // A path-only token that matches both paths keeps both.
+        assert_eq!(m.filtered(".exe").len(), 2);
 
         // Empty keeps all.
         assert_eq!(m.filtered("  ").len(), 2);
@@ -884,5 +969,70 @@ mod tests {
     #[test]
     fn preferred_row_index_none_for_empty() {
         assert_eq!(preferred_row_index(&[]), None);
+    }
+
+    #[test]
+    fn preferred_row_index_for_matches_remembered_name_case_insensitively() {
+        // The C++ `selectPreferredProcess` compares the remembered name against
+        // each row's ORIGINAL name (Qt::UserRole) with Qt::CaseInsensitive.
+        let rows = vec![
+            available(30, "Alpha.exe"),
+            available(20, "Target.exe"),
+            available(10, "Gamma.exe"),
+        ];
+        // Different case than the row's name → still matches (index 1).
+        assert_eq!(preferred_row_index_for(&rows, Some("target.EXE")), Some(1));
+    }
+
+    #[test]
+    fn preferred_row_index_for_matches_original_not_display_name() {
+        // The remembered name compares against the original `name`, NOT the
+        // `(32-bit)`-suffixed display name. A 32-bit row whose original name is
+        // "game.exe" matches "game.exe" even though display_name is
+        // "game.exe (32-bit)".
+        let mut row = available(99, "game.exe");
+        row.is_32bit = true;
+        assert_eq!(row.display_name(), "game.exe (32-bit)");
+        let rows = vec![available(10, "other.exe"), row];
+        assert_eq!(preferred_row_index_for(&rows, Some("game.exe")), Some(1));
+        // The display-name form must NOT match the original-name compare.
+        assert_eq!(
+            preferred_row_index_for(&rows, Some("game.exe (32-bit)")),
+            // Falls back to first attachable (index 0) since no original name matches.
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn preferred_row_index_for_missing_name_falls_back_to_first_attachable() {
+        let rows = vec![
+            ProcessRow {
+                availability: SourceAvailability::Stub,
+                ..available(0, "stub")
+            },
+            available(10, "real"),
+        ];
+        // Remembered name not present → fall back to the first attachable row (1).
+        assert_eq!(
+            preferred_row_index_for(&rows, Some("nonexistent.exe")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn preferred_row_index_for_empty_or_none_falls_back() {
+        let rows = vec![
+            ProcessRow {
+                availability: SourceAvailability::Stub,
+                ..available(0, "stub")
+            },
+            available(10, "real"),
+        ];
+        // None → first attachable.
+        assert_eq!(preferred_row_index_for(&rows, None), Some(1));
+        // Empty string → treated as "no remembered name" → first attachable.
+        assert_eq!(preferred_row_index_for(&rows, Some("")), Some(1));
+        // Empty list → None regardless of remembered name.
+        assert_eq!(preferred_row_index_for(&[], Some("anything")), None);
     }
 }

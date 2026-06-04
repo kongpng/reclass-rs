@@ -299,10 +299,7 @@ pub use open::{open_confirm, open_message};
 
 #[cfg(feature = "ui")]
 mod open {
-    use super::{
-        format_detail, ButtonVariant, DefaultButton, DetailLayout, MessageSpec, Severity,
-        MSG_MAX_WIDTH,
-    };
+    use super::{format_detail, ButtonVariant, DetailLayout, MessageSpec, Severity, MSG_MAX_WIDTH};
     use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
@@ -391,8 +388,26 @@ mod open {
 
     /// Open a two-button confirm (`confirm`) through the `Root` overlay, calling
     /// `on_accept` if the accept button is pressed. The accept button keeps its
-    /// variant (Primary or Danger for destructive); the C++ default-focus rule is
-    /// preserved by mapping [`DefaultButton::Cancel`] → not auto-confirming.
+    /// variant (Primary or Danger for destructive).
+    ///
+    /// **Destructive default-focus is a documented platform limitation, NOT
+    /// faked.** The C++ `themed_messagebox.cpp:181-203` rule — a destructive
+    /// confirm focuses **Cancel** initially so a stray Enter can't destroy work —
+    /// is fully encoded in the model ([`confirm`] sets [`DefaultButton::Cancel`]
+    /// for `destructive`, asserted by `confirm_destructive_defaults_to_cancel`).
+    /// But gpui-component's `AlertDialog` / [`DialogButtonProps`] expose no API to
+    /// choose which footer button receives initial keyboard focus:
+    /// `DialogButtonProps` has only `ok_text`/`ok_variant`/`cancel_text`/
+    /// `cancel_variant`/`show_cancel` + callbacks, and `render_ok`/`render_cancel`
+    /// build fresh `Button`s with no focus call (the dialog's single
+    /// `focus_handle` is on the container, not a button). Setting initial focus to
+    /// Cancel would require either patching the upstream crate or rebuilding the
+    /// footer by hand (re-implementing focus management + Esc/Enter trapping),
+    /// which is out of scope for this batch. We therefore preserve the model rule
+    /// and surface `spec.default` here for when the upstream API gains the hook;
+    /// we do NOT spoof focus. Enter still maps to OK via the dialog's own key
+    /// handling — matching gpui-component's default for every dialog — so the only
+    /// divergence is the *initial* focus ring, never the action wiring.
     pub fn open_confirm<F>(spec: MessageSpec, on_accept: F, window: &mut Window, cx: &mut App)
     where
         F: Fn(&mut Window, &mut App) + 'static,
@@ -404,7 +419,11 @@ mod open {
         // buttons = [Cancel, Accept]; read the accept (last) button.
         let accept = spec.buttons.last().cloned();
         let cancel = spec.buttons.first().cloned();
-        let _focus_accept = spec.default == DefaultButton::Accept;
+        // The model's default-focus target (the C++ destructive→Cancel safety
+        // rule). Read but not applied: the AlertDialog API exposes no initial
+        // button-focus hook (see the doc comment above) — this is intentionally
+        // NOT faked. Kept named so the limitation is greppable.
+        let _default_focus_unsupported_by_alertdialog = spec.default;
         let on_accept = std::rc::Rc::new(on_accept);
         window.open_alert_dialog(cx, move |alert, window, cx| {
             // Clamp to the live window so the confirm stays fully visible (QA #1).
