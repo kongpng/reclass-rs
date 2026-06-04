@@ -2,9 +2,8 @@
 
 Authoritative C++ original: `/home/loke/Documents/Reclass`
 Rust port: `/home/loke/reclass-rs`
-HEAD at report time: `374e3a6` (2 wf22 follow-up commits — D1 `fa41d4b`, D2 `374e3a6` —
-on top of the intervening plugin P4–P6 work that landed after the wf21 HEAD
-`29b30f6`).
+HEAD at report time: `374e3a6` (the 2 wf22 follow-up commits — D1 `fa41d4b`, D2
+`374e3a6` — directly on top of the wf21 HEAD `cbe5b41`; no other work intervened).
 
 This report scores **1:1 behavioral parity OUTSIDE the deliberate stubs**. The
 deliberately-excluded stubs (live-memory providers, the managed .NET CLR host,
@@ -22,24 +21,24 @@ All 7 checks of the universal parity gate pass:
 | 1 | default/ui build | Finished |
 | 2 | headless build (`disasm,symbols,imports,mcp`) | Finished |
 | 3 | plugins build (`--features plugins`) | Finished |
-| 4 | full tests (`disasm,symbols,imports,mcp` `--lib`) | **1551 pass / 0 fail** |
+| 4 | full tests (`disasm,symbols,imports,mcp`) | **1120 pass / 0 fail** |
 | 5 | ui tests (`--lib ui::`) | **575 pass / 0 fail** |
 | 6 | plugins tests (`--features plugins --lib`) | **1596 pass / 0 fail** |
-| 7 | bare tests (`--no-default-features --lib`) | **781 pass / 0 fail** |
+| 7 | bare tests (`--no-default-features`) | **840 pass / 0 fail** |
 
 `git status --short` is clean.
 
-**Honest note on the absolute counts.** These four numbers differ substantially
-from the wf21-recorded baselines (full 1103, ui 575, plugins 1579, bare 823)
-because the report was last *verified* at the wf21 HEAD `29b30f6`, but the repo
-HEAD has since advanced through the separately-tracked plugin **P4–P6** work
-(`0f14306`, `bcd4a55`, `e827e6b`, etc.) **and** the wf22 D1/D2 batches. The bulk
-of the full/plugins/bare drift (and the bare count moving *down* 823→781) is the
-plugin feature-flag reshuffle from P4–P6, not wf22 and not a regression — the
-gate is all-green (0 failures in every target). **The wf22-specific delta is
-exactly +17 tests**, all in the new `src/core/debug_view.rs`; that module is
-unconditionally compiled (`pub mod debug_view;`), so those 17 land in **every**
-target (full, ui-adjacent, plugins, and bare alike). See "## wf22 follow-up".
+**Note on the counts.** These are the wf21 baselines plus exactly **+17** in every
+config (full 1103→1120, plugins 1579→1596, bare 823→840) — the new tests in
+`src/core/debug_view.rs`, which is unconditionally compiled (`pub mod debug_view;`)
+so its tests run in every target. The `ui` count is unchanged (575) because those
+tests live under `core::`, not the `--lib ui::` name filter. **No P4–P6 work or
+feature-flag change intervened between the wf21 and wf22 HEADs** — `git log
+cbe5b41..HEAD` is only the four wf22 commits and `Cargo.toml` is unchanged — and
+nothing regressed (every target is 0-fail). [Independently re-verified with the
+canonical all-target gate commands; an earlier draft of this section misreported
+`--lib`-only subset counts (full 1551/967, bare 781) and an incorrect P4–P6
+attribution — corrected here.]
 
 ---
 
@@ -327,14 +326,14 @@ one feature across two rows for an unscored gap, so the conservative honest figu
 stays **96%**. VM_Debug's value is *completeness* — a 1:1 byte-faithful developer
 view now exists — not an integer bump.
 
-**Test counts (7-step gate, GREEN at HEAD `374e3a6`, tree clean):**
-full **1551**, ui **575**, plugins **1596**, bare **781** (all 0 fail). The
-wf22-specific delta is **+17 tests**, all in `src/core/debug_view.rs`; because that
-module is unconditionally compiled, the +17 land in **every** target. The larger
-drift from the wf21-recorded baselines (1103/575/1579/823) is the separately-tracked
-plugin **P4–P6** feature-flag reshuffle that landed between `29b30f6` and the wf22
-HEAD — not wf22, and not a regression (gate all-green). See the gate section's
-"Honest note on the absolute counts".
+**Test counts (7-step gate, GREEN at HEAD `374e3a6`, tree clean), canonical
+all-target commands:** full **1120**, ui **575**, plugins **1596**, bare **840**
+(all 0 fail). The wf22 delta is exactly **+17 tests**, all in
+`src/core/debug_view.rs` — unconditionally compiled, so +17 in full (1103→1120),
+plugins (1579→1596) and bare (823→840); `ui` is unchanged (575) since those tests
+are under `core::`, outside the `--lib ui::` filter. No P4–P6 work or feature-flag
+change intervened between the wf21 HEAD `cbe5b41` and here (`git log cbe5b41..HEAD`
+is only the wf22 commits; `Cargo.toml` unchanged); nothing regressed.
 
 **Still open after wf22** (all documented latent/cosmetic, none data-loss-class,
 none regressions):
