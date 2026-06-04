@@ -8955,7 +8955,14 @@ impl Render for RcxEditor {
             // native vertical scroll.
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
                 if !(ev.modifiers.control || ev.modifiers.platform) {
-                    return; // plain wheel → let the list scroll natively.
+                    // Plain wheel → the list scrolls natively. Drop the hover band /
+                    // popup: the rows slide out from under the stationary cursor, so
+                    // the old highlight is stale (gpui only re-evaluates hover on the
+                    // next real mouse move). Clearing avoids a band stuck on the row
+                    // that used to be under the cursor; the next move re-establishes
+                    // it. `clear_hover_state` is a no-op when nothing is hovered.
+                    this.clear_hover_state(cx);
+                    return;
                 }
                 let dy = match ev.delta {
                     gpui::ScrollDelta::Lines(p) => p.y,

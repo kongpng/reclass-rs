@@ -353,6 +353,11 @@ mod view {
         /// Whether the Theme / Font dropdown popovers are open.
         theme_open: bool,
         font_open: bool,
+        /// First-letter type-ahead buffer for the open combo (the C++ QComboBox
+        /// keyboard selection) + the last keystroke time; the buffer resets after a
+        /// short pause so a fresh prefix isn't appended to a stale one.
+        type_ahead: String,
+        type_ahead_at: Option<std::time::Instant>,
         focus_handle: FocusHandle,
         _subscriptions: Vec<Subscription>,
     }
@@ -412,6 +417,8 @@ mod view {
                 refresh,
                 theme_open: false,
                 font_open: false,
+                type_ahead: String::new(),
+                type_ahead_at: None,
                 focus_handle: cx.focus_handle(),
                 _subscriptions: subs,
             }
@@ -494,6 +501,11 @@ mod view {
                 cx.notify();
                 return true;
             }
+            // While a combo dropdown is open, printable keys drive first-letter
+            // type-ahead over its entries (the C++ QComboBox keyboard selection).
+            if self.combo_type_ahead(key, modifiers, cx) {
+                return true;
+            }
             match key {
                 "escape" => {
                     self.cancel(cx);
@@ -519,6 +531,57 @@ mod view {
                 }
                 _ => false,
             }
+        }
+
+        /// First-letter type-ahead for the OPEN combo: accumulate the typed prefix
+        /// (resetting after ~0.8s of inactivity) and move the combo's highlighted
+        /// entry to the first name that matches, keeping the popover open so Enter /
+        /// click still commits. Returns `true` when it consumed the key.
+        fn combo_type_ahead(
+            &mut self,
+            key: &str,
+            modifiers: &Modifiers,
+            cx: &mut Context<Self>,
+        ) -> bool {
+            if !(self.theme_open || self.font_open) {
+                return false;
+            }
+            // Only plain printable single characters (never a shortcut chord).
+            if modifiers.control || modifiers.alt || modifiers.platform || key.chars().count() != 1 {
+                return false;
+            }
+            let ch = key.chars().next().unwrap();
+            if !ch.is_alphanumeric() {
+                return false;
+            }
+            let now = std::time::Instant::now();
+            let stale = self
+                .type_ahead_at
+                .map_or(true, |t| now.duration_since(t) > std::time::Duration::from_millis(800));
+            if stale {
+                self.type_ahead.clear();
+            }
+            self.type_ahead.push(ch.to_ascii_lowercase());
+            self.type_ahead_at = Some(now);
+            let needle = self.type_ahead.as_str();
+            if self.theme_open {
+                let themes: Vec<String> = if self.themes.is_empty() {
+                    vec![self.theme_label()]
+                } else {
+                    self.themes.clone()
+                };
+                if let Some(ix) = themes.iter().position(|n| n.to_lowercase().starts_with(needle)) {
+                    self.result.theme_index = ix;
+                    cx.notify();
+                }
+            } else if let Some(ix) = FONT_CHOICES
+                .iter()
+                .position(|n| n.to_lowercase().starts_with(needle))
+            {
+                self.result.font_name = FONT_CHOICES[ix].to_string();
+                cx.notify();
+            }
+            true
         }
 
         /// Pick a theme (the C++ `m_themeCombo->setCurrentIndex`).
