@@ -5985,7 +5985,7 @@ impl RcxEditor {
                     // Always-available member edits: Edit Value… sets the member's
                     // integer value (the C++ member-line Value edit).
                     .menu_with_icon(
-                        "Edit Value\tEnter",
+                        "Edit Value",
                         IconName::SquareTerminal,
                         Box::new(EditorBeginValueEdit),
                     );
@@ -6003,7 +6003,7 @@ impl RcxEditor {
                     );
                 } else {
                     menu = menu.menu_with_icon(
-                        "Edit Value...\tEnter",
+                        "Edit Value...",
                         IconName::SquareTerminal,
                         Box::new(EditorBeginValueEdit),
                     );
@@ -6069,19 +6069,19 @@ impl RcxEditor {
                     )
                 })
                 .menu_with_icon(
-                    SharedString::from(format!("Duplicate {count} nodes\tCtrl+D")),
+                    SharedString::from(format!("Duplicate {count} nodes")),
                     IconName::Copy,
                     Box::new(EditorDuplicate),
                 )
                 .menu_with_icon(
-                    SharedString::from(format!("Delete {count} nodes\tDelete")),
+                    SharedString::from(format!("Delete {count} nodes")),
                     IconName::Delete,
                     Box::new(EditorDelete),
                 )
                 .separator()
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon(
-                        "Copy Address\tCtrl+C",
+                        "Copy Address",
                         IconName::Copy,
                         Box::new(EditorCopyAddress),
                     )
@@ -6141,12 +6141,12 @@ impl RcxEditor {
                 // Fold ▸ — Collapse All / Expand All (whole tree).
                 .submenu("Fold", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon(
-                        "Collapse All\tCtrl+Shift+[",
+                        "Collapse All",
                         IconName::ChevronRight,
                         Box::new(EditorCollapseAll),
                     )
                     .menu_with_icon(
-                        "Expand All\tCtrl+Shift+]",
+                        "Expand All",
                         IconName::ChevronDown,
                         Box::new(EditorExpandAll),
                     )
@@ -6405,7 +6405,7 @@ impl RcxEditor {
                 // Item 17: Edit Value (Enter) for writable, non-hex, non-container.
                 .when(show_edit_value, |menu| {
                     menu.menu_with_icon(
-                        "Edit Value\tEnter",
+                        "Edit Value",
                         IconName::SquareTerminal,
                         Box::new(EditorBeginValueEdit),
                     )
@@ -6413,20 +6413,20 @@ impl RcxEditor {
                 // Item 16/19: Rename omitted for hex nodes; F2 hint appended.
                 .when(show_rename, |menu| {
                     menu.menu_with_icon(
-                        "Rename\tF2",
+                        "Rename",
                         IconName::SquareTerminal,
                         Box::new(EditorRename),
                     )
                 })
                 .menu_with_icon(
-                    "Change Type\tT",
+                    "Change Type",
                     IconName::Frame,
                     Box::new(EditorChangeType),
                 )
                 // Item 17: Comment (;) only when the Comments toggle is on.
                 .when(show_comment, |menu| {
                     menu.menu_with_icon(
-                        "Comment\t;",
+                        "Comment",
                         IconName::SquareTerminal,
                         Box::new(EditorCommentEdit),
                     )
@@ -6437,12 +6437,12 @@ impl RcxEditor {
                 // maps Insert/Shift+Insert to those — plus Insert Below.
                 .submenu("Insert", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon(
-                        "Insert 8 Above (Hex64)\tIns",
+                        "Insert 8 Above (Hex64)",
                         IconName::Plus,
                         Box::new(EditorInsertHex64),
                     )
                     .menu_with_icon(
-                        "Insert 4 Above (Hex32)\tShift+Ins",
+                        "Insert 4 Above (Hex32)",
                         IconName::Plus,
                         Box::new(EditorInsertHex32),
                     )
@@ -6616,11 +6616,11 @@ impl RcxEditor {
                 })
                 .separator()
                 .menu_with_icon(
-                    "Duplicate\tCtrl+D",
+                    "Duplicate",
                     IconName::Copy,
                     Box::new(EditorDuplicate),
                 )
-                .menu_with_icon("Delete\tDelete", IconName::Delete, Box::new(EditorDelete))
+                .menu_with_icon("Delete", IconName::Delete, Box::new(EditorDelete))
                 .separator()
                 // Item 18: Fold submenu — Toggle Fold + Collapse All / Expand All
                 // (whole-tree), with the keyboard hints the C++ uses.
@@ -6634,12 +6634,12 @@ impl RcxEditor {
                     )
                     .separator()
                     .menu_with_icon(
-                        "Collapse All\tCtrl+Shift+[",
+                        "Collapse All",
                         IconName::ChevronRight,
                         Box::new(EditorCollapseAll),
                     )
                     .menu_with_icon(
-                        "Expand All\tCtrl+Shift+]",
+                        "Expand All",
                         IconName::ChevronDown,
                         Box::new(EditorExpandAll),
                     )
@@ -6649,7 +6649,7 @@ impl RcxEditor {
                 // line/all group (the C++ separator), plus Ctrl+C/Ctrl+X hints.
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon(
-                        "Copy Address\tCtrl+C",
+                        "Copy Address",
                         IconName::Copy,
                         Box::new(EditorCopyAddress),
                     )
