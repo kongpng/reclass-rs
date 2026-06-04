@@ -660,6 +660,16 @@ struct EditingField {
     /// `[col_start, col_end)` so it covers exactly the edited column (and occludes
     /// the static glyphs beneath it), item 3.
     col_end: i32,
+    /// PIXEL left of the edited span, measured by SHAPING the real line prefix
+    /// `[0, col_start)` with the editor font at edit-begin (not `col_start *
+    /// cell_width`). Rows with non-ASCII glyphs before the span — the command
+    /// row's `▸`/`▾`/source chip ahead of the class name, tree connectors — shape
+    /// at advances ≠ the mono cell, so the cell-grid estimate drifted the box
+    /// right of the painted token (worst at high columns, e.g. the class name).
+    /// Shaping matches the painter (`RowElement` uses `shape_line` too) exactly.
+    left_px: f32,
+    /// PIXEL width of the edited span `[col_start, col_end)`, likewise shaped.
+    width_px: f32,
     /// Item 5: this edit is an ASCII byte-overwrite ('Edit ASCII'). The Value
     /// commit must pass `is_ascii = true` to `set_node_value` so the text is
     /// written per-byte as ASCII (the field opens as a Value edit then switches to
@@ -1793,12 +1803,49 @@ impl RcxEditor {
                 cx.notify();
             });
 
+        // PIXEL-accurate overlay placement: SHAPE the real line prefix + span with
+        // the editor font (same font/size/shaper the row painter uses) instead of
+        // `col * cell_width`. The cell grid only matches ASCII glyphs; the command
+        // row's `▸`/`▾`/chip glyphs (and tree connectors) advance differently, so a
+        // cell estimate put the edit box right of the painted token.
+        let (left_px, width_px) = {
+            let chars: Vec<char> = text.chars().collect();
+            let cs = (span.start.max(0) as usize).min(chars.len());
+            let ce = (span.end.max(span.start) as usize).min(chars.len());
+            let prefix: String = chars[..cs].iter().collect();
+            let span_str: String = chars[cs..ce].iter().collect();
+            let ff = self.editor_font_family();
+            let fs = px(self.editor_font_size());
+            let mut shape_w = |s: &str, window: &mut Window| -> f32 {
+                if s.is_empty() {
+                    return 0.0;
+                }
+                let run = TextRun {
+                    len: s.len(),
+                    font: gpui::font(ff.clone()),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(s.to_string().into(), fs, std::slice::from_ref(&run), None)
+                        .width(),
+                )
+            };
+            (shape_w(&prefix, window), shape_w(&span_str, window))
+        };
+
         self.last_tab_target = Some(target);
         self.editing = Some(EditingField {
             field: field.clone(),
             line,
             col_start: span.start,
             col_end: span.end,
+            left_px,
+            width_px,
             ascii_overwrite: false,
             _subscription: subscription,
         });
@@ -4464,11 +4511,15 @@ impl RcxEditor {
             && ((self.hovered_node_id != 0 && lm.node_id == self.hovered_node_id)
                 || (self.hovered_node_id == 0 && self.hovered_line == Some(idx)));
 
-        let editing_here = self
-            .editing
-            .as_ref()
-            .filter(|e| e.line == idx)
-            .map(|e| (e.field.clone(), e.col_start, e.col_end));
+        let editing_here = self.editing.as_ref().filter(|e| e.line == idx).map(|e| {
+            (
+                e.field.clone(),
+                e.col_start,
+                e.col_end,
+                e.left_px,
+                e.width_px,
+            )
+        });
         // The "active line" (Zed's active-line bg / reclass's highlighted current
         // row): the row currently being edited, even when it is not part of the
         // multi-selection. A selected row already carries the louder accent fill.
@@ -4835,11 +4886,15 @@ impl RcxEditor {
         // class NAME on the command row), not after the `{` and not on the `struct`
         // keyword (items 1/2): painted text column `c` and overlay-left `c*cell` are
         // the same pixel by construction.
-        if let Some((field, col_start, col_end)) = editing_here {
-            let left = px(col_start.max(0) as f32 * cell);
-            // The opaque band spans the edited column `[col_start, col_end)` (a
-            // generous minimum so short seeds still get a visible field box).
-            let editing_width = ((col_end - col_start).max(0) as f32).max(6.0);
+        if let Some((field, _col_start, col_end, left_px, width_px)) = editing_here {
+            // PIXEL-accurate placement from the SHAPED prefix/span computed at
+            // begin_inline_edit, not `col * cell` — so the box lands exactly on the
+            // painted token even on rows with non-mono glyphs (the command row's
+            // `▸`/`▾`/chip ahead of the class name, tree connectors), which is what
+            // pushed the box right of the text ("off-center to the right").
+            let left = px(left_px);
+            // A generous minimum so short seeds still get a visible field box.
+            let editing_width_px = width_px.max(6.0 * cell);
             // The inline field paints over the static row text. Give it a FULLY
             // OPAQUE editor-paper band (not the semi-transparent active-line fill,
             // which let the column's static glyphs — the type token / pre-edit name —
@@ -4852,7 +4907,7 @@ impl RcxEditor {
                     .top_0()
                     .left(left)
                     .h(px(self.metrics.line_height))
-                    .w(px((editing_width + 1.0) * cell))
+                    .w(px(editing_width_px + cell))
                     .bg(palette.paper)
                     .border_1()
                     .border_color(palette.accent)
