@@ -330,8 +330,13 @@ mod view {
                 COL_NAME => Column::new("name", "Process Name")
                     .width(px(220.))
                     .sortable(),
-                COL_PATH => Column::new("path", "Path").width(px(360.)).sortable(),
-                _ => Column::new("path", "Path").width(px(360.)).sortable(),
+                // The Path column absorbs the remaining card width so the columns
+                // fill the table box (PID 72 + Name 220 + Path 394 ≈ the 720px
+                // card's inner table width); a narrower Path left an empty strip on
+                // the right where the header/row background stopped short of the
+                // box border (the "missing right bar").
+                COL_PATH => Column::new("path", "Path").width(px(394.)).sortable(),
+                _ => Column::new("path", "Path").width(px(394.)).sortable(),
             }
         }
 
