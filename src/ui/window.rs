@@ -5863,8 +5863,9 @@ impl Render for RcxUnsavedDialog {
         let card_w = modal::clamp_width(super::messagebox::MSG_MAX_WIDTH, window);
         let detail_layout = super::messagebox::format_detail(&self.spec.detail);
 
-        // Body: the count sentence, then the dirty-name list (label for ≤5,
-        // scrollable list for >5 — the C++ detail threshold).
+        // Body: the count sentence, then the dirty-name detail as a single
+        // word-wrapped muted label (the C++ setDetailText shows one QLabel — no
+        // list, no threshold). Left-inset to align under the body text.
         let mut body = modal::body(cx).child(
             div()
                 .text_size(px(super::design::tokens::font::UI_MD))
@@ -5875,22 +5876,10 @@ impl Render for RcxUnsavedDialog {
             DetailLayout::None => body,
             DetailLayout::Label(s) => body.child(
                 div()
+                    .pl(px(super::design::tokens::space::MD))
                     .text_size(px(super::design::tokens::font::UI_SM))
                     .text_color(super::design::color::text_muted(cx))
                     .child(s),
-            ),
-            DetailLayout::List(items) => body.child(
-                gpui_component::v_flex()
-                    .id("rcx-unsaved-detail")
-                    .max_h(px(140.))
-                    .overflow_y_scroll()
-                    .gap(px(super::design::tokens::space::XXS))
-                    .children(items.into_iter().map(|item| {
-                        div()
-                            .text_size(px(super::design::tokens::font::UI_SM))
-                            .text_color(super::design::color::text_muted(cx))
-                            .child(item)
-                    })),
             ),
         };
 

@@ -12,8 +12,10 @@
 //!   dialog (`themeIndex`/`fontName`/…); the controls read/write it.
 //! - [`OptionsPage`] — the three pages (General/AI/Generator) + their nav labels,
 //!   keywords (for search), and the controls each hosts.
-//! - [`filter_visible`] — the recursive tree search filter (`filterTree`),
-//!   unit-tested against the C++ rule (name OR page-keywords OR any child).
+//! - [`filter_visible`] / [`filter_visible_with_themes`] — the recursive tree
+//!   search filter (`filterTree`), unit-tested against the C++ rule (name OR
+//!   page-keywords OR any child); the themes-aware variant also matches the
+//!   General page against the live `m_themeCombo` item texts.
 //! - [`FONT_CHOICES`] — the two font combo items in C++ order
 //!   (`optionsdialog.cpp:111-112`): JetBrains Mono, then Consolas.
 //! - [`parse_refresh_ms`] / [`font_choice_index`] — the General-page control
@@ -175,22 +177,51 @@ impl OptionsPage {
     }
 
     /// The page's searchable keywords — every label/checkbox/groupbox-title/combo
-    /// item under the page (`collectPageKeywords`, `optionsdialog.cpp:235`). Drives
-    /// the tree search filter so e.g. "MCP" surfaces the AI Features page.
+    /// item under the page (`collectPageKeywords`, `optionsdialog.cpp:234-249`).
+    /// Drives the tree search filter so e.g. "MCP" surfaces the AI Features page.
+    ///
+    /// This mirrors the C++ exactly: `collectPageKeywords` walks
+    /// `page->findChildren<QWidget*>()` and gathers every `QLabel->text()`,
+    /// `QCheckBox->text()`, `QGroupBox->title()`, and `QComboBox` item text. A
+    /// `QFormLayout::addRow("Label:", widget)` creates a `QLabel` child, so the
+    /// `"Interval:"`/`"Color theme:"`/`"Editor Font:"` field captions and the two
+    /// long description labels ([`REFRESH_DESC`]/[`MCP_DESC`]) are collected too.
+    ///
+    /// The one keyword set this static list *cannot* hold is the General page's
+    /// theme-combo item texts (the live `ThemeManager` theme names), which the C++
+    /// collects from `m_themeCombo`. Those are folded into the search via
+    /// [`filter_visible_with_themes`] / [`page_matches_themes`], which feed the
+    /// live `self.themes` list in addition to these static keywords.
     pub fn keywords(self) -> Vec<&'static str> {
         match self {
             OptionsPage::General => {
                 let mut kw = vec![
+                    // QGroupBox "Refresh Rate" (line 74).
                     "Refresh Rate",
+                    // QLabel "Interval:" (addRow, line 85).
+                    "Interval:",
+                    // QLabel refreshDesc (lines 87-89).
+                    REFRESH_DESC,
+                    // QGroupBox "Visual Experience" (line 97).
                     "Visual Experience",
+                    // QLabel "Color theme:" (addRow, line 108).
+                    "Color theme:",
+                    // QLabel "Editor Font:" (addRow, line 115).
+                    "Editor Font:",
+                    // QCheckBox texts (lines 117/121/125).
                     "Uppercase menu items",
                     "Show icon in title bar",
                     "Opening brace on new line",
                 ];
+                // m_fontCombo item texts (lines 111-112). (m_themeCombo item texts
+                // are dynamic — see [`page_matches_themes`].)
                 kw.extend(FONT_CHOICES);
                 kw
             }
-            OptionsPage::AiFeatures => vec!["MCP Server", "Auto-start MCP server"],
+            // QGroupBox "MCP Server" (line 144), QCheckBox "Auto-start MCP server"
+            // (line 148), QLabel mcpDesc (lines 152-154).
+            OptionsPage::AiFeatures => vec!["MCP Server", "Auto-start MCP server", MCP_DESC],
+            // QGroupBox "C++ Header" (line 174), QCheckBox text (line 176).
             OptionsPage::Generator => vec!["C++ Header", "Emit static_assert size checks"],
         }
     }
@@ -203,7 +234,19 @@ impl OptionsPage {
 /// visible. Here the tree is the flat Environment → {General, AI, Generator}, so
 /// "a page is visible" = its own label/keywords match (the parent "Environment"
 /// is then visible because a child is). Returns the visible pages in nav order.
+///
+/// This zero-arg variant uses the static [`keywords`](OptionsPage::keywords) only;
+/// it does **not** know the live theme names. Use [`filter_visible_with_themes`]
+/// (passing the dialog's `self.themes`) to also match the General page against the
+/// dynamic `m_themeCombo` item texts, as the C++ `collectPageKeywords` does.
 pub fn filter_visible(query: &str) -> Vec<OptionsPage> {
+    filter_visible_with_themes(query, &[])
+}
+
+/// [`filter_visible`] but also testing the General page against the live theme
+/// names — the C++ `m_themeCombo` item texts that `collectPageKeywords` folds into
+/// `m_pageKeywords[generalItem]`. `themes` is the dialog's available theme list.
+pub fn filter_visible_with_themes(query: &str, themes: &[String]) -> Vec<OptionsPage> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return OptionsPage::ALL.to_vec();
@@ -211,7 +254,7 @@ pub fn filter_visible(query: &str) -> Vec<OptionsPage> {
     OptionsPage::ALL
         .iter()
         .copied()
-        .filter(|p| page_matches(*p, &q))
+        .filter(|p| page_matches_themes(*p, &q, themes))
         .collect()
 }
 
@@ -237,14 +280,33 @@ pub fn step_visible_page(
 }
 
 /// Whether a page matches the (already-lowercased, trimmed) query — label OR any
-/// keyword contains it.
+/// static keyword contains it.
 fn page_matches(page: OptionsPage, q_lower: &str) -> bool {
+    page_matches_themes(page, q_lower, &[])
+}
+
+/// Whether a page matches the (already-lowercased, trimmed) query, additionally
+/// testing the General page against the live theme names (the dynamic
+/// `m_themeCombo` item texts). `themes` only affects the General page (the only
+/// page hosting a theme combo in the C++); the other pages ignore it.
+fn page_matches_themes(page: OptionsPage, q_lower: &str, themes: &[String]) -> bool {
     if page.nav_label().to_lowercase().contains(q_lower) {
         return true;
     }
-    page.keywords()
+    if page
+        .keywords()
         .iter()
         .any(|kw| kw.to_lowercase().contains(q_lower))
+    {
+        return true;
+    }
+    // The General page also carries the live theme-combo item texts as keywords.
+    if page == OptionsPage::General {
+        return themes
+            .iter()
+            .any(|name| name.to_lowercase().contains(q_lower));
+    }
+    false
 }
 
 // ── gpui view ───────────────────────────────────────────────────────────────
@@ -255,8 +317,8 @@ pub use view::{OptionsDialog, OptionsEvent};
 #[cfg(feature = "ui")]
 mod view {
     use super::{
-        filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
-        OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DESC,
+        filter_visible_with_themes, font_choice_index, parse_refresh_ms, step_visible_page,
+        OptionsPage, OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DESC,
     };
     use crate::ui::design::{color, section_label, tokens, zed_list_row};
     use crate::ui::dialogs::modal;
@@ -322,7 +384,7 @@ mod view {
                         this.query = this.search.read(cx).value().to_string();
                         // If the selected page is filtered out, jump to the first
                         // visible page (the C++ tree hides non-matching items).
-                        let visible = filter_visible(&this.query);
+                        let visible = filter_visible_with_themes(&this.query, &this.themes);
                         if !visible.is_empty() && !visible.contains(&this.page) {
                             this.page = visible[0];
                         }
@@ -407,7 +469,7 @@ mod view {
 
         /// Move the nav-tree selection to the next/previous visible page (Up/Down).
         fn step_page(&mut self, delta: isize, cx: &mut Context<Self>) {
-            let visible = filter_visible(&self.query);
+            let visible = filter_visible_with_themes(&self.query, &self.themes);
             if let Some(next) = step_visible_page(&visible, self.page, delta) {
                 self.select_page(next, cx);
             }
@@ -495,7 +557,7 @@ mod view {
         /// like a Zed settings sidebar (an "Environment" group caption + soft
         /// accent-selected rows).
         fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-            let visible = filter_visible(&self.query);
+            let visible = filter_visible_with_themes(&self.query, &self.themes);
             let mut list = gpui_component::v_flex()
                 .w_full()
                 .gap(px(tokens::space::XXS))
@@ -853,9 +915,9 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_visible, font_choice_index, parse_refresh_ms, step_visible_page, OptionsPage,
-        OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DEFAULT, REFRESH_FALLBACK, REFRESH_MAX,
-        REFRESH_MIN,
+        filter_visible, filter_visible_with_themes, font_choice_index, parse_refresh_ms,
+        step_visible_page, OptionsPage, OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DEFAULT,
+        REFRESH_FALLBACK, REFRESH_MAX, REFRESH_MIN,
     };
 
     #[test]
@@ -937,6 +999,85 @@ mod tests {
         // A General-page keyword.
         let visible = filter_visible("uppercase");
         assert_eq!(visible, vec![OptionsPage::General]);
+    }
+
+    #[test]
+    fn general_field_caption_keywords_surface_general() {
+        // The QFormLayout addRow captions ("Interval:"/"Color theme:"/"Editor
+        // Font:") are QLabel children collected by collectPageKeywords, so each
+        // surfaces the General page (optionsdialog.cpp:85/108/115).
+        for q in ["interval", "color", "theme", "editor", "font"] {
+            let visible = filter_visible(q);
+            assert!(
+                visible.contains(&OptionsPage::General),
+                "query {q:?} should surface General"
+            );
+            assert!(
+                !visible.contains(&OptionsPage::Generator),
+                "query {q:?} should NOT surface Generator"
+            );
+        }
+        // "color"/"theme"/"interval"/"font" are unique to General.
+        for q in ["color", "theme", "interval", "font"] {
+            assert_eq!(filter_visible(q), vec![OptionsPage::General], "query {q:?}");
+        }
+        // NB: "editor" ALSO surfaces AI Features — the C++ mcpDesc ends "...interact
+        // with the editor." So the substring match (collectPageKeywords gathers
+        // QLabel text) hits both pages, faithfully (optionsdialog.cpp:154).
+        let visible = filter_visible("editor");
+        assert!(visible.contains(&OptionsPage::General));
+        assert!(visible.contains(&OptionsPage::AiFeatures));
+    }
+
+    #[test]
+    fn refresh_desc_words_surface_general() {
+        // The refresh description QLabel (REFRESH_DESC) is a General keyword, so
+        // words unique to it ("milliseconds", "cpu") surface General and nothing
+        // else (optionsdialog.cpp:87-89).
+        for q in ["milliseconds", "cpu"] {
+            let visible = filter_visible(q);
+            assert_eq!(visible, vec![OptionsPage::General], "query {q:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_desc_words_surface_ai_only() {
+        // The MCP description QLabel (MCP_DESC) is an AI-page keyword, so its
+        // distinctive phrasing surfaces AI Features only (optionsdialog.cpp:152-154).
+        let visible = filter_visible("bridge");
+        assert_eq!(visible, vec![OptionsPage::AiFeatures]);
+        let visible = filter_visible("external AI");
+        assert_eq!(visible, vec![OptionsPage::AiFeatures]);
+    }
+
+    #[test]
+    fn interval_query_hides_ai_and_generator() {
+        // A General-only term must hide the other two pages (the C++ tree hides
+        // non-matching items).
+        let visible = filter_visible("interval");
+        assert_eq!(visible, vec![OptionsPage::General]);
+        assert!(!visible.contains(&OptionsPage::AiFeatures));
+        assert!(!visible.contains(&OptionsPage::Generator));
+    }
+
+    #[test]
+    fn theme_name_search_surfaces_general_via_themes() {
+        // The live m_themeCombo item texts are folded into the General page's
+        // keyword set (collectPageKeywords gathers QComboBox itemText). A theme
+        // name only matches when fed through the themes-aware filter.
+        let themes = vec!["Midnight Ocean".to_string(), "Solarized Light".to_string()];
+        let visible = filter_visible_with_themes("ocean", &themes);
+        assert_eq!(visible, vec![OptionsPage::General]);
+        // "solarized" likewise — and only General (theme combo is General-only).
+        let visible = filter_visible_with_themes("solarized", &themes);
+        assert_eq!(visible, vec![OptionsPage::General]);
+        // Without the themes the same query matches no page (the static keyword
+        // list has no theme names).
+        assert!(filter_visible("ocean").is_empty());
+        // A theme name does not leak into AI/Generator matching.
+        let visible = filter_visible_with_themes("ocean", &themes);
+        assert!(!visible.contains(&OptionsPage::AiFeatures));
+        assert!(!visible.contains(&OptionsPage::Generator));
     }
 
     #[test]

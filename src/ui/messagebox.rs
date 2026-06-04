@@ -17,8 +17,10 @@
 //! Gated behind the `ui` feature for the open helpers; the model is always built.
 
 /// Severity of a message box (`ThemedMessageBox::Severity`,
-/// `themed_messagebox.h:42`). The severity icon was removed in the C++ — title +
-/// text convey it — so this only influences default button styling/labels.
+/// `themed_messagebox.h:42`). The C++ draws a 32×32 severity SVG
+/// (info/warning/error/question, `themed_messagebox.cpp:93-124`); the Zed port
+/// substitutes a tinted leading glyph (see `open::severity_icon`). Severity also
+/// influences the default button styling/labels.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     Info,
@@ -81,27 +83,29 @@ pub struct MessageSpec {
     pub default: DefaultButton,
 }
 
-/// The width clamp for a message box (`themed_messagebox.cpp`: `[420,640]`).
-pub const MSG_MIN_WIDTH: f32 = 420.0;
-pub const MSG_MAX_WIDTH: f32 = 640.0;
+/// The width clamp for a message box (`themed_messagebox.cpp:46-47`:
+/// `setMinimumWidth(380)` / `setMaximumWidth(620)`).
+pub const MSG_MIN_WIDTH: f32 = 380.0;
+pub const MSG_MAX_WIDTH: f32 = 620.0;
 
-/// The detail-list threshold: **>5 items → a scrollable list**, else a wrapped
-/// label (`setDetailText`, `themed_messagebox.cpp:59-111`).
-pub const DETAIL_LIST_THRESHOLD: usize = 5;
-
-/// How a detail block should be presented.
+/// How a detail block should be presented. The C++ `setDetailText`
+/// (`themed_messagebox.cpp:53-71`) creates a **single** word-wrapped `QLabel`
+/// (themed `textDim`) inserted above the button row — there is no list and no
+/// item-count threshold (an earlier port fabricated both). So this is just
+/// "no detail" vs. "one wrapped label".
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DetailLayout {
     /// No detail.
     None,
-    /// ≤5 items → a single word-wrapped label (items joined by newlines).
+    /// A single word-wrapped label (items joined by newlines).
     Label(String),
-    /// >5 items → a scrollable read-only list of the items.
-    List(Vec<String>),
 }
 
-/// Decide how to present a detail block (`setDetailText`): split on `\n` (already
-/// done — `detail` is the item vec), drop empties; `> 5` → list, else label.
+/// Decide how to present a detail block (`setDetailText`,
+/// `themed_messagebox.cpp:53-71`): `detail` is the per-line item vec; drop
+/// empty/whitespace-only items, then — if any remain — present them as one
+/// word-wrapped label (lines joined by `\n`), else [`DetailLayout::None`]. The C++
+/// shows the whole detail as a single `QLabel`, regardless of item count.
 pub fn format_detail(detail: &[String]) -> DetailLayout {
     let items: Vec<String> = detail
         .iter()
@@ -110,8 +114,6 @@ pub fn format_detail(detail: &[String]) -> DetailLayout {
         .collect();
     if items.is_empty() {
         DetailLayout::None
-    } else if items.len() > DETAIL_LIST_THRESHOLD {
-        DetailLayout::List(items)
     } else {
         DetailLayout::Label(items.join("\n"))
     }
@@ -316,8 +318,10 @@ mod open {
         }
     }
 
-    /// The severity icon + tint (the C++ removed the icon, but a Zed alert reads
-    /// far better with a tinted leading glyph; title + text still carry meaning).
+    /// The severity icon + tint. The C++ draws a 32×32 severity SVG
+    /// (`themed_messagebox.cpp:93-124`); the Zed substitution is a tinted leading
+    /// glyph from the bundled icon set (the SVG assets aren't bundled here, but the
+    /// behavior — a severity icon left of the title/text — matches).
     fn severity_icon(severity: Severity, cx: &App) -> impl IntoElement {
         let (name, tint) = match severity {
             Severity::Info => (IconName::Info, color::accent(cx)),
@@ -330,8 +334,11 @@ mod open {
         Icon::new(name).text_color(tint)
     }
 
-    /// Build the alert body: the wrapped message text, then the detail block
-    /// (small list/label) when present, as a single description element.
+    /// Build the alert body: the wrapped message text, then the detail block (one
+    /// word-wrapped muted label) when present, as a single description element. The
+    /// C++ `setDetailText` (`themed_messagebox.cpp:53-71`) inserts the detail as a
+    /// single `QLabel` indented 48 px so it aligns under the body text (left of the
+    /// 32 px icon + 16 px gap); we left-inset the label to mirror that.
     fn description_body(text: String, detail: &[String], cx: &App) -> AnyElement {
         let layout = format_detail(detail);
         gpui_component::v_flex()
@@ -346,27 +353,10 @@ mod open {
                 DetailLayout::None => col,
                 DetailLayout::Label(s) => col.child(
                     div()
+                        .pl(px(tokens::space::MD))
                         .text_size(px(tokens::font::UI_SM))
                         .text_color(color::text_muted(cx))
                         .child(s),
-                ),
-                DetailLayout::List(items) => col.child(
-                    gpui_component::v_flex()
-                        .id("rcx-msg-detail")
-                        .max_h(px(140.))
-                        .overflow_y_scroll()
-                        .p(px(tokens::space::MD))
-                        .gap(px(tokens::space::XXS))
-                        .rounded(px(tokens::radius::MD))
-                        .border_1()
-                        .border_color(color::border(cx))
-                        .bg(color::panel_bg(cx))
-                        .children(items.into_iter().map(|item| {
-                            div()
-                                .text_size(px(tokens::font::UI_SM))
-                                .text_color(color::text_muted(cx))
-                                .child(item)
-                        })),
                 ),
             })
             .into_any_element()
@@ -531,7 +521,7 @@ mod tests {
         let items: Vec<String> = (0..5).map(|i| format!("file{i}.rcx")).collect();
         match format_detail(&items) {
             DetailLayout::Label(s) => {
-                // 5 items joined by newlines (≤ threshold → label).
+                // 5 items joined by newlines (the C++ shows one wrapped label).
                 assert_eq!(s.lines().count(), 5);
             }
             other => panic!("expected Label, got {other:?}"),
@@ -539,12 +529,43 @@ mod tests {
     }
 
     #[test]
-    fn detail_list_for_more_than_five() {
+    fn detail_label_joins_all_items() {
+        // The C++ setDetailText shows ALL items as a single word-wrapped QLabel —
+        // there is no list and no item-count threshold. 6 items → a 6-line label.
         let items: Vec<String> = (0..6).map(|i| format!("file{i}.rcx")).collect();
         match format_detail(&items) {
-            DetailLayout::List(v) => assert_eq!(v.len(), 6),
-            other => panic!("expected List, got {other:?}"),
+            DetailLayout::Label(s) => {
+                assert_eq!(s.lines().count(), 6);
+                assert!(s.contains("file0.rcx"));
+                assert!(s.contains("file5.rcx"));
+            }
+            other => panic!("expected Label, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detail_label_drops_blank_items_only() {
+        // Empty/whitespace items are dropped; the rest stay (no list ever).
+        let items = vec![
+            "keep1".to_string(),
+            "   ".to_string(),
+            "".to_string(),
+            "keep2".to_string(),
+        ];
+        match format_detail(&items) {
+            DetailLayout::Label(s) => {
+                assert_eq!(s, "keep1\nkeep2");
+            }
+            other => panic!("expected Label, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn width_clamp_matches_cpp() {
+        // themed_messagebox.cpp:46-47: setMinimumWidth(380)/setMaximumWidth(620).
+        assert_eq!(super::MSG_MIN_WIDTH, 380.0);
+        assert_eq!(super::MSG_MAX_WIDTH, 620.0);
+        assert!(super::MSG_MIN_WIDTH < super::MSG_MAX_WIDTH);
     }
 
     #[test]
