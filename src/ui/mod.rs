@@ -41,6 +41,7 @@ pub mod editor;
 pub mod enumpicker;
 pub mod examples;
 mod navlist;
+pub mod window_dialogs;
 pub mod findbar;
 pub mod fuzzy;
 pub mod gotoaddress;
