@@ -27,6 +27,7 @@
 //! Gated behind the `ui` feature (the dialogs render via gpui-component).
 
 pub mod messagebox;
+pub mod plugin_manager;
 pub mod window_dialogs;
 pub mod optionsdialog;
 pub mod gotoaddress;
