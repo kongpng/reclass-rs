@@ -32,10 +32,54 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, Div, FontWeight, Hsla, InteractiveElement as _, ParentElement as _, SharedString,
-    Stateful, Styled,
+    div, px, AnyElement, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement as _,
+    ParentElement as _, SharedString, Stateful, Styled,
 };
 use gpui_component::ActiveTheme;
+
+/// Coalesce `text` + a sorted/raw list of matched character `positions` (from the
+/// fuzzy matcher) into render spans: matched chars are tinted `accent` + semibold,
+/// the rest `base`. Runs of same-state chars are merged into one element. Shared by
+/// the command palette, the type selector, and the enum picker (was three
+/// byte-identical private copies).
+pub fn highlighted_spans(
+    text: &str,
+    positions: &[usize],
+    base: Hsla,
+    accent: Hsla,
+) -> Vec<AnyElement> {
+    let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
+    let mut spans: Vec<AnyElement> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_hit: Option<bool> = None;
+    let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
+        if text.is_empty() {
+            return;
+        }
+        let mut el = div().child(text.to_string());
+        if hit {
+            el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
+        } else {
+            el = el.text_color(base);
+        }
+        spans.push(el.into_any_element());
+    };
+    for (i, ch) in text.chars().enumerate() {
+        let hit = pos.contains(&i);
+        if cur_hit != Some(hit) {
+            if let Some(prev) = cur_hit {
+                flush(&mut spans, &cur, prev);
+            }
+            cur.clear();
+            cur_hit = Some(hit);
+        }
+        cur.push(ch);
+    }
+    if let Some(prev) = cur_hit {
+        flush(&mut spans, &cur, prev);
+    }
+    spans
+}
 
 /// The theme the app loads on launch — the Zed One Dark-styled bundled theme
 /// (`src/theme/defaults/zed_one_dark.json`). Read by

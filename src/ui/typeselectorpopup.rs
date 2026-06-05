@@ -971,7 +971,7 @@ mod view {
     };
     use crate::core::kind::NodeKind;
     use crate::theme::model::Theme;
-    use crate::ui::design::{color, icon, tokens};
+    use crate::ui::design::{color, highlighted_spans, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
@@ -996,44 +996,6 @@ mod view {
 
     /// Render a type name with fuzzy-matched chars emphasized (accent + semibold),
     /// the rest in `base`. `positions` are char indices into `name`.
-    fn highlighted_name(
-        name: &str,
-        positions: &[usize],
-        base: Hsla,
-        accent: Hsla,
-    ) -> Vec<AnyElement> {
-        let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
-        let mut spans: Vec<AnyElement> = Vec::new();
-        let mut cur = String::new();
-        let mut cur_hit: Option<bool> = None;
-        let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
-            if text.is_empty() {
-                return;
-            }
-            let mut el = div().child(text.to_string());
-            if hit {
-                el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
-            } else {
-                el = el.text_color(base);
-            }
-            spans.push(el.into_any_element());
-        };
-        for (i, ch) in name.chars().enumerate() {
-            let hit = pos.contains(&i);
-            if cur_hit != Some(hit) {
-                if let Some(prev) = cur_hit {
-                    flush(&mut spans, &cur, prev);
-                }
-                cur.clear();
-                cur_hit = Some(hit);
-            }
-            cur.push(ch);
-        }
-        if let Some(prev) = cur_hit {
-            flush(&mut spans, &cur, prev);
-        }
-        spans
-    }
 
     /// The popup's outcome (the editor consumes this — see the menus↔editor
     /// CONTRACT). `Chosen` carries the picked base [`NodeKind`] plus the optional
@@ -1562,7 +1524,7 @@ mod view {
                             group_color
                         };
                         let name_spans = if filtering {
-                            highlighted_name(
+                            highlighted_spans(
                                 &r.entry.display_name,
                                 &r.match_positions,
                                 name_color,

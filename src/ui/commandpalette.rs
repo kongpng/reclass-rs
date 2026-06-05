@@ -585,7 +585,7 @@ pub use view::{command_palette_key_bindings, CommandPalette, PaletteEvent};
 #[cfg(feature = "ui")]
 mod view {
     use super::{default_menu_tree, flatten_menu_bar, CommandId, PaletteModel};
-    use crate::ui::design::{color, tokens};
+    use crate::ui::design::{color, highlighted_spans, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
@@ -608,50 +608,6 @@ mod view {
             .justify_center()
             .child(text.to_string())
             .into_any_element()
-    }
-
-    /// Render a command-path label with the fuzzy-matched characters emphasized
-    /// (Zed `command_palette::render_match`: matched chars in the accent color +
-    /// semibold, the rest muted). `positions` are char indices into `path`.
-    fn highlighted_path(
-        path: &str,
-        positions: &[usize],
-        base: Hsla,
-        accent: Hsla,
-    ) -> Vec<AnyElement> {
-        let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
-        // Coalesce runs of (matched | unmatched) chars into spans so we emit few
-        // elements; each span carries the matched styling or the base styling.
-        let mut spans: Vec<AnyElement> = Vec::new();
-        let mut cur = String::new();
-        let mut cur_hit: Option<bool> = None;
-        let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
-            if text.is_empty() {
-                return;
-            }
-            let mut el = div().child(text.to_string());
-            if hit {
-                el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
-            } else {
-                el = el.text_color(base);
-            }
-            spans.push(el.into_any_element());
-        };
-        for (i, ch) in path.chars().enumerate() {
-            let hit = pos.contains(&i);
-            if cur_hit != Some(hit) {
-                if let Some(prev) = cur_hit {
-                    flush(&mut spans, &cur, prev);
-                }
-                cur.clear();
-                cur_hit = Some(hit);
-            }
-            cur.push(ch);
-        }
-        if let Some(prev) = cur_hit {
-            flush(&mut spans, &cur, prev);
-        }
-        spans
     }
 
     actions!(
@@ -844,7 +800,7 @@ mod view {
                 .map(|(row, (path, shortcut, enabled, positions))| {
                     let is_sel = selected == Some(row);
                     let name_color = if enabled { fg } else { disabled };
-                    let name_spans = highlighted_path(&path, &positions, name_color, accent);
+                    let name_spans = highlighted_spans(&path, &positions, name_color, accent);
                     let caps: Vec<AnyElement> = if shortcut.is_empty() {
                         Vec::new()
                     } else {

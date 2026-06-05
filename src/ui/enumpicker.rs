@@ -222,50 +222,11 @@ pub use view::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
 mod view {
     use super::EnumPickerModel;
-    use crate::ui::design::{color, icon, tokens};
+    use crate::ui::design::{color, highlighted_spans, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
 
-    /// Render a member name with fuzzy-matched chars emphasized (accent + semibold).
-    fn highlighted_name(
-        name: &str,
-        positions: &[usize],
-        base: Hsla,
-        accent: Hsla,
-    ) -> Vec<AnyElement> {
-        let pos: std::collections::BTreeSet<usize> = positions.iter().copied().collect();
-        let mut spans: Vec<AnyElement> = Vec::new();
-        let mut cur = String::new();
-        let mut cur_hit: Option<bool> = None;
-        let flush = |spans: &mut Vec<AnyElement>, text: &str, hit: bool| {
-            if text.is_empty() {
-                return;
-            }
-            let mut el = div().child(text.to_string());
-            if hit {
-                el = el.text_color(accent).font_weight(FontWeight::SEMIBOLD);
-            } else {
-                el = el.text_color(base);
-            }
-            spans.push(el.into_any_element());
-        };
-        for (i, ch) in name.chars().enumerate() {
-            let hit = pos.contains(&i);
-            if cur_hit != Some(hit) {
-                if let Some(prev) = cur_hit {
-                    flush(&mut spans, &cur, prev);
-                }
-                cur.clear();
-                cur_hit = Some(hit);
-            }
-            cur.push(ch);
-        }
-        if let Some(prev) = cur_hit {
-            flush(&mut spans, &cur, prev);
-        }
-        spans
-    }
 
     /// The picker's outcome.
     #[derive(Clone, Debug)]
@@ -432,7 +393,7 @@ mod view {
                     let is_sel = selected == Some(row);
                     let is_current = r.member.value == current;
                     let name_spans = if filtering {
-                        highlighted_name(&r.member.name, &r.match_positions, fg, accent)
+                        highlighted_spans(&r.member.name, &r.match_positions, fg, accent)
                     } else {
                         vec![div()
                             .text_color(fg)
