@@ -4390,7 +4390,7 @@ impl MainWindow {
     /// `VM_Debug` view): the [`generate_debug_text`](crate::core::generate_debug_text)
     /// dump of the editor's last composed line/`LineMeta` model, **styled** per
     /// the C++ `styleDebugText` segmentation via the shared
-    /// [`debug_styled_spans`](super::tabs::debug_styled_spans) helper so the split
+    /// [`debug_styled_spans`](super::cpp_highlight::debug_styled_spans) helper so the split
     /// and primary debug panes agree exactly. A developer view of the existing
     /// structure — no live process, no editing — mirroring `render_split_tree` so
     /// the split never re-renders the live `RcxEditor` entity.
@@ -4423,7 +4423,7 @@ impl MainWindow {
                     .px(px(tokens::space::SM))
                     .items_center()
                     .whitespace_nowrap()
-                    .children(super::tabs::debug_styled_spans(line, cx))
+                    .children(super::cpp_highlight::debug_styled_spans(line, cx))
                     .into_any_element()
             })
             .collect();

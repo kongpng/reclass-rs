@@ -33,6 +33,7 @@
 pub mod bookmarkspanel;
 pub mod commandpalette;
 pub mod contextmenu;
+pub(crate) mod cpp_highlight;
 pub mod design;
 pub mod dialogs;
 pub mod docks;
