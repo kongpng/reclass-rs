@@ -1731,6 +1731,40 @@ impl ScannerPanel {
     }
 }
 
+/// The shared `.content` builder for the scanner toolbar dropdowns — a
+/// `dropdown_menu` of `dropdown_row`s (the current pick highlighted) whose clicks
+/// run `pick` on the panel. Factors the mode/cond/type/align popover menus.
+#[allow(clippy::type_complexity)]
+fn dropdown_content<T: Copy + PartialEq + 'static>(
+    row_prefix: &'static str,
+    items: Vec<(SharedString, T)>,
+    current: T,
+    panel: WeakEntity<ScannerPanel>,
+    pick: impl Fn(&mut ScannerPanel, T, &mut Context<ScannerPanel>) + Copy + 'static,
+) -> impl Fn(
+    &mut gpui_component::popover::PopoverState,
+    &mut Window,
+    &mut Context<gpui_component::popover::PopoverState>,
+) -> Div
+       + 'static {
+    move |_state, _window, cx| {
+        let mut menu = dropdown_menu(cx);
+        for (i, (label, item)) in items.iter().enumerate() {
+            let item = *item;
+            let label = label.clone();
+            let panel = panel.clone();
+            menu = menu.child(
+                dropdown_row((row_prefix, i), label, item == current, cx).on_click(
+                    move |_e, _w, cx| {
+                        panel.update(cx, |this, cx| pick(this, item, cx)).ok();
+                    },
+                ),
+            );
+        }
+        menu
+    }
+}
+
 /// A compact Zed dropdown popover row: a clickable inset row inside the
 /// elevated popover surface, with the soft-accent fill on the current pick.
 fn dropdown_row(
@@ -1841,32 +1875,18 @@ impl Render for ScannerPanel {
                 cx.notify();
             }))
             .trigger(dropdown_trigger("mode", self.mode_label()))
-            .content({
-                let panel = panel.clone();
-                move |_state, _window, cx| {
-                    let mut menu = dropdown_menu(cx);
-                    for (i, (mode, name)) in [
-                        (ScanMode::Value, "Value"),
-                        (ScanMode::Signature, "Signature"),
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
-                        let mode = *mode;
-                        let panel = panel.clone();
-                        menu = menu.child(
-                            dropdown_row(("mode-row", i), *name, mode == cur_mode, cx).on_click(
-                                move |_e, _w, cx| {
-                                    panel
-                                        .update(cx, |this, cx| this.set_scan_mode(mode, cx))
-                                        .ok();
-                                },
-                            ),
-                        );
-                    }
-                    menu
-                }
-            });
+            .content(dropdown_content(
+                "mode-row",
+                vec![
+                    ("Value".into(), ScanMode::Value),
+                    ("Signature".into(), ScanMode::Signature),
+                ],
+                cur_mode,
+                panel.clone(),
+                |this, m, cx| {
+                    this.set_scan_mode(m, cx);
+                },
+            ));
 
         // ── Condition dropdown (the C++ condition combo). In Value mode it
         // offers the real value conditions only (the Signature sentinel lives
@@ -1882,30 +1902,19 @@ impl Render for ScannerPanel {
                 "cond",
                 format!("Scan: {}", self.cond_label()),
             ))
-            .content({
-                let panel = panel.clone();
-                move |_state, _window, cx| {
-                    let mut menu = dropdown_menu(cx);
-                    for (i, (entry, name)) in CondEntry::entries()
-                        .iter()
-                        .filter(|(c, _)| !matches!(c, CondEntry::Signature))
-                        .enumerate()
-                    {
-                        let entry = *entry;
-                        let panel = panel.clone();
-                        menu = menu.child(
-                            dropdown_row(("cond-row", i), *name, entry == cur_cond, cx).on_click(
-                                move |_e, _w, cx| {
-                                    panel
-                                        .update(cx, |this, cx| this.set_condition(entry, cx))
-                                        .ok();
-                                },
-                            ),
-                        );
-                    }
-                    menu
-                }
-            });
+            .content(dropdown_content(
+                "cond-row",
+                CondEntry::entries()
+                    .iter()
+                    .filter(|(c, _)| !matches!(c, CondEntry::Signature))
+                    .map(|(e, n)| (SharedString::from(*n), *e))
+                    .collect(),
+                cur_cond,
+                panel.clone(),
+                |this, e, cx| {
+                    this.set_condition(e, cx);
+                },
+            ));
 
         // ── Value-type dropdown (value mode only) ──
         let type_popover = Popover::new("scanner-type-pop")
@@ -1919,26 +1928,18 @@ impl Render for ScannerPanel {
                 "type",
                 format!("Type: {}", self.type_label()),
             ))
-            .content({
-                let panel = panel.clone();
-                move |_state, _window, cx| {
-                    let mut menu = dropdown_menu(cx);
-                    for (i, (vt, name)) in value_type_entries().iter().enumerate() {
-                        let vt = *vt;
-                        let panel = panel.clone();
-                        menu = menu.child(
-                            dropdown_row(("type-row", i), *name, vt == cur_type, cx).on_click(
-                                move |_e, _w, cx| {
-                                    panel
-                                        .update(cx, |this, cx| this.set_value_type(vt, cx))
-                                        .ok();
-                                },
-                            ),
-                        );
-                    }
-                    menu
-                }
-            });
+            .content(dropdown_content(
+                "type-row",
+                value_type_entries()
+                    .iter()
+                    .map(|(vt, n)| (SharedString::from(*n), *vt))
+                    .collect(),
+                cur_type,
+                panel.clone(),
+                |this, vt, cx| {
+                    this.set_value_type(vt, cx);
+                },
+            ));
 
         // ── Fast-Scan (alignment) dropdown (value mode only) ──
         let align_popover = Popover::new("scanner-align-pop")
@@ -1949,23 +1950,18 @@ impl Render for ScannerPanel {
                 cx.notify();
             }))
             .trigger(dropdown_trigger("align", format!("Align: {cur_align}")))
-            .content({
-                let panel = panel.clone();
-                move |_state, _window, cx| {
-                    let mut menu = dropdown_menu(cx);
-                    for (i, a) in FAST_SCAN_ALIGNMENTS.iter().enumerate() {
-                        let a = *a;
-                        let panel = panel.clone();
-                        menu = menu.child(
-                            dropdown_row(("align-row", i), a.to_string(), a == cur_align, cx)
-                                .on_click(move |_e, _w, cx| {
-                                    panel.update(cx, |this, cx| this.set_alignment(a, cx)).ok();
-                                }),
-                        );
-                    }
-                    menu
-                }
-            });
+            .content(dropdown_content(
+                "align-row",
+                FAST_SCAN_ALIGNMENTS
+                    .iter()
+                    .map(|a| (SharedString::from(a.to_string()), *a))
+                    .collect(),
+                cur_align,
+                panel.clone(),
+                |this, a, cx| {
+                    this.set_alignment(a, cx);
+                },
+            ));
 
         // ── Status line: muted "N results" / "Copied ..." (the C++ result
         // count line). The scan path sets `status`; before the first scan it
