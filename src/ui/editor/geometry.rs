@@ -494,6 +494,17 @@ pub fn line_byte_range(text: &str, line_starts: &[i32], idx: usize) -> std::ops:
     begin..end.max(begin)
 }
 
+/// The byte range of display span `[start, end)` in `text`. Command-row spans are
+/// UTF-16-unit scans (`utf16_to_byte`); every other line's span is a display
+/// column (`byte_for_col`). Shared by the inline-edit seed and keyword-hover.
+pub fn span_byte_range(text: &str, start: i32, end: i32, command_row: bool) -> std::ops::Range<usize> {
+    if command_row {
+        utf16_to_byte(text, start)..utf16_to_byte(text, end)
+    } else {
+        byte_for_col(text, start)..byte_for_col(text, end)
+    }
+}
+
 /// The footer pill (if any) whose span contains display column `col` — the
 /// shared "which pill is under the cursor" scan.
 pub fn footer_pill_at(text: &str, col: i32) -> Option<ColumnSpan> {

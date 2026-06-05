@@ -1662,18 +1662,14 @@ impl RcxEditor {
         // when an earlier token carries a non-BMP glyph (e.g. an astral char in the
         // data-source label would otherwise shift a char-based slice and seed the
         // wrong substring — the `byte_for_col`-vs-unit-span hazard).
-        let (start_byte, end_byte) = if lm.line_kind == LineKind::CommandRow {
-            (
-                geometry::utf16_to_byte(&text, span.start),
-                geometry::utf16_to_byte(&text, span.end),
-            )
-        } else {
-            (
-                geometry::byte_for_col(&text, span.start),
-                geometry::byte_for_col(&text, span.end),
-            )
-        };
-        let raw_span = text.get(start_byte..end_byte).unwrap_or("");
+        let raw_span = text
+            .get(geometry::span_byte_range(
+                &text,
+                span.start,
+                span.end,
+                lm.line_kind == LineKind::CommandRow,
+            ))
+            .unwrap_or("");
 
         // Item 7: editing the VALUE of a hex node is a fixed-length per-byte
         // overwrite (hex digits, space-separated). Detect it here and seed the
@@ -4962,10 +4958,7 @@ impl RcxEditor {
             if kts.valid && kts.end > kts.start {
                 let (kw_left, kw_w) = self.shaped_span_px(&text, kts.start, kts.end, window);
                 let kw_word = text
-                    .get(
-                        geometry::utf16_to_byte(&text, kts.start)
-                            ..geometry::utf16_to_byte(&text, kts.end),
-                    )
+                    .get(geometry::span_byte_range(&text, kts.start, kts.end, true))
                     .unwrap_or("")
                     .trim()
                     .to_string();
