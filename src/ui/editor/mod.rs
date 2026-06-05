@@ -972,20 +972,8 @@ impl RcxEditor {
     /// `\n` is stripped.
     fn line_text(&self, idx: usize) -> &str {
         let result = self.controller.last_result();
-        let starts = &result.line_starts;
-        if idx >= starts.len() {
-            return "";
-        }
-        let begin = geometry::utf16_to_byte(&result.text, starts[idx]);
-        let end = if idx + 1 < starts.len() {
-            geometry::utf16_to_byte(&result.text, starts[idx + 1])
-        } else {
-            result.text.len()
-        };
-        if end <= begin {
-            return "";
-        }
-        result.text[begin..end].trim_end_matches('\n')
+        let r = geometry::line_byte_range(&result.text, &result.line_starts, idx);
+        result.text[r].trim_end_matches('\n')
     }
 
     fn line_meta(&self, idx: usize) -> Option<&LineMeta> {
@@ -7924,14 +7912,8 @@ mod tests {
             .expect("element row exists");
         let lm = &meta[el];
         let text = {
-            use super::geometry::utf16_to_byte;
-            let begin = utf16_to_byte(&result.text, result.line_starts[el]);
-            let end = if el + 1 < result.line_starts.len() {
-                utf16_to_byte(&result.text, result.line_starts[el + 1])
-            } else {
-                result.text.len()
-            };
-            result.text[begin..end].trim_end_matches('\n').to_string()
+            let r = geometry::line_byte_range(&result.text, &result.line_starts, el);
+            result.text[r].trim_end_matches('\n').to_string()
         };
         let (type_w, name_w) = geometry::effective_widths(lm);
         // Resolve the element row's Type span from its geometry, then probe a column
@@ -7958,7 +7940,7 @@ mod tests {
         // converting each to a byte offset (geometry::utf16_to_byte). The command
         // row contains multi-byte glyphs (▸/▾), so a naive byte slice would split
         // a line mid-glyph — this asserts the conversion yields clean single lines.
-        use super::geometry::utf16_to_byte;
+        use super::geometry::line_byte_range;
         let c = editor_with_struct();
         let result = c.last_result();
         assert!(!result.meta.is_empty());
@@ -7966,17 +7948,12 @@ mod tests {
         // would not exercise the conversion).
         assert!(result.text.chars().any(|ch| ch.len_utf8() > 1));
         for i in 0..result.meta.len() {
-            let begin = utf16_to_byte(&result.text, result.line_starts[i]);
-            let end = if i + 1 < result.line_starts.len() {
-                utf16_to_byte(&result.text, result.line_starts[i + 1])
-            } else {
-                result.text.len()
-            };
+            let r = line_byte_range(&result.text, &result.line_starts, i);
             // Byte offsets must be valid char boundaries and ordered.
-            assert!(result.text.is_char_boundary(begin));
-            assert!(result.text.is_char_boundary(end));
-            assert!(begin <= end);
-            let slice = result.text[begin..end].trim_end_matches('\n');
+            assert!(result.text.is_char_boundary(r.start));
+            assert!(result.text.is_char_boundary(r.end));
+            assert!(r.start <= r.end);
+            let slice = result.text[r].trim_end_matches('\n');
             assert!(!slice.contains('\n'), "row text must be a single line");
         }
     }

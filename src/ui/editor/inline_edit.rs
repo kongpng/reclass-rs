@@ -689,6 +689,16 @@ impl FieldInput {
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
         self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
     }
+
+    /// Resolve the byte range an IME edit replaces: the explicit `range_utf16` if
+    /// given, else the marked (composition) range, else the current selection.
+    fn resolve_replace_range(&self, range_utf16: &Option<Range<usize>>) -> Range<usize> {
+        range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone())
+    }
 }
 
 impl Focusable for FieldInput {
@@ -762,11 +772,7 @@ impl EntityInputHandler for FieldInput {
             cx.notify();
             return;
         }
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+        let range = self.resolve_replace_range(&range_utf16);
         let (content, cursor) = splice_text(&self.content, range, new_text);
         self.content = content.into();
         self.selected_range = cursor..cursor;
@@ -785,11 +791,7 @@ impl EntityInputHandler for FieldInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+        let range = self.resolve_replace_range(&range_utf16);
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();

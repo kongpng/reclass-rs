@@ -478,6 +478,30 @@ pub fn heat_role_for_level(level: i32) -> Option<SpanRole> {
 /// as subtle rounded chips. Each returned [`ColumnSpan`] is a char-column range to
 /// paint a pill background behind. Matched longest-first so `+1000h` is not eaten
 /// by `+100h`/`+10h` (the C++ collision guard). Pure (text-scan), unit-tested.
+/// The byte range of composed line `idx` in `text`, derived from the UTF-16-unit
+/// `line_starts` (the last / out-of-range line ends at `text.len()`). The shared
+/// line-slicing idiom behind `RcxEditor::line_text`.
+pub fn line_byte_range(text: &str, line_starts: &[i32], idx: usize) -> std::ops::Range<usize> {
+    if idx >= line_starts.len() {
+        return 0..0;
+    }
+    let begin = utf16_to_byte(text, line_starts[idx]);
+    let end = if idx + 1 < line_starts.len() {
+        utf16_to_byte(text, line_starts[idx + 1])
+    } else {
+        text.len()
+    };
+    begin..end.max(begin)
+}
+
+/// The footer pill (if any) whose span contains display column `col` — the
+/// shared "which pill is under the cursor" scan.
+pub fn footer_pill_at(text: &str, col: i32) -> Option<ColumnSpan> {
+    footer_pill_spans(text)
+        .into_iter()
+        .find(|p| p.valid && col >= p.start && col < p.end)
+}
+
 pub fn footer_pill_spans(text: &str) -> Vec<ColumnSpan> {
     // Longest-first so a longer token's match consumes its columns before a
     // shorter token can match the suffix. `+1` (the single-field add pill) comes
@@ -767,12 +791,7 @@ pub fn hover_span_for(
     }
     // 2. Footer pill under the cursor.
     if lm.line_kind == LineKind::Footer {
-        for pill in footer_pill_spans(text) {
-            if pill.valid && col >= pill.start && col < pill.end {
-                return Some((pill.start, pill.end));
-            }
-        }
-        return None;
+        return footer_pill_at(text, col).map(|p| (p.start, p.end));
     }
     // 3. The resolved edit token under the cursor. (Footer rows already returned;
     // the C++ explicitly skips the hover span on footer lines, editor.cpp:4296.)

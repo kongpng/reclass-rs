@@ -197,10 +197,8 @@ pub fn cursor_for_hit(lm: &LineMeta, text: &str, hit: HitInfo) -> CursorKind {
     }
     // 2. Footer row: PointingHand over a pill, Arrow everywhere else.
     if lm.line_kind == LineKind::Footer {
-        for pill in geometry::footer_pill_spans(text) {
-            if span_contains(pill, hit.col) {
-                return CursorKind::PointingHand;
-            }
+        if geometry::footer_pill_at(text, hit.col).is_some() {
+            return CursorKind::PointingHand;
         }
         return CursorKind::Arrow;
     }
