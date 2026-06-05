@@ -585,14 +585,7 @@ pub fn format_value(mode: ScanMode, vt: ValueType, last_pattern: &[u8], bytes: &
         } else {
             bytes.len().min(last_pattern.len())
         };
-        let mut s = String::new();
-        for (j, b) in bytes.iter().take(show_len).enumerate() {
-            if j > 0 {
-                s.push(' ');
-            }
-            s.push_str(&format!("{b:02X}"));
-        }
-        return s;
+        return hex_space_upper(&bytes[..show_len]);
     }
 
     let sz = bytes.len();
@@ -640,14 +633,7 @@ pub fn format_value(mode: ScanMode, vt: ValueType, last_pattern: &[u8], bytes: &
         }
         // Hex bytes: space-separated uppercase, same shape as signature display.
         ValueType::HexBytes if sz > 0 => {
-            let mut s = String::new();
-            for (j, b) in bytes.iter().enumerate() {
-                if j > 0 {
-                    s.push(' ');
-                }
-                s.push_str(&format!("{b:02X}"));
-            }
-            return s;
+            return hex_space_upper(bytes);
         }
         _ => {}
     }
@@ -1026,6 +1012,19 @@ pub fn previous_delta_text(prev_text: &str, delta: &DeltaInfo, changed: bool) ->
     } else {
         prev_text.to_string()
     }
+}
+
+/// Space-joined uppercase hex (`"DE AD BE EF"`) of `bytes` — the scanner's
+/// signature / hex-bytes value rendering.
+fn hex_space_upper(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for (j, b) in bytes.iter().enumerate() {
+        if j > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{b:02X}"));
+    }
+    s
 }
 
 /// `"{prefix}1 result"` / `"{prefix}{n} results"` — the result-count status line
@@ -2722,15 +2721,19 @@ mod view {
         /// "Copy All" footer button — copy every displayed result address to the
         /// clipboard, newline-joined (the C++ multi-row Copy). Honors the current
         /// sort/filter (it reads the displayed-row list).
-        fn copy_all_addresses(&mut self, cx: &mut Context<Self>) {
-            let addrs: Vec<u64> = self
-                .table
+        /// The addresses of every currently-displayed result row (delegate order).
+        fn displayed_addresses(&self, cx: &App) -> Vec<u64> {
+            self.table
                 .read(cx)
                 .delegate()
                 .rows
                 .iter()
                 .map(|r| r.row.address)
-                .collect();
+                .collect()
+        }
+
+        fn copy_all_addresses(&mut self, cx: &mut Context<Self>) {
+            let addrs = self.displayed_addresses(cx);
             if addrs.is_empty() {
                 return;
             }
@@ -2766,14 +2769,7 @@ mod view {
         /// drag-into-editor / add-as-nodes path). Raised as a [`ScannerAddNodes`]
         /// event the window resolves against its editor controller.
         fn add_all_as_nodes(&mut self, cx: &mut Context<Self>) {
-            let addresses: Vec<u64> = self
-                .table
-                .read(cx)
-                .delegate()
-                .rows
-                .iter()
-                .map(|r| r.row.address)
-                .collect();
+            let addresses = self.displayed_addresses(cx);
             if addresses.is_empty() {
                 return;
             }
