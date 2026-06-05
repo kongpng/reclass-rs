@@ -23,11 +23,11 @@
 //!
 //! ## Reuse, not re-model
 //! The command/menu tree already exists as data for the command palette
-//! ([`crate::ui::commandpalette::default_menu_tree`] →
-//! [`MenuNode`](crate::ui::commandpalette::MenuNode)). This module **reuses** it
+//! ([`crate::ui::pickers::commandpalette::default_menu_tree`] →
+//! [`MenuNode`](crate::ui::pickers::commandpalette::MenuNode)). This module **reuses** it
 //! verbatim — every dropdown is rendered straight from those [`MenuNode`]s, so
 //! the menu bar and the palette can never drift. Leaf items carry a
-//! [`CommandId`](crate::ui::commandpalette::CommandId); clicking one emits
+//! [`CommandId`](crate::ui::pickers::commandpalette::CommandId); clicking one emits
 //! [`MenuCommand`] which [`MainWindow`](crate::ui::window::MainWindow) routes to
 //! `run_menu_command` (the same handler the palette's `Trigger` uses).
 //!
@@ -44,7 +44,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Selectable as _, Sizable as _};
 
-use crate::ui::commandpalette::{default_menu_tree, CommandId, MenuNode};
+use crate::ui::pickers::commandpalette::{default_menu_tree, CommandId, MenuNode};
 use crate::ui::design::{color, elevated_surface, icon, tokens};
 
 /// The menu-bar's outcome — a top-level→leaf command was chosen. Routed by the
@@ -137,7 +137,7 @@ impl MenuBar {
     /// Replace the whole menu tree (the C++ menus rebuilt on `aboutToShow` for
     /// the dynamic Recent-Files / Data-Source submenus and the dynamic MCP
     /// Start/Stop label). The host builds the tree from live data via
-    /// [`menu_tree_with`](crate::ui::commandpalette::menu_tree_with) and pushes it
+    /// [`menu_tree_with`](crate::ui::pickers::commandpalette::menu_tree_with) and pushes it
     /// here; always re-renders so the next open shows the fresh rows.
     pub fn set_menus(&mut self, menus: Vec<MenuNode>, cx: &mut Context<Self>) {
         self.menus = menus;

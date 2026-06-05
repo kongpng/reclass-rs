@@ -6,7 +6,7 @@
 //! Per the cookbook (ARCHITECTURE §5) the rendering maps onto
 //! `ContextMenuExt` + `PopupMenu`; the gpui side needs an `Action` per item, so
 //! this module models the menus as **data** ([`MenuItem`] catalogues, keyed by a
-//! [`CommandId`](crate::ui::commandpalette::CommandId)) + the load-bearing logic
+//! [`CommandId`](crate::ui::pickers::commandpalette::CommandId)) + the load-bearing logic
 //! (single-vs-multi selection, class↔struct convert, pin/unpin label, delete
 //! label pluralization) — all unit-tested — and the host turns the item list into
 //! a `PopupMenu`.
@@ -14,7 +14,7 @@
 //! Gated behind the `ui` feature only for the (small) menu-builder helper; the
 //! catalogues + logic are always built/tested.
 
-use crate::ui::commandpalette::CommandId;
+use crate::ui::pickers::commandpalette::CommandId;
 
 /// One entry in a context menu — a labeled command, a checkable toggle, or a
 /// separator. Mirrors a `menu.addAction(...)` / `addSeparator()`.

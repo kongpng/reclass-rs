@@ -31,14 +31,13 @@
 //! dialogs are deliberately NOT implemented here. Gated behind the `ui` feature.
 
 pub mod bookmarkspanel;
-pub mod commandpalette;
 pub mod contextmenu;
 pub(crate) mod cpp_highlight;
 pub mod design;
 pub mod dialogs;
 pub mod docks;
 pub mod editor;
-pub mod enumpicker;
+pub mod pickers;
 pub mod examples;
 mod navlist;
 pub mod findbar;
@@ -51,9 +50,7 @@ pub mod plugindialog;
 pub mod pluginhost;
 pub mod pluginpanel;
 pub mod pluginview;
-pub mod processpicker;
 pub mod scannerpanel;
-pub mod sourcechooser;
 pub mod startpage;
 pub mod state;
 pub mod statusbar;
@@ -61,7 +58,6 @@ pub mod tabs;
 pub mod theme_apply;
 pub mod titlebar;
 pub mod tooltip;
-pub mod typeselectorpopup;
 pub mod window;
 pub mod workspace;
 

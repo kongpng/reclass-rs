@@ -791,8 +791,8 @@ fn seed_root_doc(kind: RootKind) -> crate::controller::RcxDocument {
 
 /// Relabel the first leaf with the given command id, in place (used for the
 /// dynamic MCP Start/Stop label). Recurses into submenus.
-fn relabel_command(nodes: &mut [crate::ui::commandpalette::MenuNode], command: &str, new_label: &str) {
-    use crate::ui::commandpalette::MenuNode;
+fn relabel_command(nodes: &mut [crate::ui::pickers::commandpalette::MenuNode], command: &str, new_label: &str) {
+    use crate::ui::pickers::commandpalette::MenuNode;
     for node in nodes {
         match node {
             MenuNode::Item {
@@ -829,10 +829,10 @@ fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement {
 /// here (they'd be injected into the editor context menu / toolbar instead — those
 /// surfaces are intended-deferred for plugin contributions).
 fn inject_plugin_menu_items(
-    tree: &mut [crate::ui::commandpalette::MenuNode],
+    tree: &mut [crate::ui::pickers::commandpalette::MenuNode],
     commands: &[crate::plugin::UiContribution],
 ) {
-    use crate::ui::commandpalette::MenuNode;
+    use crate::ui::pickers::commandpalette::MenuNode;
     use crate::plugin::{CommandSlot, UiContribution};
     // Find the &Plugins submenu by its label (the static menu tree carries it).
     let Some(MenuNode::Submenu { children, .. }) = tree
@@ -1530,7 +1530,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::commandpalette::{CommandPalette, PaletteEvent};
+        use crate::ui::pickers::commandpalette::{CommandPalette, PaletteEvent};
         let palette = cx.new(|cx| CommandPalette::new(window, cx));
         let focus = palette.read(cx).focus_handle(cx);
         self.palette_sub = Some(cx.subscribe_in(
@@ -1668,7 +1668,7 @@ impl MainWindow {
 
     /// Dispatch a chosen command (from the menu bar, the command palette, or a
     /// global key binding). Maps a
-    /// [`CommandId`](crate::ui::commandpalette::CommandId) to the app operation that
+    /// [`CommandId`](crate::ui::pickers::commandpalette::CommandId) to the app operation that
     /// realizes it — handling **every** command id in the MENU CONTRACT (File /
     /// Edit / View / Help). Commands whose deeper workflow has no logic yet
     /// (some Edit clipboard ops, split editor) degrade gracefully — they notify
@@ -1676,7 +1676,7 @@ impl MainWindow {
     /// *does* something visible.
     fn run_menu_command(
         &mut self,
-        cmd: &crate::ui::commandpalette::CommandId,
+        cmd: &crate::ui::pickers::commandpalette::CommandId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1917,7 +1917,7 @@ impl MainWindow {
     /// platform the registry exposes no live factories, so the picker surfaces
     /// the (possibly stub) provider rows; a chosen row reports the selection.
     fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
+        use crate::ui::pickers::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
         // Build the picker's available-source rows from the SESSION-OWNED plugin
         // manager's registry (the in-tree File/Buffer/Snapshot/Null providers
         // registered through the contract) — the single source the rest of the app
@@ -3308,7 +3308,7 @@ impl MainWindow {
     /// `updateRecentFilesMenu` / `populateSourceMenu` / MCP label flip). Preserves
     /// the checkmark state (held separately on the menu bar).
     fn rebuild_menus(&mut self, cx: &mut Context<Self>) {
-        use crate::ui::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        use crate::ui::pickers::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
         // Skip entries whose file no longer exists (the C++
         // `updateRecentFilesMenu` exists-filter); the command carries the
         // ORIGINAL stored index so a reopen targets the right path.
@@ -4970,7 +4970,7 @@ impl MainWindow {
     /// first paint so the Theme submenu reflects reality.
     fn sync_theme_menu_checked(&mut self, cx: &mut Context<Self>) {
         let active = self.state.theme_name().to_string();
-        let names = crate::ui::commandpalette::theme_display_names();
+        let names = crate::ui::pickers::commandpalette::theme_display_names();
         self.menubar.update(cx, |mb, cx| {
             for n in &names {
                 mb.set_command_checked(&format!("view.theme.{n}"), *n == active, cx);
@@ -6781,7 +6781,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     let mut bindings = scope_editor_text_keys_to_non_field(crate::ui::editor::editor_key_bindings());
     bindings.extend(crate::ui::editor::inline_edit::field_key_bindings());
     bindings.extend(crate::ui::startpage::start_page_key_bindings());
-    bindings.extend(crate::ui::commandpalette::command_palette_key_bindings());
+    bindings.extend(crate::ui::pickers::commandpalette::command_palette_key_bindings());
     bindings.extend(crate::ui::findbar::find_bar_key_bindings());
     bindings.extend(crate::ui::scannerpanel::scanner_panel_key_bindings());
     // Global trigger to OPEN the palette (Zed: ctrl-shift-p / f1; cmd-shift-p on mac).
@@ -7758,7 +7758,7 @@ mod tests {
 
     #[test]
     fn relabel_command_flips_the_mcp_label() {
-        use crate::ui::commandpalette::{menu_tree_with, MenuNode};
+        use crate::ui::pickers::commandpalette::{menu_tree_with, MenuNode};
         let mut tree = menu_tree_with(&[], &[]);
         super::relabel_command(&mut tree, "tools.mcp", "Stop MCP Server");
         // Find the relabelled leaf.
@@ -7836,8 +7836,8 @@ mod tests {
 
     /// The direct children-commands of the &Plugins submenu, in order (the menu-bar
     /// surface the F3 injection targets).
-    fn plugins_submenu_commands(tree: &[crate::ui::commandpalette::MenuNode]) -> Vec<String> {
-        use crate::ui::commandpalette::MenuNode;
+    fn plugins_submenu_commands(tree: &[crate::ui::pickers::commandpalette::MenuNode]) -> Vec<String> {
+        use crate::ui::pickers::commandpalette::MenuNode;
         for n in tree {
             if let MenuNode::Submenu { label, children } = n {
                 if label == "&Plugins" {
@@ -7858,7 +7858,7 @@ mod tests {
     fn plugins_menu_is_byte_identical_without_contributions() {
         // PARITY: with no plugin UI contributions, injecting leaves the &Plugins
         // submenu EXACTLY as the static tree built it — only [plugins.manage].
-        use crate::ui::commandpalette::menu_tree_with;
+        use crate::ui::pickers::commandpalette::menu_tree_with;
         let mut tree = menu_tree_with(&[], &[]);
         let before = plugins_submenu_commands(&tree);
         assert_eq!(before, ["plugins.manage"]);
@@ -7873,7 +7873,7 @@ mod tests {
         // static Manage Plugins… row (so the existing row is untouched, and the
         // dialog dialog/panel — not Menu-slot — are NOT injected as menu items).
         use crate::plugin::PluginManager;
-        use crate::ui::commandpalette::menu_tree_with;
+        use crate::ui::pickers::commandpalette::menu_tree_with;
         let mgr = PluginManager::with_builtins_and_demo();
         let mut tree = menu_tree_with(&[], &[]);
         super::inject_plugin_menu_items(&mut tree, &mgr.ui_contributions());

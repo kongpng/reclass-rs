@@ -64,7 +64,7 @@ pub struct DemoPlugin {
     last_target: Option<String>,
     /// The candidate rows the dialog's process table shows (the generalized
     /// `selectTarget` process list; static here since live enumeration is out of
-    /// scope, mirroring [`crate::ui::processpicker`]).
+    /// scope, mirroring [`crate::ui::pickers::processpicker`]).
     candidates: Vec<(u32, String)>,
 }
 

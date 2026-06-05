@@ -11,12 +11,12 @@
 //! Each surface lives in its own sibling module (gpui-free model + a thin view):
 //! - [`optionsdialog`](crate::ui::dialogs::optionsdialog) — Options dialog (§5).
 //! - [`gotoaddress`](crate::ui::dialogs::gotoaddress) — Goto-Address dialog (§7).
-//! - [`commandpalette`](crate::ui::commandpalette) — Command palette (§8).
+//! - [`commandpalette`](crate::ui::pickers::commandpalette) — Command palette (§8).
 //! - [`findbar`](crate::ui::findbar) — the Find bar (Ctrl+F).
 //! - [`messagebox`](crate::ui::dialogs::messagebox) — themed message/confirm/input (§3,§4).
-//! - [`typeselectorpopup`](crate::ui::typeselectorpopup) — type picker (§9).
-//! - [`enumpicker`](crate::ui::enumpicker) — enum picker (§10).
-//! - [`sourcechooser`](crate::ui::sourcechooser) — source chooser (§11).
+//! - [`typeselectorpopup`](crate::ui::pickers::typeselectorpopup) — type picker (§9).
+//! - [`enumpicker`](crate::ui::pickers::enumpicker) — enum picker (§10).
+//! - [`sourcechooser`](crate::ui::pickers::sourcechooser) — source chooser (§11).
 //! - [`hextoolbar`](crate::ui::hextoolbar) — hex toolbar (§12).
 //! - [`contextmenu`](crate::ui::contextmenu) — context menus (§0).
 //! - [`tooltip`](crate::ui::tooltip) — tooltips + hover previews (§15,§20).
@@ -34,9 +34,9 @@ pub mod gotoaddress;
 // Re-export the implemented dialog/popup views + their event types under one
 // roof (the "open a dialog" entry point the window wires to).
 #[cfg(feature = "ui")]
-pub use crate::ui::commandpalette::{CommandPalette, PaletteEvent};
+pub use crate::ui::pickers::commandpalette::{CommandPalette, PaletteEvent};
 #[cfg(feature = "ui")]
-pub use crate::ui::enumpicker::{EnumPickerEvent, EnumPickerPopup};
+pub use crate::ui::pickers::enumpicker::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
 pub use crate::ui::findbar::{FindBar, FindEvent};
 #[cfg(feature = "ui")]
@@ -46,9 +46,9 @@ pub use crate::ui::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
 #[cfg(feature = "ui")]
 pub use crate::ui::dialogs::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
 #[cfg(feature = "ui")]
-pub use crate::ui::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
+pub use crate::ui::pickers::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 #[cfg(feature = "ui")]
-pub use crate::ui::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
+pub use crate::ui::pickers::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
 
 /// The modal/overlay surfaces to be ported (widgets-dialogs.md). A catalogue
 /// only — each variant becomes its own gpui-component-backed view later.

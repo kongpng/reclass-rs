@@ -12,7 +12,7 @@
 //! [`DialogResult`](crate::plugin::contract::DialogResult) field set (so the
 //! plugin's `handle_dialog_closed` receives the chosen target — the C++
 //! `selectTarget` return). The proven `window.open_dialog` + subscription mount
-//! pattern (see [`crate::ui::processpicker`]) carries it into the modal layer.
+//! pattern (see [`crate::ui::pickers::processpicker`]) carries it into the modal layer.
 //!
 //! Gated behind the `ui` feature.
 

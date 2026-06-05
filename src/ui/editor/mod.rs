@@ -47,7 +47,7 @@ use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
 use crate::core::linemeta::K_COMMAND_ROW_ID;
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
 use crate::ui::findbar::{FindBar, FindEvent};
-use crate::ui::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
+use crate::ui::pickers::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 use crate::ui::design::color::with_alpha;
 use crate::ui::{design, tooltip};
 
@@ -6941,7 +6941,7 @@ mod tests {
         // extent is 12. `full_type_entries` itself needs a gpui Window, so we
         // exercise the same two pieces it composes: the extent source
         // (`tree.struct_span`) and the `TypeEntry::composite` carry-through.
-        use crate::ui::typeselectorpopup::{EntryKind, TypeEntry};
+        use crate::ui::pickers::typeselectorpopup::{EntryKind, TypeEntry};
         let c = editor_with_struct();
         let tree = c.tree();
         let player_idx = tree

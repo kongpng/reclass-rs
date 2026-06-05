@@ -9,9 +9,9 @@ use crate::core::NodeKind;
 use gpui::*;
 
 impl super::RcxEditor {
-    /// Open the [`TypeSelectorPopup`](crate::ui::typeselectorpopup::TypeSelectorPopup)
+    /// Open the [`TypeSelectorPopup`](crate::ui::pickers::typeselectorpopup::TypeSelectorPopup)
     /// over `target`'s current kind and subscribe to its outcome. On
-    /// [`Chosen`](crate::ui::typeselectorpopup::TypeSelectorEvent::Chosen) apply the
+    /// [`Chosen`](crate::ui::pickers::typeselectorpopup::TypeSelectorEvent::Chosen) apply the
     /// kind via `change_node_kind` then the chosen [`Modifier`]
     /// (pointer/array/etc.) via the matching controller ops + `apply_document`; on
     /// Cancel close the modal. Opened through the host's centered-modal overlay
@@ -41,9 +41,9 @@ impl super::RcxEditor {
     pub(super) fn full_type_entries(
         &self,
         exclude_id: u64,
-        mode: crate::ui::typeselectorpopup::TypePopupMode,
-    ) -> Vec<crate::ui::typeselectorpopup::TypeEntry> {
-        use crate::ui::typeselectorpopup::{default_type_entries, TypeEntry, TypePopupMode};
+        mode: crate::ui::pickers::typeselectorpopup::TypePopupMode,
+    ) -> Vec<crate::ui::pickers::typeselectorpopup::TypeEntry> {
+        use crate::ui::pickers::typeselectorpopup::{default_type_entries, TypeEntry, TypePopupMode};
         let mut entries: Vec<TypeEntry> = Vec::new();
         if mode == TypePopupMode::PointerTarget {
             // Synthetic "void" target — a Hex8-backed primitive applied as refId 0.
@@ -95,7 +95,7 @@ impl super::RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::typeselectorpopup::TypePopupMode;
+        use crate::ui::pickers::typeselectorpopup::TypePopupMode;
         let mode = match edit_target {
             EditTarget::ArrayElementType => TypePopupMode::ArrayElement,
             EditTarget::PointerTarget => TypePopupMode::PointerTarget,
@@ -110,7 +110,7 @@ impl super::RcxEditor {
     /// `*`/`[]` modifiers); on Chosen the kind is applied to the root node via
     /// [`apply_type_choice`].
     pub(super) fn open_root_type_selector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::typeselectorpopup::TypePopupMode;
+        use crate::ui::pickers::typeselectorpopup::TypePopupMode;
         let root_id = self.controller.view_root_id();
         let root_idx = self.controller.tree().index_of_id(root_id);
         let kind = if root_idx >= 0 {
@@ -136,13 +136,13 @@ impl super::RcxEditor {
     /// the host's centered-modal overlay via [`RcxEditorEvent::OpenModal`].
     fn spawn_type_selector(
         &mut self,
-        entries: Vec<crate::ui::typeselectorpopup::TypeEntry>,
+        entries: Vec<crate::ui::pickers::typeselectorpopup::TypeEntry>,
         target: ContextTarget,
-        mode: crate::ui::typeselectorpopup::TypePopupMode,
+        mode: crate::ui::pickers::typeselectorpopup::TypePopupMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::typeselectorpopup::{TypePopupMode, TypeSelectorEvent, TypeSelectorPopup};
+        use crate::ui::pickers::typeselectorpopup::{TypePopupMode, TypeSelectorEvent, TypeSelectorPopup};
         // The popup opens pre-highlighting the node's ACTUAL current type (the C++
         // `setTypes(.., &currentEntry)`): for a composite that means the referenced
         // struct id (pre-select by structId), for a primitive the kind. Also compute
@@ -248,17 +248,17 @@ impl super::RcxEditor {
     #[allow(clippy::too_many_arguments)]
     fn apply_type_choice(
         &mut self,
-        mode: crate::ui::typeselectorpopup::TypePopupMode,
+        mode: crate::ui::pickers::typeselectorpopup::TypePopupMode,
         node_id: u64,
         kind: NodeKind,
-        modifier: Option<crate::ui::typeselectorpopup::Modifier>,
-        entry_kind: crate::ui::typeselectorpopup::EntryKind,
+        modifier: Option<crate::ui::pickers::typeselectorpopup::Modifier>,
+        entry_kind: crate::ui::pickers::typeselectorpopup::EntryKind,
         struct_id: u64,
         display_name: &str,
         cx: &mut Context<Self>,
     ) {
         use crate::controller::{TypeEntryKind, TypePopupChoice, TypePopupMode as CMode};
-        use crate::ui::typeselectorpopup::{EntryKind, Modifier, TypePopupMode};
+        use crate::ui::pickers::typeselectorpopup::{EntryKind, Modifier, TypePopupMode};
 
         // Map the popup's mode → the controller's mode (same four cases).
         let cmode = match mode {
@@ -361,7 +361,7 @@ impl super::RcxEditor {
             &popup,
             window,
             move |this, _p, ev: &SourceChooserEvent, _window, cx| {
-                use crate::ui::sourcechooser::SourcePick;
+                use crate::ui::pickers::sourcechooser::SourcePick;
                 cx.emit(RcxEditorEvent::CloseModal);
                 this._source_chooser_sub = None;
                 match ev {
@@ -417,7 +417,7 @@ impl super::RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::enumpicker::{EnumPickerEvent, Member};
+        use crate::ui::pickers::enumpicker::{EnumPickerEvent, Member};
         let (enum_name, members, current) = {
             let n = &self.controller.tree().nodes[idx];
             let members: Vec<Member> = n
@@ -437,7 +437,7 @@ impl super::RcxEditor {
         let resolved_addr = self.line_meta(line).map(|lm| lm.offset_addr).unwrap_or(0);
         let sub_line = self.line_meta(line).map(|lm| lm.sub_line).unwrap_or(0);
         let popup = cx.new(|cx| {
-            crate::ui::enumpicker::EnumPickerPopup::new(&enum_name, members, current, window, cx)
+            crate::ui::pickers::enumpicker::EnumPickerPopup::new(&enum_name, members, current, window, cx)
         });
         let focus = popup.read(cx).focus_handle(cx);
         self._enum_picker_sub = Some(cx.subscribe_in(
