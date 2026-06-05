@@ -28,7 +28,8 @@ use crate::core::linemeta::{
 use crate::core::{
     alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node,
     is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string, size_for_kind,
-    Command, ComposeResult, LineKind, Node, NodeKind, NodeTree, OffsetAdj, ValueHistory,
+    BitfieldMember, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree, OffsetAdj,
+    ValueHistory,
     K_COMMON_TYPES,
 };
 use crate::format;
@@ -1072,6 +1073,15 @@ impl RcxController {
         self.doc.tree.touch();
         let mut success = true;
 
+        // Trivial undo/redo field assignments: `n.field = if undo { old } else { new }`.
+        macro_rules! apply_field {
+            ($node_id:expr, $field:ident, $old:expr, $new:expr) => {
+                if let Some(n) = self.node_mut($node_id) {
+                    n.$field = if is_undo { $old } else { $new };
+                }
+            };
+        }
+
         match cmd {
             Command::ChangeKind {
                 node_id,
@@ -1101,24 +1111,12 @@ impl RcxController {
                 node_id,
                 old_name,
                 new_name,
-            } => {
-                if let Some(n) = self.node_mut(*node_id) {
-                    n.name = if is_undo {
-                        old_name.clone()
-                    } else {
-                        new_name.clone()
-                    };
-                }
-            }
+            } => apply_field!(*node_id, name, old_name.clone(), new_name.clone()),
             Command::Collapse {
                 node_id,
                 old_state,
                 new_state,
-            } => {
-                if let Some(n) = self.node_mut(*node_id) {
-                    n.collapsed = if is_undo { *old_state } else { *new_state };
-                }
-            }
+            } => apply_field!(*node_id, collapsed, *old_state, *new_state),
             Command::Insert { node, off_adjs } => {
                 if is_undo {
                     self.revert_off_adjs(off_adjs);
@@ -1229,28 +1227,12 @@ impl RcxController {
                 node_id,
                 old_name,
                 new_name,
-            } => {
-                if let Some(n) = self.node_mut(*node_id) {
-                    n.struct_type_name = if is_undo {
-                        old_name.clone()
-                    } else {
-                        new_name.clone()
-                    };
-                }
-            }
+            } => apply_field!(*node_id, struct_type_name, old_name.clone(), new_name.clone()),
             Command::ChangeClassKeyword {
                 node_id,
                 old_keyword,
                 new_keyword,
-            } => {
-                if let Some(n) = self.node_mut(*node_id) {
-                    n.class_keyword = if is_undo {
-                        old_keyword.clone()
-                    } else {
-                        new_keyword.clone()
-                    };
-                }
-            }
+            } => apply_field!(*node_id, class_keyword, old_keyword.clone(), new_keyword.clone()),
             Command::ChangeOffset {
                 node_id,
                 old_offset,
@@ -1623,6 +1605,145 @@ impl RcxController {
         }
     }
 
+    /// Offset adjustments for siblings at or past `from_offset` when the field at
+    /// `skip_idx` grows/shrinks by `delta` — the shared insert/remove/duplicate/
+    /// resize sibling-shift walk. Empty when `delta == 0`.
+    fn sibling_offset_adjs(
+        &self,
+        parent_id: u64,
+        skip_idx: Option<usize>,
+        from_offset: i32,
+        delta: i32,
+    ) -> Vec<OffsetAdj> {
+        let mut adjs: Vec<OffsetAdj> = Vec::new();
+        if delta == 0 {
+            return adjs;
+        }
+        for si in self.doc.tree.children_of(parent_id) {
+            if Some(si) == skip_idx {
+                continue;
+            }
+            let sib = &self.doc.tree.nodes[si];
+            if sib.offset >= from_offset {
+                adjs.push(OffsetAdj {
+                    node_id: sib.id,
+                    old_offset: sib.offset,
+                    new_offset: sib.offset + delta,
+                });
+            }
+        }
+        adjs
+    }
+
+    /// Fill `[start_offset, start_offset+total)` with padding fields. `uniform`
+    /// forces one (kind,size) for every pad (the hex→hex resize case); otherwise a
+    /// largest-first Hex64/32/16/8 ladder is used.
+    fn fill_hex_pads(
+        &mut self,
+        parent_id: u64,
+        start_offset: i32,
+        total: i32,
+        uniform: Option<(NodeKind, i32)>,
+    ) {
+        let mut pad_offset = start_offset;
+        let mut gap = total;
+        while gap > 0 {
+            let (pad_kind, pad_size) = match uniform {
+                Some(u) => u,
+                None if gap >= 8 => (NodeKind::Hex64, 8),
+                None if gap >= 4 => (NodeKind::Hex32, 4),
+                None if gap >= 2 => (NodeKind::Hex16, 2),
+                None => (NodeKind::Hex8, 1),
+            };
+            self.insert_node(
+                parent_id,
+                pad_offset,
+                pad_kind,
+                &format!("pad_{:02x}", pad_offset),
+            );
+            pad_offset += pad_size;
+            gap -= pad_size;
+        }
+    }
+
+    /// The viewed root class's `(target_id, node_index)`, or `None` when there is no
+    /// root class target — the shared preamble of the root keyword/name edits.
+    fn resolve_root_class(&self) -> Option<(u64, i32)> {
+        let target_id = self.root_class_target_id();
+        if target_id == 0 {
+            return None;
+        }
+        let idx = self.doc.tree.index_of_id(target_id);
+        if idx < 0 {
+            return None;
+        }
+        Some((target_id, idx))
+    }
+
+    /// Clone-edit-push envelope for the enum-member operations: clones the member
+    /// list, runs `edit`, and pushes `ChangeEnumMembers` only when it returns `true`
+    /// (a failed bounds check is a no-op). Returns whether a command was queued.
+    fn edit_enum_members(
+        &mut self,
+        node_id: u64,
+        edit: impl FnOnce(&mut Vec<(String, i64)>) -> bool,
+    ) -> bool {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return false;
+        }
+        if !self.doc.tree.nodes[ni as usize].is_enum() {
+            return false;
+        }
+        let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
+        let mut members = old_members.clone();
+        if !edit(&mut members) {
+            return false;
+        }
+        self.push_command(Command::ChangeEnumMembers {
+            node_id,
+            old_members,
+            new_members: members,
+        });
+        true
+    }
+
+    /// The `(member, element_kind, addr)` preamble shared by the three bitfield
+    /// member operations, or `None` when the node isn't a valid bitfield member.
+    fn resolve_bitfield_member(
+        &self,
+        node_id: u64,
+        member_idx: usize,
+    ) -> Option<(BitfieldMember, NodeKind, u64)> {
+        let ni = self.doc.tree.index_of_id(node_id);
+        if ni < 0 {
+            return None;
+        }
+        let (member, element_kind) = {
+            let n = &self.doc.tree.nodes[ni as usize];
+            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
+                return None;
+            }
+            (n.bitfield_members[member_idx].clone(), n.element_kind)
+        };
+        let signed_off = self.doc.tree.compute_offset(ni);
+        if signed_off < 0 {
+            return None;
+        }
+        let addr = self.doc.tree.base_address + signed_off as u64;
+        Some((member, element_kind, addr))
+    }
+
+    /// `(1 << width) - 1`, saturating to `u64::MAX` at width ≥ 64 — the bitfield
+    /// member value mask.
+    fn bitfield_max(width: u8) -> u64 {
+        if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        }
+    }
+
     /// `changeNodeKind(nodeIdx, newKind)` (`controller.cpp:2078`).
     pub fn change_node_kind(&mut self, node_idx: usize, new_kind: NodeKind) {
         if node_idx >= self.doc.tree.nodes.len() {
@@ -1643,7 +1764,7 @@ impl RcxController {
 
         if new_size > 0 && new_size < old_size {
             // Shrinking — insert hex padding (no offset shift).
-            let mut gap = old_size - new_size;
+            let gap = old_size - new_size;
             let parent_id = node.parent_id;
             let base_offset = node.offset + new_size;
 
@@ -1672,28 +1793,12 @@ impl RcxController {
             }
 
             let hex_to_hex = is_hex_node(node.kind) && is_hex_node(new_kind);
-            let mut pad_offset = base_offset;
-            while gap > 0 {
-                let (pad_kind, pad_size) = if hex_to_hex {
-                    (new_kind, new_size)
-                } else if gap >= 8 {
-                    (NodeKind::Hex64, 8)
-                } else if gap >= 4 {
-                    (NodeKind::Hex32, 4)
-                } else if gap >= 2 {
-                    (NodeKind::Hex16, 2)
-                } else {
-                    (NodeKind::Hex8, 1)
-                };
-                self.insert_node(
-                    parent_id,
-                    pad_offset,
-                    pad_kind,
-                    &format!("pad_{:02x}", pad_offset),
-                );
-                pad_offset += pad_size;
-                gap -= pad_size;
-            }
+            let uniform = if hex_to_hex {
+                Some((new_kind, new_size))
+            } else {
+                None
+            };
+            self.fill_hex_pads(parent_id, base_offset, gap, uniform);
 
             self.end_macro();
             self.suppress_refresh = was_suppressed;
@@ -1703,24 +1808,16 @@ impl RcxController {
         } else {
             // Same size or larger — adjust sibling offsets.
             let delta = new_size - old_size;
-            let mut adjs: Vec<OffsetAdj> = Vec::new();
-            if delta != 0 && old_size > 0 && new_size > 0 {
-                let old_end = node.offset + old_size;
-                let siblings = self.doc.tree.children_of(node.parent_id);
-                for si in siblings {
-                    if si == node_idx {
-                        continue;
-                    }
-                    let sib = &self.doc.tree.nodes[si];
-                    if sib.offset >= old_end {
-                        adjs.push(OffsetAdj {
-                            node_id: sib.id,
-                            old_offset: sib.offset,
-                            new_offset: sib.offset + delta,
-                        });
-                    }
-                }
-            }
+            let adjs = if old_size > 0 && new_size > 0 {
+                self.sibling_offset_adjs(
+                    node.parent_id,
+                    Some(node_idx),
+                    node.offset + old_size,
+                    delta,
+                )
+            } else {
+                Vec::new()
+            };
             let needs_rename = is_hex_node(node.kind) && !is_hex_node(new_kind);
             if needs_rename {
                 self.begin_macro("Change type");
@@ -1801,17 +1898,7 @@ impl RcxController {
         };
         n.id = self.doc.tree.reserve_id();
         let insert_size = size_for_kind(kind);
-        let mut adjs: Vec<OffsetAdj> = Vec::new();
-        for si in self.doc.tree.children_of(before.parent_id) {
-            let sib = &self.doc.tree.nodes[si];
-            if sib.offset >= before.offset {
-                adjs.push(OffsetAdj {
-                    node_id: sib.id,
-                    old_offset: sib.offset,
-                    new_offset: sib.offset + insert_size,
-                });
-            }
-        }
+        let adjs = self.sibling_offset_adjs(before.parent_id, None, before.offset, insert_size);
         self.push_command(Command::Insert {
             node: n,
             off_adjs: adjs,
@@ -1977,22 +2064,11 @@ impl RcxController {
         let deleted_size = self.node_size(&node);
         let deleted_end = node.offset + deleted_size;
 
-        let mut adjs: Vec<OffsetAdj> = Vec::new();
-        if parent_id != 0 {
-            for si in self.doc.tree.children_of(parent_id) {
-                if si == node_idx {
-                    continue;
-                }
-                let sib = &self.doc.tree.nodes[si];
-                if sib.offset >= deleted_end {
-                    adjs.push(OffsetAdj {
-                        node_id: sib.id,
-                        old_offset: sib.offset,
-                        new_offset: sib.offset - deleted_size,
-                    });
-                }
-            }
-        }
+        let adjs = if parent_id != 0 {
+            self.sibling_offset_adjs(parent_id, Some(node_idx), deleted_end, -deleted_size)
+        } else {
+            Vec::new()
+        };
 
         let subtree: Vec<Node> = self
             .doc
@@ -2179,14 +2255,9 @@ impl RcxController {
     /// double-click path that *cycles* the root class keyword (struct↔class). Only
     /// allows class↔struct (never enum), pushes an undoable `ChangeClassKeyword`.
     pub fn convert_root_keyword(&mut self, new_keyword: &str) {
-        let target_id = self.root_class_target_id();
-        if target_id == 0 {
+        let Some((target_id, idx)) = self.resolve_root_class() else {
             return;
-        }
-        let idx = self.doc.tree.index_of_id(target_id);
-        if idx < 0 {
-            return;
-        }
+        };
         let old_kw = self.doc.tree.nodes[idx as usize]
             .resolved_class_keyword()
             .to_string();
@@ -2217,14 +2288,9 @@ impl RcxController {
         if kw != "struct" && kw != "class" && kw != "enum" {
             return;
         }
-        let target_id = self.root_class_target_id();
-        if target_id == 0 {
+        let Some((target_id, idx)) = self.resolve_root_class() else {
             return;
-        }
-        let idx = self.doc.tree.index_of_id(target_id);
-        if idx < 0 {
-            return;
-        }
+        };
         let old_kw = self.doc.tree.nodes[idx as usize]
             .resolved_class_keyword()
             .to_string();
@@ -2246,14 +2312,9 @@ impl RcxController {
         if text.is_empty() {
             return;
         }
-        let target_id = self.root_class_target_id();
-        if target_id == 0 {
+        let Some((target_id, idx)) = self.resolve_root_class() else {
             return;
-        }
-        let idx = self.doc.tree.index_of_id(target_id);
-        if idx < 0 {
-            return;
-        }
+        };
         let old_name = self.doc.tree.nodes[idx as usize].struct_type_name.clone();
         if old_name == text {
             return;
@@ -2277,22 +2338,11 @@ impl RcxController {
         let copy_size = src.byte_size();
         let copy_offset = src.offset + copy_size;
 
-        let mut adjs: Vec<OffsetAdj> = Vec::new();
-        if src.parent_id != 0 {
-            for si in self.doc.tree.children_of(src.parent_id) {
-                if si == node_idx {
-                    continue;
-                }
-                let sib = &self.doc.tree.nodes[si];
-                if sib.offset >= copy_offset {
-                    adjs.push(OffsetAdj {
-                        node_id: sib.id,
-                        old_offset: sib.offset,
-                        new_offset: sib.offset + copy_size,
-                    });
-                }
-            }
-        }
+        let adjs = if src.parent_id != 0 {
+            self.sibling_offset_adjs(src.parent_id, Some(node_idx), copy_offset, copy_size)
+        } else {
+            Vec::new()
+        };
         let n = Node {
             kind: src.kind,
             name: format!("{}_copy", src.name),
@@ -3162,22 +3212,7 @@ impl RcxController {
     /// `(value, max_val)`, or `None` if the node is not a valid bitfield member.
     /// Reads through [`format::extract_bits`] (the same path the formatter uses).
     pub fn bitfield_member_value(&self, node_id: u64, member_idx: usize) -> Option<(u64, u64)> {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
-            return None;
-        }
-        let (member, element_kind) = {
-            let n = &self.doc.tree.nodes[ni as usize];
-            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
-                return None;
-            }
-            (n.bitfield_members[member_idx].clone(), n.element_kind)
-        };
-        let signed_off = self.doc.tree.compute_offset(ni);
-        if signed_off < 0 {
-            return None;
-        }
-        let addr = self.doc.tree.base_address + signed_off as u64;
+        let (member, element_kind, addr) = self.resolve_bitfield_member(node_id, member_idx)?;
         let val = format::extract_bits(
             &*self.doc.provider,
             addr,
@@ -3185,12 +3220,7 @@ impl RcxController {
             member.bit_offset,
             member.bit_width,
         );
-        let max_val = if member.bit_width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << member.bit_width) - 1
-        };
-        Some((val, max_val))
+        Some((val, Self::bitfield_max(member.bit_width)))
     }
 
     /// `toggleBitfieldBit(nodeId, memberIdx)` (`controller.cpp:2825`).
@@ -3199,33 +3229,21 @@ impl RcxController {
     /// No-op unless the node is a bitfield, the member index is in range, and the
     /// provider is writable.
     pub fn toggle_bitfield_bit(&mut self, node_id: u64, member_idx: usize) {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
+        let Some((member, element_kind, addr)) = self.resolve_bitfield_member(node_id, member_idx)
+        else {
             return;
-        }
-        let (is_bitfield, member, container_size) = {
-            let n = &self.doc.tree.nodes[ni as usize];
-            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
-                return;
-            }
-            let cs = {
-                let s = size_for_kind(n.element_kind);
-                if s <= 0 {
-                    4
-                } else {
-                    s
-                }
-            };
-            (true, n.bitfield_members[member_idx].clone(), cs)
         };
-        if !is_bitfield || !self.doc.provider.is_writable() {
+        if !self.doc.provider.is_writable() {
             return;
         }
-        let signed_off = self.doc.tree.compute_offset(ni);
-        if signed_off < 0 {
-            return;
-        }
-        let addr = self.doc.tree.base_address + signed_off as u64;
+        let container_size = {
+            let s = size_for_kind(element_kind);
+            if s <= 0 {
+                4
+            } else {
+                s
+            }
+        };
 
         let mut old_bytes = vec![0u8; container_size as usize];
         self.doc.provider.read(addr, &mut old_bytes);
@@ -3253,39 +3271,23 @@ impl RcxController {
         member_idx: usize,
         new_value_text: &str,
     ) -> bool {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
+        let Some((member, element_kind, addr)) = self.resolve_bitfield_member(node_id, member_idx)
+        else {
             return false;
-        }
-        let (member, container_size) = {
-            let n = &self.doc.tree.nodes[ni as usize];
-            if !n.is_bitfield() || member_idx >= n.bitfield_members.len() {
-                return false;
-            }
-            let cs = {
-                let s = size_for_kind(n.element_kind);
-                if s <= 0 {
-                    4
-                } else {
-                    s
-                }
-            };
-            (n.bitfield_members[member_idx].clone(), cs)
         };
         if !self.doc.provider.is_writable() {
             return false;
         }
-        let signed_off = self.doc.tree.compute_offset(ni);
-        if signed_off < 0 {
-            return false;
-        }
-        let addr = self.doc.tree.base_address + signed_off as u64;
-
-        let max_val: u64 = if member.bit_width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << member.bit_width) - 1
+        let container_size = {
+            let s = size_for_kind(element_kind);
+            if s <= 0 {
+                4
+            } else {
+                s
+            }
         };
+
+        let max_val: u64 = Self::bitfield_max(member.bit_width);
 
         // Parse the typed value (hex with 0x prefix, else decimal).
         let s = new_value_text.trim();
@@ -3355,14 +3357,7 @@ impl RcxController {
     /// context menu only offers Toggle Bit / Edit Value (`controller.cpp:3348`),
     /// so this is a no-op (returns `false`) for bitfields.
     pub fn add_member(&mut self, node_id: u64, at: Option<usize>) -> bool {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
-            return false;
-        }
-        let is_enum = self.doc.tree.nodes[ni as usize].is_enum();
-        if is_enum {
-            let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
-            let mut members = old_members.clone();
+        self.edit_enum_members(node_id, |members| {
             let pos = at.unwrap_or(members.len()).min(members.len());
             // Value policy (`controller.cpp:3321`/`3368`): a strict append uses
             // `last + 1`; an insert before `pos` uses `predecessor + 1` (or 0 at
@@ -3375,14 +3370,8 @@ impl RcxController {
                 0
             };
             members.insert(pos, ("NewMember".to_string(), val));
-            self.push_command(Command::ChangeEnumMembers {
-                node_id,
-                old_members,
-                new_members: members,
-            });
-            return true;
-        }
-        false
+            true
+        })
     }
 
     /// Rename enum member `member_idx` to `name` (`controller.cpp:1142-1149`).
@@ -3391,64 +3380,39 @@ impl RcxController {
     /// context menu only offers Toggle Bit / Edit Value, `controller.cpp:3348`),
     /// so this is a no-op (returns `false`) for bitfields.
     pub fn rename_member(&mut self, node_id: u64, member_idx: usize, name: &str) -> bool {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
-            return false;
-        }
-        let is_enum = self.doc.tree.nodes[ni as usize].is_enum();
-        if is_enum {
-            let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
-            if member_idx >= old_members.len() {
+        self.edit_enum_members(node_id, |members| {
+            if member_idx >= members.len() {
                 return false;
             }
-            let mut members = old_members.clone();
             members[member_idx].0 = name.to_string();
-            self.push_command(Command::ChangeEnumMembers {
-                node_id,
-                old_members,
-                new_members: members,
-            });
-            return true;
-        }
-        false
+            true
+        })
     }
 
     /// Set enum member `member_idx`'s value (`controller.cpp:1222-1239`). Accepts
     /// decimal or `0x`-prefixed hex; no-op on parse failure.
     pub fn set_member_value(&mut self, node_id: u64, member_idx: usize, value_text: &str) -> bool {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
-            return false;
-        }
-        if !self.doc.tree.nodes[ni as usize].is_enum() {
-            return false;
-        }
-        let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
-        if member_idx >= old_members.len() {
-            return false;
-        }
-        let s = value_text.trim();
-        // toLongLong(10) then toLongLong(16) fallback, mirroring the C++.
-        let parsed = s
-            .parse::<i64>()
-            .ok()
-            .or_else(|| {
-                s.strip_prefix("0x")
-                    .or_else(|| s.strip_prefix("0X"))
-                    .and_then(|h| i64::from_str_radix(h, 16).ok())
-            })
-            .or_else(|| i64::from_str_radix(s, 16).ok());
-        let Some(val) = parsed else {
-            return false;
-        };
-        let mut members = old_members.clone();
-        members[member_idx].1 = val;
-        self.push_command(Command::ChangeEnumMembers {
-            node_id,
-            old_members,
-            new_members: members,
-        });
-        true
+        self.edit_enum_members(node_id, |members| {
+            if member_idx >= members.len() {
+                return false;
+            }
+            let s = value_text.trim();
+            // toLongLong(10) then toLongLong(16) fallback, mirroring the C++.
+            let parsed = s
+                .parse::<i64>()
+                .ok()
+                .or_else(|| {
+                    s.strip_prefix("0x")
+                        .or_else(|| s.strip_prefix("0X"))
+                        .and_then(|h| i64::from_str_radix(h, 16).ok())
+                })
+                .or_else(|| i64::from_str_radix(s, 16).ok());
+            let Some(val) = parsed else {
+                return false;
+            };
+            members[member_idx].1 = val;
+            true
+        })
     }
 
     /// Delete enum member `member_idx` (`Remove Member`, `controller.cpp:3337`),
@@ -3458,26 +3422,13 @@ impl RcxController {
     /// context menu only offers Toggle Bit / Edit Value, `controller.cpp:3348`),
     /// so this is a no-op (returns `false`) for bitfields.
     pub fn delete_member(&mut self, node_id: u64, member_idx: usize) -> bool {
-        let ni = self.doc.tree.index_of_id(node_id);
-        if ni < 0 {
-            return false;
-        }
-        let is_enum = self.doc.tree.nodes[ni as usize].is_enum();
-        if is_enum {
-            let old_members = self.doc.tree.nodes[ni as usize].enum_members.clone();
-            if member_idx >= old_members.len() {
+        self.edit_enum_members(node_id, |members| {
+            if member_idx >= members.len() {
                 return false;
             }
-            let mut members = old_members.clone();
             members.remove(member_idx);
-            self.push_command(Command::ChangeEnumMembers {
-                node_id,
-                old_members,
-                new_members: members,
-            });
-            return true;
-        }
-        false
+            true
+        })
     }
 
     /// Resolve an address expression through [`AddressParser`] against the active
@@ -3745,27 +3696,7 @@ impl RcxController {
         });
 
         // Largest-first hex pads covering the whole byte range.
-        let mut pad_offset = base_offset;
-        let mut gap = total_size;
-        while gap > 0 {
-            let (pad_kind, pad_size) = if gap >= 8 {
-                (NodeKind::Hex64, 8)
-            } else if gap >= 4 {
-                (NodeKind::Hex32, 4)
-            } else if gap >= 2 {
-                (NodeKind::Hex16, 2)
-            } else {
-                (NodeKind::Hex8, 1)
-            };
-            self.insert_node(
-                parent_id,
-                pad_offset,
-                pad_kind,
-                &format!("pad_{:02x}", pad_offset),
-            );
-            pad_offset += pad_size;
-            gap -= pad_size;
-        }
+        self.fill_hex_pads(parent_id, base_offset, total_size, None);
 
         self.end_macro();
         self.suppress_refresh = was;
