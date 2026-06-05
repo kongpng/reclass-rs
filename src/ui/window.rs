@@ -968,6 +968,12 @@ fn unique_dirty_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
+/// A command's own toast, unless the live host already surfaced it (dedup the
+/// `CommandResult.toast` against the host's drained toast list).
+fn surface_command_toast(res_toast: Option<String>, already: &[String]) -> Option<String> {
+    res_toast.filter(|m| !already.iter().any(|t| t == m))
+}
+
 /// Generate a thin global-key-binding handler routing a gpui action to its MENU
 /// CONTRACT command via `run_menu_command`.
 macro_rules! menu_action {
@@ -2524,6 +2530,21 @@ impl MainWindow {
         }
     }
 
+    /// A scoped [`LivePluginHost`] wired to the document area + settings — the
+    /// shared 4-arg construction behind every F3 plugin-routing path.
+    fn live_host<'a>(
+        &self,
+        window: &'a mut Window,
+        cx: &'a mut App,
+    ) -> crate::ui::plugins::pluginhost::LivePluginHost<'a> {
+        crate::ui::plugins::pluginhost::LivePluginHost::new(
+            self.document_area.clone(),
+            self.settings.clone(),
+            window,
+            cx,
+        )
+    }
+
     /// Route one [`PluginPanelEvent`](crate::ui::plugins::pluginpanel::PluginPanelEvent) through
     /// the manager (design §6 Phase 2 Elm loop): build a scoped `LivePluginHost`,
     /// call `handle_ui_event`, push any fresh tree back into the panel, then drain
@@ -2538,12 +2559,7 @@ impl MainWindow {
     ) {
         // Scope the host so its `cx` borrow ends before we re-borrow `cx`.
         let (tree, toasts, open_dialogs, rerenders) = {
-            let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
-                self.document_area.clone(),
-                self.settings.clone(),
-                window,
-                cx,
-            );
+            let mut host = self.live_host(window, cx);
             let tree =
                 self.plugin_manager
                     .handle_ui_event(&ev.view_id, ev.event.clone(), &mut host);
@@ -2581,12 +2597,7 @@ impl MainWindow {
     /// recognizes (a contributed menu/palette item).
     fn dispatch_plugin_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let (cmd_toast, toasts, open_dialogs, rerenders) = {
-            let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
-                self.document_area.clone(),
-                self.settings.clone(),
-                window,
-                cx,
-            );
+            let mut host = self.live_host(window, cx);
             let res = self
                 .plugin_manager
                 .handle_command(id, serde_json::Value::Null, &mut host);
@@ -2595,7 +2606,7 @@ impl MainWindow {
             // Surface a command's own `CommandResult::toast` ONLY if the handler
             // didn't already push the same message through `host.show_toast` (the
             // demo's ping does both — collecting both here would double-toast).
-            let cmd_toast = res.toast.filter(|m| !toasts.iter().any(|t| t == m));
+            let cmd_toast = surface_command_toast(res.toast, &toasts);
             (cmd_toast, toasts, r.take_open_dialogs(), r.take_rerenders())
         };
         if let Some(msg) = cmd_toast {
@@ -2636,12 +2647,7 @@ impl MainWindow {
                 crate::ui::plugins::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
                     let dialog_id = view_id.clone();
                     let (tree, toasts, open_dialogs, close_dialogs, rerenders) = {
-                        let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
-                            this.document_area.clone(),
-                            this.settings.clone(),
-                            window,
-                            cx,
-                        );
+                        let mut host = this.live_host(window, cx);
                         let tree =
                             this.plugin_manager
                                 .handle_ui_event(view_id, event.clone(), &mut host);
@@ -2666,12 +2672,7 @@ impl MainWindow {
                 }
                 crate::ui::plugins::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
                     let (cmd_toast, toasts, open_dialogs, rerenders) = {
-                        let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
-                            this.document_area.clone(),
-                            this.settings.clone(),
-                            window,
-                            cx,
-                        );
+                        let mut host = this.live_host(window, cx);
                         let res = this.plugin_manager.handle_dialog_closed(
                             view_id,
                             result.clone(),
@@ -2685,7 +2686,7 @@ impl MainWindow {
                         // handler already pushed the same message through the host
                         // (mirror of `dispatch_plugin_command`'s dedup → no
                         // double-toast).
-                        let cmd_toast = res.toast.filter(|m| !toasts.iter().any(|t| t == m));
+                        let cmd_toast = surface_command_toast(res.toast, &toasts);
                         (cmd_toast, toasts, r.take_open_dialogs(), r.take_rerenders())
                     };
                     if let Some(msg) = cmd_toast {
@@ -2778,12 +2779,7 @@ impl MainWindow {
                     // library, then refresh the rows. The host borrows `cx`, so it is
                     // scoped + dropped before we re-borrow `cx` for `notify`/`update`.
                     let toasts = {
-                        let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
-                            this.document_area.clone(),
-                            this.settings.clone(),
-                            window,
-                            cx,
-                        );
+                        let mut host = this.live_host(window, cx);
                         this.plugin_manager.safe_unload(identifier, &mut host);
                         host.take_toasts()
                     };
