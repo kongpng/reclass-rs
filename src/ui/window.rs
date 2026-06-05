@@ -1956,14 +1956,7 @@ impl MainWindow {
                 ProcessPickEvent::Cancel => window.close_dialog(cx),
             },
         ));
-        let picker_for_modal = picker.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(720.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(picker_for_modal.clone())
-        });
-        cx.notify();
+        self.present_modal(&picker, 720., 80., None, window, cx);
     }
 
     /// File ▸ Data Source ▸ {Remote / WinDbg / ReClass.NET} — these live providers
@@ -2505,15 +2498,7 @@ impl MainWindow {
                 RttiBrowserEvent::Close => window.close_dialog(cx),
             },
         ));
-        let dlg_for_modal = dlg.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(720.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dlg_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dlg, 720., 80., Some(&focus), window, cx);
     }
 
     // ── F3 live declarative-UI host (design §6 Phase 2) ──
@@ -2754,14 +2739,7 @@ impl MainWindow {
                 }
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(560.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        cx.notify();
+        self.present_modal(&dialog, 560., 80., None, window, cx);
     }
 
     /// Drain a scoped live host's collected requests into the window: toasts →
@@ -2866,15 +2844,7 @@ impl MainWindow {
                 }
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(620.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, 620., 80., Some(&focus), window, cx);
     }
 
     /// Load a native plugin from a user-chosen path (the C++ load-from-path;
@@ -2960,15 +2930,7 @@ impl MainWindow {
         ));
         // The ProfilerDialog renders its own self-clamping card (820×640); the
         // outer overlay just hosts it (no extra card / close button).
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(820.))
-                .margin_top(px(48.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, 820., 48., Some(&focus), window, cx);
     }
 
     /// Tools ▸ Start/Stop MCP Server — toggle the MCP bridge flag and flip the
@@ -3020,15 +2982,7 @@ impl MainWindow {
             },
         ));
         let focus = dlg.read(cx).focus_handle(cx);
-        let dlg_for_modal = dlg.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(460.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dlg_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dlg, 460., 80., Some(&focus), window, cx);
     }
 
     /// Tools ▸ Options — open the [`OptionsDialog`] seeded from the live window
@@ -3073,15 +3027,7 @@ impl MainWindow {
                 OptionsEvent::Cancel => window.close_dialog(cx),
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(640.))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, 640., 80., Some(&focus), window, cx);
     }
 
     /// View ▸ Edit Theme… — open the dedicated [`ThemeEditor`] (the swatch grid /
@@ -3120,15 +3066,7 @@ impl MainWindow {
                 }
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(480.))
-                .margin_top(px(60.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, 480., 60., Some(&focus), window, cx);
     }
 
     /// Apply an accepted [`OptionsResult`] to the live app + persist every field
@@ -3582,6 +3520,31 @@ impl MainWindow {
         out
     }
 
+    /// Float `dialog` as a centered modal card of `width` × `margin_top` (the shared
+    /// tail every modal opener repeated): `window.open_dialog` with no close button,
+    /// optionally focus `focus`, then re-render. Collapses 12 copy-pasted tails.
+    fn present_modal<D: Render>(
+        &self,
+        dialog: &Entity<D>,
+        width: f32,
+        margin_top: f32,
+        focus: Option<&FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let card = dialog.clone();
+        window.open_dialog(cx, move |d, _window, _cx| {
+            d.w(px(width))
+                .margin_top(px(margin_top))
+                .close_button(false)
+                .child(card.clone())
+        });
+        if let Some(f) = focus {
+            window.focus(f, cx);
+        }
+        cx.notify();
+    }
+
     /// Open the 3-way unsaved-changes guard for `dirty` docs (the C++
     /// `ThemedMessageBox::unsavedChanges`). On **Save changes** it persists every
     /// dirty doc through its editor (the C++ `project_save(dock,false)` per doc),
@@ -3632,15 +3595,7 @@ impl MainWindow {
                 }
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(super::messagebox::MSG_MAX_WIDTH))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, super::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
     }
 
     /// Open a two-button confirm whose DEFAULT button is honoured — Enter triggers
@@ -3674,15 +3629,7 @@ impl MainWindow {
                 }
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(super::messagebox::MSG_MAX_WIDTH))
-                .margin_top(px(80.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, super::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
     }
 
     /// Persist each editor's document to its known path (the C++
@@ -4890,15 +4837,7 @@ impl MainWindow {
                 GotoEvent::Cancel => window.close_dialog(cx),
             },
         ));
-        let dialog_for_modal = dialog.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(460.))
-                .margin_top(px(120.))
-                .close_button(false)
-                .child(dialog_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&dialog, 460., 120., Some(&focus), window, cx);
     }
 
     /// Resolve `formula` against the active provider's module/symbol/pointer
@@ -6086,15 +6025,7 @@ impl MainWindow {
             },
         ));
         let focus = prompt.read(cx).focus_handle(cx);
-        let prompt_for_modal = prompt.clone();
-        window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(420.))
-                .margin_top(px(140.))
-                .close_button(false)
-                .child(prompt_for_modal.clone())
-        });
-        window.focus(&focus, cx);
-        cx.notify();
+        self.present_modal(&prompt, 420., 140., Some(&focus), window, cx);
     }
 }
 
