@@ -737,6 +737,13 @@ fn submenu_row(
 ) -> impl IntoElement {
     let fg = color::text(cx);
     let muted = color::text_muted(cx);
+    // Soft-accent highlight (see `command_row`) — the theme overlay is invisible on
+    // the dropdown surface.
+    let highlight_bg = {
+        let mut c = color::accent(cx);
+        c.a = 0.30;
+        c
+    };
 
     // Empty leading slot mirrors the command row's checkmark slot so submenu
     // labels line up with sibling leaves.
@@ -761,13 +768,10 @@ fn submenu_row(
                 .text_size(px(tokens::font::UI_MD))
                 .text_color(fg)
                 .cursor_pointer()
-                // Keyboard selection wins (clear selection bg); else the open
-                // fly-out's parent row keeps the faint hover tint.
-                .when(highlighted, |r| r.bg(color::selected_bg(cx)))
-                .when(open && !highlighted, |r| r.bg(color::hover_overlay(cx)))
-                .when(!open && !highlighted, |r| {
-                    r.hover(|s| s.bg(color::hover_overlay(cx)))
-                })
+                // Keyboard selection or an open fly-out highlights the row; else a
+                // plain hover does. All use the soft-accent wash so they read.
+                .when(highlighted || open, |r| r.bg(highlight_bg))
+                .when(!open && !highlighted, |r| r.hover(|s| s.bg(highlight_bg)))
                 .child(lead_slot)
                 .child(div().flex_1().min_w_0().child(label.to_string()))
                 // The fly-out affordance (the C++ submenu ▸).
@@ -831,6 +835,15 @@ fn command_row(
     };
     let muted = color::text_muted(cx);
     let accent = color::accent(cx);
+    // Hover / keyboard-highlight background. The theme's `list_hover` / `list_active`
+    // overlays are nearly invisible on the menu's lighter elevated surface (they are
+    // tuned for the darker base background the palette uses), so use a soft accent
+    // wash that clearly reads on the dropdown.
+    let highlight_bg = {
+        let mut c = accent;
+        c.a = 0.30;
+        c
+    };
 
     // Leading fixed-width checkmark slot — keeps every label left-aligned whether
     // or not a row is checkable. Holds a real SVG check (accent-tinted) when this
@@ -872,10 +885,9 @@ fn command_row(
         .rounded(px(tokens::radius::MD))
         .text_size(px(tokens::font::UI_MD))
         .text_color(label_color)
-        // The keyboard-highlighted row carries the clear selection background (the
-        // same one the command palette / type selector use), not the faint hover
-        // tint — a persistent keyboard selection needs to read at a glance.
-        .when(highlighted, |r| r.bg(color::selected_bg(cx)))
+        // The keyboard-highlighted row carries the soft-accent highlight so it reads
+        // at a glance (the faint theme overlay was invisible on this surface).
+        .when(highlighted, |r| r.bg(highlight_bg))
         // Resting the pointer on a plain leaf at this level collapses any open
         // fly-out from a *sibling* "▸" row (the C++ slide-off-the-submenu close).
         .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
@@ -885,7 +897,7 @@ fn command_row(
         }))
         .when(enabled, |r| {
             r.cursor_pointer()
-                .hover(|s| s.bg(color::hover_overlay(cx)))
+                .hover(|s| s.bg(highlight_bg))
                 // Dispatch on mouse-DOWN, not click (mouse-up). A fly-out submenu
                 // panel (Import/Export/Examples/Data Source) is a `deferred` child
                 // positioned OUTSIDE the top-level dropdown's bounds, so pressing a
