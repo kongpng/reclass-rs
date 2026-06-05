@@ -1866,12 +1866,28 @@ impl MainWindow {
 
     // ── File: data source providers (the C++ m_sourceMenu → selectSource) ──
 
+    /// The active document's editor, or — when none is open — show `msg` and
+    /// return None (the shared "Open a document first." guard).
+    fn active_editor_or_notify(
+        &mut self,
+        msg: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::ui::editor::RcxEditor>> {
+        match self.document_area.read(cx).active_editor().cloned() {
+            Some(e) => Some(e),
+            None => {
+                self.notify(msg, window, cx);
+                None
+            }
+        }
+    }
+
     /// File ▸ Data Source ▸ File — attach a binary file as the active document's
     /// data source via the native file picker (the C++ `loadData(path)` /
     /// File-provider attach). Updates the tab source icon + window state.
     fn prompt_data_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            self.notify("Open a document first.", window, cx);
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
             return;
         };
         let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -2010,8 +2026,7 @@ impl MainWindow {
     /// `promptAddBookmark`; main.cpp:8090). The themed prompt collects the name;
     /// the formula defaults to the current base.
     fn prompt_add_bookmark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            self.notify("Open a document first.", window, cx);
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
             return;
         };
         let default_formula = {
@@ -2055,8 +2070,7 @@ impl MainWindow {
     /// Edit ▸ Quick Bookmark Here (Ctrl+Alt+B) — capture the current address as an
     /// auto-named `bookmark_NN` (no dialog; the C++ lambda at main.cpp:1197).
     fn quick_bookmark_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            self.notify("Open a document first.", window, cx);
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
             return;
         };
         let formula = {
@@ -2161,8 +2175,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            self.notify("Open a document first.", window, cx);
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
             return;
         };
         editor.update(cx, |ed, cx| {
@@ -2454,8 +2467,7 @@ impl MainWindow {
             resolve_field_vtable, resolve_rtti, RttiBrowserDialog, RttiBrowserEvent,
         };
 
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            self.notify("Open a document first.", window, cx);
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
             return;
         };
 
@@ -2957,8 +2969,7 @@ impl MainWindow {
     /// accept, apply the edited aliases to the document and recompose so the
     /// editor + generated code reflect the new type names.
     fn open_type_aliases_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            self.notify("Open a document first.", window, cx);
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
             return;
         };
         let current: std::collections::HashMap<crate::core::NodeKind, String> =
