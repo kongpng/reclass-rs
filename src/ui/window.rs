@@ -37,7 +37,7 @@ use gpui_component::dock::{DockArea, DockPlacement};
 use gpui_component::notification::Notification;
 use gpui_component::{ActiveTheme, Root, TitleBar, WindowExt};
 
-use crate::ui::window_dialogs::{
+use crate::ui::dialogs::window_dialogs::{
     ConfirmChoice, RcxConfirmDialog, RcxUnsavedDialog, TextPromptDialog, TextPromptEvent,
     TypeAliasesDialog, TypeAliasesEvent,
 };
@@ -1051,7 +1051,7 @@ impl MainWindow {
             // The C++ default font is JetBrains Mono (main.cpp:1311).
             .unwrap_or_else(|| "JetBrains Mono".to_string());
         let view_opts = ViewOptions::load(&settings.borrow());
-        let goto_recent = crate::ui::gotoaddress::load_recent(&*settings.borrow());
+        let goto_recent = crate::ui::dialogs::gotoaddress::load_recent(&*settings.borrow());
         // Tools ▸ Options persisted prefs (the C++ refreshMs/autoStartMcp/
         // braceWrap/generatorAsserts QSettings keys).
         let (auto_start_mcp, brace_wrap, generator_asserts, refresh_ms) = {
@@ -1062,7 +1062,7 @@ impl MainWindow {
                 s.get_bool(settings_keys::GENERATOR_ASSERTS, false),
                 s.get(settings_keys::REFRESH_MS)
                     .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(crate::ui::optionsdialog::REFRESH_DEFAULT),
+                    .unwrap_or(crate::ui::dialogs::optionsdialog::REFRESH_DEFAULT),
             )
         };
         // Appearance prefs (the C++ `menuBarTitleCase` / `showIcon`; main.cpp:988).
@@ -1981,14 +1981,14 @@ impl MainWindow {
             "source.rcnet" => "ReClass.NET Compat",
             _ => "This data source",
         };
-        let spec = crate::ui::messagebox::warn(
+        let spec = crate::ui::dialogs::messagebox::warn(
             "Source Unavailable",
             &format!(
                 "{label} is not available on this platform. Open a project with a saved \
                  source, or attach a binary File instead."
             ),
         );
-        crate::ui::messagebox::open_message(spec, window, cx);
+        crate::ui::dialogs::messagebox::open_message(spec, window, cx);
     }
 
     /// File ▸ Data Source ▸ Clear All — detach the active document's source (the
@@ -2995,7 +2995,7 @@ impl MainWindow {
     /// the live window/editors/controllers + persist via the disk store (the
     /// C++ `showOptionsDialog` → apply + `QSettings::setValue`).
     fn open_options_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::optionsdialog::{OptionsDialog, OptionsEvent, OptionsResult};
+        use crate::ui::dialogs::optionsdialog::{OptionsDialog, OptionsEvent, OptionsResult};
         let themes: Vec<String> = self
             .theme_manager
             .borrow()
@@ -3079,7 +3079,7 @@ impl MainWindow {
     /// helpers (which persist on their own); the remaining fields persist here.
     fn apply_options(
         &mut self,
-        result: crate::ui::optionsdialog::OptionsResult,
+        result: crate::ui::dialogs::optionsdialog::OptionsResult,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3102,8 +3102,8 @@ impl MainWindow {
         }
         // Refresh interval — push into every controller + persist "refreshMs".
         self.refresh_ms = result.refresh_ms.clamp(
-            crate::ui::optionsdialog::REFRESH_MIN,
-            crate::ui::optionsdialog::REFRESH_MAX,
+            crate::ui::dialogs::optionsdialog::REFRESH_MIN,
+            crate::ui::dialogs::optionsdialog::REFRESH_MAX,
         );
         self.settings
             .borrow_mut()
@@ -3176,7 +3176,7 @@ impl MainWindow {
     /// project (the C++ `about()` themed dialog; main.cpp:4415). The GitHub button
     /// is folded into the body text (the modal message box is single-button).
     fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let spec = crate::ui::messagebox::info(
+        let spec = crate::ui::dialogs::messagebox::info(
             "About Reclass",
             &format!(
                 "Reclass {} — a Rust + GPUI port of ReClass.\n\nA memory structure editor.\n\
@@ -3184,7 +3184,7 @@ impl MainWindow {
                 env!("CARGO_PKG_VERSION")
             ),
         );
-        crate::ui::messagebox::open_message(spec, window, cx);
+        crate::ui::dialogs::messagebox::open_message(spec, window, cx);
     }
 
     /// Help ▸ Keyboard Shortcuts… (F1) — a themed reference of the bound
@@ -3200,9 +3200,9 @@ impl MainWindow {
             "Ctrl+Shift+S — Memory Scanner    Ctrl+Shift+Y — Modules".to_string(),
             "Ctrl+Shift+B — Bookmarks    Ctrl+\\ — Split Editor".to_string(),
         ];
-        let mut spec = crate::ui::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
+        let mut spec = crate::ui::dialogs::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
         spec.detail = detail;
-        crate::ui::messagebox::open_message(spec, window, cx);
+        crate::ui::dialogs::messagebox::open_message(spec, window, cx);
     }
 
     // ── Recent files (the C++ recentFiles QSettings list) ──
@@ -3578,8 +3578,8 @@ impl MainWindow {
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
-            move |this, _d, choice: &crate::ui::messagebox::UnsavedChoice, window, cx| {
-                use crate::ui::messagebox::UnsavedChoice;
+            move |this, _d, choice: &crate::ui::dialogs::messagebox::UnsavedChoice, window, cx| {
+                use crate::ui::dialogs::messagebox::UnsavedChoice;
                 match choice {
                     UnsavedChoice::Cancel => window.close_dialog(cx),
                     UnsavedChoice::Discard => {
@@ -3600,18 +3600,18 @@ impl MainWindow {
                 }
             },
         ));
-        self.present_modal(&dialog, crate::ui::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
+        self.present_modal(&dialog, crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
     }
 
     /// Open a two-button confirm whose DEFAULT button is honoured — Enter triggers
     /// the spec's `default` (Cancel for destructive confirms, so a stray Enter can't
     /// destroy work), Esc cancels, and `on_accept` runs only on an explicit accept.
-    /// Used in place of [`messagebox::open_confirm`](crate::ui::messagebox) (the
+    /// Used in place of [`messagebox::open_confirm`](crate::ui::dialogs::messagebox) (the
     /// gpui-component `AlertDialog`) for destructive confirms, which it cannot make
     /// safe (no per-button focus hook; Enter is hard-bound to OK).
     fn open_confirm_dialog<F>(
         &mut self,
-        spec: crate::ui::messagebox::MessageSpec,
+        spec: crate::ui::dialogs::messagebox::MessageSpec,
         on_accept: F,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3634,7 +3634,7 @@ impl MainWindow {
                 }
             },
         ));
-        self.present_modal(&dialog, crate::ui::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
+        self.present_modal(&dialog, crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
     }
 
     /// Persist each editor's document to its known path (the C++
@@ -4817,7 +4817,7 @@ impl MainWindow {
     /// accepted formula is pushed onto the recent list, and a failed resolve shows
     /// a themed modal warning (not a transient toast).
     fn open_goto_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::gotoaddress::{GotoAddressDialog, GotoEvent};
+        use crate::ui::dialogs::gotoaddress::{GotoAddressDialog, GotoEvent};
         // Pointer size from the active document (32-bit projects deref correctly).
         let ptr_size = self
             .document_area
@@ -4916,10 +4916,10 @@ impl MainWindow {
                     tree.base_address_formula = formula.to_string();
                     ed.apply_document(cx);
                 });
-                self.goto_recent = crate::ui::gotoaddress::push_recent_list(&self.goto_recent, formula);
+                self.goto_recent = crate::ui::dialogs::gotoaddress::push_recent_list(&self.goto_recent, formula);
                 // Persist the recent formulas across launches (the C++
                 // `gotoAddress/recent` key) via the disk store.
-                crate::ui::gotoaddress::store_recent(
+                crate::ui::dialogs::gotoaddress::store_recent(
                     &mut *self.settings.borrow_mut(),
                     &self.goto_recent,
                 );
@@ -4929,14 +4929,14 @@ impl MainWindow {
                 cx.notify();
             }
             None => {
-                let spec = crate::ui::messagebox::warn(
+                let spec = crate::ui::dialogs::messagebox::warn(
                     "Address Not Resolved",
                     &format!(
                         "Couldn't evaluate \"{formula}\". The expression isn't valid or its \
                          module/symbol can't be resolved without a live data source."
                     ),
                 );
-                crate::ui::messagebox::open_message(spec, window, cx);
+                crate::ui::dialogs::messagebox::open_message(spec, window, cx);
             }
         }
     }
@@ -5502,7 +5502,7 @@ impl MainWindow {
                 if name < 0 {
                     return;
                 }
-                let spec = crate::ui::messagebox::confirm(
+                let spec = crate::ui::dialogs::messagebox::confirm(
                     "Delete Type",
                     "Delete this type and its members? This can be undone.",
                     "Delete",

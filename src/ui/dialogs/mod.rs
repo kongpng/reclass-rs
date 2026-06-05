@@ -9,11 +9,11 @@
 //! (`render_dialog_layer` / `render_sheet_layer` / `render_notification_layer`).
 //!
 //! Each surface lives in its own sibling module (gpui-free model + a thin view):
-//! - [`optionsdialog`](crate::ui::optionsdialog) — Options dialog (§5).
-//! - [`gotoaddress`](crate::ui::gotoaddress) — Goto-Address dialog (§7).
+//! - [`optionsdialog`](crate::ui::dialogs::optionsdialog) — Options dialog (§5).
+//! - [`gotoaddress`](crate::ui::dialogs::gotoaddress) — Goto-Address dialog (§7).
 //! - [`commandpalette`](crate::ui::commandpalette) — Command palette (§8).
 //! - [`findbar`](crate::ui::findbar) — the Find bar (Ctrl+F).
-//! - [`messagebox`](crate::ui::messagebox) — themed message/confirm/input (§3,§4).
+//! - [`messagebox`](crate::ui::dialogs::messagebox) — themed message/confirm/input (§3,§4).
 //! - [`typeselectorpopup`](crate::ui::typeselectorpopup) — type picker (§9).
 //! - [`enumpicker`](crate::ui::enumpicker) — enum picker (§10).
 //! - [`sourcechooser`](crate::ui::sourcechooser) — source chooser (§11).
@@ -26,6 +26,11 @@
 //!
 //! Gated behind the `ui` feature (the dialogs render via gpui-component).
 
+pub mod messagebox;
+pub mod window_dialogs;
+pub mod optionsdialog;
+pub mod gotoaddress;
+
 // Re-export the implemented dialog/popup views + their event types under one
 // roof (the "open a dialog" entry point the window wires to).
 #[cfg(feature = "ui")]
@@ -35,11 +40,11 @@ pub use crate::ui::enumpicker::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
 pub use crate::ui::findbar::{FindBar, FindEvent};
 #[cfg(feature = "ui")]
-pub use crate::ui::gotoaddress::{GotoAddressDialog, GotoEvent};
+pub use crate::ui::dialogs::gotoaddress::{GotoAddressDialog, GotoEvent};
 #[cfg(feature = "ui")]
 pub use crate::ui::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
 #[cfg(feature = "ui")]
-pub use crate::ui::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
+pub use crate::ui::dialogs::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
 #[cfg(feature = "ui")]
 pub use crate::ui::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 #[cfg(feature = "ui")]

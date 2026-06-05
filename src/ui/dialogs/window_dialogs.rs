@@ -1,6 +1,6 @@
 //! The window's message / prompt dialog views — the unsaved-changes, generic
 //! confirm, text-prompt, and type-aliases dialogs — extracted from the oversized
-//! window.rs into a sibling module. A flat sibling (`crate::ui::window_dialogs`)
+//! window.rs into a sibling module. A flat sibling (`crate::ui::dialogs::window_dialogs`)
 //! so the dialogs' `super::{design,messagebox,dialogs}` references still resolve
 //! to the ui submodules.
 
@@ -16,15 +16,15 @@ use gpui_component::ActiveTheme;
 /// boxes; emits a [`messagebox::UnsavedChoice`] mapped via
 /// [`messagebox::unsaved_choice_for`]. Replaces the old 2-button confirm that
 /// quit/closed WITHOUT ever offering Save (item 1).
-pub(super) struct RcxUnsavedDialog {
-    spec: crate::ui::messagebox::MessageSpec,
+pub(crate) struct RcxUnsavedDialog {
+    spec: crate::ui::dialogs::messagebox::MessageSpec,
     focus_handle: FocusHandle,
 }
 
 impl RcxUnsavedDialog {
-    pub(super) fn new(title: &str, text: &str, dirty_names: Vec<String>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(title: &str, text: &str, dirty_names: Vec<String>, cx: &mut Context<Self>) -> Self {
         Self {
-            spec: crate::ui::messagebox::unsaved_changes(title, text, dirty_names),
+            spec: crate::ui::dialogs::messagebox::unsaved_changes(title, text, dirty_names),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -33,7 +33,7 @@ impl RcxUnsavedDialog {
     /// `[Cancel, Discard, Save changes]` order [`messagebox::unsaved_changes`]
     /// builds.
     fn choose(&mut self, button_index: usize, cx: &mut Context<Self>) {
-        cx.emit(crate::ui::messagebox::unsaved_choice_for(button_index));
+        cx.emit(crate::ui::dialogs::messagebox::unsaved_choice_for(button_index));
     }
 }
 
@@ -43,16 +43,16 @@ impl Focusable for RcxUnsavedDialog {
     }
 }
 
-impl EventEmitter<crate::ui::messagebox::UnsavedChoice> for RcxUnsavedDialog {}
+impl EventEmitter<crate::ui::dialogs::messagebox::UnsavedChoice> for RcxUnsavedDialog {}
 
 impl Render for RcxUnsavedDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::ui::dialogs::modal;
-        use crate::ui::messagebox::{ButtonVariant, DetailLayout};
+        use crate::ui::dialogs::messagebox::{ButtonVariant, DetailLayout};
         use gpui_component::button::{Button, ButtonVariants as _};
 
-        let card_w = modal::clamp_width(crate::ui::messagebox::MSG_MAX_WIDTH, window);
-        let detail_layout = crate::ui::messagebox::format_detail(&self.spec.detail);
+        let card_w = modal::clamp_width(crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, window);
+        let detail_layout = crate::ui::dialogs::messagebox::format_detail(&self.spec.detail);
 
         // Body: the count sentence, then the dirty-name detail as a single
         // word-wrapped muted label (the C++ setDetailText shows one QLabel — no
@@ -119,7 +119,7 @@ impl Render for RcxUnsavedDialog {
 
 /// The outcome of an [`RcxConfirmDialog`].
 #[derive(Clone, Copy, Debug)]
-pub(super) enum ConfirmChoice {
+pub(crate) enum ConfirmChoice {
     Accept,
     Cancel,
 }
@@ -132,13 +132,13 @@ pub(super) enum ConfirmChoice {
 /// ourselves and map Enter to the spec's `default` button (Cancel for
 /// destructive) and Esc to Cancel. The destructive action is reachable only by an
 /// explicit click on its button.
-pub(super) struct RcxConfirmDialog {
-    spec: crate::ui::messagebox::MessageSpec,
+pub(crate) struct RcxConfirmDialog {
+    spec: crate::ui::dialogs::messagebox::MessageSpec,
     focus_handle: FocusHandle,
 }
 
 impl RcxConfirmDialog {
-    pub(super) fn new(spec: crate::ui::messagebox::MessageSpec, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(spec: crate::ui::dialogs::messagebox::MessageSpec, cx: &mut Context<Self>) -> Self {
         Self {
             spec,
             focus_handle: cx.focus_handle(),
@@ -173,10 +173,10 @@ impl EventEmitter<ConfirmChoice> for RcxConfirmDialog {}
 impl Render for RcxConfirmDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::ui::dialogs::modal;
-        use crate::ui::messagebox::{ButtonVariant, DefaultButton, DetailLayout};
+        use crate::ui::dialogs::messagebox::{ButtonVariant, DefaultButton, DetailLayout};
         use gpui_component::button::{Button, ButtonVariants as _};
 
-        let card_w = modal::clamp_width(crate::ui::messagebox::MSG_MAX_WIDTH, window);
+        let card_w = modal::clamp_width(crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, window);
 
         let mut body = modal::body(cx).child(
             div()
@@ -184,7 +184,7 @@ impl Render for RcxConfirmDialog {
                 .text_color(crate::ui::design::color::text(cx))
                 .child(self.spec.text.clone()),
         );
-        if let DetailLayout::Label(s) = crate::ui::messagebox::format_detail(&self.spec.detail) {
+        if let DetailLayout::Label(s) = crate::ui::dialogs::messagebox::format_detail(&self.spec.detail) {
             body = body.child(
                 div()
                     .pl(px(crate::ui::design::tokens::space::MD))
@@ -243,7 +243,7 @@ impl Render for RcxConfirmDialog {
 
 /// The outcome of the [`TextPromptDialog`] (the C++ `QInputDialog` accept/reject).
 #[derive(Clone, Debug)]
-pub(super) enum TextPromptEvent {
+pub(crate) enum TextPromptEvent {
     /// OK / Enter on a non-empty value — the trimmed text.
     Accept(String),
     /// Cancel / Esc.
@@ -253,7 +253,7 @@ pub(super) enum TextPromptEvent {
 /// A minimal modal free-text input dialog — the port's `QInputDialog::getText`.
 /// A single input seeded with a default (all-selected), an OK button (disabled
 /// while the trimmed text is empty), and Cancel. Enter confirms; Esc cancels.
-pub(super) struct TextPromptDialog {
+pub(crate) struct TextPromptDialog {
     title: String,
     label: String,
     input: Entity<gpui_component::input::InputState>,
@@ -262,7 +262,7 @@ pub(super) struct TextPromptDialog {
 }
 
 impl TextPromptDialog {
-    pub(super) fn new(
+    pub(crate) fn new(
         title: String,
         label: String,
         default: String,
@@ -376,7 +376,7 @@ impl Render for TextPromptDialog {
 
 /// The outcome of the [`TypeAliasesDialog`].
 #[derive(Clone, Debug)]
-pub(super) enum TypeAliasesEvent {
+pub(crate) enum TypeAliasesEvent {
     /// OK — commit the edited alias map.
     Accept,
     /// Cancel / Esc.
@@ -388,7 +388,7 @@ pub(super) enum TypeAliasesEvent {
 /// Vec/Mat/Struct/Array), each with the canonical type name on the left and an
 /// editable alias field on the right. Two preset buttons fill the column with the
 /// stdint (C99) or Windows (basetsd.h) names; Clear empties them.
-pub(super) struct TypeAliasesDialog {
+pub(crate) struct TypeAliasesDialog {
     /// (kind, canonical-name, alias-input) per aliasable kind, in `K_KIND_META`
     /// order.
     rows: Vec<(
@@ -427,7 +427,7 @@ impl TypeAliasesDialog {
         })
     }
 
-    pub(super) fn new(
+    pub(crate) fn new(
         current: std::collections::HashMap<crate::core::NodeKind, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -455,7 +455,7 @@ impl TypeAliasesDialog {
     }
 
     /// Collect the edited alias map (empty fields are dropped — no alias).
-    pub(super) fn collect(&self, cx: &App) -> std::collections::HashMap<crate::core::NodeKind, String> {
+    pub(crate) fn collect(&self, cx: &App) -> std::collections::HashMap<crate::core::NodeKind, String> {
         let mut map = std::collections::HashMap::new();
         for (kind, _name, input) in &self.rows {
             let v = input.read(cx).value().to_string();
