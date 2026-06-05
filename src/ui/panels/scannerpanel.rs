@@ -263,15 +263,7 @@ impl ScannerForm {
         let is_sig = self.mode() == ScanMode::Signature;
         let cond = self.effective_condition();
         let needs_value = is_sig
-            || matches!(
-                cond,
-                ScanCondition::ExactValue
-                    | ScanCondition::BiggerThan
-                    | ScanCondition::SmallerThan
-                    | ScanCondition::Between
-                    | ScanCondition::IncreasedBy
-                    | ScanCondition::DecreasedBy
-            );
+            || consumes_typed_value(cond);
         let needs_range = cond == ScanCondition::Between && !is_sig;
         FieldVisibility {
             pattern_visible: is_sig,
@@ -311,15 +303,7 @@ impl ScannerForm {
             // Compare-against-previous conditions need a baseline; on first scan
             // capture every aligned address (UnknownValue), the real comparison
             // is applied on the next Re-scan.
-            if matches!(
-                cond,
-                ScanCondition::Changed
-                    | ScanCondition::Unchanged
-                    | ScanCondition::Increased
-                    | ScanCondition::Decreased
-                    | ScanCondition::IncreasedBy
-                    | ScanCondition::DecreasedBy
-            ) {
+            if is_compare_previous(cond) {
                 cond = ScanCondition::UnknownValue;
             }
 
@@ -332,10 +316,7 @@ impl ScannerForm {
 
             if cond == ScanCondition::UnknownValue {
                 req.max_results = 10_000_000;
-            } else if matches!(
-                cond,
-                ScanCondition::BiggerThan | ScanCondition::SmallerThan | ScanCondition::Between
-            ) {
+            } else if is_range_condition(cond) {
                 let (pat, _dummy) = serialize_value(vt, &self.value_text)
                     .map_err(|e| format!("Value error: {e}"))?;
                 req.pattern = pat;
@@ -1012,6 +993,42 @@ pub fn previous_delta_text(prev_text: &str, delta: &DeltaInfo, changed: bool) ->
     } else {
         prev_text.to_string()
     }
+}
+
+/// Whether a scan condition consumes a typed/exact value from the value field
+/// (used to gate the value input + the rescan filter pattern).
+fn consumes_typed_value(c: ScanCondition) -> bool {
+    matches!(
+        c,
+        ScanCondition::ExactValue
+            | ScanCondition::BiggerThan
+            | ScanCondition::SmallerThan
+            | ScanCondition::Between
+            | ScanCondition::IncreasedBy
+            | ScanCondition::DecreasedBy
+    )
+}
+
+/// Whether a condition compares each value against its previous snapshot (so the
+/// first scan must capture a baseline as UnknownValue).
+fn is_compare_previous(c: ScanCondition) -> bool {
+    matches!(
+        c,
+        ScanCondition::Changed
+            | ScanCondition::Unchanged
+            | ScanCondition::Increased
+            | ScanCondition::Decreased
+            | ScanCondition::IncreasedBy
+            | ScanCondition::DecreasedBy
+    )
+}
+
+/// Whether a condition compares against a typed bound / range.
+fn is_range_condition(c: ScanCondition) -> bool {
+    matches!(
+        c,
+        ScanCondition::BiggerThan | ScanCondition::SmallerThan | ScanCondition::Between
+    )
 }
 
 /// Space-joined uppercase hex (`"DE AD BE EF"`) of `bytes` — the scanner's
@@ -2147,15 +2164,7 @@ mod view {
             let mut filter_mask: Vec<u8> = Vec::new();
             let mut filter_pattern2: Vec<u8> = Vec::new();
             let vt = self.form.value_type;
-            let needs_typed = matches!(
-                cond,
-                ScanCondition::ExactValue
-                    | ScanCondition::BiggerThan
-                    | ScanCondition::SmallerThan
-                    | ScanCondition::Between
-                    | ScanCondition::IncreasedBy
-                    | ScanCondition::DecreasedBy
-            );
+            let needs_typed = super::consumes_typed_value(cond);
             if needs_typed && !self.form.value_text.trim().is_empty() {
                 if last_mode == ScanMode::Signature {
                     match crate::scanner::parse_signature(&self.form.value_text) {
