@@ -1806,6 +1806,11 @@ impl MainWindow {
         // new tab honours the current compact-columns/tree-lines/etc. state.
         if let Some(editor) = new_editor {
             self.apply_view_opts_to_editor(&editor, cx);
+            // Focus the fresh editor so the keyboard (arrow-nav, F2 rename, …) works
+            // immediately without a click — the C++ `m_sci->setFocus()` on a new
+            // tab. Deferred so the focus lands once the editor has mounted.
+            let handle = editor.read(cx).focus_handle(cx);
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
         }
         self.state.open_document(title);
         self.rebuild_workspace(cx);
@@ -5215,6 +5220,14 @@ impl MainWindow {
                     }
                     crate::ui::editor::RcxEditorEvent::Status { message } => {
                         this.notify(message.clone(), window, cx);
+                    }
+                    // The editor mutated its document (rename / structural op /
+                    // undo). Rebuild the workspace TYPES list so a class rename /
+                    // add / remove shows up in the left panel — the per-selection
+                    // `observe` above only re-renders the status bar, leaving the
+                    // cached `WorkspaceModel` stale (a renamed class kept its name).
+                    crate::ui::editor::RcxEditorEvent::DocumentEdited => {
+                        this.rebuild_workspace(cx);
                     }
                     // An in-editor View-option toggle (offset-margin double-click /
                     // right-click Relative/Absolute): the editor already applied it

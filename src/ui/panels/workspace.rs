@@ -685,7 +685,15 @@ impl WorkspacePanel {
 
     /// Replace the workspace model (the window calls this on project change;
     /// `rebuildWorkspaceModel`) and refresh the tree.
+    ///
+    /// Idempotent: an unchanged model skips the tree rebuild, so the now-frequent
+    /// `rebuild_workspace` (fired on every editor `DocumentEdited` — value edits
+    /// included) does NOT churn the tree's scroll/selection/expansion when the
+    /// type list is unchanged. Only a real add/remove/rename re-feeds the tree.
     pub fn set_model(&mut self, model: WorkspaceModel, cx: &mut Context<Self>) {
+        if self.model == model {
+            return;
+        }
         self.model = model;
         self.refresh_tree(cx);
     }

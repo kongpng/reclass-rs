@@ -397,6 +397,13 @@ pub enum RcxEditorEvent {
     /// Dismiss the topmost host centered modal — the editor's popup signalled a
     /// Chosen / Cancel / close. Replaces the editor's old `window.close_dialog`.
     CloseModal,
+    /// The controlled document was mutated — an inline-edit commit (rename / value
+    /// / type), a structural op (insert / delete / New Class / type change), or
+    /// undo/redo. The host rebuilds the workspace TYPES list so a class rename /
+    /// add / remove is reflected in the left panel: the workspace caches a
+    /// `WorkspaceModel` that the per-selection `observe` (status-bar `cx.notify()`)
+    /// does NOT refresh, so without this a renamed class kept its stale name.
+    DocumentEdited,
 }
 
 /// Item 12: the editor-originated View options that can be toggled from within the
@@ -800,6 +807,7 @@ impl RcxEditor {
     /// `applyDocument` analogue — force a recompose + repaint.
     pub fn apply_document(&mut self, cx: &mut Context<Self>) {
         self.controller.refresh();
+        cx.emit(RcxEditorEvent::DocumentEdited);
         cx.notify();
     }
 
@@ -1589,6 +1597,7 @@ impl RcxEditor {
     fn after_mutation(&mut self, cx: &mut Context<Self>) {
         let _events = self.controller.take_events();
         self.sync_find_bar_lines(cx);
+        cx.emit(RcxEditorEvent::DocumentEdited);
         cx.notify();
     }
 
