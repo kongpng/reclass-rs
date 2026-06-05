@@ -9,8 +9,8 @@
 //!   view-mode switch is the document area's bottom segmented control),
 //! - a [`DockArea`] holding the MDI document-tab center
 //!   ([`DocumentArea`](crate::ui::tabs::DocumentArea)) + the workspace dock
-//!   ([`WorkspacePanel`](crate::ui::workspace::WorkspacePanel)) + a scanner dock,
-//!   built by [`crate::ui::docks::build_default_layout`],
+//!   ([`WorkspacePanel`](crate::ui::panels::workspace::WorkspacePanel)) + a scanner dock,
+//!   built by [`crate::ui::panels::docks::build_default_layout`],
 //! - the [`StartPage`](crate::ui::startpage::StartPage) welcome overlay (shown over
 //!   the workspace on launch; app-shell §13),
 //! - the [`Root`] overlay layers (modals/dialogs/sheets/notifications), and
@@ -42,17 +42,17 @@ use crate::ui::dialogs::window_dialogs::{
     TypeAliasesDialog, TypeAliasesEvent,
 };
 
-use crate::ui::bookmarkspanel::BookmarksPanel;
-use crate::ui::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
+use crate::ui::panels::bookmarkspanel::BookmarksPanel;
+use crate::ui::panels::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
 use crate::ui::menubar::{MenuBar, MenuCommand};
-use crate::ui::modulespanel::ModulesPanel;
+use crate::ui::panels::modulespanel::ModulesPanel;
 use crate::ui::startpage::{RecentEntry, StartPage, StartPageEvent};
 use crate::ui::state::{AppState, DocId, ViewMode};
 use crate::ui::statusbar::{render_status_bar, StatusInfo};
 use crate::ui::tabs::{DocAreaEvent, DocumentArea};
 use crate::ui::theme_apply::ThemeRegistryGlobal;
 use crate::ui::titlebar::{self, LayoutPreset};
-use crate::ui::workspace::{
+use crate::ui::panels::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
     WorkspaceTypeAction,
 };
@@ -403,7 +403,7 @@ pub struct MainWindow {
     /// scanner). Held so the window can feed it the active document's provider —
     /// previously dropped (`..` in the `LayoutHandles` destructure), so the
     /// scanner could never scan.
-    scanner: Entity<crate::ui::scannerpanel::ScannerPanel>,
+    scanner: Entity<crate::ui::panels::scannerpanel::ScannerPanel>,
     /// Live subscription to an open Tools ▸ Options dialog — kept so its
     /// Apply/Cancel events fire while shown (mirrors [`goto_sub`](Self::goto_sub)).
     options_sub: Option<Subscription>,
@@ -1173,7 +1173,7 @@ impl MainWindow {
         cx.subscribe_in(
             &workspace,
             window,
-            |this, _ws, ev: &crate::ui::workspace::WorkspaceTypeAction, window, cx| {
+            |this, _ws, ev: &crate::ui::panels::workspace::WorkspaceTypeAction, window, cx| {
                 this.on_workspace_type_action(ev.clone(), window, cx);
             },
         )
@@ -1197,7 +1197,7 @@ impl MainWindow {
         cx.subscribe_in(
             &bookmarks,
             window,
-            |this, _bm, ev: &crate::ui::bookmarkspanel::BookmarkAction, window, cx| {
+            |this, _bm, ev: &crate::ui::panels::bookmarkspanel::BookmarkAction, window, cx| {
                 this.on_bookmark_action(ev.clone(), window, cx);
             },
         )
@@ -1208,7 +1208,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, _sc, ev: &crate::ui::scannerpanel::ScannerNav, window, cx| {
+            |this, _sc, ev: &crate::ui::panels::scannerpanel::ScannerNav, window, cx| {
                 this.navigate_active_editor_to_address(ev.address, window, cx);
             },
         )
@@ -1222,7 +1222,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, sc, ev: &crate::ui::scannerpanel::ScannerEdit, window, cx| {
+            |this, sc, ev: &crate::ui::panels::scannerpanel::ScannerEdit, window, cx| {
                 this.on_scanner_edit(sc.clone(), ev.clone(), window, cx);
             },
         )
@@ -1235,7 +1235,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, _sc, ev: &crate::ui::scannerpanel::ScannerAddNodes, window, cx| {
+            |this, _sc, ev: &crate::ui::panels::scannerpanel::ScannerAddNodes, window, cx| {
                 this.on_scanner_add_nodes(&ev.addresses, window, cx);
             },
         )
@@ -1248,7 +1248,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, sc, ev: &crate::ui::scannerpanel::ScannerBatchEdit, window, cx| {
+            |this, sc, ev: &crate::ui::panels::scannerpanel::ScannerBatchEdit, window, cx| {
                 this.on_scanner_batch_edit(sc.clone(), ev.clone(), window, cx);
             },
         )
@@ -1259,11 +1259,11 @@ impl MainWindow {
         cx.subscribe_in(
             &modules,
             window,
-            |this, _md, ev: &crate::ui::modulespanel::ModuleAction, window, cx| match ev {
-                crate::ui::modulespanel::ModuleAction::Activate { base, .. } => {
+            |this, _md, ev: &crate::ui::panels::modulespanel::ModuleAction, window, cx| match ev {
+                crate::ui::panels::modulespanel::ModuleAction::Activate { base, .. } => {
                     this.navigate_active_editor_to_address(*base, window, cx);
                 }
-                crate::ui::modulespanel::ModuleAction::DownloadAll => {
+                crate::ui::panels::modulespanel::ModuleAction::DownloadAll => {
                     this.download_all_module_symbols(window, cx);
                 }
             },
@@ -2126,11 +2126,11 @@ impl MainWindow {
     /// the dock.
     fn on_bookmark_action(
         &mut self,
-        ev: crate::ui::bookmarkspanel::BookmarkAction,
+        ev: crate::ui::panels::bookmarkspanel::BookmarkAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::bookmarkspanel::BookmarkAction;
+        use crate::ui::panels::bookmarkspanel::BookmarkAction;
         match ev {
             BookmarkAction::Navigate { formula } => {
                 // Reuse the go-to-address resolve/navigate path so `<mod>+0x..` /
@@ -2195,12 +2195,12 @@ impl MainWindow {
     /// clone; the mutable controller lives here on the window.
     fn on_scanner_edit(
         &mut self,
-        scanner: Entity<crate::ui::scannerpanel::ScannerPanel>,
-        ev: crate::ui::scannerpanel::ScannerEdit,
+        scanner: Entity<crate::ui::panels::scannerpanel::ScannerPanel>,
+        ev: crate::ui::panels::scannerpanel::ScannerEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::scannerpanel::ScannerEdit;
+        use crate::ui::panels::scannerpanel::ScannerEdit;
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             self.notify("Attach a data source first.", window, cx);
             return;
@@ -2351,8 +2351,8 @@ impl MainWindow {
     /// only the writes that landed.
     fn on_scanner_batch_edit(
         &mut self,
-        scanner: Entity<crate::ui::scannerpanel::ScannerPanel>,
-        ev: crate::ui::scannerpanel::ScannerBatchEdit,
+        scanner: Entity<crate::ui::panels::scannerpanel::ScannerPanel>,
+        ev: crate::ui::panels::scannerpanel::ScannerBatchEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6783,7 +6783,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     bindings.extend(crate::ui::startpage::start_page_key_bindings());
     bindings.extend(crate::ui::pickers::commandpalette::command_palette_key_bindings());
     bindings.extend(crate::ui::overlays::findbar::find_bar_key_bindings());
-    bindings.extend(crate::ui::scannerpanel::scanner_panel_key_bindings());
+    bindings.extend(crate::ui::panels::scannerpanel::scanner_panel_key_bindings());
     // Global trigger to OPEN the palette (Zed: ctrl-shift-p / f1; cmd-shift-p on mac).
     bindings.push(KeyBinding::new(
         "ctrl-shift-p",

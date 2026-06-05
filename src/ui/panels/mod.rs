@@ -2,7 +2,7 @@
 //!
 //! Port of the dockable side panels + MDI document panels (app-shell §8, §10).
 //! The **workspace** ("Project") dock is now the real
-//! [`WorkspacePanel`](crate::ui::workspace::WorkspacePanel) (a virtualized tree) and
+//! [`WorkspacePanel`](crate::ui::panels::workspace::WorkspacePanel) (a virtualized tree) and
 //! the **center document area** is the real
 //! [`DocumentArea`](crate::ui::tabs::DocumentArea) (the tab strip + editor host); the
 //! remaining docks (memory scanner, symbols, bookmarks) are still stood up with
@@ -16,6 +16,12 @@
 //! center is now the multi-tab [`DocumentArea`](crate::ui::tabs::DocumentArea).
 //!
 //! Gated behind the `ui` feature (pulls gpui-component).
+
+pub mod workspace;
+pub mod scannerpanel;
+pub mod modulespanel;
+pub mod bookmarkspanel;
+pub mod docks;
 
 use gpui::*;
 use gpui_component::{
@@ -36,10 +42,10 @@ pub enum PanelKind {
     /// The center MDI document area (app-shell §8 — the editor surface lives here).
     Document,
     /// The right-dock modules/symbols/types list (the C++ View ▸ Modules,
-    /// `Ctrl+Shift+Y`). The real view is [`crate::ui::modulespanel::ModulesPanel`].
+    /// `Ctrl+Shift+Y`). The real view is [`crate::ui::panels::modulespanel::ModulesPanel`].
     Modules,
     /// The right-dock bookmarks list (the C++ View ▸ Bookmarks, `Ctrl+Shift+B`).
-    /// The real view is [`crate::ui::bookmarkspanel::BookmarksPanel`].
+    /// The real view is [`crate::ui::panels::bookmarkspanel::BookmarksPanel`].
     Bookmarks,
 }
 
@@ -62,8 +68,8 @@ impl PanelKind {
             PanelKind::Workspace => "WorkspacePanel",
             PanelKind::Scanner => "ScannerPanel",
             PanelKind::Document => "DocumentPanel",
-            PanelKind::Modules => crate::ui::modulespanel::PANEL_NAME,
-            PanelKind::Bookmarks => crate::ui::bookmarkspanel::PANEL_NAME,
+            PanelKind::Modules => crate::ui::panels::modulespanel::PANEL_NAME,
+            PanelKind::Bookmarks => crate::ui::panels::bookmarkspanel::PANEL_NAME,
         }
     }
 }

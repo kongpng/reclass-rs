@@ -30,11 +30,9 @@
 //! and panels can be filled in by the next workflows; the editor grid and real
 //! dialogs are deliberately NOT implemented here. Gated behind the `ui` feature.
 
-pub mod bookmarkspanel;
 pub(crate) mod cpp_highlight;
 pub mod design;
 pub mod dialogs;
-pub mod docks;
 pub mod editor;
 pub mod overlays;
 pub mod pickers;
@@ -42,13 +40,11 @@ pub mod examples;
 mod navlist;
 pub mod fuzzy;
 pub mod menubar;
-pub mod modulespanel;
 pub mod panels;
 pub mod plugindialog;
 pub mod pluginhost;
 pub mod pluginpanel;
 pub mod pluginview;
-pub mod scannerpanel;
 pub mod startpage;
 pub mod state;
 pub mod statusbar;
@@ -56,6 +52,5 @@ pub mod tabs;
 pub mod theme_apply;
 pub mod titlebar;
 pub mod window;
-pub mod workspace;
 
 pub use window::{open_main_window, open_main_window_with, MainWindow, StartupOptions};

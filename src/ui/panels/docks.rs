@@ -11,11 +11,11 @@
 //! [`build_default_layout`] assembles the canonical layout: the center is the
 //! real MDI [`DocumentArea`](crate::ui::tabs::DocumentArea) (tab strip + "+" sentinel
 //! + source icons + view-mode toggle + editor), the left dock is the real
-//! [`WorkspacePanel`](crate::ui::workspace::WorkspacePanel), the bottom dock is the
-//! real [`ScannerPanel`](crate::ui::scannerpanel::ScannerPanel) (closed by default),
+//! [`WorkspacePanel`](crate::ui::panels::workspace::WorkspacePanel), the bottom dock is the
+//! real [`ScannerPanel`](crate::ui::panels::scannerpanel::ScannerPanel) (closed by default),
 //! and the **right** dock tabifies the
-//! [`ModulesPanel`](crate::ui::modulespanel::ModulesPanel) +
-//! [`BookmarksPanel`](crate::ui::bookmarkspanel::BookmarksPanel) (also closed by
+//! [`ModulesPanel`](crate::ui::panels::modulespanel::ModulesPanel) +
+//! [`BookmarksPanel`](crate::ui::panels::bookmarkspanel::BookmarksPanel) (also closed by
 //! default — the C++ View ▸ Modules / Bookmarks summon them on demand). It
 //! returns [`LayoutHandles`] the window wires + observes. The dock drag overlay +
 //! per-dock toolbars (app-shell §9) come later; the seam is the layout builder +
@@ -27,11 +27,11 @@ use gpui::*;
 use gpui_component::dock::{DockArea, DockItem};
 use std::sync::Arc;
 
-use crate::ui::bookmarkspanel::BookmarksPanel;
-use crate::ui::modulespanel::ModulesPanel;
-use crate::ui::scannerpanel::ScannerPanel;
+use crate::ui::panels::bookmarkspanel::BookmarksPanel;
+use crate::ui::panels::modulespanel::ModulesPanel;
+use crate::ui::panels::scannerpanel::ScannerPanel;
 use crate::ui::tabs::DocumentArea;
-use crate::ui::workspace::WorkspacePanel;
+use crate::ui::panels::workspace::WorkspacePanel;
 
 /// Identity + layout version for the main dock area, used as the `dump`/`load`
 /// key (the C++ `QSettings` dock-layout slot; app-shell §10 dock persistence).
@@ -84,7 +84,7 @@ pub struct LayoutHandles {
 ///   "+" sentinel, source icons, view-mode toggle, and the editor),
 /// - **left dock** = the workspace / project tree ([`WorkspacePanel`]),
 /// - **bottom dock** = the real memory scanner
-///   ([`ScannerPanel`](crate::ui::scannerpanel::ScannerPanel)), **closed by default** —
+///   ([`ScannerPanel`](crate::ui::panels::scannerpanel::ScannerPanel)), **closed by default** —
 ///   the C++ memory scanner is a separate pop-out summoned on demand
 ///   (`reclass_memory_scanner.png` shows it as its own detached window, hidden
 ///   until requested), not an always-present panel. It is revealed by
