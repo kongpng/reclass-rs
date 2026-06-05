@@ -279,12 +279,6 @@ pub fn step_visible_page(
     Some(pages[next])
 }
 
-/// Whether a page matches the (already-lowercased, trimmed) query — label OR any
-/// static keyword contains it.
-fn page_matches(page: OptionsPage, q_lower: &str) -> bool {
-    page_matches_themes(page, q_lower, &[])
-}
-
 /// Whether a page matches the (already-lowercased, trimmed) query, additionally
 /// testing the General page against the live theme names (the dynamic
 /// `m_themeCombo` item texts). `themes` only affects the General page (the only

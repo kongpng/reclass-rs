@@ -298,23 +298,3 @@ fn lerp_rgb(a: Hsla, b: Hsla, t: f32) -> Hsla {
     .into()
 }
 
-/// Linear interpolation between two `Hsla` colors in HSL space (item 22 heat
-/// ramp). `t` is clamped to `[0,1]`; `0` → `a`, `1` → `b`. Hue is lerped on the
-/// shorter arc so an amber/tan target does not wrap the wheel.
-#[allow(dead_code)]
-fn lerp(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    let t = t.clamp(0.0, 1.0);
-    let mut dh = b.h - a.h;
-    if dh > 0.5 {
-        dh -= 1.0;
-    } else if dh < -0.5 {
-        dh += 1.0;
-    }
-    let h = (a.h + dh * t).rem_euclid(1.0);
-    Hsla {
-        h,
-        s: a.s + (b.s - a.s) * t,
-        l: a.l + (b.l - a.l) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
-}
