@@ -1141,6 +1141,39 @@ fn sanitize_chip(s: &str) -> String {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+/// Detect a vtable pointer at `abs_addr` and append the matching RTTI chip — the
+/// `{RTTI: …}` hint, or the "(Name class…)" null CTA when `allow_null_cta` and RTTI
+/// display is on. Shared by `compose_leaf`'s Hex64/Pointer64 value column and
+/// `compose_node`'s typed-pointer header (`compose.cpp:462-484`, `1217-1241`).
+fn attach_rtti_chip(
+    state: &mut ComposeState,
+    prov: &dyn Provider,
+    line_text: &mut U16Str,
+    lm: &mut LineMeta,
+    abs_addr: u64,
+    allow_null_cta: bool,
+) {
+    if !prov.is_readable(abs_addr, 8) {
+        return;
+    }
+    let candidate = prov.read_u64(abs_addr);
+    if candidate == 0 {
+        if allow_null_cta && state.show_rtti {
+            push_chip(line_text, lm, ChipKind::Rtti, "(Name class\u{2026})", |c| {
+                c.rtti_vtable_addr = 0;
+            });
+        }
+    } else if candidate != u64::MAX {
+        let info = rtti_for_vtable(state, prov, candidate);
+        if info.ok && !info.demangled_name.is_empty() {
+            let hint = format!("{{RTTI: {}}}", info.demangled_name);
+            push_chip(line_text, lm, ChipKind::Rtti, &hint, |c| {
+                c.rtti_vtable_addr = candidate;
+            });
+        }
+    }
+}
+
 fn compose_leaf(
     state: &mut ComposeState,
     tree: &NodeTree,
@@ -1398,32 +1431,15 @@ fn compose_leaf(
             //    is gated on `show_rtti`; the PDB symbol annotation now rides in
             //    the value text via `read_value` (`format.cpp:425`), so no
             //    Symbol chip.
-            if (node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64)
-                && prov.is_readable(abs_addr, 8)
-            {
-                let candidate = prov.read_u64(abs_addr);
-                if candidate == 0
-                    && state.show_rtti
-                    && (node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32)
-                {
-                    push_chip(
-                        &mut line_text,
-                        &mut lm,
-                        ChipKind::Rtti,
-                        "(Name class\u{2026})",
-                        |c| {
-                            c.rtti_vtable_addr = 0;
-                        },
-                    );
-                } else if candidate != 0 && candidate != u64::MAX {
-                    let info = rtti_for_vtable(state, prov, candidate);
-                    if info.ok && !info.demangled_name.is_empty() {
-                        let hint = format!("{{RTTI: {}}}", info.demangled_name);
-                        push_chip(&mut line_text, &mut lm, ChipKind::Rtti, &hint, |c| {
-                            c.rtti_vtable_addr = candidate;
-                        });
-                    }
-                }
+            if node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64 {
+                attach_rtti_chip(
+                    state,
+                    prov,
+                    &mut line_text,
+                    &mut lm,
+                    abs_addr,
+                    node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32,
+                );
             }
         }
 
@@ -2468,30 +2484,7 @@ fn compose_node(
             // `{RTTI: …}` text (`compose.cpp:1217-1241`). The PDB symbol rides
             // in the pointer-header value text via `read_value`
             // (`format.cpp:457`), so no separate Symbol chip.
-            if prov.is_readable(abs_addr, 8) {
-                let candidate = prov.read_u64(abs_addr);
-                if candidate == 0 {
-                    if state.show_rtti {
-                        push_chip(
-                            &mut ptr_text,
-                            &mut lm,
-                            ChipKind::Rtti,
-                            "(Name class\u{2026})",
-                            |c| {
-                                c.rtti_vtable_addr = 0;
-                            },
-                        );
-                    }
-                } else if candidate != u64::MAX {
-                    let info = rtti_for_vtable(state, prov, candidate);
-                    if info.ok && !info.demangled_name.is_empty() {
-                        let hint = format!("{{RTTI: {}}}", info.demangled_name);
-                        push_chip(&mut ptr_text, &mut lm, ChipKind::Rtti, &hint, |c| {
-                            c.rtti_vtable_addr = candidate;
-                        });
-                    }
-                }
-            }
+            attach_rtti_chip(state, prov, &mut ptr_text, &mut lm, abs_addr, true);
 
             // NOTE: C++ `composeNode` (`compose.cpp:1213-1257`) attaches ONLY the
             // RTTI hint to a typed-pointer header — never a comment chip. A comment
