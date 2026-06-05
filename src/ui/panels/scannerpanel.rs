@@ -1028,6 +1028,13 @@ pub fn previous_delta_text(prev_text: &str, delta: &DeltaInfo, changed: bool) ->
     }
 }
 
+/// `"{prefix}1 result"` / `"{prefix}{n} results"` — the result-count status line
+/// used across the scan-finish, undo, load, and render-fallback paths.
+pub fn count_status(prefix: &str, n: usize) -> String {
+    let noun = if n == 1 { "result" } else { "results" };
+    format!("{prefix}{n} {noun}")
+}
+
 /// The status line after a Re-scan (`scannerpanel.cpp:1716-1735`): the
 /// `Narrowed N → M (eliminated K)` / `All N still match` / `M results` variants.
 /// `before` is the pre-rescan count (0 = no narrowing context).
@@ -1043,10 +1050,8 @@ pub fn rescan_status(before: usize, after: usize) -> String {
         )
     } else if before > 0 && after == before {
         format!("All {after} results still match")
-    } else if after == 1 {
-        "1 result".to_string()
     } else {
-        format!("{after} results")
+        count_status("", after)
     }
 }
 
@@ -2264,11 +2269,7 @@ mod view {
             self.selected_row = None;
             self.form = form.clone();
             let n = self.results.len();
-            self.status = if n == 1 {
-                "1 result".to_string()
-            } else {
-                format!("{n} results")
-            };
+            self.status = super::count_status("", n);
             self.refresh_table(cx);
             cx.notify();
         }
@@ -2417,11 +2418,7 @@ mod view {
             self.selected_row = None;
             self.scanning = false;
             let n = results.len();
-            self.status = if n == 1 {
-                "1 result".to_string()
-            } else {
-                format!("{n} results")
-            };
+            self.status = super::count_status("", n);
             self.refresh_table(cx);
             cx.notify();
             results
@@ -2448,11 +2445,7 @@ mod view {
             }
             self.show_previous = self.undo_stack.iter().count() > 0 || self.generation > 1;
             let n = self.results.len();
-            self.status = if n == 1 {
-                "Restored — 1 result".to_string()
-            } else {
-                format!("Restored — {n} results")
-            };
+            self.status = super::count_status("Restored — ", n);
             self.selected_row = None;
             self.refresh_table(cx);
             cx.notify();
@@ -2489,11 +2482,7 @@ mod view {
                             // Restore the prior result-count status (the confirm
                             // prompt above overwrote it).
                             let n = this.results.len();
-                            this.status = if n == 1 {
-                                "1 result".to_string()
-                            } else {
-                                format!("{n} results")
-                            };
+                            this.status = super::count_status("", n);
                             cx.notify();
                         }
                     })
@@ -2949,11 +2938,7 @@ mod view {
             self.generation = if n > 0 { 1 } else { 0 };
             self.undo_stack.clear();
             self.selected_row = None;
-            self.status = if n == 1 {
-                "Loaded 1 result".to_string()
-            } else {
-                format!("Loaded {n} results")
-            };
+            self.status = super::count_status("Loaded ", n);
             self.refresh_table(cx);
             cx.notify();
         }
@@ -3315,11 +3300,7 @@ mod view {
                 "No data source — attach a process or file to scan".to_string()
             } else {
                 let n = self.results.len();
-                if n == 1 {
-                    "1 result".to_string()
-                } else {
-                    format!("{n} results")
-                }
+                super::count_status("", n)
             };
 
             gpui_component::v_flex()
