@@ -370,8 +370,9 @@ impl<'a> GenContext<'a> {
         format!("_pad{:04x}", n)
     }
 
-    /// `GenContext::cType(NodeKind)` (`generator.cpp:104-111`).
-    fn c_type(&self, kind: NodeKind) -> String {
+    /// A user type-alias for `kind` if one is set (non-empty), else `fallback`.
+    /// The shared body of the per-language `c_type` / `rust_type` / `cs_type`.
+    fn aliased(&self, kind: NodeKind, fallback: fn(NodeKind) -> &'static str) -> String {
         if let Some(m) = self.type_aliases {
             if let Some(v) = m.get(&kind) {
                 if !v.is_empty() {
@@ -379,31 +380,33 @@ impl<'a> GenContext<'a> {
                 }
             }
         }
-        c_type_name(kind).to_string()
+        fallback(kind).to_string()
+    }
+
+    /// `GenContext::cType(NodeKind)` (`generator.cpp:104-111`).
+    fn c_type(&self, kind: NodeKind) -> String {
+        self.aliased(kind, c_type_name)
     }
 
     /// `rustType(GenContext&, NodeKind)` (`generator.cpp:545-552`).
     fn rust_type(&self, kind: NodeKind) -> String {
-        if let Some(m) = self.type_aliases {
-            if let Some(v) = m.get(&kind) {
-                if !v.is_empty() {
-                    return v.clone();
-                }
-            }
-        }
-        rust_type_name(kind).to_string()
+        self.aliased(kind, rust_type_name)
     }
 
     /// `csType(GenContext&, NodeKind)` (`generator.cpp:890-897`).
     fn cs_type(&self, kind: NodeKind) -> String {
-        if let Some(m) = self.type_aliases {
-            if let Some(v) = m.get(&kind) {
-                if !v.is_empty() {
-                    return v.clone();
-                }
+        self.aliased(kind, cs_type_name)
+    }
+
+    /// The element struct's emitted name for an Array node `array_id`: the name of
+    /// its first Struct child, or None when the element type is a primitive.
+    fn array_elem_struct_name(&self, array_id: u64) -> Option<String> {
+        for &ak in self.child_map.get(&array_id)? {
+            if self.tree.nodes[ak].kind == NodeKind::Struct {
+                return Some(self.name_for(&self.tree.nodes[ak]));
             }
         }
-        cs_type_name(kind).to_string()
+        None
     }
 
     /// `GenContext::structName(const Node&)` (`generator.cpp:114-118`).
@@ -673,15 +676,7 @@ fn emit_struct_body(
                 ));
             }
         } else if child.kind == NodeKind::Array {
-            let mut elem_type_name: Option<String> = None;
-            if let Some(array_kids) = ctx.child_map.get(&child.id) {
-                for &ak in array_kids {
-                    if ctx.tree.nodes[ak].kind == NodeKind::Struct {
-                        elem_type_name = Some(ctx.name_for(&ctx.tree.nodes[ak]));
-                        break;
-                    }
-                }
-            }
+            let elem_type_name = ctx.array_elem_struct_name(child.id);
             let field_name = sanitize_ident(&child.name);
             match elem_type_name {
                 Some(elem) if !elem.is_empty() => {
@@ -1019,15 +1014,7 @@ fn emit_rust_struct_body(
                 ));
             }
         } else if child.kind == NodeKind::Array {
-            let mut elem_type_name: Option<String> = None;
-            if let Some(array_kids) = ctx.child_map.get(&child.id) {
-                for &ak in array_kids {
-                    if ctx.tree.nodes[ak].kind == NodeKind::Struct {
-                        elem_type_name = Some(ctx.name_for(&ctx.tree.nodes[ak]));
-                        break;
-                    }
-                }
-            }
+            let elem_type_name = ctx.array_elem_struct_name(child.id);
             let field_name = sanitize_ident(&child.name);
             match elem_type_name {
                 Some(elem) if !elem.is_empty() => {
@@ -1303,15 +1290,7 @@ fn emit_csharp_struct_body(
                 ));
             }
         } else if child.kind == NodeKind::Array {
-            let mut elem_type_name: Option<String> = None;
-            if let Some(array_kids) = ctx.child_map.get(&child.id) {
-                for &ak in array_kids {
-                    if ctx.tree.nodes[ak].kind == NodeKind::Struct {
-                        elem_type_name = Some(ctx.name_for(&ctx.tree.nodes[ak]));
-                        break;
-                    }
-                }
-            }
+            let elem_type_name = ctx.array_elem_struct_name(child.id);
             match elem_type_name {
                 Some(elem) if !elem.is_empty() => {
                     ctx.output.push_str(&format!(
@@ -1571,15 +1550,7 @@ fn emit_python_struct_body(ctx: &mut GenContext, struct_id: u64, is_union: bool,
                     .push_str(&format!("{}(\"{}\", {}),{}\n", ind, name, type_name, oc));
             }
         } else if child.kind == NodeKind::Array {
-            let mut elem_type_name: Option<String> = None;
-            if let Some(array_kids) = ctx.child_map.get(&child.id) {
-                for &ak in array_kids {
-                    if ctx.tree.nodes[ak].kind == NodeKind::Struct {
-                        elem_type_name = Some(ctx.name_for(&ctx.tree.nodes[ak]));
-                        break;
-                    }
-                }
-            }
+            let elem_type_name = ctx.array_elem_struct_name(child.id);
             match elem_type_name {
                 Some(elem) if !elem.is_empty() => {
                     ctx.output.push_str(&format!(
