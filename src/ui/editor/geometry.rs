@@ -922,6 +922,47 @@ fn col_slice_trimmed(text: &str, start: i32, end: i32) -> (String, i32, i32) {
 /// the column padding to the actual type-name bounds. Returns an invalid span
 /// (so the caller falls through / refuses the edit) when the type column is empty
 /// or a bare keyword. Items 90/91.
+/// Skip leading spaces from `start`, then return the `[start, end)` column bounds
+/// of the first whitespace-delimited token before `end`, or `None` if only spaces
+/// remain. The shared "type column" scan in [`header_type_span`].
+fn first_token_in(chars: &[char], start: i32, end: i32) -> Option<(i32, i32)> {
+    let mut cursor = start;
+    while cursor < end && chars[cursor as usize] == ' ' {
+        cursor += 1;
+    }
+    let t_start = cursor;
+    while cursor < end && chars[cursor as usize] != ' ' {
+        cursor += 1;
+    }
+    if cursor > t_start {
+        Some((t_start, cursor))
+    } else {
+        None
+    }
+}
+
+/// The pure Vec/Mat value-component narrowing `begin_inline_edit` applies for a
+/// Value click: split the comma-joined `raw_span`, count commas before the clicked
+/// display column, and return `(component_index, seed_text)`. The index is both
+/// the seeded component and the write `sub_line` (`set_node_value` routes it to
+/// `addr + sub_line*4` as a Float). A single-component value seeds whole at 0; pass
+/// `click_col == span_start` for a keyboard edit (no click column).
+pub fn vec_component_for_click(raw_span: &str, span_start: i32, click_col: i32) -> (usize, String) {
+    let comps: Vec<&str> = raw_span.split(',').collect();
+    if comps.len() <= 1 {
+        return (0, raw_span.trim().to_string());
+    }
+    let rel = (click_col - span_start).max(0) as usize;
+    let span_chars: Vec<char> = raw_span.chars().collect();
+    let upto = rel.min(span_chars.len());
+    let comp = span_chars[..upto]
+        .iter()
+        .filter(|&&c| c == ',')
+        .count()
+        .min(comps.len() - 1);
+    (comp, comps[comp].trim().to_string())
+}
+
 fn header_type_span(lm: &LineMeta, text: &str, type_w: i32) -> ColumnSpan {
     if lm.line_kind != LineKind::Header || lm.is_array_header {
         return ColumnSpan::default();
@@ -956,40 +997,25 @@ fn header_type_span(lm: &LineMeta, text: &str, type_w: i32) -> ColumnSpan {
         if peek == "static " {
             cursor += 7;
         }
-        while cursor < type_end && chars[cursor as usize] == ' ' {
-            cursor += 1;
-        }
-        let t_start = cursor;
-        while cursor < type_end && chars[cursor as usize] != ' ' {
-            cursor += 1;
-        }
-        if cursor > t_start {
-            return ColumnSpan {
-                start: t_start,
-                end: cursor,
+        return match first_token_in(&chars, cursor, type_end) {
+            Some((start, end)) => ColumnSpan {
+                start,
+                end,
                 valid: true,
-            };
-        }
-        return ColumnSpan::default();
+            },
+            None => ColumnSpan::default(),
+        };
     }
 
     // Named struct: the entire type column is the type name; find its bounds
     // within the padded column.
-    let mut start = ind;
-    while start < type_end && chars[start as usize] == ' ' {
-        start += 1;
-    }
-    let mut end = start;
-    while end < type_end && chars[end as usize] != ' ' {
-        end += 1;
-    }
-    if end <= start {
-        return ColumnSpan::default();
-    }
-    ColumnSpan {
-        start,
-        end,
-        valid: true,
+    match first_token_in(&chars, ind, type_end) {
+        Some((start, end)) => ColumnSpan {
+            start,
+            end,
+            valid: true,
+        },
+        None => ColumnSpan::default(),
     }
 }
 

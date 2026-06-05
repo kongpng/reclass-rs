@@ -1717,21 +1717,16 @@ impl RcxEditor {
                 NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 | NodeKind::Mat4x4
             )
         {
-            let comps: Vec<&str> = raw_span.split(',').collect();
-            if comps.len() > 1 {
-                // Map the clicked display column to a component index by walking the
-                // value span char-by-char and counting commas before the click.
-                let comp = if let Some(col) = click_col {
-                    // `col` is a display column; the value span starts at span.start.
-                    let rel = (col - span.start).max(0) as usize;
-                    let span_chars: Vec<char> = raw_span.chars().collect();
-                    let upto = rel.min(span_chars.len());
-                    span_chars[..upto].iter().filter(|&&c| c == ',').count()
-                } else {
-                    0
-                };
-                let comp = comp.min(comps.len() - 1);
-                initial = comps[comp].trim().to_string();
+            // Narrow the seed + write `sub_line` to the clicked comma-component;
+            // a keyboard edit (no click column) defaults to component 0 via
+            // `unwrap_or(span.start)`.
+            if raw_span.split(',').count() > 1 {
+                let (comp, seed) = geometry::vec_component_for_click(
+                    raw_span,
+                    span.start,
+                    click_col.unwrap_or(span.start),
+                );
+                initial = seed;
                 sub_line = comp as i32;
             }
         }
@@ -8362,25 +8357,9 @@ mod tests {
 
     // ── Item 4: Vec/Mat value-component narrowing (the column→component map) ──
 
-    /// The pure narrowing math `begin_inline_edit` applies for a Vec/Mat Value
-    /// click: split the comma-joined value, count commas before the clicked column,
-    /// and that index is both the seeded component and the write `sub_line` (which
-    /// `set_node_value` routes to `addr + sub_line*4` as a Float).
-    fn vec_component_for_click(raw_span: &str, span_start: i32, click_col: i32) -> (usize, String) {
-        let comps: Vec<&str> = raw_span.split(',').collect();
-        if comps.len() <= 1 {
-            return (0, raw_span.trim().to_string());
-        }
-        let rel = (click_col - span_start).max(0) as usize;
-        let span_chars: Vec<char> = raw_span.chars().collect();
-        let upto = rel.min(span_chars.len());
-        let comp = span_chars[..upto]
-            .iter()
-            .filter(|&&c| c == ',')
-            .count()
-            .min(comps.len() - 1);
-        (comp, comps[comp].trim().to_string())
-    }
+    // The narrowing math now lives in geometry::vec_component_for_click (exercised
+    // by the production begin_inline_edit path); the tests below cover it directly.
+    use crate::ui::editor::geometry::vec_component_for_click;
 
     #[test]
     fn vec3_value_click_narrows_to_clicked_component() {
