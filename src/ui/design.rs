@@ -600,6 +600,33 @@ pub fn menu_accel_row(
         })
 }
 
+/// A docked-panel scroll list shell — `v_flex` with the standard panel padding
+/// and vertical scroll. Add `.children(...)`.
+pub fn panel_list(id: impl Into<gpui::ElementId>) -> Stateful<Div> {
+    use gpui::StatefulInteractiveElement as _;
+    gpui_component::v_flex()
+        .id(id)
+        .size_full()
+        .px(px(tokens::space::SM))
+        .py(px(tokens::space::XS))
+        .overflow_y_scroll()
+}
+
+/// A 32px docked-panel header strip (geometry + bottom border, no content) — the
+/// shell shared by the modules / bookmarks / workspace panel headers. Add the
+/// left cluster + right action as children.
+pub fn panel_header_strip(cx: &gpui::App) -> Div {
+    gpui_component::h_flex()
+        .h(px(32.0))
+        .w_full()
+        .flex_none()
+        .px(px(tokens::space::LG))
+        .items_center()
+        .justify_between()
+        .border_b_1()
+        .border_color(color::border(cx))
+}
+
 /// A centered panel empty-state: a muted 20px `icon` over a `UI_SM` muted
 /// `caption`. Shared by the docked panels' "nothing here yet" state.
 pub fn empty_state(

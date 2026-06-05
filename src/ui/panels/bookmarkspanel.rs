@@ -278,15 +278,7 @@ mod view {
     /// left, an "Add" ("+") action on the right (the C++ bookmarks dock header).
     fn render_header(view: &Entity<BookmarksPanel>, count: usize, cx: &App) -> impl IntoElement {
         let add_view = view.clone();
-        gpui_component::h_flex()
-            .h(px(32.0))
-            .w_full()
-            .flex_none()
-            .px(px(tokens::space::LG))
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(color::border(cx))
+        crate::ui::design::panel_header_strip(cx)
             .child(
                 gpui_component::h_flex()
                     .gap(px(tokens::space::MD))
@@ -336,12 +328,7 @@ mod view {
         rows: Vec<BookmarkRow>,
         cx: &App,
     ) -> impl IntoElement {
-        gpui_component::v_flex()
-            .id("rcx-bookmarks-list")
-            .size_full()
-            .px(px(tokens::space::SM))
-            .py(px(tokens::space::XS))
-            .overflow_y_scroll()
+        crate::ui::design::panel_list("rcx-bookmarks-list")
             .children(rows.into_iter().map(|row| bookmark_row(view, row, cx)))
     }
 

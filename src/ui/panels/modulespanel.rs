@@ -430,15 +430,7 @@ mod view {
         fn render_header(&self, cur: ModulesTab, cx: &Context<Self>) -> impl IntoElement {
             let view = cx.entity();
 
-            gpui_component::h_flex()
-                .h(px(32.0))
-                .w_full()
-                .flex_none()
-                .px(px(tokens::space::LG))
-                .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(color::border(cx))
+            crate::ui::design::panel_header_strip(cx)
                 // ── Tab strip (Modules / Symbols / Types) ──
                 .child(
                     gpui_component::h_flex()
@@ -514,12 +506,7 @@ mod view {
         rows: Vec<ModuleRow>,
         cx: &App,
     ) -> impl IntoElement {
-        gpui_component::v_flex()
-            .id("rcx-modules-list")
-            .size_full()
-            .px(px(tokens::space::SM))
-            .py(px(tokens::space::XS))
-            .overflow_y_scroll()
+        crate::ui::design::panel_list("rcx-modules-list")
             .children(
                 rows.into_iter()
                     .enumerate()
@@ -607,12 +594,7 @@ mod view {
 
     /// The Symbols list — one row per resolved symbol (name + `module+RVA`).
     fn symbol_list(rows: Vec<SymbolRow>, cx: &App) -> impl IntoElement {
-        gpui_component::v_flex()
-            .id("rcx-symbols-list")
-            .size_full()
-            .px(px(tokens::space::SM))
-            .py(px(tokens::space::XS))
-            .overflow_y_scroll()
+        crate::ui::design::panel_list("rcx-symbols-list")
             .children(rows.into_iter().enumerate().map(|(ix, row)| {
                 gpui_component::h_flex()
                     .id(("rcx-symbol-row", ix))
@@ -645,12 +627,7 @@ mod view {
 
     /// The Types list — one row per imported PDB type (kind tag + name + size).
     fn type_list(rows: Vec<TypeRow>, cx: &App) -> impl IntoElement {
-        gpui_component::v_flex()
-            .id("rcx-types-list")
-            .size_full()
-            .px(px(tokens::space::SM))
-            .py(px(tokens::space::XS))
-            .overflow_y_scroll()
+        crate::ui::design::panel_list("rcx-types-list")
             .children(rows.into_iter().enumerate().map(|(ix, row)| {
                 gpui_component::h_flex()
                     .id(("rcx-type-row", ix))

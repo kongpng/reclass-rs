@@ -971,15 +971,7 @@ impl WorkspacePanel {
         // The count caption ("N structs · M enums"), or nothing when empty.
         let count = m.count_caption();
 
-        gpui_component::h_flex()
-            .h(px(32.0))
-            .w_full()
-            .flex_none()
-            .px(px(tokens::space::LG))
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(color::border(cx))
+        crate::ui::design::panel_header_strip(cx)
             .child(
                 gpui_component::h_flex()
                     .min_w_0()
