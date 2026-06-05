@@ -968,6 +968,16 @@ fn unique_dirty_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
+/// Generate a thin global-key-binding handler routing a gpui action to its MENU
+/// CONTRACT command via `run_menu_command`.
+macro_rules! menu_action {
+    ($name:ident, $action:ty, $cmd:literal) => {
+        fn $name(&mut self, _: &$action, window: &mut Window, cx: &mut Context<Self>) {
+            self.run_menu_command(&$cmd.to_string(), window, cx);
+        }
+    };
+}
+
 impl MainWindow {
     /// Construct the main window view: build the [`DockArea`], assemble the
     /// default dock layout, seed [`AppState`], wire the dock/tab/workspace events,
@@ -1557,36 +1567,11 @@ impl MainWindow {
     // Each maps a registered key binding to its MENU CONTRACT command so the
     // keyboard, the menu bar, and the command palette share one dispatch.
 
-    fn on_refresh(&mut self, _: &RefreshView, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"view.refresh".to_string(), window, cx);
-    }
-    fn on_goto_address(
-        &mut self,
-        _: &GotoAddressAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_menu_command(&"view.goto_address".to_string(), window, cx);
-    }
-    fn on_toggle_modules(
-        &mut self,
-        _: &ToggleModules,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_menu_command(&"view.modules".to_string(), window, cx);
-    }
-    fn on_toggle_bookmarks(
-        &mut self,
-        _: &ToggleBookmarks,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_menu_command(&"view.bookmarks".to_string(), window, cx);
-    }
-    fn on_split_editor(&mut self, _: &SplitEditor, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"view.split".to_string(), window, cx);
-    }
+    menu_action!(on_refresh, RefreshView, "view.refresh");
+    menu_action!(on_goto_address, GotoAddressAction, "view.goto_address");
+    menu_action!(on_toggle_modules, ToggleModules, "view.modules");
+    menu_action!(on_toggle_bookmarks, ToggleBookmarks, "view.bookmarks");
+    menu_action!(on_split_editor, SplitEditor, "view.split");
     /// Toggle the top-level menu-bar menu whose Alt-mnemonic is `letter` (the
     /// Alt+letter accelerators, e.g. Alt+F ⇒ File). Opening it focuses its dropdown
     /// (via `MenuBar::render`), so Esc then closes it.
@@ -1596,75 +1581,30 @@ impl MainWindow {
         });
     }
 
-    fn on_unsplit_editor(
-        &mut self,
-        _: &UnsplitEditor,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_menu_command(&"view.unsplit".to_string(), window, cx);
-    }
+    menu_action!(on_unsplit_editor, UnsplitEditor, "view.unsplit");
 
     // The File/Edit accelerator handlers — each routes its bound key to the same
     // MENU CONTRACT command `run_menu_command` dispatches (the blocker fix: these
     // accelerators were advertised in the menu but had no global key binding).
-    fn on_new_class(&mut self, _: &NewClassAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.new_class".to_string(), window, cx);
-    }
-    fn on_new_struct(&mut self, _: &NewStructAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.new_struct".to_string(), window, cx);
-    }
-    fn on_new_enum(&mut self, _: &NewEnumAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.new_enum".to_string(), window, cx);
-    }
-    fn on_open_file(&mut self, _: &OpenFileAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.open".to_string(), window, cx);
-    }
-    fn on_save(&mut self, _: &SaveAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.save".to_string(), window, cx);
-    }
-    fn on_save_as(&mut self, _: &SaveAsAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.save_as".to_string(), window, cx);
-    }
-    fn on_close_doc(&mut self, _: &CloseDocAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"file.close".to_string(), window, cx);
-    }
-    fn on_undo(&mut self, _: &UndoAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"edit.undo".to_string(), window, cx);
-    }
-    fn on_redo(&mut self, _: &RedoAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"edit.redo".to_string(), window, cx);
-    }
-    fn on_add_bookmark(
-        &mut self,
-        _: &AddBookmarkAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_menu_command(&"edit.add_bookmark".to_string(), window, cx);
-    }
-    fn on_quick_bookmark(
-        &mut self,
-        _: &QuickBookmarkAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_menu_command(&"edit.quick_bookmark".to_string(), window, cx);
-    }
-    fn on_shortcuts(&mut self, _: &ShortcutsAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"help.shortcuts".to_string(), window, cx);
-    }
+    menu_action!(on_new_class, NewClassAction, "file.new_class");
+    menu_action!(on_new_struct, NewStructAction, "file.new_struct");
+    menu_action!(on_new_enum, NewEnumAction, "file.new_enum");
+    menu_action!(on_open_file, OpenFileAction, "file.open");
+    menu_action!(on_save, SaveAction, "file.save");
+    menu_action!(on_save_as, SaveAsAction, "file.save_as");
+    menu_action!(on_close_doc, CloseDocAction, "file.close");
+    menu_action!(on_undo, UndoAction, "edit.undo");
+    menu_action!(on_redo, RedoAction, "edit.redo");
+    menu_action!(on_add_bookmark, AddBookmarkAction, "edit.add_bookmark");
+    menu_action!(on_quick_bookmark, QuickBookmarkAction, "edit.quick_bookmark");
+    menu_action!(on_shortcuts, ShortcutsAction, "help.shortcuts");
     // The Tools accelerator handlers — the RTTI Browser (Ctrl+Shift+R;
     // main.cpp:1524) and Performance Profiler (Ctrl+Shift+F; main.cpp:1565) were
     // advertised in the Tools menu but had no global key binding, so both
     // shortcuts were dead. Each routes its bound key to the same MENU CONTRACT
     // command `run_menu_command` already dispatches.
-    fn on_rtti(&mut self, _: &RttiAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"tools.rtti".to_string(), window, cx);
-    }
-    fn on_profiler(&mut self, _: &ProfilerAction, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_command(&"tools.profiler".to_string(), window, cx);
-    }
+    menu_action!(on_rtti, RttiAction, "tools.rtti");
+    menu_action!(on_profiler, ProfilerAction, "tools.profiler");
 
     /// Dispatch a chosen command (from the menu bar, the command palette, or a
     /// global key binding). Maps a
