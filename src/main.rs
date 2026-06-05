@@ -1,25 +1,5 @@
 //! The `reclass` application binary.
-//!
-//! Port of `src/main.cpp`. Parses the CLI, sets up logging, and — when built
-//! with the `ui` feature — assembles + runs the GPUI application: it initializes
-//! gpui-component (`gpui_component::init`), opens the main window (titlebar +
-//! docks + document tabs + bespoke editor surface + workspace/scanner panels +
-//! dialogs + theme, per `gpui_component_cookbook.md` §4 and `window.rs`), and
-//! runs the event loop. A project/`.rcx` (and an optional `--data` binary) given
-//! on the command line is opened into the initial tab after the window comes up
-//! (the C++ deferred `project_open(path)` after `window.show()`; main.cpp:8774).
-//!
-//! Without the `ui` feature it runs as a headless engine entry point (logic
-//! only, no gpui), so `--no-default-features` still builds a `reclass` binary
-//! that parses the CLI and reports what it would open.
-
 use clap::Parser;
-
-/// reclass — a structured-data / struct-layout editor.
-///
-/// Open a Reclass project (`.rcx` native JSON or `.xml` ReClass-XML) by passing
-/// it as the positional argument; attach a binary file as the document's data
-/// source with `--data`. With no arguments, launches to the start page.
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "reclass", version, about)]
 struct Cli {
@@ -32,10 +12,7 @@ struct Cli {
 }
 
 fn main() {
-    // Logging: respect `RUST_LOG`; default to `info` so the document-lifecycle
-    // tracing (open/load/attach) is visible out of the box.
     init_tracing();
-
     let cli = Cli::parse();
     log_cli(&cli);
     run(cli);
@@ -63,11 +40,6 @@ fn log_cli(cli: &Cli) {
 #[cfg(feature = "ui")]
 fn run(cli: Cli) {
     let options = cli.into_startup_options();
-    // gpui-component setup pattern (gpui_component_cookbook.md §4, build-verified):
-    // build the platform application, register the gpui-component icon asset
-    // source (so `IconName` SVGs resolve — without it they render as empty
-    // boxes), init gpui-component, then open the main window — optionally opening
-    // the CLI project once the window is up.
     gpui_platform::application()
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx: &mut gpui::App| {

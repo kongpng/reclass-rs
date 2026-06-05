@@ -1798,330 +1798,212 @@ pub fn code_scope_name(scope: CodeScope) -> &'static str {
     }
 }
 
+// ── Public code-gen API ──
+//
+// The per-language single / tree / all renderers share three idioms — the root
+// validation guard, the GenContext+header preamble, and the emit loop — captured
+// here so each public fn below is a one-line driver call differing only in its
+// header string, `emit_*_struct` fn, and whether `align_comments` runs.
+
+/// The `finish` step for renderers whose text carries no align markers (`#define`).
+fn passthrough(s: &str) -> String {
+    s.to_string()
+}
+
+/// Validate `root_struct_id` is a real root struct, emit it under `header`, then
+/// `finish`. The body of every single-struct renderer.
+fn render_single(
+    mut ctx: GenContext,
+    root_struct_id: u64,
+    header: &str,
+    finish: fn(&str) -> String,
+    mut emit: impl FnMut(&mut GenContext, u64),
+) -> String {
+    let idx = ctx.tree.index_of_id(root_struct_id);
+    if idx < 0 || ctx.tree.nodes[idx as usize].kind != NodeKind::Struct {
+        return String::new();
+    }
+    ctx.assign_unique_names();
+    ctx.output.push_str(header);
+    emit(&mut ctx, root_struct_id);
+    finish(&ctx.output)
+}
+
+/// As [`render_single`] but emits every struct reachable from the root.
+fn render_tree(
+    mut ctx: GenContext,
+    root_struct_id: u64,
+    header: &str,
+    finish: fn(&str) -> String,
+    mut emit: impl FnMut(&mut GenContext, u64),
+) -> String {
+    let idx = ctx.tree.index_of_id(root_struct_id);
+    if idx < 0 || ctx.tree.nodes[idx as usize].kind != NodeKind::Struct {
+        return String::new();
+    }
+    ctx.assign_unique_names();
+    ctx.output.push_str(header);
+    for sid in collect_reachable_structs(ctx.tree, &ctx.child_map, root_struct_id) {
+        emit(&mut ctx, sid);
+    }
+    finish(&ctx.output)
+}
+
+/// Emit every top-level (offset-sorted) root struct in the tree.
+fn render_all(
+    mut ctx: GenContext,
+    header: &str,
+    finish: fn(&str) -> String,
+    mut emit: impl FnMut(&mut GenContext, u64),
+) -> String {
+    ctx.assign_unique_names();
+    ctx.output.push_str(header);
+    let mut roots: Vec<usize> = ctx.child_map.get(&0).cloned().unwrap_or_default();
+    roots.sort_by_key(|&i| ctx.tree.nodes[i].offset);
+    for ri in roots {
+        if ctx.tree.nodes[ri].kind == NodeKind::Struct {
+            let id = ctx.tree.nodes[ri].id;
+            emit(&mut ctx, id);
+        }
+    }
+    finish(&ctx.output)
+}
+
+
 // ── C/C++ public API (`generator.cpp:1439-1498`) ──
 
 /// `renderCpp(...)` (`generator.cpp:1439-1457`).
-pub fn render_cpp(
-    tree: &NodeTree,
-    root_struct_id: u64,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output.push_str("#pragma once\n#include <cstdint>\n\n");
-    emit_struct(&mut ctx, root_struct_id);
-    align_comments(&ctx.output)
+pub fn render_cpp(tree: &NodeTree, root_struct_id: u64, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_single(
+        GenContext::new(tree, type_aliases, emit_asserts),
+        root_struct_id,
+        "#pragma once\n#include <cstdint>\n\n",
+        align_comments,
+        emit_struct,
+    )
 }
-
 /// `renderCppTree(...)` (`generator.cpp:1459-1476`).
-pub fn render_cpp_tree(
-    tree: &NodeTree,
-    root_struct_id: u64,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output.push_str("#pragma once\n#include <cstdint>\n\n");
-
-    for sid in collect_reachable_structs(tree, &ctx.child_map, root_struct_id) {
-        emit_struct(&mut ctx, sid);
-    }
-    align_comments(&ctx.output)
+pub fn render_cpp_tree(tree: &NodeTree, root_struct_id: u64, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_tree(
+        GenContext::new(tree, type_aliases, emit_asserts),
+        root_struct_id,
+        "#pragma once\n#include <cstdint>\n\n",
+        align_comments,
+        emit_struct,
+    )
 }
-
 /// `renderCppAll(...)` (`generator.cpp:1478-1498`).
-pub fn render_cpp_all(
-    tree: &NodeTree,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output.push_str("#pragma once\n#include <cstdint>\n\n");
-
-    let mut roots: Vec<usize> = ctx.child_map.get(&0).cloned().unwrap_or_default();
-    roots.sort_by_key(|&i| tree.nodes[i].offset);
-    for ri in roots {
-        if tree.nodes[ri].kind == NodeKind::Struct {
-            let id = tree.nodes[ri].id;
-            emit_struct(&mut ctx, id);
-        }
-    }
-    align_comments(&ctx.output)
+pub fn render_cpp_all(tree: &NodeTree, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_all(GenContext::new(tree, type_aliases, emit_asserts), "#pragma once\n#include <cstdint>\n\n", align_comments, emit_struct)
 }
 
 // ── Rust public API (`generator.cpp:1502-1553`) ──
 
 /// `renderRust(...)` (`generator.cpp:1502-1515`).
-pub fn render_rust(
-    tree: &NodeTree,
-    root_struct_id: u64,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output.push_str("// Generated by Reclass 2027\n\n");
-    emit_rust_struct(&mut ctx, root_struct_id);
-    align_comments(&ctx.output)
+pub fn render_rust(tree: &NodeTree, root_struct_id: u64, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_single(
+        GenContext::new(tree, type_aliases, emit_asserts),
+        root_struct_id,
+        "// Generated by Reclass 2027\n\n",
+        align_comments,
+        emit_rust_struct,
+    )
 }
-
 /// `renderRustTree(...)` (`generator.cpp:1517-1534`).
-pub fn render_rust_tree(
-    tree: &NodeTree,
-    root_struct_id: u64,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output.push_str("// Generated by Reclass 2027\n\n");
-
-    for sid in collect_reachable_structs(tree, &ctx.child_map, root_struct_id) {
-        emit_rust_struct(&mut ctx, sid);
-    }
-    align_comments(&ctx.output)
+pub fn render_rust_tree(tree: &NodeTree, root_struct_id: u64, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_tree(
+        GenContext::new(tree, type_aliases, emit_asserts),
+        root_struct_id,
+        "// Generated by Reclass 2027\n\n",
+        align_comments,
+        emit_rust_struct,
+    )
 }
-
 /// `renderRustAll(...)` (`generator.cpp:1536-1553`).
-pub fn render_rust_all(
-    tree: &NodeTree,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output.push_str("// Generated by Reclass 2027\n\n");
-
-    let mut roots: Vec<usize> = ctx.child_map.get(&0).cloned().unwrap_or_default();
-    roots.sort_by_key(|&i| tree.nodes[i].offset);
-    for ri in roots {
-        if tree.nodes[ri].kind == NodeKind::Struct {
-            let id = tree.nodes[ri].id;
-            emit_rust_struct(&mut ctx, id);
-        }
-    }
-    align_comments(&ctx.output)
+pub fn render_rust_all(tree: &NodeTree, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_all(GenContext::new(tree, type_aliases, emit_asserts), "// Generated by Reclass 2027\n\n", align_comments, emit_rust_struct)
 }
 
 // ── #define public API (`generator.cpp:1557-1602`) ──
 
-/// `renderDefines(...)` (`generator.cpp:1557-1568`). Returns raw output (no
-/// `align_comments`; the `#define` text contains no markers).
+/// `renderDefines(...)` (`generator.cpp:1557-1568`). Raw output (no
+/// `align_comments`; the `#define` text carries no markers).
 pub fn render_defines(tree: &NodeTree, root_struct_id: u64) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, None, false);
-    ctx.assign_unique_names();
-    ctx.output.push_str("#pragma once\n#include <cstdint>\n\n");
-    emit_defines_for_struct(&mut ctx, root_struct_id, "", 0);
-    ctx.output
+    render_single(
+        GenContext::new(tree, None, false),
+        root_struct_id,
+        "#pragma once\n#include <cstdint>\n\n",
+        passthrough,
+        |ctx, id| emit_defines_for_struct(ctx, id, "", 0),
+    )
 }
-
 /// `renderDefinesTree(...)` (`generator.cpp:1570-1585`).
 pub fn render_defines_tree(tree: &NodeTree, root_struct_id: u64) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, None, false);
-    ctx.assign_unique_names();
-    ctx.output.push_str("#pragma once\n#include <cstdint>\n\n");
-
-    for sid in collect_reachable_structs(tree, &ctx.child_map, root_struct_id) {
-        emit_defines_for_struct(&mut ctx, sid, "", 0);
-    }
-    ctx.output
+    render_tree(
+        GenContext::new(tree, None, false),
+        root_struct_id,
+        "#pragma once\n#include <cstdint>\n\n",
+        passthrough,
+        |ctx, id| emit_defines_for_struct(ctx, id, "", 0),
+    )
 }
-
 /// `renderDefinesAll(...)` (`generator.cpp:1587-1602`).
 pub fn render_defines_all(tree: &NodeTree) -> String {
-    let mut ctx = GenContext::new(tree, None, false);
-    ctx.assign_unique_names();
-    ctx.output.push_str("#pragma once\n#include <cstdint>\n\n");
-
-    let mut roots: Vec<usize> = ctx.child_map.get(&0).cloned().unwrap_or_default();
-    roots.sort_by_key(|&i| tree.nodes[i].offset);
-    for ri in roots {
-        if tree.nodes[ri].kind == NodeKind::Struct {
-            let id = tree.nodes[ri].id;
-            emit_defines_for_struct(&mut ctx, id, "", 0);
-        }
-    }
-    ctx.output
+    render_all(GenContext::new(tree, None, false), "#pragma once\n#include <cstdint>\n\n", passthrough, |ctx, id| emit_defines_for_struct(ctx, id, "", 0))
 }
 
 // ── C# public API (`generator.cpp:1606-1657`) ──
 
 /// `renderCSharp(...)` (`generator.cpp:1606-1619`).
-pub fn render_csharp(
-    tree: &NodeTree,
-    root_struct_id: u64,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output
-        .push_str("using System.Runtime.InteropServices;\n#nullable disable\n\n");
-    emit_csharp_struct(&mut ctx, root_struct_id);
-    align_comments(&ctx.output)
+pub fn render_csharp(tree: &NodeTree, root_struct_id: u64, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_single(
+        GenContext::new(tree, type_aliases, emit_asserts),
+        root_struct_id,
+        "using System.Runtime.InteropServices;\n#nullable disable\n\n",
+        align_comments,
+        emit_csharp_struct,
+    )
 }
-
 /// `renderCSharpTree(...)` (`generator.cpp:1621-1638`).
-pub fn render_csharp_tree(
-    tree: &NodeTree,
-    root_struct_id: u64,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output
-        .push_str("using System.Runtime.InteropServices;\n#nullable disable\n\n");
-
-    for sid in collect_reachable_structs(tree, &ctx.child_map, root_struct_id) {
-        emit_csharp_struct(&mut ctx, sid);
-    }
-    align_comments(&ctx.output)
+pub fn render_csharp_tree(tree: &NodeTree, root_struct_id: u64, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_tree(
+        GenContext::new(tree, type_aliases, emit_asserts),
+        root_struct_id,
+        "using System.Runtime.InteropServices;\n#nullable disable\n\n",
+        align_comments,
+        emit_csharp_struct,
+    )
 }
-
 /// `renderCSharpAll(...)` (`generator.cpp:1640-1657`).
-pub fn render_csharp_all(
-    tree: &NodeTree,
-    type_aliases: Option<&TypeAliases>,
-    emit_asserts: bool,
-) -> String {
-    let mut ctx = GenContext::new(tree, type_aliases, emit_asserts);
-    ctx.assign_unique_names();
-    ctx.output
-        .push_str("using System.Runtime.InteropServices;\n#nullable disable\n\n");
-
-    let mut roots: Vec<usize> = ctx.child_map.get(&0).cloned().unwrap_or_default();
-    roots.sort_by_key(|&i| tree.nodes[i].offset);
-    for ri in roots {
-        if tree.nodes[ri].kind == NodeKind::Struct {
-            let id = tree.nodes[ri].id;
-            emit_csharp_struct(&mut ctx, id);
-        }
-    }
-    align_comments(&ctx.output)
+pub fn render_csharp_all(tree: &NodeTree, type_aliases: Option<&TypeAliases>, emit_asserts: bool) -> String {
+    render_all(GenContext::new(tree, type_aliases, emit_asserts), "using System.Runtime.InteropServices;\n#nullable disable\n\n", align_comments, emit_csharp_struct)
 }
 
 // ── Python public API (`generator.cpp:1661-1706`) ──
 
 /// `renderPython(...)` (`generator.cpp:1661-1672`).
 pub fn render_python(tree: &NodeTree, root_struct_id: u64) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, None, false);
-    ctx.assign_unique_names();
-    ctx.output.push_str("import ctypes\n\n");
-    emit_python_struct(&mut ctx, root_struct_id);
-    align_comments(&ctx.output)
+    render_single(
+        GenContext::new(tree, None, false),
+        root_struct_id,
+        "import ctypes\n\n",
+        align_comments,
+        emit_python_struct,
+    )
 }
-
 /// `renderPythonTree(...)` (`generator.cpp:1674-1689`).
 pub fn render_python_tree(tree: &NodeTree, root_struct_id: u64) -> String {
-    let idx = tree.index_of_id(root_struct_id);
-    if idx < 0 {
-        return String::new();
-    }
-    if tree.nodes[idx as usize].kind != NodeKind::Struct {
-        return String::new();
-    }
-
-    let mut ctx = GenContext::new(tree, None, false);
-    ctx.assign_unique_names();
-    ctx.output.push_str("import ctypes\n\n");
-
-    for sid in collect_reachable_structs(tree, &ctx.child_map, root_struct_id) {
-        emit_python_struct(&mut ctx, sid);
-    }
-    align_comments(&ctx.output)
+    render_tree(
+        GenContext::new(tree, None, false),
+        root_struct_id,
+        "import ctypes\n\n",
+        align_comments,
+        emit_python_struct,
+    )
 }
-
 /// `renderPythonAll(...)` (`generator.cpp:1691-1706`).
 pub fn render_python_all(tree: &NodeTree) -> String {
-    let mut ctx = GenContext::new(tree, None, false);
-    ctx.assign_unique_names();
-    ctx.output.push_str("import ctypes\n\n");
-
-    let mut roots: Vec<usize> = ctx.child_map.get(&0).cloned().unwrap_or_default();
-    roots.sort_by_key(|&i| tree.nodes[i].offset);
-    for ri in roots {
-        if tree.nodes[ri].kind == NodeKind::Struct {
-            let id = tree.nodes[ri].id;
-            emit_python_struct(&mut ctx, id);
-        }
-    }
-    align_comments(&ctx.output)
+    render_all(GenContext::new(tree, None, false), "import ctypes\n\n", align_comments, emit_python_struct)
 }
 
 // ── Format dispatch (`generator.cpp:1710-1745`) ──
