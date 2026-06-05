@@ -250,7 +250,7 @@ mod view {
     use crate::ui::design::{color, tokens};
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
-    use gpui_component::{ActiveTheme as _, Icon, IconName};
+    use gpui_component::{Icon, IconName};
 
     /// The leading SVG icon for a context-menu command (the C++ menus paint an
     /// icon next to each action). Maps each [`CommandId`] family to a verified
@@ -448,7 +448,7 @@ mod view {
             let fg = color::text(cx);
             let muted = color::text_muted(cx);
             let disabled = color::text_disabled(cx);
-            let danger = cx.theme().danger_foreground;
+            let danger = color::danger_emphasis(cx);
             let hover_bg = color::hover_overlay(cx);
             let sel_bg = color::selected_bg(cx);
             let selected = self.selected;

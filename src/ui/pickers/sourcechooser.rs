@@ -528,7 +528,6 @@ mod view {
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::ActiveTheme as _;
 
     /// What the user picked in the chooser — the descriptor the editor applies
     /// through the controller/document data-source API (the C++
@@ -786,7 +785,7 @@ mod view {
             let muted = color::text_muted(cx);
             let disabled = color::text_disabled(cx);
             let accent = color::accent(cx);
-            let danger = cx.theme().danger_foreground;
+            let danger = color::danger_emphasis(cx);
             let hover_bg = color::hover_overlay(cx);
             let sel_bg = color::selected_bg(cx);
             let border = color::border(cx);

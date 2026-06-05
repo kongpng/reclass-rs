@@ -341,6 +341,29 @@ pub mod color {
         cx.theme().primary
     }
 
+    // ── Severity ──────────────────────────────────────────────────────────────
+
+    /// Error / destructive severity (the theme `danger`).
+    pub fn danger(cx: &gpui::App) -> Hsla {
+        cx.theme().danger
+    }
+
+    /// Warning severity (the theme `warning`).
+    pub fn warning(cx: &gpui::App) -> Hsla {
+        cx.theme().warning
+    }
+
+    /// Success / confirmation severity (the theme `success`).
+    pub fn success(cx: &gpui::App) -> Hsla {
+        cx.theme().success
+    }
+
+    /// Emphasized danger — the foreground tint for danger text/icons
+    /// (the theme `danger_foreground`).
+    pub fn danger_emphasis(cx: &gpui::App) -> Hsla {
+        cx.theme().danger_foreground
+    }
+
     /// Link / hover-span color.
     pub fn link(cx: &gpui::App) -> Hsla {
         cx.theme().link

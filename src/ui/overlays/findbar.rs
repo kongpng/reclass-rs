@@ -175,7 +175,6 @@ mod view {
     use crate::ui::design::{color, tokens};
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::ActiveTheme;
 
     actions!(rcx_find_bar, [FindNext, FindPrev, FindClose]);
 
@@ -315,7 +314,7 @@ mod view {
                 format!("{ordinal} of {count}")
             };
             let readout_color = if no_results {
-                cx.theme().danger
+                color::danger(cx)
             } else {
                 color::text_muted(cx)
             };

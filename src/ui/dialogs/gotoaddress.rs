@@ -259,7 +259,7 @@ mod view {
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{ActiveTheme, Disableable as _};
+    use gpui_component::Disableable as _;
 
     /// The "Base Address" help table (PIC5) — example expression on the left, the
     /// addressing mode it demonstrates on the right. The C++ goto dialog shows the
@@ -548,8 +548,8 @@ mod view {
             let mono = SharedString::from(tokens::font::mono_family());
             let (status_text, status_color) = match self.state.status() {
                 GotoStatus::Idle => (" ".to_string(), color::text_muted(cx)),
-                GotoStatus::Resolved(v) => (format!("\u{2192} 0x{v:x}"), cx.theme().success),
-                GotoStatus::Error(e) => (e, cx.theme().danger),
+                GotoStatus::Resolved(v) => (format!("\u{2192} 0x{v:x}"), color::success(cx)),
+                GotoStatus::Error(e) => (e, color::danger(cx)),
             };
 
             // The recent entries as compact Zed list-rows (mono, selectable). The

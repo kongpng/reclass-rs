@@ -305,7 +305,7 @@ mod open {
     use gpui::*;
     use gpui_component::button::ButtonVariant as GButtonVariant;
     use gpui_component::dialog::DialogButtonProps;
-    use gpui_component::{ActiveTheme as _, Icon, IconName, WindowExt as _};
+    use gpui_component::{Icon, IconName, WindowExt as _};
 
     fn to_gpui_variant(v: ButtonVariant) -> GButtonVariant {
         match v {
@@ -322,8 +322,8 @@ mod open {
     fn severity_icon(severity: Severity, cx: &App) -> impl IntoElement {
         let (name, tint) = match severity {
             Severity::Info => (IconName::Info, color::accent(cx)),
-            Severity::Warning => (IconName::TriangleAlert, cx.theme().warning),
-            Severity::Critical => (IconName::CircleX, cx.theme().danger),
+            Severity::Warning => (IconName::TriangleAlert, color::warning(cx)),
+            Severity::Critical => (IconName::CircleX, color::danger(cx)),
             // No dedicated question glyph in the bundled set; the accent Info glyph
             // reads as a neutral prompt for confirm/unsaved dialogs.
             Severity::Question => (IconName::Info, color::accent(cx)),

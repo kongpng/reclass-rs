@@ -6380,7 +6380,7 @@ impl Render for PluginManagerDialog {
             None
         } else {
             let header = div()
-                .text_color(cx.theme().danger)
+                .text_color(color::danger(cx))
                 .text_size(px(tokens::font::UI_SM))
                 .child(format!(
                     "Failed to load {} plugin(s):",
