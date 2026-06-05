@@ -7,6 +7,7 @@
 //! `ThemeColor` palette so theme switches are instant (every frame re-reads
 //! `cx.theme()`). Kept tiny and gpui-only; no logic that needs unit testing.
 
+use crate::ui::design::color::with_alpha;
 use gpui::Hsla;
 use gpui_component::ActiveTheme;
 
@@ -255,11 +256,6 @@ fn darker(c: Hsla, amount: f32) -> Hsla {
         l: (c.l - amount).clamp(0.0, 1.0),
         ..c
     }
-}
-
-/// Apply an alpha to an `Hsla` (translucent tints: soft selection, dim ASCII).
-fn with_alpha(c: Hsla, a: f32) -> Hsla {
-    Hsla { a, ..c }
 }
 
 /// A deeper "text faint" tone (item 29): the C++ `textFaint` (≈ #505050) is a

@@ -42,6 +42,7 @@ use crate::core::linemeta::K_COMMAND_ROW_ID;
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
 use crate::ui::findbar::{FindBar, FindEvent};
 use crate::ui::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
+use crate::ui::design::color::with_alpha;
 use crate::ui::{design, tooltip};
 
 use element::{RowElement, RowPaint};
@@ -9068,11 +9069,6 @@ impl Render for RcxEditor {
             // floated near the cursor over the hovered value column.
             .children(self.render_hover_popup(cx))
     }
-}
-
-/// Apply an alpha to an `Hsla` (heat/byte-sel overlays are translucent fills).
-fn with_alpha(c: Hsla, a: f32) -> Hsla {
-    Hsla { a, ..c }
 }
 
 /// Structural equality for two hover popup kinds (item 13) — used to avoid

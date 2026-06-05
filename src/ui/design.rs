@@ -256,6 +256,20 @@ pub mod color {
         cx.theme().selection
     }
 
+    /// Return `c` with its alpha replaced by `a` — the shared translucent-tint
+    /// helper (heat / byte-selection overlays, soft selections, dim ASCII).
+    /// `Hsla.a` is an unclamped `f32`, so this is identical to `let mut c=…; c.a=a`.
+    pub fn with_alpha(c: Hsla, a: f32) -> Hsla {
+        Hsla { a, ..c }
+    }
+
+    /// The menu-bar dropdown's hover / keyboard-highlight background — a soft
+    /// accent wash that reads on the dropdown's lighter elevated surface (where
+    /// the theme's `list_hover` / `list_active` overlays are nearly invisible).
+    pub fn menu_highlight(cx: &gpui::App) -> Hsla {
+        with_alpha(accent(cx), 0.30)
+    }
+
     // ── Text ──────────────────────────────────────────────────────────────
 
     /// Primary content text.

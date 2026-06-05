@@ -737,13 +737,8 @@ fn submenu_row(
 ) -> impl IntoElement {
     let fg = color::text(cx);
     let muted = color::text_muted(cx);
-    // Soft-accent highlight (see `command_row`) — the theme overlay is invisible on
-    // the dropdown surface.
-    let highlight_bg = {
-        let mut c = color::accent(cx);
-        c.a = 0.30;
-        c
-    };
+    // Soft-accent highlight (see `command_row`).
+    let highlight_bg = color::menu_highlight(cx);
 
     // Empty leading slot mirrors the command row's checkmark slot so submenu
     // labels line up with sibling leaves.
@@ -835,15 +830,9 @@ fn command_row(
     };
     let muted = color::text_muted(cx);
     let accent = color::accent(cx);
-    // Hover / keyboard-highlight background. The theme's `list_hover` / `list_active`
-    // overlays are nearly invisible on the menu's lighter elevated surface (they are
-    // tuned for the darker base background the palette uses), so use a soft accent
-    // wash that clearly reads on the dropdown.
-    let highlight_bg = {
-        let mut c = accent;
-        c.a = 0.30;
-        c
-    };
+    // Hover / keyboard-highlight background — a soft accent wash that reads on the
+    // dropdown surface (the theme overlays are invisible there).
+    let highlight_bg = color::menu_highlight(cx);
 
     // Leading fixed-width checkmark slot — keeps every label left-aligned whether
     // or not a row is checkable. Holds a real SVG check (accent-tinted) when this
