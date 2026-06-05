@@ -600,6 +600,28 @@ pub fn menu_accel_row(
         })
 }
 
+/// A centered panel empty-state: a muted 20px `icon` over a `UI_SM` muted
+/// `caption`. Shared by the docked panels' "nothing here yet" state.
+pub fn empty_state(
+    icon: gpui_component::Icon,
+    caption: impl Into<SharedString>,
+    cx: &gpui::App,
+) -> Div {
+    use gpui_component::Sizable as _;
+    gpui_component::v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(tokens::space::MD))
+        .child(icon.with_size(px(20.0)).text_color(color::text_disabled(cx)))
+        .child(
+            div()
+                .text_size(px(tokens::font::UI_SM))
+                .text_color(color::text_muted(cx))
+                .child(caption.into()),
+        )
+}
+
 /// A Zed key-cap chip (`zed_ui_spec.md` §6): a small `SM`-radius, `UI_XS`,
 /// hairline-bordered muted pill for one keystroke token. Shared by the command
 /// palette row end-slot and the welcome-page action rows.

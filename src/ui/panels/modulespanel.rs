@@ -693,22 +693,7 @@ mod view {
     /// The clean empty-state body: a centered muted caption (the Zed "nothing
     /// here yet" panel state).
     fn empty_state(caption: &'static str, cx: &App) -> impl IntoElement {
-        gpui_component::v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap(px(tokens::space::MD))
-            .child(
-                icon::database()
-                    .with_size(px(20.0))
-                    .text_color(color::text_disabled(cx)),
-            )
-            .child(
-                div()
-                    .text_size(px(tokens::font::UI_SM))
-                    .text_color(color::text_muted(cx))
-                    .child(caption),
-            )
+        crate::ui::design::empty_state(icon::database(), caption, cx)
     }
 
     // Bring the `with_size` (Sizable) + Disableable helpers into scope.
