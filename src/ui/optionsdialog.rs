@@ -907,11 +907,7 @@ mod view {
                 }))
                 .w(card_w)
                 .h(card_h)
-                .child(modal::header("Options", cx).child(modal::close_button(
-                    "opt-close",
-                    cx.listener(|this, _e, _window, cx| this.cancel(cx)),
-                    cx,
-                )))
+                .child(modal::header_with_close("Options", "opt-close", cx.listener(|this, _e, _window, cx| this.cancel(cx)), cx))
                 .child(body)
                 .child(footer)
         }

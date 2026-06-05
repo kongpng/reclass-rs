@@ -6388,11 +6388,7 @@ impl Render for TextPromptDialog {
             }))
             .w(card_w)
             .child(
-                modal::header(self.title.clone(), cx).child(modal::close_button(
-                    "prompt-close",
-                    cx.listener(|this, _e, _w, cx| this.cancel(cx)),
-                    cx,
-                )),
+                modal::header_with_close(self.title.clone(), "prompt-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx),
             )
             .child(body)
             .child(footer)
@@ -6643,11 +6639,7 @@ impl Render for TypeAliasesDialog {
             }))
             .w(card_w)
             .max_h(card_max_h)
-            .child(modal::header("Type Aliases", cx).child(modal::close_button(
-                "alias-close",
-                cx.listener(|this, _e, _w, cx| this.cancel(cx)),
-                cx,
-            )))
+            .child(modal::header_with_close("Type Aliases", "alias-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx))
             .child(body)
             .child(footer)
     }
@@ -7064,11 +7056,7 @@ impl Render for PluginManagerDialog {
             }))
             .w(card_w)
             .max_h(card_max_h)
-            .child(modal::header("Plugins", cx).child(modal::close_button(
-                "plugins-x",
-                cx.listener(|this, _e, _w, cx| this.close(cx)),
-                cx,
-            )))
+            .child(modal::header_with_close("Plugins", "plugins-x", cx.listener(|this, _e, _w, cx| this.close(cx)), cx))
             .child(body)
             .child(footer)
     }

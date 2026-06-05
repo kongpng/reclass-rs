@@ -644,11 +644,7 @@ mod view {
                 .w(card_w)
                 .max_h(card_max_h)
                 .child(
-                    modal::header("Go to Address", cx).child(modal::close_button(
-                        "goto-close",
-                        cx.listener(|this, _e, _window, cx| this.cancel(cx)),
-                        cx,
-                    )),
+                    modal::header_with_close("Go to Address", "goto-close", cx.listener(|this, _e, _window, cx| this.cancel(cx)), cx),
                 )
                 .child(body)
                 .child(footer)

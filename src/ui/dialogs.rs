@@ -207,6 +207,18 @@ pub mod modal {
             .child("\u{2715}")
     }
 
+    /// A modal header row with the `title` on the left and the `×` close button
+    /// (with unique `id`, running `on_close`) on the right — the shared header
+    /// every dialog builds.
+    pub fn header_with_close(
+        title: impl Into<SharedString>,
+        id: &'static str,
+        on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &App,
+    ) -> Div {
+        header(title, cx).child(close_button(id, on_close, cx))
+    }
+
     /// The modal body container: comfortable `XL` padding, vertical stack with a
     /// `LG` gap, and it grows to fill the card (`flex_1`). Callers add the
     /// labelled rows / sections / controls.
@@ -839,11 +851,7 @@ mod profiler_view {
                 .w(card_w)
                 .h(card_h)
                 .child(
-                    modal::header("Performance Profiler", cx).child(modal::close_button(
-                        "prof-close",
-                        cx.listener(|this, _e, _window, cx| this.close(cx)),
-                        cx,
-                    )),
+                    modal::header_with_close("Performance Profiler", "prof-close", cx.listener(|this, _e, _window, cx| this.close(cx)), cx),
                 )
                 .child(body)
         }

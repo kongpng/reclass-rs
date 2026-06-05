@@ -820,11 +820,7 @@ mod view {
                 .w(card_w)
                 .h(card_h)
                 .child(
-                    modal::header("Attach to Process", cx).child(modal::close_button(
-                        "process-close",
-                        cx.listener(|this, _e, _w, cx| this.cancel(cx)),
-                        cx,
-                    )),
+                    modal::header_with_close("Attach to Process", "process-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx),
                 )
                 .child(body)
                 .child(footer)
