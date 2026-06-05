@@ -397,6 +397,27 @@ impl WorkspaceModel {
         (count, children)
     }
 
+    /// The `"N structs · M enums"` count caption (empty when no types exist) —
+    /// shared by the dock title and the panel header.
+    pub fn count_caption(&self) -> String {
+        if self.struct_count == 0 && self.enum_count == 0 {
+            return String::new();
+        }
+        let mut s = format!(
+            "{} struct{}",
+            self.struct_count,
+            if self.struct_count != 1 { "s" } else { "" }
+        );
+        if self.enum_count > 0 {
+            s.push_str(&format!(
+                " \u{b7} {} enum{}",
+                self.enum_count,
+                if self.enum_count != 1 { "s" } else { "" }
+            ));
+        }
+        s
+    }
+
     /// The dock title (`m_dockTitleLabel` text; app-shell §10): `"Project"` plus
     /// a `" — N structs · M enums"` suffix when any types exist. `dirty` adds the
     /// leading `•` modified marker.
@@ -406,19 +427,10 @@ impl WorkspaceModel {
             s.push_str("\u{2022} ");
         }
         s.push_str("Project");
-        if self.struct_count > 0 || self.enum_count > 0 {
-            s.push_str(&format!(
-                " \u{2014} {} struct{}",
-                self.struct_count,
-                if self.struct_count != 1 { "s" } else { "" }
-            ));
-            if self.enum_count > 0 {
-                s.push_str(&format!(
-                    " \u{b7} {} enum{}",
-                    self.enum_count,
-                    if self.enum_count != 1 { "s" } else { "" }
-                ));
-            }
+        let caption = self.count_caption();
+        if !caption.is_empty() {
+            s.push_str(" \u{2014} ");
+            s.push_str(&caption);
         }
         s
     }
@@ -970,21 +982,7 @@ impl WorkspacePanel {
 
         let m = &self.model;
         // The count caption ("N structs · M enums"), or nothing when empty.
-        let mut count = String::new();
-        if m.struct_count > 0 || m.enum_count > 0 {
-            count.push_str(&format!(
-                "{} struct{}",
-                m.struct_count,
-                if m.struct_count != 1 { "s" } else { "" }
-            ));
-            if m.enum_count > 0 {
-                count.push_str(&format!(
-                    " \u{b7} {} enum{}",
-                    m.enum_count,
-                    if m.enum_count != 1 { "s" } else { "" }
-                ));
-            }
-        }
+        let count = m.count_caption();
 
         gpui_component::h_flex()
             .h(px(32.0))
