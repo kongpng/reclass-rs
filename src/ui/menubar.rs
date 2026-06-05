@@ -73,6 +73,11 @@ pub struct MenuBar {
     /// submenu row at a given depth replaces the tail (the classic "slide between
     /// fly-outs" behaviour); hovering a plain leaf collapses any deeper fly-outs.
     open_submenu: Vec<usize>,
+    /// Keyboard-navigation highlight: the row index (in the DEEPEST open panel)
+    /// that ↑/↓ moved to and Enter activates. `None` until the first arrow key, and
+    /// cleared whenever the mouse changes the open structure (so pointer and
+    /// keyboard don't fight over the highlight).
+    highlight: Option<usize>,
     /// Command ids that should render a leading checkmark (checkable/toggle menu
     /// items reflecting live app state — e.g. `view.scanner` while the scanner
     /// pop-out is open; the C++ `QAction::setChecked`). The host
@@ -105,6 +110,7 @@ impl MenuBar {
             menus: default_menu_tree(),
             open_index: None,
             open_submenu: Vec::new(),
+            highlight: None,
             checked: HashSet::new(),
             // The C++ default is Title-Case (`menuBarTitleCase = false`).
             title_case: false,
@@ -164,6 +170,7 @@ impl MenuBar {
             Some(index)
         };
         self.open_submenu.clear();
+        self.highlight = None;
         cx.notify();
     }
 
@@ -194,6 +201,7 @@ impl MenuBar {
         if self.open_index.is_some() && self.open_index != Some(index) {
             self.open_index = Some(index);
             self.open_submenu.clear();
+            self.highlight = None;
             cx.notify();
         }
     }
@@ -205,6 +213,8 @@ impl MenuBar {
     fn open_submenu_path(&mut self, path: Vec<usize>, cx: &mut Context<Self>) {
         if self.open_submenu != path {
             self.open_submenu = path;
+            // A mouse hover changed the open fly-out — drop the keyboard highlight.
+            self.highlight = None;
             cx.notify();
         }
     }
@@ -223,9 +233,141 @@ impl MenuBar {
     fn close_menus(&mut self, cx: &mut Context<Self>) {
         let was_open = self.open_index.take().is_some() || !self.open_submenu.is_empty();
         self.open_submenu.clear();
+        self.highlight = None;
         if was_open {
             cx.notify();
         }
+    }
+
+    // ── Keyboard navigation of the open menu (↑/↓ move the highlight, Enter
+    // activates, Tab / ← / → traverse). The highlight always refers to the DEEPEST
+    // open panel; mouse hover clears it so the two input modes don't fight. ──
+
+    /// The children of the deepest currently-open panel (the top-level menu's body,
+    /// or the body of the innermost open fly-out). Empty when no menu is open.
+    fn deepest_children(&self) -> Vec<MenuNode> {
+        let Some(top) = self.open_index else {
+            return Vec::new();
+        };
+        let mut cur = match self.menus.get(top) {
+            Some(MenuNode::Submenu { children, .. }) => children,
+            _ => return Vec::new(),
+        };
+        for &idx in &self.open_submenu {
+            match cur.get(idx) {
+                Some(MenuNode::Submenu { children, .. }) => cur = children,
+                _ => break,
+            }
+        }
+        cur.clone()
+    }
+
+    /// Whether a row can hold the keyboard highlight (enabled leaf or a submenu;
+    /// separators and disabled rows are skipped).
+    fn selectable(node: &MenuNode) -> bool {
+        matches!(
+            node,
+            MenuNode::Item { enabled: true, .. } | MenuNode::Submenu { .. }
+        )
+    }
+
+    /// Move the highlight by `delta` over the selectable rows of the deepest panel,
+    /// wrapping. From no highlight, ↓ lands on the first row and ↑ on the last.
+    fn move_highlight(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let rows = self.deepest_children();
+        let sel: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| Self::selectable(n))
+            .map(|(i, _)| i)
+            .collect();
+        if sel.is_empty() {
+            return;
+        }
+        let pos = self.highlight.and_then(|h| sel.iter().position(|&i| i == h));
+        let next = match pos {
+            Some(p) => (p as i32 + delta).rem_euclid(sel.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => sel.len() - 1,
+        };
+        self.highlight = Some(sel[next]);
+        cx.notify();
+    }
+
+    /// Activate the highlighted row: an enabled leaf runs its command (closing the
+    /// menu); a submenu opens its fly-out and moves the highlight into it.
+    fn activate_highlight(&mut self, cx: &mut Context<Self>) {
+        let Some(h) = self.highlight else { return };
+        match self.deepest_children().get(h) {
+            Some(MenuNode::Item {
+                command,
+                enabled: true,
+                ..
+            }) => {
+                let command = command.clone();
+                self.choose_command(command, cx);
+            }
+            Some(MenuNode::Submenu { .. }) => self.open_highlighted_submenu(cx),
+            _ => {}
+        }
+    }
+
+    /// Open the highlighted submenu's fly-out (keyboard → / Enter) and move the
+    /// highlight to the first selectable row of the new panel.
+    fn open_highlighted_submenu(&mut self, cx: &mut Context<Self>) {
+        let Some(h) = self.highlight else { return };
+        if matches!(self.deepest_children().get(h), Some(MenuNode::Submenu { .. })) {
+            self.open_submenu.push(h);
+            self.highlight = None;
+            self.move_highlight(1, cx); // first selectable row of the fly-out
+        }
+    }
+
+    /// Keyboard ←: collapse the innermost open fly-out (re-highlighting the parent
+    /// row), or — at the top level — switch to the previous top-level menu.
+    fn back_or_prev_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(parent) = self.open_submenu.pop() {
+            self.highlight = Some(parent);
+            cx.notify();
+        } else {
+            self.switch_menu(-1, cx);
+        }
+    }
+
+    /// Keyboard →: open the highlighted submenu, or — on a leaf — move to the next
+    /// top-level menu (the C++ Right-arrow menu-bar walk).
+    fn right_key(&mut self, cx: &mut Context<Self>) {
+        let is_submenu = self
+            .highlight
+            .map(|h| matches!(self.deepest_children().get(h), Some(MenuNode::Submenu { .. })))
+            .unwrap_or(false);
+        if is_submenu {
+            self.open_highlighted_submenu(cx);
+        } else {
+            self.switch_menu(1, cx);
+        }
+    }
+
+    /// Switch the open top-level menu by `delta` (Tab / Shift+Tab, ←/→ at the top
+    /// level), wrapping; resets the fly-out chain and highlight.
+    fn switch_menu(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let tops: Vec<usize> = self
+            .menus
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, MenuNode::Submenu { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if tops.is_empty() {
+            return;
+        }
+        let cur = self.open_index.unwrap_or(tops[0]);
+        let pos = tops.iter().position(|&i| i == cur).unwrap_or(0);
+        let next = (pos as i32 + delta).rem_euclid(tops.len() as i32) as usize;
+        self.open_index = Some(tops[next]);
+        self.open_submenu.clear();
+        self.highlight = None;
+        cx.notify();
     }
 
     /// Close all menus and hand the keyboard back to whoever held it when the menu
@@ -244,6 +386,7 @@ impl MenuBar {
     fn choose_command(&mut self, command: CommandId, cx: &mut Context<Self>) {
         self.open_index = None;
         self.open_submenu.clear();
+        self.highlight = None;
         // The command (host slot) decides where focus goes; don't restore the
         // opener's focus over it. Just drop the saved handle.
         self.restore_focus = None;
@@ -316,6 +459,7 @@ impl Render for MenuBar {
         let checked = self.checked.clone();
         let title_case = self.title_case;
         let dropdown_focus = self.dropdown_focus.clone();
+        let highlight = self.highlight;
 
         gpui_component::h_flex()
             .id("rcx-menubar")
@@ -332,6 +476,8 @@ impl Render for MenuBar {
                         open_submenu.clone(),
                         checked.clone(),
                         dropdown_focus.clone(),
+                        // Highlight only applies to the menu that is actually open.
+                        if open_index == Some(i) { highlight } else { None },
                         cx,
                     )),
                     // Top-level leaves/separators don't appear in the C++ bar.
@@ -358,6 +504,7 @@ fn render_top_level(
     open_submenu: Vec<usize>,
     checked: HashSet<CommandId>,
     dropdown_focus: FocusHandle,
+    highlight: Option<usize>,
     cx: &mut Context<MenuBar>,
 ) -> AnyElement {
     // The clickable title — Zed chrome: muted text, hover overlay, MD radius. It
@@ -400,13 +547,47 @@ fn render_top_level(
                             // Hold focus so Escape reaches the dropdown; the parent
                             // `MenuBar::render` focuses this handle while open.
                             .track_focus(&dropdown_focus)
-                            // Escape dismisses the menu (the C++ QMenu modal-loop
-                            // Escape) and hands the keyboard back to the editor.
-                            .on_key_down(cx.listener(
+                            // Keyboard navigation of the open menu: ↑/↓ move the
+                            // highlight, Enter activates, Tab / Shift+Tab walk the
+                            // top-level menus (File · Edit · …), ←/→ traverse
+                            // submenus, Escape dismisses (handing focus back to the
+                            // editor). The C++ QMenuBar keyboard walk. Capture-phase
+                            // so it intercepts Tab / arrows BEFORE gpui's focus
+                            // traversal or a window-level binding can swallow them
+                            // (bubble-phase on_key_down only ever saw Escape).
+                            .capture_key_down(cx.listener(
                                 |this, ev: &KeyDownEvent, window, cx| {
-                                    if ev.keystroke.key == "escape" {
-                                        cx.stop_propagation();
-                                        this.close_menus_restoring(window, cx);
+                                    let shift = ev.keystroke.modifiers.shift;
+                                    match ev.keystroke.key.as_str() {
+                                        "escape" => {
+                                            cx.stop_propagation();
+                                            this.close_menus_restoring(window, cx);
+                                        }
+                                        "down" => {
+                                            cx.stop_propagation();
+                                            this.move_highlight(1, cx);
+                                        }
+                                        "up" => {
+                                            cx.stop_propagation();
+                                            this.move_highlight(-1, cx);
+                                        }
+                                        "enter" | "space" => {
+                                            cx.stop_propagation();
+                                            this.activate_highlight(cx);
+                                        }
+                                        "right" => {
+                                            cx.stop_propagation();
+                                            this.right_key(cx);
+                                        }
+                                        "left" => {
+                                            cx.stop_propagation();
+                                            this.back_or_prev_menu(cx);
+                                        }
+                                        "tab" => {
+                                            cx.stop_propagation();
+                                            this.switch_menu(if shift { -1 } else { 1 }, cx);
+                                        }
+                                        _ => {}
                                     }
                                 },
                             ))
@@ -421,7 +602,13 @@ fn render_top_level(
                             // fly-outs) is rendered relative to the top-level
                             // dropdown so each child anchors to the right of its
                             // parent row.
-                            .child(menu_dropdown(&children, &open_submenu, &checked, cx)),
+                            .child(menu_dropdown(
+                                &children,
+                                &open_submenu,
+                                &checked,
+                                highlight,
+                                cx,
+                            )),
                     ),
             ))
         })
@@ -435,9 +622,10 @@ fn menu_dropdown(
     children: &[MenuNode],
     open_submenu: &[usize],
     checked: &HashSet<CommandId>,
+    highlight: Option<usize>,
     cx: &mut Context<MenuBar>,
 ) -> impl IntoElement {
-    menu_panel(children, &[], open_submenu, checked, cx)
+    menu_panel(children, &[], open_submenu, checked, highlight, cx)
 }
 
 /// Render one cascading menu **panel**: an elevated surface of inset rows for
@@ -456,6 +644,7 @@ fn menu_panel(
     parent_path: &[usize],
     open_path: &[usize],
     checked: &HashSet<CommandId>,
+    highlight: Option<usize>,
     cx: &mut Context<MenuBar>,
 ) -> AnyElement {
     // The host's checked-command set (the C++ checkable `QAction` state — e.g.
@@ -466,6 +655,10 @@ fn menu_panel(
     // Depth of this panel = number of fly-outs already crossed to reach it.
     let depth = parent_path.len();
     let open_here = open_path.first().copied();
+    // The keyboard highlight applies to the DEEPEST open panel only (the one with
+    // no further fly-out open below it).
+    let is_deepest = open_path.is_empty();
+    let row_highlighted = |i: usize| is_deepest && highlight == Some(i);
 
     let mut rows: Vec<AnyElement> = Vec::new();
     for (i, child) in children.iter().enumerate() {
@@ -484,6 +677,7 @@ fn menu_panel(
                     command.clone(),
                     *enabled,
                     is_checked(command),
+                    row_highlighted(i),
                     depth,
                     cx,
                 )
@@ -499,12 +693,20 @@ fn menu_panel(
                 let is_open = open_here == Some(i);
                 // Recurse into the child panel only while this fly-out is open.
                 let child_panel: Option<AnyElement> = if is_open {
-                    Some(menu_panel(sub, &abs_path, &open_path[1..], checked, cx))
+                    Some(menu_panel(
+                        sub,
+                        &abs_path,
+                        &open_path[1..],
+                        checked,
+                        highlight,
+                        cx,
+                    ))
                 } else {
                     None
                 };
                 rows.push(
-                    submenu_row(i, label, is_open, abs_path, child_panel, cx).into_any_element(),
+                    submenu_row(i, label, is_open, row_highlighted(i), abs_path, child_panel, cx)
+                        .into_any_element(),
                 );
             }
         }
@@ -528,6 +730,7 @@ fn submenu_row(
     key: usize,
     label: &str,
     open: bool,
+    highlighted: bool,
     abs_path: Vec<usize>,
     child_panel: Option<AnyElement>,
     cx: &mut Context<MenuBar>,
@@ -558,8 +761,13 @@ fn submenu_row(
                 .text_size(px(tokens::font::UI_MD))
                 .text_color(fg)
                 .cursor_pointer()
-                .when(open, |r| r.bg(color::hover_overlay(cx)))
-                .when(!open, |r| r.hover(|s| s.bg(color::hover_overlay(cx))))
+                // Keyboard selection wins (clear selection bg); else the open
+                // fly-out's parent row keeps the faint hover tint.
+                .when(highlighted, |r| r.bg(color::selected_bg(cx)))
+                .when(open && !highlighted, |r| r.bg(color::hover_overlay(cx)))
+                .when(!open && !highlighted, |r| {
+                    r.hover(|s| s.bg(color::hover_overlay(cx)))
+                })
                 .child(lead_slot)
                 .child(div().flex_1().min_w_0().child(label.to_string()))
                 // The fly-out affordance (the C++ submenu ▸).
@@ -612,6 +820,7 @@ fn command_row(
     command: CommandId,
     enabled: bool,
     checked: bool,
+    highlighted: bool,
     depth: usize,
     cx: &mut Context<MenuBar>,
 ) -> impl IntoElement {
@@ -663,6 +872,10 @@ fn command_row(
         .rounded(px(tokens::radius::MD))
         .text_size(px(tokens::font::UI_MD))
         .text_color(label_color)
+        // The keyboard-highlighted row carries the clear selection background (the
+        // same one the command palette / type selector use), not the faint hover
+        // tint — a persistent keyboard selection needs to read at a glance.
+        .when(highlighted, |r| r.bg(color::selected_bg(cx)))
         // Resting the pointer on a plain leaf at this level collapses any open
         // fly-out from a *sibling* "▸" row (the C++ slide-off-the-submenu close).
         .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
