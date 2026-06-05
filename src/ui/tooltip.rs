@@ -426,7 +426,7 @@ mod view {
                 .into_any_element(),
         };
 
-        super::super::design::elevated_surface(cx)
+        crate::ui::design::elevated_surface(cx)
             .max_w(px(MAX_W))
             .p(px(PAD))
             .child(

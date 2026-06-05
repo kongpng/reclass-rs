@@ -9,17 +9,17 @@
 //! (`render_dialog_layer` / `render_sheet_layer` / `render_notification_layer`).
 //!
 //! Each surface lives in its own sibling module (gpui-free model + a thin view):
-//! - [`optionsdialog`](super::optionsdialog) — Options dialog (§5).
-//! - [`gotoaddress`](super::gotoaddress) — Goto-Address dialog (§7).
-//! - [`commandpalette`](super::commandpalette) — Command palette (§8).
-//! - [`findbar`](super::findbar) — the Find bar (Ctrl+F).
-//! - [`messagebox`](super::messagebox) — themed message/confirm/input (§3,§4).
-//! - [`typeselectorpopup`](super::typeselectorpopup) — type picker (§9).
-//! - [`enumpicker`](super::enumpicker) — enum picker (§10).
-//! - [`sourcechooser`](super::sourcechooser) — source chooser (§11).
-//! - [`hextoolbar`](super::hextoolbar) — hex toolbar (§12).
-//! - [`contextmenu`](super::contextmenu) — context menus (§0).
-//! - [`tooltip`](super::tooltip) — tooltips + hover previews (§15,§20).
+//! - [`optionsdialog`](crate::ui::optionsdialog) — Options dialog (§5).
+//! - [`gotoaddress`](crate::ui::gotoaddress) — Goto-Address dialog (§7).
+//! - [`commandpalette`](crate::ui::commandpalette) — Command palette (§8).
+//! - [`findbar`](crate::ui::findbar) — the Find bar (Ctrl+F).
+//! - [`messagebox`](crate::ui::messagebox) — themed message/confirm/input (§3,§4).
+//! - [`typeselectorpopup`](crate::ui::typeselectorpopup) — type picker (§9).
+//! - [`enumpicker`](crate::ui::enumpicker) — enum picker (§10).
+//! - [`sourcechooser`](crate::ui::sourcechooser) — source chooser (§11).
+//! - [`hextoolbar`](crate::ui::hextoolbar) — hex toolbar (§12).
+//! - [`contextmenu`](crate::ui::contextmenu) — context menus (§0).
+//! - [`tooltip`](crate::ui::tooltip) — tooltips + hover previews (§15,§20).
 //!
 //! This module keeps the [`DialogKind`] catalogue (a stable, logged identifier for
 //! each surface, used for action routing + tests) and re-exports the views.
@@ -29,21 +29,21 @@
 // Re-export the implemented dialog/popup views + their event types under one
 // roof (the "open a dialog" entry point the window wires to).
 #[cfg(feature = "ui")]
-pub use super::commandpalette::{CommandPalette, PaletteEvent};
+pub use crate::ui::commandpalette::{CommandPalette, PaletteEvent};
 #[cfg(feature = "ui")]
-pub use super::enumpicker::{EnumPickerEvent, EnumPickerPopup};
+pub use crate::ui::enumpicker::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
-pub use super::findbar::{FindBar, FindEvent};
+pub use crate::ui::findbar::{FindBar, FindEvent};
 #[cfg(feature = "ui")]
-pub use super::gotoaddress::{GotoAddressDialog, GotoEvent};
+pub use crate::ui::gotoaddress::{GotoAddressDialog, GotoEvent};
 #[cfg(feature = "ui")]
-pub use super::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
+pub use crate::ui::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
 #[cfg(feature = "ui")]
-pub use super::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
+pub use crate::ui::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
 #[cfg(feature = "ui")]
-pub use super::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
+pub use crate::ui::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 #[cfg(feature = "ui")]
-pub use super::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
+pub use crate::ui::typeselectorpopup::{TypeSelectorEvent, TypeSelectorPopup};
 
 /// The modal/overlay surfaces to be ported (widgets-dialogs.md). A catalogue
 /// only — each variant becomes its own gpui-component-backed view later.

@@ -643,7 +643,7 @@ impl TypeModel {
 
     /// Re-filter against `filter` (`applyFilter`). Empty → group-bucketed sections
     /// in the fixed [`KindGroup::ALL`] order, each with a header; non-empty →
-    /// flat list ranked by [`fuzzy_score`](super::fuzzy::fuzzy_score) desc (no
+    /// flat list ranked by [`fuzzy_score`](crate::ui::fuzzy::fuzzy_score) desc (no
     /// headers). Selects the first selectable row.
     pub fn apply_filter(&mut self, filter: &str) {
         let trimmed = filter.trim();
@@ -797,7 +797,7 @@ impl TypeModel {
                 continue;
             }
             let mut pos = Vec::new();
-            let s = super::fuzzy::source_score(query, &e.display_name, Some(&mut pos));
+            let s = crate::ui::fuzzy::source_score(query, &e.display_name, Some(&mut pos));
             if s > 0 {
                 scored.push((s, i, pos));
             }
@@ -815,36 +815,36 @@ impl TypeModel {
         self.rows = rows;
     }
 
-    /// The selectability mask over `rows`, for [`super::navlist`] navigation.
+    /// The selectability mask over `rows`, for [`crate::ui::navlist`] navigation.
     fn selectable_mask(&self) -> Vec<bool> {
         self.rows.iter().map(|r| r.entry.selectable()).collect()
     }
 
     /// The first selectable row (`nextSelectableRow` from the top).
     fn first_selectable_row(&self) -> Option<usize> {
-        super::navlist::first_selectable(&self.selectable_mask())
+        crate::ui::navlist::first_selectable(&self.selectable_mask())
     }
 
     /// Move the selection down to the next selectable row (Down).
     pub fn move_down(&mut self) {
-        self.selected = super::navlist::step(&self.selectable_mask(), self.selected, 1);
+        self.selected = crate::ui::navlist::step(&self.selectable_mask(), self.selected, 1);
     }
 
     /// Move the selection up to the previous selectable row (Up).
     pub fn move_up(&mut self) {
-        self.selected = super::navlist::step(&self.selectable_mask(), self.selected, -1);
+        self.selected = crate::ui::navlist::step(&self.selectable_mask(), self.selected, -1);
     }
 
     /// Move the selection down by `page` selectable rows (PageDown), landing on
     /// the last selectable row if fewer remain (`Key_PageDown`).
     pub fn page_down(&mut self, page: usize) {
-        self.selected = super::navlist::page(&self.selectable_mask(), self.selected, 1, page);
+        self.selected = crate::ui::navlist::page(&self.selectable_mask(), self.selected, 1, page);
     }
 
     /// Move the selection up by `page` selectable rows (PageUp), landing on the
     /// first selectable row if fewer remain (`Key_PageUp`).
     pub fn page_up(&mut self, page: usize) {
-        self.selected = super::navlist::page(&self.selectable_mask(), self.selected, -1, page);
+        self.selected = crate::ui::navlist::page(&self.selectable_mask(), self.selected, -1, page);
     }
 
     /// Select the first selectable row (Home).
@@ -854,7 +854,7 @@ impl TypeModel {
 
     /// Select the last selectable row (End).
     pub fn move_end(&mut self) {
-        self.selected = super::navlist::last_selectable(&self.selectable_mask());
+        self.selected = crate::ui::navlist::last_selectable(&self.selectable_mask());
     }
 
     /// Pre-select the row matching a primitive `kind` (`setTypes` current-entry
@@ -1299,7 +1299,7 @@ mod view {
         fn theme(&self, cx: &App) -> Theme {
             // The popover tints rows from our theme; pull the current one from the
             // app-shared manager so chip/group colors match the editor.
-            super::super::theme_apply::ThemeRegistryGlobal::current(cx)
+            crate::ui::theme_apply::ThemeRegistryGlobal::current(cx)
         }
 
         /// Keyboard navigation (`typeselectorpopup.cpp:1881` `eventFilter`):
@@ -1430,7 +1430,7 @@ mod view {
                         // micro label, muted.
                         let group = r.entry_group_for_label();
                         let dot = group.map(|g| {
-                            super::super::theme_apply::to_hsla(super::kind_group_color(g, &theme))
+                            crate::ui::theme_apply::to_hsla(super::kind_group_color(g, &theme))
                         });
                         gpui_component::h_flex()
                             .w_full()
@@ -1449,7 +1449,7 @@ mod view {
                             )
                             .into_any_element()
                     } else {
-                        let group_color = super::super::theme_apply::to_hsla(
+                        let group_color = crate::ui::theme_apply::to_hsla(
                             super::kind_group_color(r.entry.group, &theme),
                         );
                         let is_sel = selected == Some(row);
@@ -1613,7 +1613,7 @@ mod view {
                 })
                 .collect();
 
-            super::super::design::elevated_surface(cx)
+            crate::ui::design::elevated_surface(cx)
                 .id("rcx-type-selector")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxTypeSelector")
@@ -1761,7 +1761,7 @@ mod view {
             };
 
             let group_color = |g: KindGroup| -> Hsla {
-                super::super::theme_apply::to_hsla(super::kind_group_color(g, theme))
+                crate::ui::theme_apply::to_hsla(super::kind_group_color(g, theme))
             };
             let on = |g: KindGroup| self.model.group_active(g);
 
@@ -2315,8 +2315,8 @@ mod tests {
             "CamelCase-boundary match should outrank the mid-word match"
         );
         // And cross-check the underlying scorer directly: boundary > mid-word.
-        let boundary = super::super::fuzzy::source_score("a", "FooAbc", None);
-        let mid_word = super::super::fuzzy::source_score("a", "Fooabc", None);
+        let boundary = crate::ui::fuzzy::source_score("a", "FooAbc", None);
+        let mid_word = crate::ui::fuzzy::source_score("a", "Fooabc", None);
         assert!(
             boundary > mid_word,
             "boundary {boundary} should beat mid-word {mid_word}"

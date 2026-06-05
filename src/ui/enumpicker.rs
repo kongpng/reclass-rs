@@ -7,7 +7,7 @@
 //! (ARCHITECTURE §5) it maps onto a `Popover` + a `List`. This ports the pure
 //! filter/sort model (unit-tested) + a popover view.
 //!
-//! Filter uses the two-pass [`fuzzy_score`](super::fuzzy::fuzzy_score) (the C++
+//! Filter uses the two-pass [`fuzzy_score`](crate::ui::fuzzy::fuzzy_score) (the C++
 //! enum picker calls `rcx::fuzzyScore` from `fuzzy_match.h`); sort is **score
 //! desc** while searching, else **by value ascending** (`applyFilter`).
 //!
@@ -113,7 +113,7 @@ impl EnumPickerModel {
         for (i, m) in self.members.iter().enumerate() {
             let mut pos = Vec::new();
             let sc = if search_active {
-                super::fuzzy::fuzzy_score(trimmed, &m.name, Some(&mut pos))
+                crate::ui::fuzzy::fuzzy_score(trimmed, &m.name, Some(&mut pos))
             } else {
                 1
             };
@@ -448,7 +448,7 @@ mod view {
                 })
                 .collect();
 
-            super::super::design::elevated_surface(cx)
+            crate::ui::design::elevated_surface(cx)
                 .id("rcx-enum-picker")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxEnumPicker")

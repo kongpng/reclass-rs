@@ -20,7 +20,7 @@
 //! was inconsistent dead UI and has been removed.
 //!
 //! The sidebar toggle emits its intent by calling back into the owning
-//! [`MainWindow`](super::window::MainWindow) (the C++ `layoutPresetSelected`
+//! [`MainWindow`](crate::ui::window::MainWindow) (the C++ `layoutPresetSelected`
 //! signal → `applyLayoutPreset`); rendering takes a plain closure so this module
 //! stays decoupled from the window type.
 //!
@@ -31,7 +31,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, TitleBar};
 
-use super::menubar::MenuBar;
+use crate::ui::menubar::MenuBar;
 
 /// The two-mode workspace layout toggle (`enum LayoutPreset`, `titlebar.h:15-18`).
 ///
@@ -282,13 +282,13 @@ pub fn render_titlebar(
 /// A small inline source-icon badge used by the document tabs + titlebar
 /// (`drawTabSourceIcon`, app-shell §8). Renders a glyph at full/dimmed opacity to
 /// signal liveness; the real SVG icon assets are wired with the icon workflow.
-pub fn source_icon(kind: super::state::SourceKind, live: bool, cx: &App) -> impl IntoElement {
+pub fn source_icon(kind: crate::ui::state::SourceKind, live: bool, cx: &App) -> impl IntoElement {
     let glyph = match kind {
-        super::state::SourceKind::None => "\u{25CB}", // ○ no source (plug)
-        super::state::SourceKind::File => "\u{1F5CE}", // 🗎 file
-        super::state::SourceKind::Buffer => "\u{25A4}", // ▤ buffer
-        super::state::SourceKind::Snapshot => "\u{25A3}", // ▣ snapshot
-        super::state::SourceKind::Process => "\u{2699}", // ⚙ process
+        crate::ui::state::SourceKind::None => "\u{25CB}", // ○ no source (plug)
+        crate::ui::state::SourceKind::File => "\u{1F5CE}", // 🗎 file
+        crate::ui::state::SourceKind::Buffer => "\u{25A4}", // ▤ buffer
+        crate::ui::state::SourceKind::Snapshot => "\u{25A3}", // ▣ snapshot
+        crate::ui::state::SourceKind::Process => "\u{2699}", // ⚙ process
     };
     let color = if live {
         cx.theme().foreground

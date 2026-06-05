@@ -44,11 +44,11 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Selectable as _, Sizable as _};
 
-use super::commandpalette::{default_menu_tree, CommandId, MenuNode};
-use super::design::{color, elevated_surface, icon, tokens};
+use crate::ui::commandpalette::{default_menu_tree, CommandId, MenuNode};
+use crate::ui::design::{color, elevated_surface, icon, tokens};
 
 /// The menu-bar's outcome — a top-level→leaf command was chosen. Routed by the
-/// owning [`MainWindow`](super::window::MainWindow) to `run_menu_command` (the
+/// owning [`MainWindow`](crate::ui::window::MainWindow) to `run_menu_command` (the
 /// same dispatch the command palette's `Trigger` uses).
 #[derive(Clone, Debug)]
 pub struct MenuCommand(pub CommandId);
@@ -56,7 +56,7 @@ pub struct MenuCommand(pub CommandId);
 /// The in-window menu bar view — a horizontal row of top-level menu titles, each
 /// opening a Zed-styled dropdown built from the shared menu tree.
 ///
-/// Owned by [`MainWindow`](super::window::MainWindow), which subscribes to
+/// Owned by [`MainWindow`](crate::ui::window::MainWindow), which subscribes to
 /// [`MenuCommand`] and dispatches the chosen command.
 pub struct MenuBar {
     /// The menu tree (the shared palette tree by default). Held so the dropdowns
@@ -81,13 +81,13 @@ pub struct MenuBar {
     /// Command ids that should render a leading checkmark (checkable/toggle menu
     /// items reflecting live app state — e.g. `view.scanner` while the scanner
     /// pop-out is open; the C++ `QAction::setChecked`). The host
-    /// ([`MainWindow`](super::window::MainWindow)) updates this via
+    /// ([`MainWindow`](crate::ui::window::MainWindow)) updates this via
     /// [`set_command_checked`](Self::set_command_checked).
     checked: HashSet<CommandId>,
     /// Whether the top-level menu titles render upper-cased (the C++
     /// `menuBarTitleCase` ⇒ `applyMenuBarTitleCase(true)`; main.cpp:1063). `false`
     /// (the C++ default) renders them Title-Cased. The host
-    /// ([`MainWindow`](super::window::MainWindow)) pushes the persisted preference
+    /// ([`MainWindow`](crate::ui::window::MainWindow)) pushes the persisted preference
     /// via [`set_title_case`](Self::set_title_case).
     title_case: bool,
     /// Focus handle the open dropdown holds while a menu is up, so the keyboard

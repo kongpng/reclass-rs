@@ -3,7 +3,7 @@
 //!
 //! Port of `CommandPalette`: a centered modal that walks the menu bar into flat
 //! "Menu > Sub > Item" [`Entry`] paths, fuzzy-filters them with the palette's own
-//! scorer ([`super::fuzzy::command_score`]), stable-sorts by score, and triggers
+//! scorer ([`crate::ui::fuzzy::command_score`]), stable-sorts by score, and triggers
 //! the chosen entry's command. The C++ reimplements no behavior — it surfaces
 //! already-wired `QAction`s; here an entry carries a [`CommandId`] the host routes
 //! to the controller/window (Ctrl+K opens it; ARCHITECTURE §5 → `List` modal).
@@ -15,14 +15,14 @@
 //! - [`Entry`] / [`walk_menu`] — the recursive, cycle-safe flattener (`walkMenu`):
 //!   strips separators + `&` mnemonics + `\t` shortcut hints; leaf → an entry.
 //! - [`PaletteModel`] — the filter/rank state (`rebuildModel`): score via
-//!   [`command_score`](super::fuzzy::command_score), keep `>0`, **stable-sort by
+//!   [`command_score`](crate::ui::fuzzy::command_score), keep `>0`, **stable-sort by
 //!   score desc**, build "path    [shortcut]" rows; selects row 0.
 //! - [`CommandPalette`] / [`PaletteEvent`] — the gpui modal raising
 //!   `Trigger(CommandId)` / `Cancel`.
 //!
 //! Gated behind the `ui` feature.
 
-use super::fuzzy::command_score;
+use crate::ui::fuzzy::command_score;
 
 /// A routed command identifier — the port's stand-in for a `QAction*` target.
 /// The host maps these to controller/window operations (the palette itself only
@@ -781,7 +781,7 @@ mod view {
                 .map(|e| {
                     let mut pos = Vec::new();
                     if !query.is_empty() {
-                        super::super::fuzzy::fuzzy_score(&query, &e.path, Some(&mut pos));
+                        crate::ui::fuzzy::fuzzy_score(&query, &e.path, Some(&mut pos));
                     }
                     (e.path.clone(), e.shortcut.clone(), e.enabled, pos)
                 })

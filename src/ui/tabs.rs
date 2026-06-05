@@ -51,9 +51,9 @@ use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
-use super::design::{color, icon, tokens};
-use super::editor::RcxEditor;
-use super::state::{DataSource, DocId, SourceKind, ViewMode};
+use crate::ui::design::{color, icon, tokens};
+use crate::ui::editor::RcxEditor;
+use crate::ui::state::{DataSource, DocId, SourceKind, ViewMode};
 use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
 
 // ── Document-tab context-menu actions (the C++ doc-tab `QMenu`, `main.cpp:3652`)
@@ -175,7 +175,7 @@ impl DocEntry {
 }
 
 /// An event the document area raises to the window (the C++ signal wiring,
-/// app-shell §8 step 9). The window reflects these into [`AppState`](super::state)
+/// app-shell §8 step 9). The window reflects these into [`AppState`](crate::ui::state)
 /// and the workspace title.
 #[derive(Clone, Debug)]
 pub enum DocAreaEvent {
@@ -437,7 +437,7 @@ impl DocumentArea {
     /// Close every open tab whose data source is of `kind`, returning how many
     /// were closed (the live-host **safe-unload** detach; design §7.A [fix]).
     ///
-    /// The [`LivePluginHost`](super::pluginhost::LivePluginHost) drives this when
+    /// The [`LivePluginHost`](crate::ui::pluginhost::LivePluginHost) drives this when
     /// the manager safe-unloads a provider plugin: every document still pointing
     /// at that provider's source kind is closed **before** the backing library is
     /// dropped, so none outlives the provider it reads (the C++ dangling-provider
@@ -1489,7 +1489,7 @@ mod tests {
     // on a lightweight mirror of `DocumentArea`'s rules (the same invariants the
     // gpui methods enforce: active follows close, never blank, monotonic ids),
     // to keep them gpui-free and deterministic.
-    use super::super::state::{DocId, SourceKind, ViewMode};
+    use crate::ui::state::{DocId, SourceKind, ViewMode};
 
     /// A gpui-free mirror of `DocumentArea`'s tab list + active-index rules.
     struct TabModel {
@@ -1807,7 +1807,7 @@ mod tests {
 
     #[test]
     fn source_status_label_describes_kind_and_target() {
-        use super::super::state::{DataSource, SourceKind};
+        use crate::ui::state::{DataSource, SourceKind};
         use super::source_status_label;
         // A live file source → "File: <target>".
         let s = DataSource::new(SourceKind::File, "game.bin");

@@ -626,7 +626,7 @@ mod view {
             };
             let has_suggestions = !suggestion_chips.is_empty();
 
-            super::super::design::elevated_surface(cx)
+            crate::ui::design::elevated_surface(cx)
                 .id("rcx-hex-toolbar")
                 .track_focus(&self.focus_handle)
                 .key_context("RcxHexToolbar")

@@ -2,9 +2,9 @@
 //!
 //! Port of the dockable side panels + MDI document panels (app-shell §8, §10).
 //! The **workspace** ("Project") dock is now the real
-//! [`WorkspacePanel`](super::workspace::WorkspacePanel) (a virtualized tree) and
+//! [`WorkspacePanel`](crate::ui::workspace::WorkspacePanel) (a virtualized tree) and
 //! the **center document area** is the real
-//! [`DocumentArea`](super::tabs::DocumentArea) (the tab strip + editor host); the
+//! [`DocumentArea`](crate::ui::tabs::DocumentArea) (the tab strip + editor host); the
 //! remaining docks (memory scanner, symbols, bookmarks) are still stood up with
 //! the generic [`PlaceholderPanel`] until their workflows land.
 //!
@@ -13,7 +13,7 @@
 //! Render + Focusable` + a `panel_name`) so a
 //! [`DockArea`](gpui_component::dock::DockArea) can host it. [`DocumentPanel`]
 //! (the older single-editor center panel) is kept for reference + reuse; the
-//! center is now the multi-tab [`DocumentArea`](super::tabs::DocumentArea).
+//! center is now the multi-tab [`DocumentArea`](crate::ui::tabs::DocumentArea).
 //!
 //! Gated behind the `ui` feature (pulls gpui-component).
 
@@ -23,7 +23,7 @@ use gpui_component::{
     ActiveTheme,
 };
 
-use super::editor::RcxEditor;
+use crate::ui::editor::RcxEditor;
 
 /// Which Reclass surface a placeholder stands in for — picks its title and the
 /// real view that will eventually replace it (app-shell mapping).
@@ -36,10 +36,10 @@ pub enum PanelKind {
     /// The center MDI document area (app-shell §8 — the editor surface lives here).
     Document,
     /// The right-dock modules/symbols/types list (the C++ View ▸ Modules,
-    /// `Ctrl+Shift+Y`). The real view is [`super::modulespanel::ModulesPanel`].
+    /// `Ctrl+Shift+Y`). The real view is [`crate::ui::modulespanel::ModulesPanel`].
     Modules,
     /// The right-dock bookmarks list (the C++ View ▸ Bookmarks, `Ctrl+Shift+B`).
-    /// The real view is [`super::bookmarkspanel::BookmarksPanel`].
+    /// The real view is [`crate::ui::bookmarkspanel::BookmarksPanel`].
     Bookmarks,
 }
 
@@ -62,8 +62,8 @@ impl PanelKind {
             PanelKind::Workspace => "WorkspacePanel",
             PanelKind::Scanner => "ScannerPanel",
             PanelKind::Document => "DocumentPanel",
-            PanelKind::Modules => super::modulespanel::PANEL_NAME,
-            PanelKind::Bookmarks => super::bookmarkspanel::PANEL_NAME,
+            PanelKind::Modules => crate::ui::modulespanel::PANEL_NAME,
+            PanelKind::Bookmarks => crate::ui::bookmarkspanel::PANEL_NAME,
         }
     }
 }

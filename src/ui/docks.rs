@@ -9,13 +9,13 @@
 //! `dump`/`load` (ARCHITECTURE §5 surface map).
 //!
 //! [`build_default_layout`] assembles the canonical layout: the center is the
-//! real MDI [`DocumentArea`](super::tabs::DocumentArea) (tab strip + "+" sentinel
+//! real MDI [`DocumentArea`](crate::ui::tabs::DocumentArea) (tab strip + "+" sentinel
 //! + source icons + view-mode toggle + editor), the left dock is the real
-//! [`WorkspacePanel`](super::workspace::WorkspacePanel), the bottom dock is the
-//! real [`ScannerPanel`](super::scannerpanel::ScannerPanel) (closed by default),
+//! [`WorkspacePanel`](crate::ui::workspace::WorkspacePanel), the bottom dock is the
+//! real [`ScannerPanel`](crate::ui::scannerpanel::ScannerPanel) (closed by default),
 //! and the **right** dock tabifies the
-//! [`ModulesPanel`](super::modulespanel::ModulesPanel) +
-//! [`BookmarksPanel`](super::bookmarkspanel::BookmarksPanel) (also closed by
+//! [`ModulesPanel`](crate::ui::modulespanel::ModulesPanel) +
+//! [`BookmarksPanel`](crate::ui::bookmarkspanel::BookmarksPanel) (also closed by
 //! default — the C++ View ▸ Modules / Bookmarks summon them on demand). It
 //! returns [`LayoutHandles`] the window wires + observes. The dock drag overlay +
 //! per-dock toolbars (app-shell §9) come later; the seam is the layout builder +
@@ -27,11 +27,11 @@ use gpui::*;
 use gpui_component::dock::{DockArea, DockItem};
 use std::sync::Arc;
 
-use super::bookmarkspanel::BookmarksPanel;
-use super::modulespanel::ModulesPanel;
-use super::scannerpanel::ScannerPanel;
-use super::tabs::DocumentArea;
-use super::workspace::WorkspacePanel;
+use crate::ui::bookmarkspanel::BookmarksPanel;
+use crate::ui::modulespanel::ModulesPanel;
+use crate::ui::scannerpanel::ScannerPanel;
+use crate::ui::tabs::DocumentArea;
+use crate::ui::workspace::WorkspacePanel;
 
 /// Identity + layout version for the main dock area, used as the `dump`/`load`
 /// key (the C++ `QSettings` dock-layout slot; app-shell §10 dock persistence).
@@ -84,12 +84,12 @@ pub struct LayoutHandles {
 ///   "+" sentinel, source icons, view-mode toggle, and the editor),
 /// - **left dock** = the workspace / project tree ([`WorkspacePanel`]),
 /// - **bottom dock** = the real memory scanner
-///   ([`ScannerPanel`](super::scannerpanel::ScannerPanel)), **closed by default** —
+///   ([`ScannerPanel`](crate::ui::scannerpanel::ScannerPanel)), **closed by default** —
 ///   the C++ memory scanner is a separate pop-out summoned on demand
 ///   (`reclass_memory_scanner.png` shows it as its own detached window, hidden
 ///   until requested), not an always-present panel. It is revealed by
 ///   View ▸ Memory Scanner / `Ctrl+Shift+M`
-///   ([`toggle_scanner_dock`](super::window::MainWindow::toggle_scanner_dock)).
+///   ([`toggle_scanner_dock`](crate::ui::window::MainWindow::toggle_scanner_dock)).
 ///
 /// Mirrors the verified gpui-component `DockArea` construction pattern
 /// (`examples/dock.rs`): build `DockItem::tabs(...)` of `Arc<dyn PanelView>`

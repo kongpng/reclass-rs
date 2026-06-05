@@ -583,7 +583,7 @@ impl ThemeRegistryGlobal {
             crate::theme::SettingsStore::set(
                 &mut settings,
                 "theme",
-                super::design::DEFAULT_THEME_NAME,
+                crate::ui::design::DEFAULT_THEME_NAME,
             );
             let manager = crate::theme::ThemeManager::new(
                 Box::new(settings),
@@ -657,7 +657,7 @@ pub fn apply_theme(theme: &Theme, window: &mut gpui::Window, cx: &mut gpui::App)
     // Zed-like global typography + surface geometry (design tokens). Comfortable
     // ~14px UI text, a real monospace for the editor, small radii on elevated
     // surfaces, restrained shadows. See `ui/design.rs` for the token source.
-    use super::design::tokens;
+    use crate::ui::design::tokens;
     gtheme.font_family = tokens::font::UI_FAMILY.into();
     gtheme.font_size = gpui::px(tokens::font::UI_MD);
     gtheme.mono_font_family = tokens::font::mono_family().into();

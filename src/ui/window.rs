@@ -4,14 +4,14 @@
 //! document tabs, §10 docks, §13 start page). Composes:
 //!
 //! - the custom frameless [`TitleBar`](gpui_component::TitleBar) (app-shell §5)
-//!   assembled by [`super::titlebar::render_titlebar`]: app label, the in-window
+//!   assembled by [`crate::ui::titlebar::render_titlebar`]: app label, the in-window
 //!   menu bar, the document title, and the workspace sidebar toggle (the
 //!   view-mode switch is the document area's bottom segmented control),
 //! - a [`DockArea`] holding the MDI document-tab center
-//!   ([`DocumentArea`](super::tabs::DocumentArea)) + the workspace dock
-//!   ([`WorkspacePanel`](super::workspace::WorkspacePanel)) + a scanner dock,
-//!   built by [`super::docks::build_default_layout`],
-//! - the [`StartPage`](super::startpage::StartPage) welcome overlay (shown over
+//!   ([`DocumentArea`](crate::ui::tabs::DocumentArea)) + the workspace dock
+//!   ([`WorkspacePanel`](crate::ui::workspace::WorkspacePanel)) + a scanner dock,
+//!   built by [`crate::ui::docks::build_default_layout`],
+//! - the [`StartPage`](crate::ui::startpage::StartPage) welcome overlay (shown over
 //!   the workspace on launch; app-shell §13),
 //! - the [`Root`] overlay layers (modals/dialogs/sheets/notifications), and
 //! - the gpui-free [`AppState`] window-state (open docs, active doc, source,
@@ -24,7 +24,7 @@
 //! navigation; the start page's cards/files open documents or dismiss.
 //!
 //! Theme is owned by a [`ThemeManager`] global; on construction the window
-//! resolves the current theme and applies it via [`super::theme_apply`].
+//! resolves the current theme and applies it via [`crate::ui::theme_apply`].
 //!
 //! Gated behind the `ui` feature.
 
@@ -37,22 +37,22 @@ use gpui_component::dock::{DockArea, DockPlacement};
 use gpui_component::notification::Notification;
 use gpui_component::{ActiveTheme, Root, TitleBar, WindowExt};
 
-use super::window_dialogs::{
+use crate::ui::window_dialogs::{
     ConfirmChoice, RcxConfirmDialog, RcxUnsavedDialog, TextPromptDialog, TextPromptEvent,
     TypeAliasesDialog, TypeAliasesEvent,
 };
 
-use super::bookmarkspanel::BookmarksPanel;
-use super::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
-use super::menubar::{MenuBar, MenuCommand};
-use super::modulespanel::ModulesPanel;
-use super::startpage::{RecentEntry, StartPage, StartPageEvent};
-use super::state::{AppState, DocId, ViewMode};
-use super::statusbar::{render_status_bar, StatusInfo};
-use super::tabs::{DocAreaEvent, DocumentArea};
-use super::theme_apply::ThemeRegistryGlobal;
-use super::titlebar::{self, LayoutPreset};
-use super::workspace::{
+use crate::ui::bookmarkspanel::BookmarksPanel;
+use crate::ui::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
+use crate::ui::menubar::{MenuBar, MenuCommand};
+use crate::ui::modulespanel::ModulesPanel;
+use crate::ui::startpage::{RecentEntry, StartPage, StartPageEvent};
+use crate::ui::state::{AppState, DocId, ViewMode};
+use crate::ui::statusbar::{render_status_bar, StatusInfo};
+use crate::ui::tabs::{DocAreaEvent, DocumentArea};
+use crate::ui::theme_apply::ThemeRegistryGlobal;
+use crate::ui::titlebar::{self, LayoutPreset};
+use crate::ui::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
     WorkspaceTypeAction,
 };
@@ -304,7 +304,7 @@ struct ModalEntry {
 /// The application's root view — the C++ `MainWindow` (app-shell §6).
 pub struct MainWindow {
     /// Window-level application state (open docs, active doc, source, selection,
-    /// view mode, theme handle). gpui-free + unit-tested (see [`super::state`]).
+    /// view mode, theme handle). gpui-free + unit-tested (see [`crate::ui::state`]).
     state: AppState,
     /// The docking workspace (center document tabs + side docks).
     dock_area: Entity<DockArea>,
@@ -403,7 +403,7 @@ pub struct MainWindow {
     /// scanner). Held so the window can feed it the active document's provider —
     /// previously dropped (`..` in the `LayoutHandles` destructure), so the
     /// scanner could never scan.
-    scanner: Entity<super::scannerpanel::ScannerPanel>,
+    scanner: Entity<crate::ui::scannerpanel::ScannerPanel>,
     /// Live subscription to an open Tools ▸ Options dialog — kept so its
     /// Apply/Cancel events fire while shown (mirrors [`goto_sub`](Self::goto_sub)).
     options_sub: Option<Subscription>,
@@ -444,13 +444,13 @@ pub struct MainWindow {
     /// controller). Empty ⇒ the editor is unsplit (the default single-pane view).
     /// `view.split` appends a pane; `view.unsplit` removes the last.
     split_panes: Vec<ViewMode>,
-    /// The mounted plugin [`PluginPanel`](super::pluginpanel::PluginPanel) views,
+    /// The mounted plugin [`PluginPanel`](crate::ui::pluginpanel::PluginPanel) views,
     /// keyed by the contributed panel id (design §6 Phase 2). One per enabled
     /// `Panel` contribution, built in [`new`](Self::new) after the demo gating and
     /// docked into the existing dock area. Empty in the default shipping build (no
     /// plugin contributes a panel ⇒ no extra dock view ⇒ byte-identical UI). Held so
     /// [`rerender_plugin_panel`](Self::rerender_plugin_panel) can push a fresh tree.
-    plugin_panels: Vec<(String, Entity<super::pluginpanel::PluginPanel>)>,
+    plugin_panels: Vec<(String, Entity<crate::ui::pluginpanel::PluginPanel>)>,
     /// Live subscriptions to the mounted plugin panels' events — kept for the
     /// window's lifetime so a panel's [`PluginPanelEvent`] keeps routing through the
     /// manager (a dropped `Subscription` stops firing). Index-independent of
@@ -791,8 +791,8 @@ fn seed_root_doc(kind: RootKind) -> crate::controller::RcxDocument {
 
 /// Relabel the first leaf with the given command id, in place (used for the
 /// dynamic MCP Start/Stop label). Recurses into submenus.
-fn relabel_command(nodes: &mut [super::commandpalette::MenuNode], command: &str, new_label: &str) {
-    use super::commandpalette::MenuNode;
+fn relabel_command(nodes: &mut [crate::ui::commandpalette::MenuNode], command: &str, new_label: &str) {
+    use crate::ui::commandpalette::MenuNode;
     for node in nodes {
         match node {
             MenuNode::Item {
@@ -829,10 +829,10 @@ fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement {
 /// here (they'd be injected into the editor context menu / toolbar instead — those
 /// surfaces are intended-deferred for plugin contributions).
 fn inject_plugin_menu_items(
-    tree: &mut [super::commandpalette::MenuNode],
+    tree: &mut [crate::ui::commandpalette::MenuNode],
     commands: &[crate::plugin::UiContribution],
 ) {
-    use super::commandpalette::MenuNode;
+    use crate::ui::commandpalette::MenuNode;
     use crate::plugin::{CommandSlot, UiContribution};
     // Find the &Plugins submenu by its label (the static menu tree carries it).
     let Some(MenuNode::Submenu { children, .. }) = tree
@@ -1062,7 +1062,7 @@ impl MainWindow {
                 s.get_bool(settings_keys::GENERATOR_ASSERTS, false),
                 s.get(settings_keys::REFRESH_MS)
                     .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(super::optionsdialog::REFRESH_DEFAULT),
+                    .unwrap_or(crate::ui::optionsdialog::REFRESH_DEFAULT),
             )
         };
         // Appearance prefs (the C++ `menuBarTitleCase` / `showIcon`; main.cpp:988).
@@ -1118,7 +1118,7 @@ impl MainWindow {
             }
             let current = tm.current().clone();
             state.set_theme_name(&current.name);
-            super::theme_apply::apply_theme(&current, window, cx);
+            crate::ui::theme_apply::apply_theme(&current, window, cx);
         }
 
         // ── Wire the document-area events (app-shell §8 step 9 signal contract). ──
@@ -1173,7 +1173,7 @@ impl MainWindow {
         cx.subscribe_in(
             &workspace,
             window,
-            |this, _ws, ev: &super::workspace::WorkspaceTypeAction, window, cx| {
+            |this, _ws, ev: &crate::ui::workspace::WorkspaceTypeAction, window, cx| {
                 this.on_workspace_type_action(ev.clone(), window, cx);
             },
         )
@@ -1197,7 +1197,7 @@ impl MainWindow {
         cx.subscribe_in(
             &bookmarks,
             window,
-            |this, _bm, ev: &super::bookmarkspanel::BookmarkAction, window, cx| {
+            |this, _bm, ev: &crate::ui::bookmarkspanel::BookmarkAction, window, cx| {
                 this.on_bookmark_action(ev.clone(), window, cx);
             },
         )
@@ -1208,7 +1208,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, _sc, ev: &super::scannerpanel::ScannerNav, window, cx| {
+            |this, _sc, ev: &crate::ui::scannerpanel::ScannerNav, window, cx| {
                 this.navigate_active_editor_to_address(ev.address, window, cx);
             },
         )
@@ -1222,7 +1222,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, sc, ev: &super::scannerpanel::ScannerEdit, window, cx| {
+            |this, sc, ev: &crate::ui::scannerpanel::ScannerEdit, window, cx| {
                 this.on_scanner_edit(sc.clone(), ev.clone(), window, cx);
             },
         )
@@ -1235,7 +1235,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, _sc, ev: &super::scannerpanel::ScannerAddNodes, window, cx| {
+            |this, _sc, ev: &crate::ui::scannerpanel::ScannerAddNodes, window, cx| {
                 this.on_scanner_add_nodes(&ev.addresses, window, cx);
             },
         )
@@ -1248,7 +1248,7 @@ impl MainWindow {
         cx.subscribe_in(
             &scanner,
             window,
-            |this, sc, ev: &super::scannerpanel::ScannerBatchEdit, window, cx| {
+            |this, sc, ev: &crate::ui::scannerpanel::ScannerBatchEdit, window, cx| {
                 this.on_scanner_batch_edit(sc.clone(), ev.clone(), window, cx);
             },
         )
@@ -1259,11 +1259,11 @@ impl MainWindow {
         cx.subscribe_in(
             &modules,
             window,
-            |this, _md, ev: &super::modulespanel::ModuleAction, window, cx| match ev {
-                super::modulespanel::ModuleAction::Activate { base, .. } => {
+            |this, _md, ev: &crate::ui::modulespanel::ModuleAction, window, cx| match ev {
+                crate::ui::modulespanel::ModuleAction::Activate { base, .. } => {
                     this.navigate_active_editor_to_address(*base, window, cx);
                 }
-                super::modulespanel::ModuleAction::DownloadAll => {
+                crate::ui::modulespanel::ModuleAction::DownloadAll => {
                     this.download_all_module_symbols(window, cx);
                 }
             },
@@ -1377,7 +1377,7 @@ impl MainWindow {
         win.sync_view_menu_checked(cx);
         // Realign the initial editor tab(s) to the persisted view options (the
         // C++ applies each saved view setting to the first editor on startup).
-        let initial_editors: Vec<Entity<super::editor::RcxEditor>> = win
+        let initial_editors: Vec<Entity<crate::ui::editor::RcxEditor>> = win
             .document_area
             .read(cx)
             .tabs()
@@ -1530,7 +1530,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use super::commandpalette::{CommandPalette, PaletteEvent};
+        use crate::ui::commandpalette::{CommandPalette, PaletteEvent};
         let palette = cx.new(|cx| CommandPalette::new(window, cx));
         let focus = palette.read(cx).focus_handle(cx);
         self.palette_sub = Some(cx.subscribe_in(
@@ -1668,7 +1668,7 @@ impl MainWindow {
 
     /// Dispatch a chosen command (from the menu bar, the command palette, or a
     /// global key binding). Maps a
-    /// [`CommandId`](super::commandpalette::CommandId) to the app operation that
+    /// [`CommandId`](crate::ui::commandpalette::CommandId) to the app operation that
     /// realizes it — handling **every** command id in the MENU CONTRACT (File /
     /// Edit / View / Help). Commands whose deeper workflow has no logic yet
     /// (some Edit clipboard ops, split editor) degrade gracefully — they notify
@@ -1676,7 +1676,7 @@ impl MainWindow {
     /// *does* something visible.
     fn run_menu_command(
         &mut self,
-        cmd: &super::commandpalette::CommandId,
+        cmd: &crate::ui::commandpalette::CommandId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1843,7 +1843,7 @@ impl MainWindow {
         self.dismiss_start_page(cx);
         let title = kind.title();
         let doc = seed_root_doc(kind);
-        let mut new_editor: Option<Entity<super::editor::RcxEditor>> = None;
+        let mut new_editor: Option<Entity<crate::ui::editor::RcxEditor>> = None;
         self.document_area.update(cx, |area, cx| {
             area.push_document(title, window, cx);
             // Push the seeded tree into the just-created tab's editor.
@@ -1901,8 +1901,8 @@ impl MainWindow {
                 // Recompose against the freshly-attached provider + reflect the
                 // File source icon in the tab and window state.
                 editor.update(cx, |ed, cx| ed.apply_document(cx));
-                let source = super::state::DataSource::new(
-                    super::state::SourceKind::File,
+                let source = crate::ui::state::DataSource::new(
+                    crate::ui::state::SourceKind::File,
                     path.to_string_lossy().into_owned(),
                 );
                 me.set_active_source(source, window, cx);
@@ -1917,7 +1917,7 @@ impl MainWindow {
     /// platform the registry exposes no live factories, so the picker surfaces
     /// the (possibly stub) provider rows; a chosen row reports the selection.
     fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use super::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
+        use crate::ui::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
         // Build the picker's available-source rows from the SESSION-OWNED plugin
         // manager's registry (the in-tree File/Buffer/Snapshot/Null providers
         // registered through the contract) — the single source the rest of the app
@@ -1951,8 +1951,8 @@ impl MainWindow {
                         .set(settings_keys::LAST_ATTACHED_PROCESS, name);
                     // No live provider factory on this platform — record the pick
                     // as the document's logical source so the tab reflects it.
-                    let source = super::state::DataSource::new(
-                        super::state::SourceKind::Process,
+                    let source = crate::ui::state::DataSource::new(
+                        crate::ui::state::SourceKind::Process,
                         format!("{name} (pid {pid})"),
                     );
                     this.set_active_source(source, window, cx);
@@ -1981,14 +1981,14 @@ impl MainWindow {
             "source.rcnet" => "ReClass.NET Compat",
             _ => "This data source",
         };
-        let spec = super::messagebox::warn(
+        let spec = crate::ui::messagebox::warn(
             "Source Unavailable",
             &format!(
                 "{label} is not available on this platform. Open a project with a saved \
                  source, or attach a binary File instead."
             ),
         );
-        super::messagebox::open_message(spec, window, cx);
+        crate::ui::messagebox::open_message(spec, window, cx);
     }
 
     /// File ▸ Data Source ▸ Clear All — detach the active document's source (the
@@ -2000,7 +2000,7 @@ impl MainWindow {
                 ed.apply_document(cx);
             });
         }
-        self.set_active_source(super::state::DataSource::none(), window, cx);
+        self.set_active_source(crate::ui::state::DataSource::none(), window, cx);
     }
 
     // ── Edit: bookmarks (the C++ promptAddBookmark / Quick Bookmark Here) ──
@@ -2079,7 +2079,7 @@ impl MainWindow {
     /// taken-set loop; main.cpp:1204).
     fn next_bookmark_name(
         &self,
-        editor: &Entity<super::editor::RcxEditor>,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
         cx: &Context<Self>,
     ) -> String {
         let taken: std::collections::HashSet<String> = editor
@@ -2126,11 +2126,11 @@ impl MainWindow {
     /// the dock.
     fn on_bookmark_action(
         &mut self,
-        ev: super::bookmarkspanel::BookmarkAction,
+        ev: crate::ui::bookmarkspanel::BookmarkAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use super::bookmarkspanel::BookmarkAction;
+        use crate::ui::bookmarkspanel::BookmarkAction;
         match ev {
             BookmarkAction::Navigate { formula } => {
                 // Reuse the go-to-address resolve/navigate path so `<mod>+0x..` /
@@ -2195,12 +2195,12 @@ impl MainWindow {
     /// clone; the mutable controller lives here on the window.
     fn on_scanner_edit(
         &mut self,
-        scanner: Entity<super::scannerpanel::ScannerPanel>,
-        ev: super::scannerpanel::ScannerEdit,
+        scanner: Entity<crate::ui::scannerpanel::ScannerPanel>,
+        ev: crate::ui::scannerpanel::ScannerEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use super::scannerpanel::ScannerEdit;
+        use crate::ui::scannerpanel::ScannerEdit;
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             self.notify("Attach a data source first.", window, cx);
             return;
@@ -2351,8 +2351,8 @@ impl MainWindow {
     /// only the writes that landed.
     fn on_scanner_batch_edit(
         &mut self,
-        scanner: Entity<super::scannerpanel::ScannerPanel>,
-        ev: super::scannerpanel::ScannerBatchEdit,
+        scanner: Entity<crate::ui::scannerpanel::ScannerPanel>,
+        ev: crate::ui::scannerpanel::ScannerBatchEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2405,7 +2405,7 @@ impl MainWindow {
         // view the SAME active editor entity, so iterating the tab editors
         // covers every visible pane.
         let family_ss: SharedString = family.to_string().into();
-        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> = self
             .document_area
             .read(cx)
             .tabs()
@@ -2519,16 +2519,16 @@ impl MainWindow {
     // list — nothing is mounted, injected, or routed (HARD PARITY).
 
     /// Mount each enabled plugin-contributed `Panel` into the existing dock area
-    /// (design §6 Phase 2). Adds one [`PluginPanel`](super::pluginpanel::PluginPanel)
+    /// (design §6 Phase 2). Adds one [`PluginPanel`](crate::ui::pluginpanel::PluginPanel)
     /// tab per `UiContribution::Panel`, docked on the contribution's
     /// [`DockSide`](crate::plugin::DockSide) (the demo's is `Right`, so it tabs in
     /// beside Modules/Bookmarks), and subscribes to its
-    /// [`PluginPanelEvent`](super::pluginpanel::PluginPanelEvent) so a widget event
+    /// [`PluginPanelEvent`](crate::ui::pluginpanel::PluginPanelEvent) so a widget event
     /// routes through the manager. The target dock is **not** forced open, so a
     /// closed dock stays closed (no launch-time behavior change). Empty list ⇒
     /// no-op (parity).
     fn mount_plugin_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use super::pluginpanel::PluginPanel;
+        use crate::ui::pluginpanel::PluginPanel;
         // Collect the panel contributions first (ends the borrow on the manager
         // before we mount gpui views / subscribe to `self`).
         let panels: Vec<(
@@ -2556,7 +2556,7 @@ impl MainWindow {
             let sub = cx.subscribe_in(
                 &panel,
                 window,
-                |this, panel, ev: &super::pluginpanel::PluginPanelEvent, window, cx| {
+                |this, panel, ev: &crate::ui::pluginpanel::PluginPanelEvent, window, cx| {
                     this.route_plugin_panel_event(panel, ev, window, cx);
                 },
             );
@@ -2572,21 +2572,21 @@ impl MainWindow {
         }
     }
 
-    /// Route one [`PluginPanelEvent`](super::pluginpanel::PluginPanelEvent) through
+    /// Route one [`PluginPanelEvent`](crate::ui::pluginpanel::PluginPanelEvent) through
     /// the manager (design §6 Phase 2 Elm loop): build a scoped `LivePluginHost`,
     /// call `handle_ui_event`, push any fresh tree back into the panel, then drain
     /// the host's collected requests (toasts → `notify`, open-dialogs →
     /// `open_plugin_dialog`, re-renders → `rerender_plugin_panel`).
     fn route_plugin_panel_event(
         &mut self,
-        panel: &Entity<super::pluginpanel::PluginPanel>,
-        ev: &super::pluginpanel::PluginPanelEvent,
+        panel: &Entity<crate::ui::pluginpanel::PluginPanel>,
+        ev: &crate::ui::pluginpanel::PluginPanelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Scope the host so its `cx` borrow ends before we re-borrow `cx`.
         let (tree, toasts, open_dialogs, rerenders) = {
-            let mut host = super::pluginhost::LivePluginHost::new(
+            let mut host = crate::ui::pluginhost::LivePluginHost::new(
                 self.document_area.clone(),
                 self.settings.clone(),
                 window,
@@ -2629,7 +2629,7 @@ impl MainWindow {
     /// recognizes (a contributed menu/palette item).
     fn dispatch_plugin_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let (cmd_toast, toasts, open_dialogs, rerenders) = {
-            let mut host = super::pluginhost::LivePluginHost::new(
+            let mut host = crate::ui::pluginhost::LivePluginHost::new(
                 self.document_area.clone(),
                 self.settings.clone(),
                 window,
@@ -2655,7 +2655,7 @@ impl MainWindow {
     /// Open a plugin-contributed `Dialog` modally (design §6 Phase 2 — the
     /// generalized C++ `selectTarget`), modeled on
     /// [`open_process_picker`](Self::open_process_picker). Pulls the initial tree +
-    /// title from the manager, mounts a [`PluginDialog`](super::plugindialog::PluginDialog)
+    /// title from the manager, mounts a [`PluginDialog`](crate::ui::plugindialog::PluginDialog)
     /// via the proven `window.open_dialog` pattern, and subscribes (on the shared
     /// close-only [`goto_sub`](Self::goto_sub)) to route the dialog's Ui / Closed
     /// events through the manager. No-op if `id` isn't a contributed dialog.
@@ -2676,15 +2676,15 @@ impl MainWindow {
             })
             .unwrap_or_else(|| id.to_string());
 
-        let dialog = super::plugindialog::PluginDialog::view(id, title, initial, window, cx);
+        let dialog = crate::ui::plugindialog::PluginDialog::view(id, title, initial, window, cx);
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
-            |this, dialog, ev: &super::plugindialog::PluginDialogEvent, window, cx| match ev {
-                super::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
+            |this, dialog, ev: &crate::ui::plugindialog::PluginDialogEvent, window, cx| match ev {
+                crate::ui::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
                     let dialog_id = view_id.clone();
                     let (tree, toasts, open_dialogs, close_dialogs, rerenders) = {
-                        let mut host = super::pluginhost::LivePluginHost::new(
+                        let mut host = crate::ui::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,
@@ -2712,9 +2712,9 @@ impl MainWindow {
                         window.close_dialog(cx);
                     }
                 }
-                super::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
+                crate::ui::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
                     let (cmd_toast, toasts, open_dialogs, rerenders) = {
-                        let mut host = super::pluginhost::LivePluginHost::new(
+                        let mut host = crate::ui::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,
@@ -2826,7 +2826,7 @@ impl MainWindow {
                     // library, then refresh the rows. The host borrows `cx`, so it is
                     // scoped + dropped before we re-borrow `cx` for `notify`/`update`.
                     let toasts = {
-                        let mut host = super::pluginhost::LivePluginHost::new(
+                        let mut host = crate::ui::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,
@@ -2923,7 +2923,7 @@ impl MainWindow {
     /// flag on close. Close-only, so it reuses the generic [`goto_sub`](Self::goto_sub)
     /// subscription slot like the other single-button dialogs.
     fn open_profiler_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use super::dialogs::{ProfilerDialog, ProfilerEvent};
+        use crate::ui::dialogs::{ProfilerDialog, ProfilerEvent};
         let dialog = cx.new(|cx| ProfilerDialog::new(window, cx));
         let focus = dialog.read(cx).focus_handle(cx);
         self.goto_sub = Some(cx.subscribe_in(
@@ -2995,7 +2995,7 @@ impl MainWindow {
     /// the live window/editors/controllers + persist via the disk store (the
     /// C++ `showOptionsDialog` → apply + `QSettings::setValue`).
     fn open_options_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use super::optionsdialog::{OptionsDialog, OptionsEvent, OptionsResult};
+        use crate::ui::optionsdialog::{OptionsDialog, OptionsEvent, OptionsResult};
         let themes: Vec<String> = self
             .theme_manager
             .borrow()
@@ -3079,7 +3079,7 @@ impl MainWindow {
     /// helpers (which persist on their own); the remaining fields persist here.
     fn apply_options(
         &mut self,
-        result: super::optionsdialog::OptionsResult,
+        result: crate::ui::optionsdialog::OptionsResult,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3102,8 +3102,8 @@ impl MainWindow {
         }
         // Refresh interval — push into every controller + persist "refreshMs".
         self.refresh_ms = result.refresh_ms.clamp(
-            super::optionsdialog::REFRESH_MIN,
-            super::optionsdialog::REFRESH_MAX,
+            crate::ui::optionsdialog::REFRESH_MIN,
+            crate::ui::optionsdialog::REFRESH_MAX,
         );
         self.settings
             .borrow_mut()
@@ -3126,7 +3126,7 @@ impl MainWindow {
         // Push refresh + brace-wrap into every open controller.
         let refresh_ms = self.refresh_ms;
         let brace_wrap = self.brace_wrap;
-        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> = self
             .document_area
             .read(cx)
             .tabs()
@@ -3176,7 +3176,7 @@ impl MainWindow {
     /// project (the C++ `about()` themed dialog; main.cpp:4415). The GitHub button
     /// is folded into the body text (the modal message box is single-button).
     fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let spec = super::messagebox::info(
+        let spec = crate::ui::messagebox::info(
             "About Reclass",
             &format!(
                 "Reclass {} — a Rust + GPUI port of ReClass.\n\nA memory structure editor.\n\
@@ -3184,7 +3184,7 @@ impl MainWindow {
                 env!("CARGO_PKG_VERSION")
             ),
         );
-        super::messagebox::open_message(spec, window, cx);
+        crate::ui::messagebox::open_message(spec, window, cx);
     }
 
     /// Help ▸ Keyboard Shortcuts… (F1) — a themed reference of the bound
@@ -3200,9 +3200,9 @@ impl MainWindow {
             "Ctrl+Shift+S — Memory Scanner    Ctrl+Shift+Y — Modules".to_string(),
             "Ctrl+Shift+B — Bookmarks    Ctrl+\\ — Split Editor".to_string(),
         ];
-        let mut spec = super::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
+        let mut spec = crate::ui::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
         spec.detail = detail;
-        super::messagebox::open_message(spec, window, cx);
+        crate::ui::messagebox::open_message(spec, window, cx);
     }
 
     // ── Recent files (the C++ recentFiles QSettings list) ──
@@ -3308,7 +3308,7 @@ impl MainWindow {
     /// `updateRecentFilesMenu` / `populateSourceMenu` / MCP label flip). Preserves
     /// the checkmark state (held separately on the menu bar).
     fn rebuild_menus(&mut self, cx: &mut Context<Self>) {
-        use super::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        use crate::ui::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
         // Skip entries whose file no longer exists (the C++
         // `updateRecentFilesMenu` exists-filter); the command carries the
         // ORIGINAL stored index so a reopen targets the right path.
@@ -3501,7 +3501,7 @@ impl MainWindow {
     fn collect_dirty_docs(
         &self,
         cx: &Context<Self>,
-    ) -> Vec<(Entity<super::editor::RcxEditor>, String)> {
+    ) -> Vec<(Entity<crate::ui::editor::RcxEditor>, String)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for t in self.document_area.read(cx).tabs() {
@@ -3558,7 +3558,7 @@ impl MainWindow {
     /// `on_discard`. On **Cancel** (or Esc) it dismisses with no action.
     fn open_unsaved_guard<S, D>(
         &mut self,
-        dirty: Vec<(Entity<super::editor::RcxEditor>, String)>,
+        dirty: Vec<(Entity<crate::ui::editor::RcxEditor>, String)>,
         on_saved: S,
         on_discard: D,
         window: &mut Window,
@@ -3569,7 +3569,7 @@ impl MainWindow {
     {
         let names = unique_dirty_names(dirty.iter().map(|(_, n)| n.clone()));
         let text = unsaved_changes_text(names.len());
-        let editors: Vec<Entity<super::editor::RcxEditor>> =
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> =
             dirty.iter().map(|(e, _)| e.clone()).collect();
         let dialog = cx.new(|cx| RcxUnsavedDialog::new("Unsaved Changes", &text, names, cx));
         let focus = dialog.read(cx).focus_handle(cx);
@@ -3578,8 +3578,8 @@ impl MainWindow {
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
-            move |this, _d, choice: &super::messagebox::UnsavedChoice, window, cx| {
-                use super::messagebox::UnsavedChoice;
+            move |this, _d, choice: &crate::ui::messagebox::UnsavedChoice, window, cx| {
+                use crate::ui::messagebox::UnsavedChoice;
                 match choice {
                     UnsavedChoice::Cancel => window.close_dialog(cx),
                     UnsavedChoice::Discard => {
@@ -3600,18 +3600,18 @@ impl MainWindow {
                 }
             },
         ));
-        self.present_modal(&dialog, super::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
+        self.present_modal(&dialog, crate::ui::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
     }
 
     /// Open a two-button confirm whose DEFAULT button is honoured — Enter triggers
     /// the spec's `default` (Cancel for destructive confirms, so a stray Enter can't
     /// destroy work), Esc cancels, and `on_accept` runs only on an explicit accept.
-    /// Used in place of [`messagebox::open_confirm`](super::messagebox) (the
+    /// Used in place of [`messagebox::open_confirm`](crate::ui::messagebox) (the
     /// gpui-component `AlertDialog`) for destructive confirms, which it cannot make
     /// safe (no per-button focus hook; Enter is hard-bound to OK).
     fn open_confirm_dialog<F>(
         &mut self,
-        spec: super::messagebox::MessageSpec,
+        spec: crate::ui::messagebox::MessageSpec,
         on_accept: F,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3634,7 +3634,7 @@ impl MainWindow {
                 }
             },
         ));
-        self.present_modal(&dialog, super::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
+        self.present_modal(&dialog, crate::ui::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
     }
 
     /// Persist each editor's document to its known path (the C++
@@ -3644,7 +3644,7 @@ impl MainWindow {
     /// write failure it notifies + returns `false` (the C++ aborts the close).
     fn save_dirty_docs(
         &mut self,
-        editors: &[Entity<super::editor::RcxEditor>],
+        editors: &[Entity<crate::ui::editor::RcxEditor>],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -3870,7 +3870,7 @@ impl MainWindow {
     /// Persist the editor's document to `path` and reflect the new title/source.
     fn write_document(
         &mut self,
-        editor: &Entity<super::editor::RcxEditor>,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
         path: &std::path::Path,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3950,7 +3950,7 @@ impl MainWindow {
     /// and open it through the normal window plumbing (the start-page Examples
     /// bucket). Opening a bundled example must WORK (the stage contract).
     fn open_example(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match super::examples::write_example_to_temp(name) {
+        match crate::ui::examples::write_example_to_temp(name) {
             Some(path) => {
                 self.open_project(&path, None, window, cx);
             }
@@ -3966,7 +3966,7 @@ impl MainWindow {
     /// (it re-seeds a fresh tab when the last closes).
     fn close_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.document_area.read(cx).active_editor().cloned();
-        let dirty: Vec<(Entity<super::editor::RcxEditor>, String)> = match active {
+        let dirty: Vec<(Entity<crate::ui::editor::RcxEditor>, String)> = match active {
             Some(editor) if editor.read(cx).controller().document().modified => {
                 let ed = editor.read(cx);
                 let ctrl = ed.controller();
@@ -4124,7 +4124,7 @@ impl MainWindow {
         // (tree_lines/type_hints/show_comments) recompose; the render-level flags
         // (compact/relative/hover/minimap) repaint. The editor owns the actual
         // effect; the window owns the ✓.
-        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> = self
             .document_area
             .read(cx)
             .tabs()
@@ -4162,7 +4162,7 @@ impl MainWindow {
     /// tabs). Calling this after `set_document` realigns the editor.
     fn apply_view_opts_to_editor(
         &self,
-        editor: &Entity<super::editor::RcxEditor>,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
         cx: &mut Context<Self>,
     ) {
         let o = self.view_opts;
@@ -4202,7 +4202,7 @@ impl MainWindow {
     /// per-`SplitPane` view-mode combo) and an "✕" that removes it. Returns an
     /// empty vec when unsplit (the primary pane is the dock area itself).
     fn render_split_panes(&self, cx: &Context<Self>) -> Vec<AnyElement> {
-        use super::design::color;
+        use crate::ui::design::color;
         if self.split_panes.is_empty() {
             return Vec::new();
         }
@@ -4236,10 +4236,10 @@ impl MainWindow {
         &self,
         pane_ix: usize,
         mode: ViewMode,
-        editor: Option<&Entity<super::editor::RcxEditor>>,
+        editor: Option<&Entity<crate::ui::editor::RcxEditor>>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        use super::design::{color, tokens};
+        use crate::ui::design::{color, tokens};
 
         // ── Header: per-pane view-mode segmented toggle + close button. ──
         let segment = |label: &'static str, this_mode: ViewMode, cx: &Context<Self>| {
@@ -4349,10 +4349,10 @@ impl MainWindow {
     /// read-only mirror.
     fn render_split_tree(
         &self,
-        editor: &Entity<super::editor::RcxEditor>,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        use super::design::{color, tokens};
+        use crate::ui::design::{color, tokens};
         let text = editor.read(cx).last_result().text.clone();
         if text.trim().is_empty() {
             return div()
@@ -4395,16 +4395,16 @@ impl MainWindow {
     /// `VM_Debug` view): the [`generate_debug_text`](crate::core::generate_debug_text)
     /// dump of the editor's last composed line/`LineMeta` model, **styled** per
     /// the C++ `styleDebugText` segmentation via the shared
-    /// [`debug_styled_spans`](super::cpp_highlight::debug_styled_spans) helper so the split
+    /// [`debug_styled_spans`](crate::ui::cpp_highlight::debug_styled_spans) helper so the split
     /// and primary debug panes agree exactly. A developer view of the existing
     /// structure — no live process, no editing — mirroring `render_split_tree` so
     /// the split never re-renders the live `RcxEditor` entity.
     fn render_split_debug(
         &self,
-        editor: &Entity<super::editor::RcxEditor>,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        use super::design::{color, tokens};
+        use crate::ui::design::{color, tokens};
         let text = crate::core::generate_debug_text(editor.read(cx).last_result());
         if text.trim().is_empty() {
             return div()
@@ -4428,7 +4428,7 @@ impl MainWindow {
                     .px(px(tokens::space::SM))
                     .items_center()
                     .whitespace_nowrap()
-                    .children(super::cpp_highlight::debug_styled_spans(line, cx))
+                    .children(crate::ui::cpp_highlight::debug_styled_spans(line, cx))
                     .into_any_element()
             })
             .collect();
@@ -4452,10 +4452,10 @@ impl MainWindow {
     /// colouring) since it is a secondary pane.
     fn render_split_code(
         &self,
-        editor: &Entity<super::editor::RcxEditor>,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        use super::design::{color, tokens};
+        use crate::ui::design::{color, tokens};
         let ed = editor.read(cx);
         let ctrl = ed.controller();
         let aliases = &ctrl.document().type_aliases;
@@ -4555,7 +4555,7 @@ impl MainWindow {
         visible: bool,
         cx: &mut Context<Self>,
     ) {
-        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> = self
             .document_area
             .read(cx)
             .tabs()
@@ -4817,7 +4817,7 @@ impl MainWindow {
     /// accepted formula is pushed onto the recent list, and a failed resolve shows
     /// a themed modal warning (not a transient toast).
     fn open_goto_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use super::gotoaddress::{GotoAddressDialog, GotoEvent};
+        use crate::ui::gotoaddress::{GotoAddressDialog, GotoEvent};
         // Pointer size from the active document (32-bit projects deref correctly).
         let ptr_size = self
             .document_area
@@ -4916,10 +4916,10 @@ impl MainWindow {
                     tree.base_address_formula = formula.to_string();
                     ed.apply_document(cx);
                 });
-                self.goto_recent = super::gotoaddress::push_recent_list(&self.goto_recent, formula);
+                self.goto_recent = crate::ui::gotoaddress::push_recent_list(&self.goto_recent, formula);
                 // Persist the recent formulas across launches (the C++
                 // `gotoAddress/recent` key) via the disk store.
-                super::gotoaddress::store_recent(
+                crate::ui::gotoaddress::store_recent(
                     &mut *self.settings.borrow_mut(),
                     &self.goto_recent,
                 );
@@ -4929,14 +4929,14 @@ impl MainWindow {
                 cx.notify();
             }
             None => {
-                let spec = super::messagebox::warn(
+                let spec = crate::ui::messagebox::warn(
                     "Address Not Resolved",
                     &format!(
                         "Couldn't evaluate \"{formula}\". The expression isn't valid or its \
                          module/symbol can't be resolved without a live data source."
                     ),
                 );
-                super::messagebox::open_message(spec, window, cx);
+                crate::ui::messagebox::open_message(spec, window, cx);
             }
         }
     }
@@ -4970,7 +4970,7 @@ impl MainWindow {
     /// first paint so the Theme submenu reflects reality.
     fn sync_theme_menu_checked(&mut self, cx: &mut Context<Self>) {
         let active = self.state.theme_name().to_string();
-        let names = super::commandpalette::theme_display_names();
+        let names = crate::ui::commandpalette::theme_display_names();
         self.menubar.update(cx, |mb, cx| {
             for n in &names {
                 mb.set_command_checked(&format!("view.theme.{n}"), *n == active, cx);
@@ -5000,7 +5000,7 @@ impl MainWindow {
         // dead because no pane's `set_presentation_mode` was ever called. Split
         // panes view the SAME active editor entity, so iterating the tab editors
         // covers every visible pane.
-        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> = self
             .document_area
             .read(cx)
             .tabs()
@@ -5019,7 +5019,7 @@ impl MainWindow {
     /// (`source.clear` / source picks). Updates both the document area and state.
     fn set_active_source(
         &mut self,
-        source: super::state::DataSource,
+        source: crate::ui::state::DataSource,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5240,7 +5240,7 @@ impl MainWindow {
     /// and whenever the tab set changes (new/closed document); the previous
     /// observations are dropped (and thus unsubscribed) by reassigning the `Vec`.
     fn observe_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let editors: Vec<Entity<super::editor::RcxEditor>> = self
+        let editors: Vec<Entity<crate::ui::editor::RcxEditor>> = self
             .document_area
             .read(cx)
             .tabs()
@@ -5258,11 +5258,11 @@ impl MainWindow {
             subs.push(cx.subscribe_in(
                 &editor,
                 window,
-                |this, _editor, ev: &super::editor::RcxEditorEvent, window, cx| match ev {
-                    super::editor::RcxEditorEvent::OpenTypeInNewTab { ref_id } => {
+                |this, _editor, ev: &crate::ui::editor::RcxEditorEvent, window, cx| match ev {
+                    crate::ui::editor::RcxEditorEvent::OpenTypeInNewTab { ref_id } => {
                         this.open_type_in_new_tab(*ref_id, window, cx);
                     }
-                    super::editor::RcxEditorEvent::Status { message } => {
+                    crate::ui::editor::RcxEditorEvent::Status { message } => {
                         this.notify(message.clone(), window, cx);
                     }
                     // An in-editor View-option toggle (offset-margin double-click /
@@ -5270,9 +5270,9 @@ impl MainWindow {
                     // locally; mirror it to the window (persist + ✓ + push to every
                     // pane) so it behaves like the menu toggle (the C++
                     // `relativeOffsetsChanged`).
-                    super::editor::RcxEditorEvent::ViewOptionToggled { option, value } => {
+                    crate::ui::editor::RcxEditorEvent::ViewOptionToggled { option, value } => {
                         let opt = match option {
-                            super::editor::EditorViewOption::RelativeOffsets => {
+                            crate::ui::editor::EditorViewOption::RelativeOffsets => {
                                 ViewOpt::RelativeOffsets
                             }
                         };
@@ -5282,7 +5282,7 @@ impl MainWindow {
                     // render it in OUR centered-modal overlay (no dialog focus_trap)
                     // and focus its input. The editor keeps its own outcome
                     // subscription; on Chosen/Cancel it emits `CloseModal` back.
-                    super::editor::RcxEditorEvent::OpenModal {
+                    crate::ui::editor::RcxEditorEvent::OpenModal {
                         view,
                         focus,
                         width,
@@ -5295,7 +5295,7 @@ impl MainWindow {
                             cx,
                         );
                     }
-                    super::editor::RcxEditorEvent::CloseModal => {
+                    crate::ui::editor::RcxEditorEvent::CloseModal => {
                         this.close_top_modal(window, cx);
                     }
                 },
@@ -5381,7 +5381,7 @@ impl MainWindow {
         let source = Self::source_for_doc(&doc);
         // Append the new tab + push the cloned document into its editor, then set
         // the view root to the referenced struct (the C++ createTab + setViewRootId).
-        let mut new_editor: Option<Entity<super::editor::RcxEditor>> = None;
+        let mut new_editor: Option<Entity<crate::ui::editor::RcxEditor>> = None;
         self.document_area.update(cx, |area, cx| {
             area.push_document(title.clone(), window, cx);
             if let Some(editor) = area.active_editor().cloned() {
@@ -5417,7 +5417,7 @@ impl MainWindow {
     }
 
     /// The editor entity owning document `doc`, if it is open in a tab.
-    fn editor_for_doc(&self, doc: DocId, cx: &App) -> Option<Entity<super::editor::RcxEditor>> {
+    fn editor_for_doc(&self, doc: DocId, cx: &App) -> Option<Entity<crate::ui::editor::RcxEditor>> {
         self.document_area
             .read(cx)
             .tabs()
@@ -5502,7 +5502,7 @@ impl MainWindow {
                 if name < 0 {
                     return;
                 }
-                let spec = super::messagebox::confirm(
+                let spec = crate::ui::messagebox::confirm(
                     "Delete Type",
                     "Delete this type and its members? This can be undone.",
                     "Delete",
@@ -5581,7 +5581,7 @@ impl MainWindow {
     fn rebuild_workspace(&mut self, cx: &mut Context<Self>) {
         // Snapshot the per-tab editor handles + ids first (a short borrow of the
         // area), then build against live read-borrows of each controller's tree.
-        let entries: Vec<(DocId, Entity<super::editor::RcxEditor>)> = self
+        let entries: Vec<(DocId, Entity<crate::ui::editor::RcxEditor>)> = self
             .document_area
             .read(cx)
             .tabs()
@@ -5597,7 +5597,7 @@ impl MainWindow {
 
         // Hold the editor read-guards so their `&NodeTree`s stay valid for the
         // build call (all immutable borrows of `cx` coexist).
-        let guards: Vec<(DocId, &super::editor::RcxEditor)> =
+        let guards: Vec<(DocId, &crate::ui::editor::RcxEditor)> =
             entries.iter().map(|(id, ed)| (*id, ed.read(cx))).collect();
         let docs: Vec<WorkspaceDoc> = guards
             .iter()
@@ -5671,7 +5671,7 @@ impl MainWindow {
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| super::startpage::age_days_from_secs(now_secs, d.as_secs()))
+                    .map(|d| crate::ui::startpage::age_days_from_secs(now_secs, d.as_secs()))
                     .unwrap_or(0);
                 RecentEntry {
                     path: p.to_string_lossy().into_owned(),
@@ -5695,7 +5695,7 @@ impl MainWindow {
         // with no recent files — the audited "start-page Continue demo absent"
         // gap. Each example's `path` is its `file.example.<name>` key, routed
         // through `open_example` (not `open_project`) by `on_start_page_event`.
-        entries.extend(super::startpage::example_entries());
+        entries.extend(crate::ui::startpage::example_entries());
         entries
     }
 
@@ -5705,7 +5705,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use super::startpage::StartCard;
+        use crate::ui::startpage::StartCard;
         match ev {
             StartPageEvent::Dismissed => {
                 self.dismiss_start_page(cx);
@@ -5917,8 +5917,8 @@ impl MainWindow {
 
     /// Map a loaded document's provider/data path to the UI [`DataSource`]
     /// summary (the tab source-icon; app-shell §8 `refreshDocTabSourceIcon`).
-    fn source_for_doc(doc: &crate::controller::RcxDocument) -> super::state::DataSource {
-        use super::state::{DataSource, SourceKind};
+    fn source_for_doc(doc: &crate::controller::RcxDocument) -> crate::ui::state::DataSource {
+        use crate::ui::state::{DataSource, SourceKind};
         match &doc.data_path {
             Some(p) => DataSource::new(SourceKind::File, p.to_string_lossy().into_owned()),
             None => DataSource::none(),
@@ -5933,8 +5933,8 @@ impl MainWindow {
     /// controller ingested left the icon showing "no source" even when values
     /// loaded (the bug). For a File source we keep the on-disk path so the icon +
     /// tooltip match the attached binary.
-    fn source_for_controller(ctrl: &crate::controller::RcxController) -> super::state::DataSource {
-        use super::state::{DataSource, SourceKind};
+    fn source_for_controller(ctrl: &crate::controller::RcxController) -> crate::ui::state::DataSource {
+        use crate::ui::state::{DataSource, SourceKind};
         let idx = ctrl.active_source_index();
         if idx >= 0 {
             if let Some(entry) = ctrl.saved_sources().get(idx as usize) {
@@ -5991,7 +5991,7 @@ impl MainWindow {
             tm.current().clone()
         };
         self.state.set_theme_name(&applied.name);
-        super::theme_apply::apply_theme(&applied, window, cx);
+        crate::ui::theme_apply::apply_theme(&applied, window, cx);
     }
 
     /// Open a modal free-text input prompt (the C++ `QInputDialog::getText`):
@@ -6228,8 +6228,8 @@ impl Focusable for PluginManagerDialog {
 
 impl Render for PluginManagerDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use super::design::{color, tokens};
-        use super::dialogs::modal;
+        use crate::ui::design::{color, tokens};
+        use crate::ui::dialogs::modal;
         use gpui_component::button::{Button, ButtonVariants as _};
 
         let card_w = modal::clamp_width(620., window);
@@ -6748,7 +6748,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // editor falls back to a proportional font and its fixed-cell column grid
     // (offsets/types/names/values, the inline-edit overlay, and mouse hit-testing)
     // drifts off the painted glyphs.
-    super::design::tokens::font::resolve_mono_family(&cx.text_system().all_font_names());
+    crate::ui::design::tokens::font::resolve_mono_family(&cx.text_system().all_font_names());
 
     let theme_manager = ThemeRegistryGlobal::get(cx);
 
@@ -6778,12 +6778,12 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // is open — letting the keystroke fall through to that input. Modified
     // accelerators (Ctrl+D, F2, …) and navigation keys (already shadowed by the
     // field's deeper `RcxFieldInput` bindings) are left untouched.
-    let mut bindings = scope_editor_text_keys_to_non_field(super::editor::editor_key_bindings());
-    bindings.extend(super::editor::inline_edit::field_key_bindings());
-    bindings.extend(super::startpage::start_page_key_bindings());
-    bindings.extend(super::commandpalette::command_palette_key_bindings());
-    bindings.extend(super::findbar::find_bar_key_bindings());
-    bindings.extend(super::scannerpanel::scanner_panel_key_bindings());
+    let mut bindings = scope_editor_text_keys_to_non_field(crate::ui::editor::editor_key_bindings());
+    bindings.extend(crate::ui::editor::inline_edit::field_key_bindings());
+    bindings.extend(crate::ui::startpage::start_page_key_bindings());
+    bindings.extend(crate::ui::commandpalette::command_palette_key_bindings());
+    bindings.extend(crate::ui::findbar::find_bar_key_bindings());
+    bindings.extend(crate::ui::scannerpanel::scanner_panel_key_bindings());
     // Global trigger to OPEN the palette (Zed: ctrl-shift-p / f1; cmd-shift-p on mac).
     bindings.push(KeyBinding::new(
         "ctrl-shift-p",
@@ -8040,7 +8040,7 @@ mod tests {
         // `age_days_from_secs` is the per-recent-file age `recent_entries` now feeds
         // into the start-page buckets. Assert the day-delta and the resulting
         // bucket for known timestamps.
-        use super::super::startpage::{age_days_from_secs, bucket_for, Bucket, RecentEntry};
+        use crate::ui::startpage::{age_days_from_secs, bucket_for, Bucket, RecentEntry};
         const DAY: u64 = 24 * 60 * 60;
         let now = 1_000 * DAY; // an arbitrary fixed "now" in whole days.
 

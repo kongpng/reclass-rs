@@ -350,11 +350,11 @@ impl StartPage {
     /// dismiss + open the tutorial/help flow; `main.cpp:9415`). We open the
     /// in-app command palette — the window's help/docs entry point (the
     /// `help.docs` notify text directs users there) — by dispatching the
-    /// window's [`OpenCommandPalette`](super::window::OpenCommandPalette) action.
+    /// window's [`OpenCommandPalette`](crate::ui::window::OpenCommandPalette) action.
     /// The start-page overlay sits inside the window's `RcxWindow` dispatch
     /// subtree, so the action bubbles up to the window's `on_action` handler.
     fn on_tutorial(&mut self, _e: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(Box::new(super::window::OpenCommandPalette), cx);
+        window.dispatch_action(Box::new(crate::ui::window::OpenCommandPalette), cx);
     }
 
     /// Render one action row (`drawCards`) as a Zed welcome-list row: a tinted

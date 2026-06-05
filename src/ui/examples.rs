@@ -3,7 +3,7 @@
 //!
 //! The original Reclass ships a handful of demo projects (`src/examples/*.rcx`)
 //! that the start page surfaces under its **Examples** bucket
-//! ([`Bucket::Examples`](super::startpage::Bucket::Examples)) so a fresh install
+//! ([`Bucket::Examples`](crate::ui::startpage::Bucket::Examples)) so a fresh install
 //! has something to open. Rather than depend on a runtime examples *directory*
 //! (which moves around per install), the port **embeds** the curated set into
 //! the binary at compile time via [`include_str!`], so they are always present
@@ -25,7 +25,7 @@
 //! The loader [`crate::controller::RcxDocument::load`] is **path-based only**
 //! (it reads bytes off disk; there is no `load_str`). To open a bundled example
 //! through the existing window plumbing
-//! ([`MainWindow::open_project`](super::window::MainWindow::open_project), which
+//! ([`MainWindow::open_project`](crate::ui::window::MainWindow::open_project), which
 //! calls `doc.load(path)`), the caller must first put the embedded JSON on disk.
 //! [`write_example_to_temp`] does exactly that — it writes the JSON to a
 //! uniquely-named file under [`std::env::temp_dir`] and returns the [`PathBuf`],
@@ -124,7 +124,7 @@ pub fn example_json(name: &str) -> Option<&'static str> {
 /// Because [`crate::controller::RcxDocument::load`] is path-based, this writes
 /// the embedded JSON to `reclass-example-<name>.rcx` under
 /// [`std::env::temp_dir`] so callers can open it through the normal
-/// [`MainWindow::open_project`](super::window::MainWindow::open_project) path.
+/// [`MainWindow::open_project`](crate::ui::window::MainWindow::open_project) path.
 ///
 /// Crucially it ALSO writes each of the example's embedded sidecar data files
 /// ([`sidecars_for`]) **next to** the `.rcx` (under the relative name its

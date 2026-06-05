@@ -17,14 +17,14 @@ use gpui_component::ActiveTheme;
 /// [`messagebox::unsaved_choice_for`]. Replaces the old 2-button confirm that
 /// quit/closed WITHOUT ever offering Save (item 1).
 pub(super) struct RcxUnsavedDialog {
-    spec: super::messagebox::MessageSpec,
+    spec: crate::ui::messagebox::MessageSpec,
     focus_handle: FocusHandle,
 }
 
 impl RcxUnsavedDialog {
     pub(super) fn new(title: &str, text: &str, dirty_names: Vec<String>, cx: &mut Context<Self>) -> Self {
         Self {
-            spec: super::messagebox::unsaved_changes(title, text, dirty_names),
+            spec: crate::ui::messagebox::unsaved_changes(title, text, dirty_names),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -33,7 +33,7 @@ impl RcxUnsavedDialog {
     /// `[Cancel, Discard, Save changes]` order [`messagebox::unsaved_changes`]
     /// builds.
     fn choose(&mut self, button_index: usize, cx: &mut Context<Self>) {
-        cx.emit(super::messagebox::unsaved_choice_for(button_index));
+        cx.emit(crate::ui::messagebox::unsaved_choice_for(button_index));
     }
 }
 
@@ -43,33 +43,33 @@ impl Focusable for RcxUnsavedDialog {
     }
 }
 
-impl EventEmitter<super::messagebox::UnsavedChoice> for RcxUnsavedDialog {}
+impl EventEmitter<crate::ui::messagebox::UnsavedChoice> for RcxUnsavedDialog {}
 
 impl Render for RcxUnsavedDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use super::dialogs::modal;
-        use super::messagebox::{ButtonVariant, DetailLayout};
+        use crate::ui::dialogs::modal;
+        use crate::ui::messagebox::{ButtonVariant, DetailLayout};
         use gpui_component::button::{Button, ButtonVariants as _};
 
-        let card_w = modal::clamp_width(super::messagebox::MSG_MAX_WIDTH, window);
-        let detail_layout = super::messagebox::format_detail(&self.spec.detail);
+        let card_w = modal::clamp_width(crate::ui::messagebox::MSG_MAX_WIDTH, window);
+        let detail_layout = crate::ui::messagebox::format_detail(&self.spec.detail);
 
         // Body: the count sentence, then the dirty-name detail as a single
         // word-wrapped muted label (the C++ setDetailText shows one QLabel — no
         // list, no threshold). Left-inset to align under the body text.
         let mut body = modal::body(cx).child(
             div()
-                .text_size(px(super::design::tokens::font::UI_MD))
-                .text_color(super::design::color::text(cx))
+                .text_size(px(crate::ui::design::tokens::font::UI_MD))
+                .text_color(crate::ui::design::color::text(cx))
                 .child(self.spec.text.clone()),
         );
         body = match detail_layout {
             DetailLayout::None => body,
             DetailLayout::Label(s) => body.child(
                 div()
-                    .pl(px(super::design::tokens::space::MD))
-                    .text_size(px(super::design::tokens::font::UI_SM))
-                    .text_color(super::design::color::text_muted(cx))
+                    .pl(px(crate::ui::design::tokens::space::MD))
+                    .text_size(px(crate::ui::design::tokens::font::UI_SM))
+                    .text_color(crate::ui::design::color::text_muted(cx))
                     .child(s),
             ),
         };
@@ -133,12 +133,12 @@ pub(super) enum ConfirmChoice {
 /// destructive) and Esc to Cancel. The destructive action is reachable only by an
 /// explicit click on its button.
 pub(super) struct RcxConfirmDialog {
-    spec: super::messagebox::MessageSpec,
+    spec: crate::ui::messagebox::MessageSpec,
     focus_handle: FocusHandle,
 }
 
 impl RcxConfirmDialog {
-    pub(super) fn new(spec: super::messagebox::MessageSpec, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(spec: crate::ui::messagebox::MessageSpec, cx: &mut Context<Self>) -> Self {
         Self {
             spec,
             focus_handle: cx.focus_handle(),
@@ -172,24 +172,24 @@ impl EventEmitter<ConfirmChoice> for RcxConfirmDialog {}
 
 impl Render for RcxConfirmDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use super::dialogs::modal;
-        use super::messagebox::{ButtonVariant, DefaultButton, DetailLayout};
+        use crate::ui::dialogs::modal;
+        use crate::ui::messagebox::{ButtonVariant, DefaultButton, DetailLayout};
         use gpui_component::button::{Button, ButtonVariants as _};
 
-        let card_w = modal::clamp_width(super::messagebox::MSG_MAX_WIDTH, window);
+        let card_w = modal::clamp_width(crate::ui::messagebox::MSG_MAX_WIDTH, window);
 
         let mut body = modal::body(cx).child(
             div()
-                .text_size(px(super::design::tokens::font::UI_MD))
-                .text_color(super::design::color::text(cx))
+                .text_size(px(crate::ui::design::tokens::font::UI_MD))
+                .text_color(crate::ui::design::color::text(cx))
                 .child(self.spec.text.clone()),
         );
-        if let DetailLayout::Label(s) = super::messagebox::format_detail(&self.spec.detail) {
+        if let DetailLayout::Label(s) = crate::ui::messagebox::format_detail(&self.spec.detail) {
             body = body.child(
                 div()
-                    .pl(px(super::design::tokens::space::MD))
-                    .text_size(px(super::design::tokens::font::UI_SM))
-                    .text_color(super::design::color::text_muted(cx))
+                    .pl(px(crate::ui::design::tokens::space::MD))
+                    .text_size(px(crate::ui::design::tokens::font::UI_SM))
+                    .text_color(crate::ui::design::color::text_muted(cx))
                     .child(s),
             );
         }
@@ -320,7 +320,7 @@ impl EventEmitter<TextPromptEvent> for TextPromptDialog {}
 
 impl Render for TextPromptDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use super::dialogs::modal;
+        use crate::ui::dialogs::modal;
         use gpui_component::button::{Button, ButtonVariants as _};
         use gpui_component::input::Input;
         use gpui_component::Disableable as _;
@@ -519,8 +519,8 @@ impl EventEmitter<TypeAliasesEvent> for TypeAliasesDialog {}
 
 impl Render for TypeAliasesDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use super::design::tokens;
-        use super::dialogs::modal;
+        use crate::ui::design::tokens;
+        use crate::ui::dialogs::modal;
         use gpui_component::button::{Button, ButtonVariants as _};
         use gpui_component::input::Input;
         use gpui_component::Sizable as _;

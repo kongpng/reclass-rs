@@ -45,9 +45,9 @@ use std::rc::Rc;
 
 use gpui::{App, Window};
 
-use super::state::SourceKind;
-use super::tabs::DocumentArea;
-use super::window::DiskSettings;
+use crate::ui::state::SourceKind;
+use crate::ui::tabs::DocumentArea;
+use crate::ui::window::DiskSettings;
 use crate::plugin::PluginHost;
 use crate::theme::SettingsStore;
 

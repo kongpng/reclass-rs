@@ -38,7 +38,7 @@ use gpui_component::tree::{tree, TreeItem, TreeState};
 use crate::core::{kind_to_string, NodeKind, NodeTree};
 use crate::ui::design::{color, icon, tokens};
 
-use super::state::DocId;
+use crate::ui::state::DocId;
 
 // ── Context-menu actions (the C++ workspace-tree `QMenu`, `main.cpp:7221`) ────
 //
@@ -1524,7 +1524,7 @@ mod tests {
 
     fn doc_id(n: u64) -> DocId {
         // Allocate ids through a throwaway AppState so DocId stays opaque.
-        let mut s = super::super::state::AppState::new();
+        let mut s = crate::ui::state::AppState::new();
         let mut last = s.open_document("x");
         for _ in 1..n {
             last = s.open_document("x");

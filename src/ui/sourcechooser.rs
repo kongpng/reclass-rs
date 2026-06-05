@@ -10,7 +10,7 @@
 //! + a `List` with a custom `render_item`. This ports the pure model + filter
 //! (unit-tested) + a popover view.
 //!
-//! Filter uses the recursive [`source_score`](super::fuzzy::source_score) (the
+//! Filter uses the recursive [`source_score`](crate::ui::fuzzy::source_score) (the
 //! C++ source chooser's own scorer); the searchable string is
 //! `name [+ kind] [+ pid] [+ dll] [+ path]` (`applyFilter`).
 //!
@@ -237,7 +237,7 @@ impl SourceModel {
 
     /// Re-filter against `filter` (`applyFilter`). Empty → show all (no
     /// selection). Else, for each non-section entry build the searchable string,
-    /// [`source_score`](super::fuzzy::source_score) it, keep `>0`, **sort by score
+    /// [`source_score`](crate::ui::fuzzy::source_score) it, keep `>0`, **sort by score
     /// desc**, and pre-select row 0.
     pub fn apply_filter(&mut self, filter: &str) {
         let trimmed = filter.trim();
@@ -266,7 +266,7 @@ impl SourceModel {
                 continue;
             }
             let mut pos = Vec::new();
-            let s = super::fuzzy::source_score(trimmed, &e.searchable(), Some(&mut pos));
+            let s = crate::ui::fuzzy::source_score(trimmed, &e.searchable(), Some(&mut pos));
             if s > 0 {
                 scored.push((s, i, pos));
             }
@@ -283,19 +283,19 @@ impl SourceModel {
         self.selected = self.rows.iter().position(|r| r.entry.selectable());
     }
 
-    /// The selectability mask over `rows`, for [`super::navlist`] navigation.
+    /// The selectability mask over `rows`, for [`crate::ui::navlist`] navigation.
     fn selectable_mask(&self) -> Vec<bool> {
         self.rows.iter().map(|r| r.entry.selectable()).collect()
     }
 
     /// Move selection down to the next selectable row.
     pub fn move_down(&mut self) {
-        self.selected = super::navlist::step(&self.selectable_mask(), self.selected, 1);
+        self.selected = crate::ui::navlist::step(&self.selectable_mask(), self.selected, 1);
     }
 
     /// Move selection up to the previous selectable row.
     pub fn move_up(&mut self) {
-        self.selected = super::navlist::step(&self.selectable_mask(), self.selected, -1);
+        self.selected = crate::ui::navlist::step(&self.selectable_mask(), self.selected, -1);
     }
 
     /// Set the selection to `row` if it is selectable (a hover / click preview).
@@ -316,22 +316,22 @@ impl SourceModel {
 
     /// Move selection down by `page` selectable rows (PageDown).
     pub fn page_down(&mut self, page: usize) {
-        self.selected = super::navlist::page(&self.selectable_mask(), self.selected, 1, page);
+        self.selected = crate::ui::navlist::page(&self.selectable_mask(), self.selected, 1, page);
     }
 
     /// Move selection up by `page` selectable rows (PageUp).
     pub fn page_up(&mut self, page: usize) {
-        self.selected = super::navlist::page(&self.selectable_mask(), self.selected, -1, page);
+        self.selected = crate::ui::navlist::page(&self.selectable_mask(), self.selected, -1, page);
     }
 
     /// Select the first selectable row (Home).
     pub fn move_home(&mut self) {
-        self.selected = super::navlist::first_selectable(&self.selectable_mask());
+        self.selected = crate::ui::navlist::first_selectable(&self.selectable_mask());
     }
 
     /// Select the last selectable row (End).
     pub fn move_end(&mut self) {
-        self.selected = super::navlist::last_selectable(&self.selectable_mask());
+        self.selected = crate::ui::navlist::last_selectable(&self.selectable_mask());
     }
 
     /// Accept a row (`acceptIndex`): reject disabled/section; an **active** saved
