@@ -1489,6 +1489,16 @@ mod view {
     }
 
     impl ScanResultsDelegate {
+        /// The physical column index of the Module column — slides from 3 to 2
+        /// when the Previous column is hidden.
+        fn module_col_ix(&self) -> usize {
+            if self.show_previous {
+                3
+            } else {
+                2
+            }
+        }
+
         fn new() -> Self {
             ScanResultsDelegate {
                 rows: Vec::new(),
@@ -1558,7 +1568,7 @@ mod view {
         fn column(&self, col_ix: usize, _cx: &App) -> Column {
             // When the Previous column is hidden the Module column slides into
             // slot 2; resolve the logical column for the physical index.
-            let module_ix = if self.show_previous { 3 } else { 2 };
+            let module_ix = self.module_col_ix();
             if col_ix == module_ix && self.show_module {
                 return Column::new("module", "Module").width(px(140.)).sortable();
             }
@@ -1579,7 +1589,7 @@ mod view {
             _cx: &mut Context<TableState<Self>>,
         ) {
             let asc = !matches!(sort, ColumnSort::Descending);
-            let module_ix = if self.show_previous { 3 } else { 2 };
+            let module_ix = self.module_col_ix();
             if col_ix == module_ix && self.show_module {
                 self.rows.sort_by(|a, b| a.module.cmp(&b.module));
             } else {
@@ -1609,7 +1619,7 @@ mod view {
                 return div();
             };
             let row = &d.row;
-            let module_ix = if self.show_previous { 3 } else { 2 };
+            let module_ix = self.module_col_ix();
             // Green/red direction tint (the C++ `#7BC97B` / `#E07B7B`): the
             // theme greens an increase, reds a decrease.
             let delta_color = |cx: &App| -> Option<gpui::Hsla> {
@@ -1678,7 +1688,7 @@ mod view {
             let Some(d) = self.rows.get(row_ix) else {
                 return String::new();
             };
-            let module_ix = if self.show_previous { 3 } else { 2 };
+            let module_ix = self.module_col_ix();
             if col_ix == module_ix && self.show_module {
                 return d.module.clone();
             }
