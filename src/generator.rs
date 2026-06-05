@@ -409,6 +409,31 @@ impl<'a> GenContext<'a> {
         None
     }
 
+    /// Emit the `// static: TYPE name @ off` trailer for each static field — the
+    /// shared C / Rust / C# loop, differing only in the per-language fallback.
+    fn emit_static_comments(
+        &mut self,
+        ind: &str,
+        static_idxs: &[usize],
+        fallback: fn(NodeKind) -> &'static str,
+    ) {
+        for &si in static_idxs {
+            let sf = self.tree.nodes[si].clone();
+            let sf_type = if sf.struct_type_name.is_empty() {
+                self.aliased(sf.kind, fallback)
+            } else {
+                sf.struct_type_name.clone()
+            };
+            self.output.push_str(&format!(
+                "{}// static: {} {} @ {}\n",
+                ind,
+                sf_type,
+                sanitize_ident(&sf.name),
+                sf.offset_expr
+            ));
+        }
+    }
+
     /// `GenContext::structName(const Node&)` (`generator.cpp:114-118`).
     fn struct_name(&self, n: &Node) -> String {
         if !n.struct_type_name.is_empty() {
@@ -583,23 +608,9 @@ fn emit_struct_body(
 
         // Collapse consecutive hex nodes into a single padding array.
         if is_hex_node(child.kind) {
-            let run_start = child.offset;
-            let mut run_end = child.offset + child_size;
-            let mut j = i + 1;
-            while j < children.len() {
-                let next = &ctx.tree.nodes[children[j]];
-                if !is_hex_node(next.kind) {
-                    break;
-                }
-                let next_size = next.byte_size();
-                if next.offset < run_end {
-                    break;
-                }
-                run_end = next.offset + next_size;
-                j += 1;
-            }
-            emit_pad_run_c(ctx, &ind, base_offset, run_start, run_end - run_start);
-            cursor = run_end;
+            let (run_start, run_len, j) = hex_run_end(ctx.tree, &children, i);
+            emit_pad_run_c(ctx, &ind, base_offset, run_start, run_len);
+            cursor = run_start + run_len;
             i = j;
             continue;
         }
@@ -719,25 +730,33 @@ fn emit_struct_body(
     }
 
     // Static field comments.
-    for si in static_idxs {
-        let sf = &ctx.tree.nodes[si];
-        let sf_type = if sf.struct_type_name.is_empty() {
-            ctx.c_type(sf.kind)
-        } else {
-            sf.struct_type_name.clone()
-        };
-        let line = format!(
-            "{}// static: {} {} @ {}\n",
-            ind,
-            sf_type,
-            sanitize_ident(&sf.name),
-            sf.offset_expr
-        );
-        ctx.output.push_str(&line);
-    }
+    ctx.emit_static_comments(&ind, &static_idxs, c_type_name);
 }
 
 /// The `emitPadRun` lambda inside `emitStructBody` (`generator.cpp:237-243`).
+/// The extent of a maximal run of consecutive, non-overlapping hex nodes starting
+/// at `children[start_i]`: `(run_start_offset, run_len, next_index)`. The shared
+/// lookahead behind the C / Rust / Python padding-collapse emitters.
+fn hex_run_end(tree: &NodeTree, children: &[usize], start_i: usize) -> (i32, i32, usize) {
+    let start = &tree.nodes[children[start_i]];
+    let run_start = start.offset;
+    let mut run_end = start.offset + start.byte_size();
+    let mut j = start_i + 1;
+    while j < children.len() {
+        let next = &tree.nodes[children[j]];
+        if !is_hex_node(next.kind) {
+            break;
+        }
+        let next_size = next.byte_size();
+        if next.offset < run_end {
+            break;
+        }
+        run_end = next.offset + next_size;
+        j += 1;
+    }
+    (run_start, run_end - run_start, j)
+}
+
 fn emit_pad_run_c(ctx: &mut GenContext, ind: &str, base_offset: i32, rel_offset: i32, size: i32) {
     if size <= 0 {
         return;
@@ -940,23 +959,9 @@ fn emit_rust_struct_body(
         }
 
         if is_hex_node(child.kind) {
-            let run_start = child.offset;
-            let mut run_end = child.offset + child_size;
-            let mut j = i + 1;
-            while j < children.len() {
-                let next = &ctx.tree.nodes[children[j]];
-                if !is_hex_node(next.kind) {
-                    break;
-                }
-                let next_size = next.byte_size();
-                if next.offset < run_end {
-                    break;
-                }
-                run_end = next.offset + next_size;
-                j += 1;
-            }
-            emit_pad_run_rust(ctx, &ind, base_offset, run_start, run_end - run_start);
-            cursor = run_end;
+            let (run_start, run_len, j) = hex_run_end(ctx.tree, &children, i);
+            emit_pad_run_rust(ctx, &ind, base_offset, run_start, run_len);
+            cursor = run_start + run_len;
             i = j;
             continue;
         }
@@ -1055,22 +1060,7 @@ fn emit_rust_struct_body(
         emit_pad_run_rust(ctx, &ind, base_offset, cursor, struct_size - cursor);
     }
 
-    for si in static_idxs {
-        let sf = &ctx.tree.nodes[si];
-        let sf_type = if sf.struct_type_name.is_empty() {
-            ctx.rust_type(sf.kind)
-        } else {
-            sf.struct_type_name.clone()
-        };
-        let line = format!(
-            "{}// static: {} {} @ {}\n",
-            ind,
-            sf_type,
-            sanitize_ident(&sf.name),
-            sf.offset_expr
-        );
-        ctx.output.push_str(&line);
-    }
+    ctx.emit_static_comments(&ind, &static_idxs, rust_type_name);
 }
 
 /// Join `name:bits` for the bitfield comment (`generator.cpp:660-662`).
@@ -1366,22 +1356,7 @@ fn emit_csharp_struct_body(
         }
     }
 
-    for si in static_idxs {
-        let sf = &ctx.tree.nodes[si];
-        let sf_type = if sf.struct_type_name.is_empty() {
-            ctx.cs_type(sf.kind)
-        } else {
-            sf.struct_type_name.clone()
-        };
-        let line = format!(
-            "{}// static: {} {} @ {}\n",
-            ind,
-            sf_type,
-            sanitize_ident(&sf.name),
-            sf.offset_expr
-        );
-        ctx.output.push_str(&line);
-    }
+    ctx.emit_static_comments(&ind, &static_idxs, cs_type_name);
 }
 
 /// `emitCSharpStruct(GenContext&, uint64_t)` (`generator.cpp:1035-1085`).
@@ -1502,23 +1477,9 @@ fn emit_python_struct_body(ctx: &mut GenContext, struct_id: u64, is_union: bool,
         }
 
         if is_hex_node(child.kind) {
-            let run_start = child.offset;
-            let mut run_end = child.offset + child_size;
-            let mut j = i + 1;
-            while j < children.len() {
-                let next = &ctx.tree.nodes[children[j]];
-                if !is_hex_node(next.kind) {
-                    break;
-                }
-                let next_size = next.byte_size();
-                if next.offset < run_end {
-                    break;
-                }
-                run_end = next.offset + next_size;
-                j += 1;
-            }
-            emit_pad_field_py(ctx, ind, base_offset, run_start, run_end - run_start);
-            cursor = run_end;
+            let (run_start, run_len, j) = hex_run_end(ctx.tree, &children, i);
+            emit_pad_field_py(ctx, ind, base_offset, run_start, run_len);
+            cursor = run_start + run_len;
             i = j;
             continue;
         }
