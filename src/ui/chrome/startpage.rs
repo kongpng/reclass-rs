@@ -418,7 +418,7 @@ impl StartPage {
                                     .child(card.description()),
                             ),
                     )
-                    .when_some(card.shortcut(), |row, keys| row.child(key_cap(keys, cx))),
+                    .when_some(card.shortcut(), |row, keys| row.child(crate::ui::design::key_cap(keys, cx))),
             )
     }
 
@@ -632,22 +632,6 @@ impl Render for StartPage {
                     ),
             )
     }
-}
-
-/// A right-aligned key-cap chip (the keybinding hint on a welcome action row):
-/// a small `SM`-radius outlined pill in `UI_XS` muted text — the shared spec's
-/// key-cap recipe (`zed_ui_spec.md` §6 "Key-cap chip").
-fn key_cap(keys: &str, cx: &gpui::App) -> impl IntoElement {
-    div()
-        .flex_none()
-        .px(px(tokens::space::SM))
-        .py(px(tokens::space::XXS))
-        .rounded(px(tokens::radius::SM))
-        .border_1()
-        .border_color(color::border(cx))
-        .text_size(px(tokens::font::UI_XS))
-        .text_color(color::text_muted(cx))
-        .child(SharedString::from(keys.to_string()))
 }
 
 #[cfg(test)]

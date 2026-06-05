@@ -600,6 +600,27 @@ pub fn menu_accel_row(
         })
 }
 
+/// A Zed key-cap chip (`zed_ui_spec.md` §6): a small `SM`-radius, `UI_XS`,
+/// hairline-bordered muted pill for one keystroke token. Shared by the command
+/// palette row end-slot and the welcome-page action rows.
+pub fn key_cap(keys: impl Into<SharedString>, cx: &gpui::App) -> Div {
+    div()
+        .flex_none()
+        .px(px(tokens::space::SM))
+        .h(px(18.))
+        .min_w(px(18.))
+        .rounded(px(tokens::radius::SM))
+        .bg(color::hover_overlay(cx))
+        .border_1()
+        .border_color(color::border(cx))
+        .text_size(px(tokens::font::UI_XS))
+        .text_color(color::text_muted(cx))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(keys.into())
+}
+
 pub fn section_label(text: impl Into<SharedString>, cx: &gpui::App) -> Div {
     let text: SharedString = text.into();
     div()

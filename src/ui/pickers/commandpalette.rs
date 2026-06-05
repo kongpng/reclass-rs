@@ -590,26 +590,6 @@ mod view {
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
 
-    /// A Zed-style key-cap chip (`SM` radius, `UI_XS`, hairline border, muted
-    /// text) for a single keystroke token shown in the row's end slot.
-    fn key_cap(text: &str, cx: &gpui::App) -> AnyElement {
-        div()
-            .px(px(tokens::space::SM))
-            .h(px(18.))
-            .min_w(px(18.))
-            .rounded(px(tokens::radius::SM))
-            .bg(color::hover_overlay(cx))
-            .border_1()
-            .border_color(color::border(cx))
-            .text_size(px(tokens::font::UI_XS))
-            .text_color(color::text_muted(cx))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(text.to_string())
-            .into_any_element()
-    }
-
     actions!(
         rcx_command_palette,
         [PaletteDown, PaletteUp, PaletteConfirm, PaletteCancel]
@@ -804,7 +784,10 @@ mod view {
                     let caps: Vec<AnyElement> = if shortcut.is_empty() {
                         Vec::new()
                     } else {
-                        shortcut.split('+').map(|k| key_cap(k.trim(), cx)).collect()
+                        shortcut
+                            .split('+')
+                            .map(|k| crate::ui::design::key_cap(k.trim(), cx).into_any_element())
+                            .collect()
                     };
                     div()
                         .id(("palette-row", row))
