@@ -257,7 +257,7 @@ fn recent_menu_label(index: usize, file_name: &str) -> String {
 /// The Reclass menu bar as data, with the **dynamic** Recent-Files and saved
 /// Data-Source rows supplied by the host. `default_menu_tree()` passes empties
 /// (the construction-time tree); the window rebuilds with live data via
-/// [`MenuBar::set_menus`](crate::ui::menubar::MenuBar::set_menus).
+/// [`MenuBar::set_menus`](crate::ui::chrome::menubar::MenuBar::set_menus).
 pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -> Vec<MenuNode> {
     use MenuNode as N;
     // Recent Files children — the C++ shows "(empty)" disabled when none, and

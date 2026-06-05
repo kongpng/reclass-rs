@@ -31,7 +31,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, TitleBar};
 
-use crate::ui::menubar::MenuBar;
+use crate::ui::chrome::menubar::MenuBar;
 
 /// The two-mode workspace layout toggle (`enum LayoutPreset`, `titlebar.h:15-18`).
 ///

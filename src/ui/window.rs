@@ -4,14 +4,14 @@
 //! document tabs, §10 docks, §13 start page). Composes:
 //!
 //! - the custom frameless [`TitleBar`](gpui_component::TitleBar) (app-shell §5)
-//!   assembled by [`crate::ui::titlebar::render_titlebar`]: app label, the in-window
+//!   assembled by [`crate::ui::chrome::titlebar::render_titlebar`]: app label, the in-window
 //!   menu bar, the document title, and the workspace sidebar toggle (the
 //!   view-mode switch is the document area's bottom segmented control),
 //! - a [`DockArea`] holding the MDI document-tab center
-//!   ([`DocumentArea`](crate::ui::tabs::DocumentArea)) + the workspace dock
+//!   ([`DocumentArea`](crate::ui::chrome::tabs::DocumentArea)) + the workspace dock
 //!   ([`WorkspacePanel`](crate::ui::panels::workspace::WorkspacePanel)) + a scanner dock,
 //!   built by [`crate::ui::panels::docks::build_default_layout`],
-//! - the [`StartPage`](crate::ui::startpage::StartPage) welcome overlay (shown over
+//! - the [`StartPage`](crate::ui::chrome::startpage::StartPage) welcome overlay (shown over
 //!   the workspace on launch; app-shell §13),
 //! - the [`Root`] overlay layers (modals/dialogs/sheets/notifications), and
 //! - the gpui-free [`AppState`] window-state (open docs, active doc, source,
@@ -44,14 +44,14 @@ use crate::ui::dialogs::window_dialogs::{
 
 use crate::ui::panels::bookmarkspanel::BookmarksPanel;
 use crate::ui::panels::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
-use crate::ui::menubar::{MenuBar, MenuCommand};
+use crate::ui::chrome::menubar::{MenuBar, MenuCommand};
 use crate::ui::panels::modulespanel::ModulesPanel;
-use crate::ui::startpage::{RecentEntry, StartPage, StartPageEvent};
+use crate::ui::chrome::startpage::{RecentEntry, StartPage, StartPageEvent};
 use crate::ui::state::{AppState, DocId, ViewMode};
-use crate::ui::statusbar::{render_status_bar, StatusInfo};
-use crate::ui::tabs::{DocAreaEvent, DocumentArea};
+use crate::ui::chrome::statusbar::{render_status_bar, StatusInfo};
+use crate::ui::chrome::tabs::{DocAreaEvent, DocumentArea};
 use crate::ui::theme_apply::ThemeRegistryGlobal;
-use crate::ui::titlebar::{self, LayoutPreset};
+use crate::ui::chrome::titlebar::{self, LayoutPreset};
 use crate::ui::panels::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
     WorkspaceTypeAction,
@@ -5671,7 +5671,7 @@ impl MainWindow {
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| crate::ui::startpage::age_days_from_secs(now_secs, d.as_secs()))
+                    .map(|d| crate::ui::chrome::startpage::age_days_from_secs(now_secs, d.as_secs()))
                     .unwrap_or(0);
                 RecentEntry {
                     path: p.to_string_lossy().into_owned(),
@@ -5695,7 +5695,7 @@ impl MainWindow {
         // with no recent files — the audited "start-page Continue demo absent"
         // gap. Each example's `path` is its `file.example.<name>` key, routed
         // through `open_example` (not `open_project`) by `on_start_page_event`.
-        entries.extend(crate::ui::startpage::example_entries());
+        entries.extend(crate::ui::chrome::startpage::example_entries());
         entries
     }
 
@@ -5705,7 +5705,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::startpage::StartCard;
+        use crate::ui::chrome::startpage::StartCard;
         match ev {
             StartPageEvent::Dismissed => {
                 self.dismiss_start_page(cx);
@@ -6780,7 +6780,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // field's deeper `RcxFieldInput` bindings) are left untouched.
     let mut bindings = scope_editor_text_keys_to_non_field(crate::ui::editor::editor_key_bindings());
     bindings.extend(crate::ui::editor::inline_edit::field_key_bindings());
-    bindings.extend(crate::ui::startpage::start_page_key_bindings());
+    bindings.extend(crate::ui::chrome::startpage::start_page_key_bindings());
     bindings.extend(crate::ui::pickers::commandpalette::command_palette_key_bindings());
     bindings.extend(crate::ui::overlays::findbar::find_bar_key_bindings());
     bindings.extend(crate::ui::panels::scannerpanel::scanner_panel_key_bindings());
@@ -8040,7 +8040,7 @@ mod tests {
         // `age_days_from_secs` is the per-recent-file age `recent_entries` now feeds
         // into the start-page buckets. Assert the day-delta and the resulting
         // bucket for known timestamps.
-        use crate::ui::startpage::{age_days_from_secs, bucket_for, Bucket, RecentEntry};
+        use crate::ui::chrome::startpage::{age_days_from_secs, bucket_for, Bucket, RecentEntry};
         const DAY: u64 = 24 * 60 * 60;
         let now = 1_000 * DAY; // an arbitrary fixed "now" in whole days.
 

@@ -4,7 +4,7 @@
 //! The **workspace** ("Project") dock is now the real
 //! [`WorkspacePanel`](crate::ui::panels::workspace::WorkspacePanel) (a virtualized tree) and
 //! the **center document area** is the real
-//! [`DocumentArea`](crate::ui::tabs::DocumentArea) (the tab strip + editor host); the
+//! [`DocumentArea`](crate::ui::chrome::tabs::DocumentArea) (the tab strip + editor host); the
 //! remaining docks (memory scanner, symbols, bookmarks) are still stood up with
 //! the generic [`PlaceholderPanel`] until their workflows land.
 //!
@@ -13,7 +13,7 @@
 //! Render + Focusable` + a `panel_name`) so a
 //! [`DockArea`](gpui_component::dock::DockArea) can host it. [`DocumentPanel`]
 //! (the older single-editor center panel) is kept for reference + reuse; the
-//! center is now the multi-tab [`DocumentArea`](crate::ui::tabs::DocumentArea).
+//! center is now the multi-tab [`DocumentArea`](crate::ui::chrome::tabs::DocumentArea).
 //!
 //! Gated behind the `ui` feature (pulls gpui-component).
 

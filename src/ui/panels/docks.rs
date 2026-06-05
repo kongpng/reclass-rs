@@ -9,7 +9,7 @@
 //! `dump`/`load` (ARCHITECTURE §5 surface map).
 //!
 //! [`build_default_layout`] assembles the canonical layout: the center is the
-//! real MDI [`DocumentArea`](crate::ui::tabs::DocumentArea) (tab strip + "+" sentinel
+//! real MDI [`DocumentArea`](crate::ui::chrome::tabs::DocumentArea) (tab strip + "+" sentinel
 //! + source icons + view-mode toggle + editor), the left dock is the real
 //! [`WorkspacePanel`](crate::ui::panels::workspace::WorkspacePanel), the bottom dock is the
 //! real [`ScannerPanel`](crate::ui::panels::scannerpanel::ScannerPanel) (closed by default),
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::ui::panels::bookmarkspanel::BookmarksPanel;
 use crate::ui::panels::modulespanel::ModulesPanel;
 use crate::ui::panels::scannerpanel::ScannerPanel;
-use crate::ui::tabs::DocumentArea;
+use crate::ui::chrome::tabs::DocumentArea;
 use crate::ui::panels::workspace::WorkspacePanel;
 
 /// Identity + layout version for the main dock area, used as the `dump`/`load`

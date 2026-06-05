@@ -3,7 +3,7 @@
 //!
 //! The original Reclass ships a handful of demo projects (`src/examples/*.rcx`)
 //! that the start page surfaces under its **Examples** bucket
-//! ([`Bucket::Examples`](crate::ui::startpage::Bucket::Examples)) so a fresh install
+//! ([`Bucket::Examples`](crate::ui::chrome::startpage::Bucket::Examples)) so a fresh install
 //! has something to open. Rather than depend on a runtime examples *directory*
 //! (which moves around per install), the port **embeds** the curated set into
 //! the binary at compile time via [`include_str!`], so they are always present

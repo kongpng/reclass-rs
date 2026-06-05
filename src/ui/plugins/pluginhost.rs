@@ -46,7 +46,7 @@ use std::rc::Rc;
 use gpui::{App, Window};
 
 use crate::ui::state::SourceKind;
-use crate::ui::tabs::DocumentArea;
+use crate::ui::chrome::tabs::DocumentArea;
 use crate::ui::window::DiskSettings;
 use crate::plugin::PluginHost;
 use crate::theme::SettingsStore;
