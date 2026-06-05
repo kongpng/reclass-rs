@@ -263,7 +263,7 @@ pub use view::{ProcessPickEvent, ProcessPicker};
 
 #[cfg(feature = "ui")]
 mod view {
-    use crate::ui::contextmenu::process_row_menu;
+    use crate::ui::overlays::contextmenu::process_row_menu;
     use crate::ui::design::{color, tokens};
     use crate::ui::dialogs::modal;
     use gpui::prelude::FluentBuilder as _;
@@ -690,7 +690,7 @@ mod view {
                 .p(px(tokens::space::XS))
                 .text_size(px(tokens::font::UI_MD));
             for (i, item) in items.into_iter().enumerate() {
-                if let crate::ui::contextmenu::MenuItem::Action {
+                if let crate::ui::overlays::contextmenu::MenuItem::Action {
                     label,
                     command,
                     enabled,

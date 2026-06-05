@@ -12,14 +12,14 @@
 //! - [`optionsdialog`](crate::ui::dialogs::optionsdialog) — Options dialog (§5).
 //! - [`gotoaddress`](crate::ui::dialogs::gotoaddress) — Goto-Address dialog (§7).
 //! - [`commandpalette`](crate::ui::pickers::commandpalette) — Command palette (§8).
-//! - [`findbar`](crate::ui::findbar) — the Find bar (Ctrl+F).
+//! - [`findbar`](crate::ui::overlays::findbar) — the Find bar (Ctrl+F).
 //! - [`messagebox`](crate::ui::dialogs::messagebox) — themed message/confirm/input (§3,§4).
 //! - [`typeselectorpopup`](crate::ui::pickers::typeselectorpopup) — type picker (§9).
 //! - [`enumpicker`](crate::ui::pickers::enumpicker) — enum picker (§10).
 //! - [`sourcechooser`](crate::ui::pickers::sourcechooser) — source chooser (§11).
-//! - [`hextoolbar`](crate::ui::hextoolbar) — hex toolbar (§12).
-//! - [`contextmenu`](crate::ui::contextmenu) — context menus (§0).
-//! - [`tooltip`](crate::ui::tooltip) — tooltips + hover previews (§15,§20).
+//! - [`hextoolbar`](crate::ui::overlays::hextoolbar) — hex toolbar (§12).
+//! - [`contextmenu`](crate::ui::overlays::contextmenu) — context menus (§0).
+//! - [`tooltip`](crate::ui::overlays::tooltip) — tooltips + hover previews (§15,§20).
 //!
 //! This module keeps the [`DialogKind`] catalogue (a stable, logged identifier for
 //! each surface, used for action routing + tests) and re-exports the views.
@@ -38,11 +38,11 @@ pub use crate::ui::pickers::commandpalette::{CommandPalette, PaletteEvent};
 #[cfg(feature = "ui")]
 pub use crate::ui::pickers::enumpicker::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
-pub use crate::ui::findbar::{FindBar, FindEvent};
+pub use crate::ui::overlays::findbar::{FindBar, FindEvent};
 #[cfg(feature = "ui")]
 pub use crate::ui::dialogs::gotoaddress::{GotoAddressDialog, GotoEvent};
 #[cfg(feature = "ui")]
-pub use crate::ui::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
+pub use crate::ui::overlays::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
 #[cfg(feature = "ui")]
 pub use crate::ui::dialogs::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
 #[cfg(feature = "ui")]

@@ -46,10 +46,10 @@ use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
 use crate::core::linemeta::K_COMMAND_ROW_ID;
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
-use crate::ui::findbar::{FindBar, FindEvent};
+use crate::ui::overlays::findbar::{FindBar, FindEvent};
 use crate::ui::pickers::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 use crate::ui::design::color::with_alpha;
-use crate::ui::{design, tooltip};
+use crate::ui::{design, overlays::tooltip};
 
 use element::{RowElement, RowPaint};
 use geometry::CellMetrics;
@@ -519,12 +519,12 @@ pub struct RcxEditor {
     /// The mounted FindBar entity (Ctrl+F), and the active find-match highlight the
     /// editor paints over the matched line (items 4/91/92). `find_bar` is `Some`
     /// while the bar is open; `find_match` is the current navigated match.
-    find_bar: Option<Entity<crate::ui::findbar::FindBar>>,
-    find_match: Option<crate::ui::findbar::FindMatch>,
+    find_bar: Option<Entity<crate::ui::overlays::findbar::FindBar>>,
+    find_match: Option<crate::ui::overlays::findbar::FindMatch>,
     /// Item 31: the FULL match set, cached for the paint path (which has no `cx` to
     /// read the find-bar entity). Refreshed on Navigate and on every recompose
     /// (`sync_find_bar_lines`) so the painted IND_FIND bands track the layout.
-    find_matches: Vec<crate::ui::findbar::FindMatch>,
+    find_matches: Vec<crate::ui::overlays::findbar::FindMatch>,
     _find_bar_sub: Option<Subscription>,
     /// Item 33: the last find query, persisted across hide/show so re-opening the
     /// bar (Ctrl+F) resumes the prior search rather than starting blank (the C++

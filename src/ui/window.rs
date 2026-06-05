@@ -6782,7 +6782,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     bindings.extend(crate::ui::editor::inline_edit::field_key_bindings());
     bindings.extend(crate::ui::startpage::start_page_key_bindings());
     bindings.extend(crate::ui::pickers::commandpalette::command_palette_key_bindings());
-    bindings.extend(crate::ui::findbar::find_bar_key_bindings());
+    bindings.extend(crate::ui::overlays::findbar::find_bar_key_bindings());
     bindings.extend(crate::ui::scannerpanel::scanner_panel_key_bindings());
     // Global trigger to OPEN the palette (Zed: ctrl-shift-p / f1; cmd-shift-p on mac).
     bindings.push(KeyBinding::new(

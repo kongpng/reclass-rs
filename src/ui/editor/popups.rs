@@ -477,8 +477,8 @@ impl super::RcxEditor {
 
     /// Build the [`HexPopupContext`] for the hex node at `idx`: its current kind +
     /// raw bytes + up to 15 adjacent same-parent hex nodes (for join previews).
-    fn build_hex_context(&self, idx: usize) -> Option<crate::ui::hextoolbar::HexPopupContext> {
-        use crate::ui::hextoolbar::{Adjacent, HexPopupContext};
+    fn build_hex_context(&self, idx: usize) -> Option<crate::ui::overlays::hextoolbar::HexPopupContext> {
+        use crate::ui::overlays::hextoolbar::{Adjacent, HexPopupContext};
         let tree = self.controller.tree();
         let n = tree.nodes.get(idx)?;
         if !is_hex_preview(n.kind) {
@@ -523,7 +523,7 @@ impl super::RcxEditor {
     /// `SizeSelected` apply the size change via `split_hex_node` (smaller) or
     /// `join_hex_nodes` (larger); Insert above/below + dismiss route accordingly.
     pub(super) fn open_hex_toolbar(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
+        use crate::ui::overlays::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
         let Some(ctx) = self.build_hex_context(idx) else {
             return;
         };
