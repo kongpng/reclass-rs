@@ -875,20 +875,7 @@ fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
 /// `render_key_binding` shows nothing), but the hint communicates the equivalent
 /// editor accelerator the way a Zed menu does.
 fn menu_row(label: &'static str, keys: &'static str, cx: &App) -> impl IntoElement {
-    gpui_component::h_flex()
-        .w_full()
-        .min_w(px(168.0))
-        .gap(px(tokens::space::LG))
-        .items_center()
-        .justify_between()
-        .child(div().flex_1().child(label))
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(tokens::font::UI_XS))
-                .text_color(color::text_disabled(cx))
-                .child(keys),
-        )
+    crate::ui::design::menu_accel_row(label, keys, 168.0, cx)
 }
 
 impl Panel for WorkspacePanel {

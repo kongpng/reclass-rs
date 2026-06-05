@@ -1418,22 +1418,7 @@ fn tab_context_menu(menu: PopupMenu, has_path: bool, multi_tab: bool) -> PopupMe
 /// right-aligned dim `keys` shortcut hint (Zed's label↔accelerator layout). The
 /// leading icon is supplied by `menu_element_with_icon`; this is the row's text.
 fn menu_row(label: &'static str, keys: &'static str, cx: &App) -> impl IntoElement {
-    gpui_component::h_flex()
-        .w_full()
-        .min_w(px(184.0))
-        .gap(px(tokens::space::LG))
-        .items_center()
-        .justify_between()
-        .child(div().flex_1().child(label))
-        .when(!keys.is_empty(), |row| {
-            row.child(
-                div()
-                    .flex_none()
-                    .text_size(px(tokens::font::UI_XS))
-                    .text_color(color::text_disabled(cx))
-                    .child(keys),
-            )
-        })
+    crate::ui::design::menu_accel_row(label, keys, 184.0, cx)
 }
 
 /// The per-tab source-status tooltip text (the C++ per-tab source tooltip): the

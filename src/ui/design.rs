@@ -574,6 +574,32 @@ pub fn panel_header(title: impl Into<SharedString>, cx: &gpui::App) -> Div {
 /// A section caption label — the small uppercase muted divider used inside
 /// dialogs / option pages / the theme editor (the C++ `makeSectionLabel`:
 /// bold 11px, `textMuted`, bottom border). Group headers in a settings list.
+/// A context-menu row: a left label and a right-aligned accelerator hint (shown
+/// only when `keys` is non-empty). Shared by the tab-bar and workspace menus.
+pub fn menu_accel_row(
+    label: &'static str,
+    keys: &'static str,
+    min_w: f32,
+    cx: &gpui::App,
+) -> Div {
+    gpui_component::h_flex()
+        .w_full()
+        .min_w(px(min_w))
+        .gap(px(tokens::space::LG))
+        .items_center()
+        .justify_between()
+        .child(div().flex_1().child(label))
+        .when(!keys.is_empty(), |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(tokens::font::UI_XS))
+                    .text_color(color::text_disabled(cx))
+                    .child(keys),
+            )
+        })
+}
+
 pub fn section_label(text: impl Into<SharedString>, cx: &gpui::App) -> Div {
     let text: SharedString = text.into();
     div()

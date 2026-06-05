@@ -8,7 +8,6 @@
 //! module contributes:
 //!
 //! - [`LayoutPreset`] — the two-mode workspace toggle enum (`titlebar.h:15-18`),
-//! - [`title_case`] / [`upper_case`] — the menu-title transform
 //!   (`setMenuBarTitleCase`, `titlebar.cpp:222-253`), unit-tested headlessly,
 //! - [`render_titlebar`] — assembles the bar contents (app label, the in-window
 //!   menu bar, stretch, the document title, and the workspace **sidebar toggle**)
@@ -79,34 +78,6 @@ impl LayoutPreset {
             LayoutPreset::Off
         }
     }
-}
-
-/// Upper-case a top-level menu title (`setMenuBarTitleCase(true)` branch,
-/// `titlebar.cpp:222-253`). Qt prefixes mnemonics with `&`; the transform
-/// upper-cases the visible text. Our titles carry no `&`, so this is a plain
-/// ASCII upper-case.
-pub fn upper_case(title: &str) -> String {
-    title.to_uppercase()
-}
-
-/// Title-case a top-level menu title (`setMenuBarTitleCase(false)` branch):
-/// capitalize the first letter of each whitespace-separated word, lower-casing
-/// the rest (the C++ "capitalize first letter of each word").
-pub fn title_case(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
-    for (i, word) in title.split(' ').enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            for c in chars {
-                out.extend(c.to_lowercase());
-            }
-        }
-    }
-    out
 }
 
 /// One small chrome glyph button used in the titlebar (the workspace/sidebar
@@ -313,7 +284,7 @@ mod tests {
     // Import only the gpui-free items under test — NOT `super::*`, which would
     // pull the module's `gpui::*` glob into the `#[test]` hygiene expansion and
     // overflow the type-recursion budget (see lib.rs note).
-    use super::{app_label_mode, title_case, upper_case, AppLabelMode, LayoutPreset};
+    use super::{app_label_mode, AppLabelMode, LayoutPreset};
 
     #[test]
     fn show_icon_selects_app_label_mode() {
@@ -348,21 +319,4 @@ mod tests {
         assert_eq!(LayoutPreset::for_visible(false), LayoutPreset::Off);
     }
 
-    #[test]
-    fn upper_case_matches_qt_uppercase() {
-        assert_eq!(upper_case("File"), "FILE");
-        assert_eq!(upper_case("View"), "VIEW");
-        assert_eq!(upper_case("plugins"), "PLUGINS");
-    }
-
-    #[test]
-    fn title_case_capitalizes_each_word() {
-        // The C++ "Title Case": first letter of each word up, rest down.
-        assert_eq!(title_case("file"), "File");
-        assert_eq!(title_case("VIEW"), "View");
-        assert_eq!(title_case("data source"), "Data Source");
-        assert_eq!(title_case("reCLASS browser"), "Reclass Browser");
-        // Idempotent on already-title-cased input.
-        assert_eq!(title_case("Help"), "Help");
-    }
 }
