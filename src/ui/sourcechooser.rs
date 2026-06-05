@@ -683,8 +683,12 @@ mod view {
             });
         }
 
-        fn accept_row(&mut self, row: usize, cx: &mut Context<Self>) {
-            match self.model.accept(row) {
+        /// Route an accepted source outcome to its event ("File" provider →
+        /// OpenFile; saved / provider / clear / none → their picks). Shared by the
+        /// click (`accept_row`) and Enter paths so the file-vs-provider special
+        /// case can't drift between them.
+        fn emit_accept(&mut self, outcome: SourceAccept, cx: &mut Context<Self>) {
+            match outcome {
                 SourceAccept::SavedSource(i) => {
                     cx.emit(SourceChooserEvent::Pick(SourcePick::SavedSource(i)))
                 }
@@ -700,6 +704,11 @@ mod view {
                 SourceAccept::Clear => cx.emit(SourceChooserEvent::Clear),
                 SourceAccept::None => cx.emit(SourceChooserEvent::Cancel),
             }
+        }
+
+        fn accept_row(&mut self, row: usize, cx: &mut Context<Self>) {
+            let outcome = self.model.accept(row);
+            self.emit_accept(outcome, cx);
         }
 
         /// Keyboard navigation (`sourcechooserpopup.cpp:603` `eventFilter`):
@@ -749,20 +758,8 @@ mod view {
                     true
                 }
                 "enter" => {
-                    match self.model.accept_current() {
-                        SourceAccept::SavedSource(i) => {
-                            cx.emit(SourceChooserEvent::Pick(SourcePick::SavedSource(i)))
-                        }
-                        SourceAccept::Provider(id) => {
-                            if id == "file" {
-                                cx.emit(SourceChooserEvent::OpenFile);
-                            } else {
-                                cx.emit(SourceChooserEvent::Pick(SourcePick::Provider(id)));
-                            }
-                        }
-                        SourceAccept::Clear => cx.emit(SourceChooserEvent::Clear),
-                        SourceAccept::None => cx.emit(SourceChooserEvent::Cancel),
-                    }
+                    let outcome = self.model.accept_current();
+                    self.emit_accept(outcome, cx);
                     true
                 }
                 "escape" => {

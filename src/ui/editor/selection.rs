@@ -156,6 +156,16 @@ pub fn byte_addr_at(
     Some(lm.offset_addr.wrapping_add(byte_idx as u64))
 }
 
+/// The display-column span `[start, end]` covering hex bytes `[first, last)` of a
+/// row — the inverse of [`byte_addr_at`]'s `col → byte` mapping (each byte is the
+/// 3-column `"XX "` cell). `value_span` is the row's value [`ColumnSpan`].
+pub fn byte_cols_in_row(value_span: ColumnSpan, first: i32, last: i32) -> (i32, i32) {
+    (
+        value_span.start + first * 3,
+        value_span.start + (last - 1) * 3 + 2,
+    )
+}
+
 /// The intersection of a hex row `[row_lo, row_lo + count)` with a byte
 /// selection `[lo, hi)`, returned as the `[first_byte, last_byte)` *byte indices*
 /// within the row to highlight (`applyByteSelectionOverlay`, editor-surface.md

@@ -4353,8 +4353,7 @@ impl RcxEditor {
                 {
                     let vs = crate::compose::value_span_for(&lm, type_w, name_w);
                     if vs.valid {
-                        let s = vs.start + first * 3;
-                        let e = vs.start + (last - 1) * 3 + 2;
+                        let (s, e) = selection::byte_cols_in_row(vs, first, last);
                         overlays.push((s, e, with_alpha(palette.byte_sel, 0.35)));
                     }
                 }
