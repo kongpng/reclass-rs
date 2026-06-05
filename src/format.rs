@@ -415,6 +415,38 @@ pub fn fmt_pointer64(v: u64) -> String {
     }
 }
 
+/// Append the `  // <module>!<symbol>` suffix to `s` when the provider resolves a
+/// symbol at `addr_val` (the shared C++ `format.cpp` pointer-value annotation).
+fn with_symbol_suffix(mut s: String, prov: &dyn Provider, addr_val: u64) -> String {
+    let sym = prov.get_symbol(addr_val);
+    if !sym.is_empty() {
+        s.push_str("  // ");
+        s.push_str(&sym);
+    }
+    s
+}
+
+/// A 32-bit pointer / function-pointer value: raw 8-hex when `!display`, else the
+/// formatted pointer + any symbol suffix. Shared by Pointer32 / FuncPtr32.
+fn ptr32_value(prov: &dyn Provider, val: u32, display: bool) -> String {
+    if !display {
+        raw_hex(u64::from(val), 8)
+    } else {
+        with_symbol_suffix(fmt_pointer32(val), prov, u64::from(val))
+    }
+}
+
+/// A 64-bit pointer / function-pointer value (the non-dereferencing case): raw
+/// 16-hex when `!display`, else the formatted pointer + any symbol suffix. Shared
+/// by FuncPtr64 and Pointer64's non-deref path.
+fn ptr64_value(prov: &dyn Provider, val: u64, display: bool) -> String {
+    if !display {
+        raw_hex(val, 16)
+    } else {
+        with_symbol_suffix(fmt_pointer64(val), prov, val)
+    }
+}
+
 /// Exact decimal expansion of a finite `f64`'s magnitude, as `(int, frac)`
 /// digit strings (no sign). Rust's `{:.*}` formatting emits the *exact* decimal
 /// value of a double (a dyadic rational, so it terminates) — formatting with a
@@ -1057,20 +1089,9 @@ fn read_value_impl(
             }
         }
         NodeKind::Bool => fmt_bool(prov.read_u8(addr)),
-        NodeKind::Pointer32 => {
+        NodeKind::Pointer32 | NodeKind::FuncPtr32 => {
             let val = prov.read_u32(addr);
-            if !display {
-                raw_hex(u64::from(val), 8)
-            } else {
-                let mut s = fmt_pointer32(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:425-426`).
-                let sym = prov.get_symbol(u64::from(val));
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
+            ptr32_value(prov, val, display)
         }
         NodeKind::Pointer64 => {
             let val = prov.read_u64(addr);
@@ -1109,48 +1130,11 @@ fn read_value_impl(
                 }
                 return fmt_pointer64(val);
             }
-            if !display {
-                raw_hex(val, 16)
-            } else {
-                let mut s = fmt_pointer64(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:457-458`).
-                let sym = prov.get_symbol(val);
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
-        }
-        NodeKind::FuncPtr32 => {
-            let val = prov.read_u32(addr);
-            if !display {
-                raw_hex(u64::from(val), 8)
-            } else {
-                let mut s = fmt_pointer32(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:465-466`).
-                let sym = prov.get_symbol(u64::from(val));
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
+            ptr64_value(prov, val, display)
         }
         NodeKind::FuncPtr64 => {
             let val = prov.read_u64(addr);
-            if !display {
-                raw_hex(val, 16)
-            } else {
-                let mut s = fmt_pointer64(val);
-                // `// <module>!<symbol>` suffix (`format.cpp:473-474`).
-                let sym = prov.get_symbol(val);
-                if !sym.is_empty() {
-                    s.push_str("  // ");
-                    s.push_str(&sym);
-                }
-                s
-            }
+            ptr64_value(prov, val, display)
         }
         NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => {
             let count = size_for_kind(node.kind) / 4;
