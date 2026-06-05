@@ -60,17 +60,28 @@ pub fn collect_input_ids(tree: &ViewTree) -> Vec<String> {
     out
 }
 
-fn collect_input_ids_into(tree: &ViewTree, out: &mut Vec<String>) {
+/// Visit every [`ViewTree::TextInput`] in `tree` in pre-order, passing
+/// `(id, value, placeholder)` to `f` — the shared structural descent behind
+/// input-id collection and input-seed lookup.
+fn walk_inputs(tree: &ViewTree, f: &mut impl FnMut(&str, &str, &str)) {
     match tree {
-        ViewTree::TextInput { id, .. } => out.push(id.clone()),
+        ViewTree::TextInput {
+            id,
+            value,
+            placeholder,
+        } => f(id, value, placeholder),
         ViewTree::Column(children) | ViewTree::Row(children) => {
             for c in children {
-                collect_input_ids_into(c, out);
+                walk_inputs(c, f);
             }
         }
-        ViewTree::Group { child, .. } => collect_input_ids_into(child, out),
+        ViewTree::Group { child, .. } => walk_inputs(child, f),
         _ => {}
     }
+}
+
+fn collect_input_ids_into(tree: &ViewTree, out: &mut Vec<String>) {
+    walk_inputs(tree, &mut |id, _, _| out.push(id.to_string()));
 }
 
 /// Flatten a [`ViewTree::Tree`] node list into `(depth, node)` rows in pre-order,
@@ -204,24 +215,15 @@ mod render {
 
     /// Find the `(value, placeholder)` to seed the input `id` with from `tree`.
     fn find_input_seed(tree: &ViewTree, id: &str) -> (String, String) {
-        match tree {
-            ViewTree::TextInput {
-                id: tid,
-                value,
-                placeholder,
-            } if tid == id => (value.clone(), placeholder.clone()),
-            ViewTree::Column(children) | ViewTree::Row(children) => {
-                for c in children {
-                    let seed = find_input_seed(c, id);
-                    if !seed.0.is_empty() || !seed.1.is_empty() {
-                        return seed;
-                    }
-                }
-                (String::new(), String::new())
+        let mut seed = (String::new(), String::new());
+        let mut found = false;
+        walk_inputs(tree, &mut |tid, value, placeholder| {
+            if !found && tid == id {
+                found = true;
+                seed = (value.to_string(), placeholder.to_string());
             }
-            ViewTree::Group { child, .. } => find_input_seed(child, id),
-            _ => (String::new(), String::new()),
-        }
+        });
+        seed
     }
 
     /// Render a plugin [`ViewTree`] into a Zed-styled element (design §3, §6
