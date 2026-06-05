@@ -221,6 +221,11 @@ impl FieldInput {
         self.hex_overwrite.is_some()
     }
 
+    /// Whether the active overwrite mode writes per-byte HEX (vs raw ASCII).
+    fn is_hex_mode(&self) -> bool {
+        self.is_hex_mode()
+    }
+
     /// Item 7: re-seed the content with the ASCII preview `seed` (one printable
     /// char per byte) and switch into [`HexOverwrite::Ascii`] mode. Used by the
     /// "Edit ASCII" context-menu entry, which opens a plain Value edit (whose seed
@@ -237,7 +242,7 @@ impl FieldInput {
     fn ow_next(&self, off: usize) -> usize {
         ow_next_in(
             &self.content,
-            self.hex_overwrite.map(|m| m.is_hex()).unwrap_or(false),
+            self.is_hex_mode(),
             off,
         )
     }
@@ -247,7 +252,7 @@ impl FieldInput {
     fn ow_prev(&self, off: usize) -> usize {
         ow_prev_in(
             &self.content,
-            self.hex_overwrite.map(|m| m.is_hex()).unwrap_or(false),
+            self.is_hex_mode(),
             off,
         )
     }

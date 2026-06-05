@@ -199,15 +199,13 @@ pub enum SpanRole {
 /// blue) vs a value type (yellow). Used to color the type column per kind, like
 /// the reclass screenshots where `fnptr64` is blue and `hex64`/`int32` are not.
 pub fn is_fnptr_kind(kind: crate::core::NodeKind) -> bool {
-    use crate::core::NodeKind::*;
-    matches!(kind, FuncPtr32 | FuncPtr64)
+    crate::core::is_func_ptr(kind)
 }
 
 /// Whether a node kind renders its type token as a keyword color (pointers and
 /// `void*` lean magenta/purple like a C++ keyword in the screenshots).
 pub fn is_pointer_kind(kind: crate::core::NodeKind) -> bool {
-    use crate::core::NodeKind::*;
-    matches!(kind, Pointer32 | Pointer64)
+    crate::core::is_pointer_kind(kind)
 }
 
 /// One colored run over a `[start,end)` **char-column** range with a role.
