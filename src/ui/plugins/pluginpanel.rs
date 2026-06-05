@@ -2,12 +2,12 @@
 //! the host-side view that mounts a plugin's declarative
 //! [`ViewTree`](crate::plugin::view::ViewTree) into a gpui-component dock
 //! [`Panel`](gpui_component::dock::Panel), Zed-styled via
-//! [`crate::ui::pluginview::render_view_tree`].
+//! [`crate::ui::plugins::pluginview::render_view_tree`].
 //!
 //! ## Elm loop, decoupled from the manager
 //!
 //! The panel is intentionally **manager-agnostic**: it owns only the current
-//! `ViewTree` + the per-view [`PluginRenderState`](crate::ui::pluginview::PluginRenderState)
+//! `ViewTree` + the per-view [`PluginRenderState`](crate::ui::plugins::pluginview::PluginRenderState)
 //! (persistent text inputs). Interactive widgets emit a
 //! [`UiEvent`](crate::plugin::view::UiEvent) that the panel re-emits as a
 //! [`PluginPanelEvent`] (gpui `EventEmitter`); the **window** (which owns the
@@ -24,7 +24,7 @@ use gpui_component::dock::{Panel, PanelEvent};
 
 use crate::plugin::view::{UiEvent, ViewTree};
 use crate::ui::design::{color, tokens};
-use crate::ui::pluginview::{render_view_tree, PluginRenderState};
+use crate::ui::plugins::pluginview::{render_view_tree, PluginRenderState};
 
 /// A UI event a [`PluginPanel`] raises for the window to route through the
 /// `PluginManager` (the panel id + the widget event). The window forwards
@@ -166,7 +166,7 @@ impl Render for PluginPanel {
 mod tests {
     // The panel's interesting logic (tree replacement, event re-emission) is
     // gpui-bound (needs a Window/Context); its pure pieces — the render mapping
-    // and event derivation — are unit-tested in `crate::ui::pluginview`, and the
+    // and event derivation — are unit-tested in `crate::ui::plugins::pluginview`, and the
     // panel's end-to-end routing is exercised by the demo plugin's tests through
     // `MockPluginHost` (`crate::plugin::demo`). Here we assert only the gpui-free
     // event payload shape so a refactor of `PluginPanelEvent` is caught.

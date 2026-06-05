@@ -4,7 +4,7 @@
 //! scaffolding ([`crate::ui::dialogs::modal`]) and routes its events back to the
 //! plugin Elm-style.
 //!
-//! Like [`PluginPanel`](crate::ui::pluginpanel) it is **manager-agnostic**: it
+//! Like [`PluginPanel`](crate::ui::plugins::pluginpanel) it is **manager-agnostic**: it
 //! owns the current tree + persistent inputs, and re-emits widget
 //! [`UiEvent`](crate::plugin::view::UiEvent)s + the dialog outcome as
 //! [`PluginDialogEvent`] for the window (the `PluginManager` owner) to route. On
@@ -21,7 +21,7 @@ use gpui::*;
 use crate::plugin::contract::DialogResult;
 use crate::plugin::view::{UiEvent, ViewTree};
 use crate::ui::dialogs::modal;
-use crate::ui::pluginview::{render_view_tree, PluginRenderState};
+use crate::ui::plugins::pluginview::{render_view_tree, PluginRenderState};
 
 /// What a [`PluginDialog`] raises for the window to route through the
 /// `PluginManager`.
@@ -193,7 +193,7 @@ impl Render for PluginDialog {
 mod tests {
     // The dialog's effectful logic (submit gathers input values, cancel) is
     // gpui-bound; the pure ViewTree→widget mapping is tested in
-    // `crate::ui::pluginview` and the end-to-end Attach→set_data_source→close
+    // `crate::ui::plugins::pluginview` and the end-to-end Attach→set_data_source→close
     // flow in `crate::plugin::demo` (via `MockPluginHost`). Here we assert the
     // gpui-free event payload shapes so a refactor of `PluginDialogEvent` /
     // `DialogResult` is caught.

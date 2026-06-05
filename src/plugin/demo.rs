@@ -22,7 +22,7 @@
 //!   chosen target.
 //!
 //! This is **pure data + logic** (no gpui): the host renders the trees
-//! ([`crate::ui::pluginview`]) and routes the events back. The `#[cfg(test)]`
+//! ([`crate::ui::plugins::pluginview`]) and routes the events back. The `#[cfg(test)]`
 //! suite drives the plugin entirely through [`MockPluginHost`].
 
 use serde_json::Value;

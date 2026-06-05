@@ -444,13 +444,13 @@ pub struct MainWindow {
     /// controller). Empty ⇒ the editor is unsplit (the default single-pane view).
     /// `view.split` appends a pane; `view.unsplit` removes the last.
     split_panes: Vec<ViewMode>,
-    /// The mounted plugin [`PluginPanel`](crate::ui::pluginpanel::PluginPanel) views,
+    /// The mounted plugin [`PluginPanel`](crate::ui::plugins::pluginpanel::PluginPanel) views,
     /// keyed by the contributed panel id (design §6 Phase 2). One per enabled
     /// `Panel` contribution, built in [`new`](Self::new) after the demo gating and
     /// docked into the existing dock area. Empty in the default shipping build (no
     /// plugin contributes a panel ⇒ no extra dock view ⇒ byte-identical UI). Held so
     /// [`rerender_plugin_panel`](Self::rerender_plugin_panel) can push a fresh tree.
-    plugin_panels: Vec<(String, Entity<crate::ui::pluginpanel::PluginPanel>)>,
+    plugin_panels: Vec<(String, Entity<crate::ui::plugins::pluginpanel::PluginPanel>)>,
     /// Live subscriptions to the mounted plugin panels' events — kept for the
     /// window's lifetime so a panel's [`PluginPanelEvent`] keeps routing through the
     /// manager (a dropped `Subscription` stops firing). Index-independent of
@@ -2519,16 +2519,16 @@ impl MainWindow {
     // list — nothing is mounted, injected, or routed (HARD PARITY).
 
     /// Mount each enabled plugin-contributed `Panel` into the existing dock area
-    /// (design §6 Phase 2). Adds one [`PluginPanel`](crate::ui::pluginpanel::PluginPanel)
+    /// (design §6 Phase 2). Adds one [`PluginPanel`](crate::ui::plugins::pluginpanel::PluginPanel)
     /// tab per `UiContribution::Panel`, docked on the contribution's
     /// [`DockSide`](crate::plugin::DockSide) (the demo's is `Right`, so it tabs in
     /// beside Modules/Bookmarks), and subscribes to its
-    /// [`PluginPanelEvent`](crate::ui::pluginpanel::PluginPanelEvent) so a widget event
+    /// [`PluginPanelEvent`](crate::ui::plugins::pluginpanel::PluginPanelEvent) so a widget event
     /// routes through the manager. The target dock is **not** forced open, so a
     /// closed dock stays closed (no launch-time behavior change). Empty list ⇒
     /// no-op (parity).
     fn mount_plugin_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::pluginpanel::PluginPanel;
+        use crate::ui::plugins::pluginpanel::PluginPanel;
         // Collect the panel contributions first (ends the borrow on the manager
         // before we mount gpui views / subscribe to `self`).
         let panels: Vec<(
@@ -2556,7 +2556,7 @@ impl MainWindow {
             let sub = cx.subscribe_in(
                 &panel,
                 window,
-                |this, panel, ev: &crate::ui::pluginpanel::PluginPanelEvent, window, cx| {
+                |this, panel, ev: &crate::ui::plugins::pluginpanel::PluginPanelEvent, window, cx| {
                     this.route_plugin_panel_event(panel, ev, window, cx);
                 },
             );
@@ -2572,21 +2572,21 @@ impl MainWindow {
         }
     }
 
-    /// Route one [`PluginPanelEvent`](crate::ui::pluginpanel::PluginPanelEvent) through
+    /// Route one [`PluginPanelEvent`](crate::ui::plugins::pluginpanel::PluginPanelEvent) through
     /// the manager (design §6 Phase 2 Elm loop): build a scoped `LivePluginHost`,
     /// call `handle_ui_event`, push any fresh tree back into the panel, then drain
     /// the host's collected requests (toasts → `notify`, open-dialogs →
     /// `open_plugin_dialog`, re-renders → `rerender_plugin_panel`).
     fn route_plugin_panel_event(
         &mut self,
-        panel: &Entity<crate::ui::pluginpanel::PluginPanel>,
-        ev: &crate::ui::pluginpanel::PluginPanelEvent,
+        panel: &Entity<crate::ui::plugins::pluginpanel::PluginPanel>,
+        ev: &crate::ui::plugins::pluginpanel::PluginPanelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Scope the host so its `cx` borrow ends before we re-borrow `cx`.
         let (tree, toasts, open_dialogs, rerenders) = {
-            let mut host = crate::ui::pluginhost::LivePluginHost::new(
+            let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
                 self.document_area.clone(),
                 self.settings.clone(),
                 window,
@@ -2629,7 +2629,7 @@ impl MainWindow {
     /// recognizes (a contributed menu/palette item).
     fn dispatch_plugin_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let (cmd_toast, toasts, open_dialogs, rerenders) = {
-            let mut host = crate::ui::pluginhost::LivePluginHost::new(
+            let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
                 self.document_area.clone(),
                 self.settings.clone(),
                 window,
@@ -2655,7 +2655,7 @@ impl MainWindow {
     /// Open a plugin-contributed `Dialog` modally (design §6 Phase 2 — the
     /// generalized C++ `selectTarget`), modeled on
     /// [`open_process_picker`](Self::open_process_picker). Pulls the initial tree +
-    /// title from the manager, mounts a [`PluginDialog`](crate::ui::plugindialog::PluginDialog)
+    /// title from the manager, mounts a [`PluginDialog`](crate::ui::plugins::plugindialog::PluginDialog)
     /// via the proven `window.open_dialog` pattern, and subscribes (on the shared
     /// close-only [`goto_sub`](Self::goto_sub)) to route the dialog's Ui / Closed
     /// events through the manager. No-op if `id` isn't a contributed dialog.
@@ -2676,15 +2676,15 @@ impl MainWindow {
             })
             .unwrap_or_else(|| id.to_string());
 
-        let dialog = crate::ui::plugindialog::PluginDialog::view(id, title, initial, window, cx);
+        let dialog = crate::ui::plugins::plugindialog::PluginDialog::view(id, title, initial, window, cx);
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
-            |this, dialog, ev: &crate::ui::plugindialog::PluginDialogEvent, window, cx| match ev {
-                crate::ui::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
+            |this, dialog, ev: &crate::ui::plugins::plugindialog::PluginDialogEvent, window, cx| match ev {
+                crate::ui::plugins::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
                     let dialog_id = view_id.clone();
                     let (tree, toasts, open_dialogs, close_dialogs, rerenders) = {
-                        let mut host = crate::ui::pluginhost::LivePluginHost::new(
+                        let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,
@@ -2712,9 +2712,9 @@ impl MainWindow {
                         window.close_dialog(cx);
                     }
                 }
-                crate::ui::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
+                crate::ui::plugins::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
                     let (cmd_toast, toasts, open_dialogs, rerenders) = {
-                        let mut host = crate::ui::pluginhost::LivePluginHost::new(
+                        let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,
@@ -2826,7 +2826,7 @@ impl MainWindow {
                     // library, then refresh the rows. The host borrows `cx`, so it is
                     // scoped + dropped before we re-borrow `cx` for `notify`/`update`.
                     let toasts = {
-                        let mut host = crate::ui::pluginhost::LivePluginHost::new(
+                        let mut host = crate::ui::plugins::pluginhost::LivePluginHost::new(
                             this.document_area.clone(),
                             this.settings.clone(),
                             window,

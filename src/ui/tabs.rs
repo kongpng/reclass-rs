@@ -437,7 +437,7 @@ impl DocumentArea {
     /// Close every open tab whose data source is of `kind`, returning how many
     /// were closed (the live-host **safe-unload** detach; design §7.A [fix]).
     ///
-    /// The [`LivePluginHost`](crate::ui::pluginhost::LivePluginHost) drives this when
+    /// The [`LivePluginHost`](crate::ui::plugins::pluginhost::LivePluginHost) drives this when
     /// the manager safe-unloads a provider plugin: every document still pointing
     /// at that provider's source kind is closed **before** the backing library is
     /// dropped, so none outlives the provider it reads (the C++ dangling-provider

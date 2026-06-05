@@ -35,7 +35,7 @@
 //! [`handle_ui_event`](PluginManager::handle_ui_event)). The in-tree
 //! [`DemoPlugin`] is the deliverable (a `Command`, a `Panel`, a `Dialog` that
 //! re-expresses `select_target`); the host-side renderer lives behind the `ui`
-//! feature in [`crate::ui::pluginview`] (+ `pluginpanel` / `plugindialog`).
+//! feature in [`crate::ui::plugins::pluginview`] (+ `pluginpanel` / `plugindialog`).
 //!
 //! ## Phase 1 scope
 //!

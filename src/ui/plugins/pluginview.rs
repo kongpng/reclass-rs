@@ -8,7 +8,7 @@
 //! [`render_view_tree`] maps each `ViewTree` variant onto a widget built **only**
 //! from [`crate::ui::design`] tokens/color (so plugin UI is auto-themed — design
 //! §7.E [+]) plus `gpui-component` widgets. It is reused by both the dock
-//! [`Panel`](crate::ui::pluginpanel) and the modal [`Dialog`](crate::ui::plugindialog).
+//! [`Panel`](crate::ui::plugins::pluginpanel) and the modal [`Dialog`](crate::ui::plugins::plugindialog).
 //!
 //! ## The mapping (design §3 widget vocabulary → Zed widget)
 //!
