@@ -666,6 +666,17 @@ impl TypeModel {
     /// Build the empty-filter **flat** sorted view for the Name/Size sort modes:
     /// every selectable entry in one list, sorted by the active key + direction,
     /// with no section headers (the C++ `SortName`/`SortSize` branch).
+    /// The single section row shown when a filter yields no rows. A no-op when
+    /// `rows` is non-empty — the guard the three list builders share.
+    fn push_empty_state(rows: &mut Vec<TypeRow>, label: &str) {
+        if rows.is_empty() {
+            rows.push(TypeRow {
+                entry: TypeEntry::section(label),
+                match_positions: Vec::new(),
+            });
+        }
+    }
+
     fn build_sorted_flat(&mut self) {
         let dir = self.sort_dir;
         let mut entries: Vec<TypeEntry> = self.entries.clone();
@@ -692,12 +703,7 @@ impl TypeModel {
                 match_positions: Vec::new(),
             })
             .collect();
-        if rows.is_empty() {
-            rows.push(TypeRow {
-                entry: TypeEntry::section("No types available"),
-                match_positions: Vec::new(),
-            });
-        }
+        Self::push_empty_state(&mut rows, "No types available");
         self.rows = rows;
     }
 
@@ -777,12 +783,7 @@ impl TypeModel {
                 });
             }
         }
-        if rows.is_empty() {
-            rows.push(TypeRow {
-                entry: TypeEntry::section("No types available"),
-                match_positions: Vec::new(),
-            });
-        }
+        Self::push_empty_state(&mut rows, "No types available");
         self.rows = rows;
     }
 
@@ -810,12 +811,7 @@ impl TypeModel {
                 match_positions: pos,
             })
             .collect();
-        if rows.is_empty() {
-            rows.push(TypeRow {
-                entry: TypeEntry::section(&format!("No types match '{query}'")),
-                match_positions: Vec::new(),
-            });
-        }
+        Self::push_empty_state(&mut rows, &format!("No types match '{query}'"));
         self.rows = rows;
     }
 
