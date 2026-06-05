@@ -68,6 +68,17 @@ pub type TypeAliases = HashMap<NodeKind, String>;
 
 // ── Identifier sanitisation (`generator.cpp:13-24`) ──
 
+/// A field's emitted identifier: its sanitized name, or a synthetic
+/// `field_<offset:02x>` when unnamed. The C/Rust/C# backends all derive field
+/// names this way.
+fn default_field_name(node: &Node) -> String {
+    sanitize_ident(&if node.name.is_empty() {
+        format!("field_{:02x}", node.offset)
+    } else {
+        node.name.clone()
+    })
+}
+
 /// `sanitizeIdent(const QString&)` (`generator.cpp:13-24`).
 ///
 /// Unicode-aware (`char::is_alphanumeric`/`is_alphabetic`, mirroring
@@ -472,11 +483,7 @@ fn is_native_ptr(kind: NodeKind, pointer_size: i32) -> bool {
 fn emit_field(ctx: &GenContext, node: &Node, depth: i32, base_offset: i32) -> String {
     let tree = ctx.tree;
     let ind = indent(depth);
-    let name = sanitize_ident(&if node.name.is_empty() {
-        format!("field_{:02x}", node.offset)
-    } else {
-        node.name.clone()
-    });
+    let name = default_field_name(node);
     let oc = offset_comment(base_offset + node.offset, false);
 
     match node.kind {
@@ -849,11 +856,7 @@ fn emit_struct(ctx: &mut GenContext, struct_id: u64) {
 fn emit_rust_field(ctx: &GenContext, node: &Node, depth: i32, base_offset: i32) -> String {
     let tree = ctx.tree;
     let ind = indent(depth);
-    let name = sanitize_ident(&if node.name.is_empty() {
-        format!("field_{:02x}", node.offset)
-    } else {
-        node.name.clone()
-    });
+    let name = default_field_name(node);
     let oc = offset_comment(base_offset + node.offset, false);
 
     match node.kind {
@@ -1219,11 +1222,7 @@ fn emit_defines_for_struct(ctx: &mut GenContext, struct_id: u64, prefix: &str, b
             continue;
         }
 
-        let field_name = sanitize_ident(&if child.name.is_empty() {
-            format!("field_{:02x}", child.offset)
-        } else {
-            child.name.clone()
-        });
+        let field_name = default_field_name(&child);
         let abs_offset = base_offset + child.offset;
 
         ctx.output.push_str(&format!(
@@ -1276,11 +1275,7 @@ fn emit_csharp_struct_body(
 
         let abs = base_offset + child.offset;
         let abs_hex = format!("{:X}", abs);
-        let name = sanitize_ident(&if child.name.is_empty() {
-            format!("field_{:02x}", child.offset)
-        } else {
-            child.name.clone()
-        });
+        let name = default_field_name(&child);
         let oc = offset_comment(abs, false);
 
         if child.kind == NodeKind::Struct {
@@ -1550,11 +1545,7 @@ fn emit_python_struct_body(ctx: &mut GenContext, struct_id: u64, is_union: bool,
         }
 
         let abs_offset = base_offset + child.offset;
-        let name = sanitize_ident(&if child.name.is_empty() {
-            format!("field_{:02x}", child.offset)
-        } else {
-            child.name.clone()
-        });
+        let name = default_field_name(&child);
         let oc = offset_comment(abs_offset, false);
 
         if child.kind == NodeKind::Struct {
