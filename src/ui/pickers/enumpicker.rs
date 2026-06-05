@@ -286,9 +286,7 @@ mod view {
         /// Scroll the selected member into view (item 9). Rows render 1:1 with
         /// model rows, so the model index is the rendered child index.
         fn scroll_selected_into_view(&self) {
-            if let Some(sel) = self.model.selected() {
-                self.list_scroll.scroll_to_item(sel);
-            }
+            crate::ui::design::scroll_selected(&self.list_scroll, self.model.selected());
         }
 
         fn accept_row(&mut self, row: usize, cx: &mut Context<Self>) {

@@ -623,6 +623,14 @@ pub fn menu_accel_row(
         })
 }
 
+/// Scroll a picker's selected row into view (no-op when nothing is selected).
+/// Shared by the type-selector / source-chooser / enum-picker list views.
+pub fn scroll_selected(scroll: &gpui::ScrollHandle, selected: Option<usize>) {
+    if let Some(sel) = selected {
+        scroll.scroll_to_item(sel);
+    }
+}
+
 /// A docked-panel scroll list shell — `v_flex` with the standard panel padding
 /// and vertical scroll. Add `.children(...)`.
 pub fn panel_list(id: impl Into<gpui::ElementId>) -> Stateful<Div> {

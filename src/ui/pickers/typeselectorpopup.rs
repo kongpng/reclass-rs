@@ -1120,9 +1120,7 @@ mod view {
         /// rows are excluded from `model.rows()`), so the rendered children map
         /// 1:1 onto the model rows and the model row index IS the child index.
         fn scroll_selected_into_view(&self) {
-            if let Some(sel) = self.model.selected() {
-                self.list_scroll.scroll_to_item(sel);
-            }
+            crate::ui::design::scroll_selected(&self.list_scroll, self.model.selected());
         }
 
         /// Read-only access to the model.

@@ -601,9 +601,7 @@ mod view {
         /// Scroll the selected row into view (item 9). Rows render 1:1 with model
         /// rows, so the model index is the rendered child index.
         fn scroll_selected_into_view(&self) {
-            if let Some(sel) = self.model.selected() {
-                self.list_scroll.scroll_to_item(sel);
-            }
+            crate::ui::design::scroll_selected(&self.list_scroll, self.model.selected());
         }
 
         /// Hover over a row moves the selection highlight to it (item 2) so
