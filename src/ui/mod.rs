@@ -40,6 +40,7 @@ pub mod docks;
 pub mod editor;
 pub mod enumpicker;
 pub mod examples;
+mod navlist;
 pub mod findbar;
 pub mod fuzzy;
 pub mod gotoaddress;

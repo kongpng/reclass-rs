@@ -819,77 +819,36 @@ impl TypeModel {
         self.rows = rows;
     }
 
-    /// The first selectable row (`nextSelectableRow` from the top).
-    fn first_selectable_row(&self) -> Option<usize> {
-        self.rows.iter().position(|r| r.entry.selectable())
+    /// The selectability mask over `rows`, for [`super::navlist`] navigation.
+    fn selectable_mask(&self) -> Vec<bool> {
+        self.rows.iter().map(|r| r.entry.selectable()).collect()
     }
 
-    /// `nextSelectableRow(from, dir)` (`typeselectorpopup.cpp:1778`): the next
-    /// selectable row after `from` in direction `dir` (+1 down / -1 up), skipping
-    /// sections + disabled. Returns `None` if none in that direction.
-    fn next_selectable(&self, from: usize, dir: i32) -> Option<usize> {
-        let len = self.rows.len();
-        if len == 0 {
-            return None;
-        }
-        let mut i = from as i32 + dir;
-        while i >= 0 && (i as usize) < len {
-            if self.rows[i as usize].entry.selectable() {
-                return Some(i as usize);
-            }
-            i += dir;
-        }
-        None
+    /// The first selectable row (`nextSelectableRow` from the top).
+    fn first_selectable_row(&self) -> Option<usize> {
+        super::navlist::first_selectable(&self.selectable_mask())
     }
 
     /// Move the selection down to the next selectable row (Down).
     pub fn move_down(&mut self) {
-        let from = self.selected.unwrap_or(0);
-        if let Some(next) = self.next_selectable(from, 1) {
-            self.selected = Some(next);
-        } else if self.selected.is_none() {
-            self.selected = self.first_selectable_row();
-        }
+        self.selected = super::navlist::step(&self.selectable_mask(), self.selected, 1);
     }
 
     /// Move the selection up to the previous selectable row (Up).
     pub fn move_up(&mut self) {
-        if let Some(from) = self.selected {
-            if let Some(prev) = self.next_selectable(from, -1) {
-                self.selected = Some(prev);
-            }
-        }
+        self.selected = super::navlist::step(&self.selectable_mask(), self.selected, -1);
     }
 
     /// Move the selection down by `page` selectable rows (PageDown), landing on
     /// the last selectable row if fewer remain (`Key_PageDown`).
     pub fn page_down(&mut self, page: usize) {
-        let page = page.max(1);
-        for _ in 0..page {
-            let from = self.selected.unwrap_or(0);
-            match self.next_selectable(from, 1) {
-                Some(next) => self.selected = Some(next),
-                None => {
-                    if self.selected.is_none() {
-                        self.selected = self.first_selectable_row();
-                    }
-                    break;
-                }
-            }
-        }
+        self.selected = super::navlist::page(&self.selectable_mask(), self.selected, 1, page);
     }
 
     /// Move the selection up by `page` selectable rows (PageUp), landing on the
     /// first selectable row if fewer remain (`Key_PageUp`).
     pub fn page_up(&mut self, page: usize) {
-        let page = page.max(1);
-        for _ in 0..page {
-            let Some(from) = self.selected else { break };
-            match self.next_selectable(from, -1) {
-                Some(prev) => self.selected = Some(prev),
-                None => break,
-            }
-        }
+        self.selected = super::navlist::page(&self.selectable_mask(), self.selected, -1, page);
     }
 
     /// Select the first selectable row (Home).
@@ -899,13 +858,7 @@ impl TypeModel {
 
     /// Select the last selectable row (End).
     pub fn move_end(&mut self) {
-        self.selected = self
-            .rows
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.entry.selectable())
-            .map(|(i, _)| i);
+        self.selected = super::navlist::last_selectable(&self.selectable_mask());
     }
 
     /// Pre-select the row matching a primitive `kind` (`setTypes` current-entry
