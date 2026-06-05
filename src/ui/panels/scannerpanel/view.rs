@@ -953,12 +953,7 @@ impl ScannerPanel {
         let override_exact = form.last_mode() == ScanMode::Value
             && form.last_condition() == ScanCondition::ExactValue
             && !form.last_pattern().is_empty();
-        for r in &mut results {
-            r.previous_value.clear();
-            if override_exact {
-                r.scan_value = form.last_pattern().to_vec();
-            }
-        }
+        apply_scan_overrides(&mut results, override_exact.then(|| form.last_pattern()));
         self.scanning = false;
         self.results = results;
         self.show_previous = false;
@@ -1099,12 +1094,7 @@ impl ScannerPanel {
         self.form
             .set_last_scan(mode, value_type, ScanCondition::ExactValue, &req.pattern);
         let override_exact = mode == ScanMode::Value && !req.pattern.is_empty();
-        for r in &mut results {
-            r.previous_value.clear();
-            if override_exact {
-                r.scan_value = req.pattern.clone();
-            }
-        }
+        apply_scan_overrides(&mut results, override_exact.then(|| req.pattern.as_slice()));
 
         self.results = results.clone();
         self.show_previous = false;
@@ -1728,6 +1718,18 @@ impl ScannerPanel {
             .find(|(vt, _)| *vt == self.form.value_type)
             .map(|(_, n)| *n)
             .unwrap_or("int32")
+    }
+}
+
+/// Apply the post-scan value overrides to `results`: always clear the previous
+/// snapshot, and — on an exact-value scan (`pattern` Some) — overwrite each
+/// scan_value with the searched bytes (the C++ onScanFinished loop).
+fn apply_scan_overrides(results: &mut [ScanResult], pattern: Option<&[u8]>) {
+    for r in results {
+        r.previous_value.clear();
+        if let Some(pat) = pattern {
+            r.scan_value = pat.to_vec();
+        }
     }
 }
 
