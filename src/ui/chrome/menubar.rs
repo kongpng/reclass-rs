@@ -726,6 +726,29 @@ fn menu_panel(
 /// as a `deferred(...)` absolutely positioned at the row's right edge so it
 /// floats over siblings (the C++ cascading `QMenu`). The row highlights while
 /// open.
+/// The shared menu-row geometry (26px inset row, MD radius, UI_MD text) — the
+/// base both `command_row` and `submenu_row` build their content + highlight on.
+fn menu_row_base() -> gpui::Div {
+    gpui_component::h_flex()
+        .w_full()
+        .h(px(26.0))
+        .px(px(tokens::space::SM))
+        .gap(px(tokens::space::SM))
+        .items_center()
+        .justify_between()
+        .rounded(px(tokens::radius::MD))
+        .text_size(px(tokens::font::UI_MD))
+}
+
+/// The fixed-width leading slot (checkmark column) that keeps menu labels aligned
+/// whether or not the row is checkable.
+fn menu_lead_slot() -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(tokens::font::UI_MD))
+        .h(px(tokens::font::UI_MD))
+}
+
 fn submenu_row(
     key: usize,
     label: &str,
@@ -742,25 +765,14 @@ fn submenu_row(
 
     // Empty leading slot mirrors the command row's checkmark slot so submenu
     // labels line up with sibling leaves.
-    let lead_slot = div()
-        .flex_none()
-        .w(px(tokens::font::UI_MD))
-        .h(px(tokens::font::UI_MD));
+    let lead_slot = menu_lead_slot();
 
     let hover_path = abs_path.clone();
     div()
         .id(("menu-submenu", key))
         .relative()
         .child(
-            gpui_component::h_flex()
-                .w_full()
-                .h(px(26.0))
-                .px(px(tokens::space::SM))
-                .gap(px(tokens::space::SM))
-                .items_center()
-                .justify_between()
-                .rounded(px(tokens::radius::MD))
-                .text_size(px(tokens::font::UI_MD))
+            menu_row_base()
                 .text_color(fg)
                 .cursor_pointer()
                 // Keyboard selection or an open fly-out highlights the row; else a
@@ -837,10 +849,7 @@ fn command_row(
     // Leading fixed-width checkmark slot — keeps every label left-aligned whether
     // or not a row is checkable. Holds a real SVG check (accent-tinted) when this
     // command's toggle is on; empty (but space-reserving) otherwise.
-    let check_slot = div()
-        .flex_none()
-        .w(px(tokens::font::UI_MD))
-        .h(px(tokens::font::UI_MD))
+    let check_slot = menu_lead_slot()
         .flex()
         .items_center()
         .justify_center()
@@ -863,16 +872,8 @@ fn command_row(
         )
     };
 
-    gpui_component::h_flex()
+    menu_row_base()
         .id(("menu-item", key))
-        .w_full()
-        .h(px(26.0))
-        .px(px(tokens::space::SM))
-        .gap(px(tokens::space::SM))
-        .items_center()
-        .justify_between()
-        .rounded(px(tokens::radius::MD))
-        .text_size(px(tokens::font::UI_MD))
         .text_color(label_color)
         // The keyboard-highlighted row carries the soft-accent highlight so it reads
         // at a glance (the faint theme overlay was invisible on this surface).
