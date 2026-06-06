@@ -2048,8 +2048,11 @@ impl RcxEditor {
         // appends a Hex64 at the container's aligned tail (so the struct visibly
         // grows past an array/struct-tail child, the array-end case), or appends
         // an auto-numbered enum member, then MOVES the selection to the new node.
-        // Plain Up-at-top (dir < 0) is a silent no-op.
-        if dir > 0 {
+        // Plain Up-at-top (dir < 0) is a silent no-op. Page nav NEVER appends —
+        // C++ Key_PageUp/PageDown has no grow branch (the append is exclusive to
+        // Key_Up/Down, editor.cpp:2965-2994), so a PageDown that overshoots to the
+        // footer just lands on the last node instead of growing the struct.
+        if dir > 0 && !page {
             // Plain Down MOVES the selection onto the new field (no extend).
             self.append_tail_field(false, cx);
         }
@@ -2353,7 +2356,7 @@ impl RcxEditor {
     /// moving caret to the next navigable node and EXTEND the selection to it (the
     /// C++ `nodeClicked(.., ShiftModifier)` keyboard path) rather than replacing it.
     /// Does NOT auto-append a field at the end (that is the plain-Down affordance).
-    fn navigate_node_extend(&mut self, dir: i32, step: usize, cx: &mut Context<Self>) {
+    fn navigate_node_extend(&mut self, dir: i32, step: usize, page: bool, cx: &mut Context<Self>) {
         self.clear_hover_state(cx);
         let count = self.controller.last_result().meta.len();
         if count == 0 {
@@ -2370,7 +2373,7 @@ impl RcxEditor {
         // reported "shift+down won't expand the last address" gap). Detect "caret
         // already at the last navigable data row + moving down" and append instead
         // of clamping in place.
-        if dir > 0 {
+        if dir > 0 && !page {
             let last_nav = self
                 .controller
                 .last_result()
@@ -2394,34 +2397,31 @@ impl RcxEditor {
                 }
             }
         }
-        let mut i = start + dir as i64 * step.max(1) as i64;
-        // Clamp into range so a big page-step still lands on the nearest node.
-        if i < 0 {
-            i = 0;
-        }
-        if i as usize >= count {
-            i = count as i64 - 1;
-        }
+        // Page nav clamps the jump to a screenful; plain nav lets it fall off the
+        // end. Then scan FORWARD in `dir` for the next navigable node — the SAME
+        // single forward scan as plain nav (navigate_node_mode), NOT a backward
+        // probe toward the caret. The old backward probe stalled: when the target
+        // `start+dir` landed on a footer/continuation between two fields it walked
+        // back and re-matched the (always-navigable) caret row, re-selecting the
+        // caret with no advance (C++ uses one forward scan for all modifiers,
+        // editor.cpp:2950-2992).
+        let mut i = if page {
+            (start + dir as i64 * step.max(1) as i64).clamp(0, count as i64 - 1)
+        } else {
+            start + dir as i64 * step.max(1) as i64
+        };
         let mut found: Option<(usize, u64)> = None;
-        // Search toward the bound from the (clamped) target; if the clamped row
-        // is not navigable, walk back toward the caret.
-        let probe_dir = if dir > 0 { 1 } else { -1 };
-        let mut j = i;
-        while j >= 0 && (j as usize) < count {
-            let lm = &self.controller.last_result().meta[j as usize];
+        while i >= 0 && (i as usize) < count {
+            let lm = &self.controller.last_result().meta[i as usize];
             if lm.node_id != 0
                 && lm.node_id != K_COMMAND_ROW_ID
                 && lm.line_kind != LineKind::Footer
                 && !lm.is_continuation
             {
-                found = Some((j as usize, lm.node_id));
+                found = Some((i as usize, lm.node_id));
                 break;
             }
-            j -= probe_dir as i64;
-            // Don't walk past the caret origin.
-            if (probe_dir > 0 && j < start) || (probe_dir < 0 && j > start) {
-                break;
-            }
+            i += dir as i64;
         }
         if let Some((line, node_id)) = found {
             self.controller.handle_node_click(
@@ -2440,7 +2440,7 @@ impl RcxEditor {
     }
 
     fn action_select_up(&mut self, _: &EditorSelectUp, _w: &mut Window, cx: &mut Context<Self>) {
-        self.navigate_node_extend(-1, 1, cx);
+        self.navigate_node_extend(-1, 1, false, cx);
     }
     fn action_select_down(
         &mut self,
@@ -2448,7 +2448,7 @@ impl RcxEditor {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.navigate_node_extend(1, 1, cx);
+        self.navigate_node_extend(1, 1, false, cx);
     }
     fn action_select_page_up(
         &mut self,
@@ -2456,7 +2456,7 @@ impl RcxEditor {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.navigate_node_extend(-1, self.page_step(), cx);
+        self.navigate_node_extend(-1, self.page_step(), true, cx);
     }
     fn action_select_page_down(
         &mut self,
@@ -2464,7 +2464,7 @@ impl RcxEditor {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.navigate_node_extend(1, self.page_step(), cx);
+        self.navigate_node_extend(1, self.page_step(), true, cx);
     }
     fn action_select_home(
         &mut self,

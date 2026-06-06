@@ -286,6 +286,16 @@ impl super::RcxEditor {
             return;
         }
 
+        // C++ gates the whole selection block on `if (h.nodeId != 0)` and consumes
+        // CommandRow clicks as a no-op (editor.cpp:2642/2644): a click on padding, a
+        // continuation gap, the brace-wrap `{` line (node_id==0), or a command-row
+        // keyword/blank (K_COMMAND_ROW_ID) must NOT clear/replace the current
+        // (multi-)selection. notify() (not after_mutation) avoids a spurious
+        // DocumentEdited event.
+        if node_id == 0 || node_id == K_COMMAND_ROW_ID {
+            cx.notify();
+            return;
+        }
         // Otherwise: selection (the controller owns Ctrl/Shift/cross-row logic).
         let mods = CtrlMods {
             ctrl: modifiers.control,
@@ -294,11 +304,8 @@ impl super::RcxEditor {
         self.controller
             .handle_node_click(line as i64, node_id, mods);
         // Track the moving caret so a subsequent Shift+arrow/page/home/end extends
-        // from THIS click (items 2/3). A shift-click moves the caret to the clicked
-        // row; a plain click reseeds it there.
-        if node_id != 0 && node_id != K_COMMAND_ROW_ID {
-            self.caret_line = Some(line);
-        }
+        // from THIS click (items 2/3).
+        self.caret_line = Some(line);
         self.after_mutation(cx);
     }
 
