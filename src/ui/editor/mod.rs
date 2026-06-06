@@ -2916,9 +2916,17 @@ impl RcxEditor {
         }
     }
 
-    /// Left/Right → cycle same-size type variants on the focused node (item 18).
-    /// Reuses the menu's forward/back kind cyclers.
+    /// Left/Right → cycle same-size type variants on the focused node (item 18),
+    /// reusing the menu's forward/back kind cyclers — EXCEPT on a container fold
+    /// head (a nested struct/array/enum), where type-cycling is a no-op so the
+    /// plain arrow instead collapses (Left) / expands (Right) it. That opens a
+    /// nested struct straight from the keyboard (the tree-view convention). Sized
+    /// leaves and pointer heads keep plain Left/Right = type-cycle for C++ parity;
+    /// Shift+arrow still folds any head, pointers included.
     fn action_cycle_left(&mut self, _: &EditorCycleLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.try_container_fold_arrow(false, cx) {
+            return;
+        }
         self.cycle_same_size(-1, cx);
     }
     fn action_cycle_right(
@@ -2927,7 +2935,27 @@ impl RcxEditor {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.try_container_fold_arrow(true, cx) {
+            return;
+        }
         self.cycle_same_size(1, cx);
+    }
+
+    /// Plain Left/Right on a CONTAINER fold head (Struct/Array/enum — where
+    /// `size_for_kind <= 0`, so the type-cycler skips it anyway) collapses
+    /// (`expand=false`) / expands (`expand=true`) it, returning true when it took
+    /// the key. Sized leaves and pointer heads return false so they keep the
+    /// type-cycle. Reuses `fold_current` (the same materialize-on-expand path as
+    /// the chevron click and Shift+arrow).
+    fn try_container_fold_arrow(&mut self, expand: bool, cx: &mut Context<Self>) -> bool {
+        let Some((_l, lm)) = self.current_node() else {
+            return false;
+        };
+        if !lm.fold_head || crate::core::size_for_kind(lm.node_kind) > 0 {
+            return false;
+        }
+        self.fold_current(expand, cx);
+        true
     }
 
     /// Shift+Left → collapse / Shift+Right → expand the current foldable node
