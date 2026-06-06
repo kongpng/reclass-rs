@@ -11,6 +11,50 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::IconName;
 
+/// Append the always-available Fold ▸ / Copy ▸ / Tracking ▸ submenus the C++ adds
+/// after every with-node menu (controller.cpp:3880-3974). Shared by the enum-header
+/// and enum/bitfield-member menus so they carry the same trailing block as the
+/// struct menu. (The struct menu inlines its own copy because its Fold submenu also
+/// offers the per-node Collapse/Expand.)
+fn append_node_submenus(
+    menu: gpui_component::menu::PopupMenu,
+    mw: &mut Window,
+    mcx: &mut Context<gpui_component::menu::PopupMenu>,
+    track_values: bool,
+) -> gpui_component::menu::PopupMenu {
+    menu.submenu("Fold", mw, mcx, |sub, _w, _cx| {
+        sub.menu_with_icon(
+            "Collapse All",
+            IconName::ChevronRight,
+            Box::new(EditorCollapseAll),
+        )
+        .menu_with_icon("Expand All", IconName::ChevronDown, Box::new(EditorExpandAll))
+    })
+    .submenu("Copy", mw, mcx, |sub, _w, _cx| {
+        sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
+            .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
+            .separator()
+            .menu_with_icon("Copy Line\tCtrl+X", IconName::Copy, Box::new(EditorCopyLine))
+            .menu_with_icon(
+                "Copy All as Text",
+                IconName::Copy,
+                Box::new(EditorCopyAllText),
+            )
+    })
+    .submenu("Tracking", mw, mcx, move |sub, _w, _cx| {
+        sub.menu_with_check(
+            "Track Value Changes",
+            track_values,
+            Box::new(EditorTrackToggle),
+        )
+        .menu_with_icon(
+            "Clear All History",
+            IconName::Delete,
+            Box::new(EditorTrackClear),
+        )
+    })
+}
+
 impl super::RcxEditor {
     // ── Node context menu (reclass `customContextMenuRequested`) ──
 
@@ -83,7 +127,25 @@ impl super::RcxEditor {
         // menu — and do NOT collapse the multi-selection to the clicked node.
         let sel_count = self.controller.selected_ids().len();
         if sel_count > 1 && already_selected {
-            self.open_batch_context_menu(sel_count, pos, window, cx);
+            // C++ only offers "Group into Union" when every selected node shares a
+            // parent (controller.cpp:3216-3229); a cross-parent selection hides it
+            // rather than showing a clickable item that silently no-ops.
+            let same_parent = {
+                let tree = self.controller.tree();
+                let mut parents = self.controller.selected_ids().iter().map(|&id| {
+                    let idx = tree.index_of_id(crate::controller::strip_sel_pub(id));
+                    if idx >= 0 {
+                        tree.nodes[idx as usize].parent_id
+                    } else {
+                        0
+                    }
+                });
+                match parents.next() {
+                    Some(first) => parents.all(|p| p == first),
+                    None => true,
+                }
+            };
+            self.open_batch_context_menu(sel_count, same_parent, pos, window, cx);
             return;
         }
 
@@ -133,7 +195,45 @@ impl super::RcxEditor {
             }
         }
 
+        // A right-click on an enum HEADER row (not a member line) opens a RESTRICTED
+        // menu — Add Member / Rename / Delete + the shared Fold/Copy/Tracking — rather
+        // than the full struct menu, whose type-cycler / Convert / Insert / Big-endian
+        // etc. would corrupt the enum (the C++ enum-header branch, controller.cpp:3362).
+        // An enum is a NodeKind::Struct, so it otherwise falls through to the container
+        // menu and (for an empty enum) offers no way to add the first member.
+        if self.node_is_enum(target.node_idx) {
+            self.open_enum_header_context_menu(target, pos, window, cx);
+            return;
+        }
+
         self.open_context_menu(target, pos, window, cx);
+    }
+
+    /// The enum HEADER context menu (the C++ enum-header branch, controller.cpp:3362):
+    /// Add Member / Rename / Delete, then the shared Fold/Copy/Tracking submenus.
+    /// Deliberately OMITS the struct ops (type-cycler, Change Type, Insert, Convert,
+    /// Static, Big endian, Duplicate, Copy-as-C-Struct) that would corrupt an enum.
+    fn open_enum_header_context_menu(
+        &mut self,
+        _target: ContextTarget,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focus = self.focus_handle.clone();
+        let track_values = self.controller.track_values();
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
+            let menu = menu
+                .min_w(px(200.0))
+                .action_context(editor_focus.clone())
+                .menu_with_icon("Add Member", IconName::Plus, Box::new(EditorEnumAddMember))
+                .separator()
+                .menu_with_icon("Rename", IconName::SquareTerminal, Box::new(EditorRename))
+                .menu_with_icon("Delete", IconName::Delete, Box::new(EditorDelete))
+                .separator();
+            append_node_submenus(menu, mw, mcx, track_values)
+        });
+        self.show_context_menu_at(menu, pos, window, cx);
     }
 
     /// Item 6: the enum / bitfield MEMBER row context menu (the C++
@@ -156,7 +256,8 @@ impl super::RcxEditor {
         cx: &mut Context<Self>,
     ) {
         let editor_focus = self.focus_handle.clone();
-        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, _mw, _mcx| {
+        let track_values = self.controller.track_values();
+        let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
             let mut menu = menu.min_w(px(200.0)).action_context(editor_focus.clone());
             if is_enum_member {
                 menu = menu
@@ -174,15 +275,9 @@ impl super::RcxEditor {
                         "Remove Member",
                         IconName::Delete,
                         Box::new(EditorMemberRemove),
-                    )
-                    .separator()
-                    // Always-available member edits: Edit Value… sets the member's
-                    // integer value (the C++ member-line Value edit).
-                    .menu_with_icon(
-                        "Edit Value",
-                        IconName::SquareTerminal,
-                        Box::new(EditorBeginValueEdit),
                     );
+                // NOTE: the C++ enum-member branch does NOT add an Edit Value item
+                // (controller.cpp:3315-3361) — inline edit still covers it. Removed.
             }
             if is_bitfield_member {
                 // Item 9: Toggle Bit ONLY for a single-bit member; a multi-bit member
@@ -203,7 +298,10 @@ impl super::RcxEditor {
                     );
                 }
             }
-            menu
+            // The C++ member branch falls through to the always-available
+            // Fold/Copy/Tracking submenus (controller.cpp:3315 has no early return)
+            // — append them so a member row gets the same trailing block as a node.
+            append_node_submenus(menu.separator(), mw, mcx, track_values)
         });
         self.show_context_menu_at(menu, pos, window, cx);
     }
@@ -217,6 +315,7 @@ impl super::RcxEditor {
     fn open_batch_context_menu(
         &mut self,
         count: usize,
+        same_parent: bool,
         pos: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -247,12 +346,15 @@ impl super::RcxEditor {
                 })
                 .separator()
                 // Item 18/48: Group into Union — wraps the selected nodes into a
-                // union (controller `group_into_union`).
-                .menu_with_icon(
-                    "Group into Union",
-                    IconName::Frame,
-                    Box::new(EditorGroupIntoUnion),
-                )
+                // union (controller `group_into_union`). Only when all selected nodes
+                // share a parent (controller.cpp:3216), else the item is hidden.
+                .when(same_parent, |menu| {
+                    menu.menu_with_icon(
+                        "Group into Union",
+                        IconName::Frame,
+                        Box::new(EditorGroupIntoUnion),
+                    )
+                })
                 .menu_with_icon("Insert Above", IconName::Plus, Box::new(EditorInsertAbove))
                 .separator()
                 .when(show_comment, |menu| {

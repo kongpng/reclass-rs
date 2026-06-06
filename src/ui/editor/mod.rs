@@ -209,6 +209,10 @@ actions!(
         EditorMemberAddBelow,
         EditorMemberRemove,
         EditorMemberToggleBit,
+        // Enum HEADER "Add Member" — appends a member to the enum (no anchor), so an
+        // empty enum can grow from its header menu (the C++ enum-header branch,
+        // controller.cpp:3364).
+        EditorEnumAddMember,
         // Item 7/18/48: group the multi-selection into a Union (controller
         // `group_into_union`).
         EditorGroupIntoUnion,
@@ -4844,6 +4848,23 @@ impl RcxEditor {
         }
     }
 
+    /// Add a member to the context-target ENUM from its HEADER menu (the C++
+    /// enum-header "Add Member", controller.cpp:3364): appends with no anchor so an
+    /// empty enum can grow its first member from the header.
+    fn action_enum_add_member(
+        &mut self,
+        _: &EditorEnumAddMember,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some(t) = self.context_target {
+            if self.controller.add_member(t.node_id, None) {
+                self.after_mutation(cx);
+            }
+        }
+    }
+
     /// Remove the context-target enum member (the C++ "Remove Member").
     fn action_member_remove(
         &mut self,
@@ -5657,6 +5678,7 @@ impl Render for RcxEditor {
             // Item 6: enum/bitfield member menu actions.
             .on_action(cx.listener(Self::action_member_add_above))
             .on_action(cx.listener(Self::action_member_add_below))
+            .on_action(cx.listener(Self::action_enum_add_member))
             .on_action(cx.listener(Self::action_member_remove))
             .on_action(cx.listener(Self::action_member_toggle_bit))
             // Item 7/18/48: group multi-selection into a union.
