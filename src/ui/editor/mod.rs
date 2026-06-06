@@ -2110,9 +2110,33 @@ impl RcxEditor {
             })
             .map(|lm| lm.node_id);
         let view_root = self.controller.view_root_id();
-        let target = last_node_id.unwrap_or(view_root);
+        let mut target = last_node_id.unwrap_or(view_root);
         if target == 0 {
             return;
+        }
+        // If the last visible row is itself a COLLAPSED container (a nested struct/
+        // array/enum with hidden children — the cursor is ON its header, not inside
+        // it), grow its PARENT (append a sibling AFTER it) rather than the container
+        // itself. "Down at the end" means "add a field after this one", and a
+        // collapsed container row is a field of its parent. When the container is
+        // EXPANDED its last CHILD is the last row (so this doesn't fire); an EMPTY
+        // container still grows itself so you can add its first field.
+        {
+            let tree = self.controller.tree();
+            let idx = tree.index_of_id(target);
+            if idx >= 0 {
+                let (is_container, parent, node_id) = {
+                    let n = &tree.nodes[idx as usize];
+                    (
+                        matches!(n.kind, NodeKind::Struct | NodeKind::Array) || n.is_enum(),
+                        n.parent_id,
+                        n.id,
+                    )
+                };
+                if is_container && parent != 0 && !tree.children_of(node_id).is_empty() {
+                    target = parent;
+                }
+            }
         }
         // For a Shift/Ctrl grow, remember the multi-selection anchor BEFORE the
         // append (`append_single_field` resets it to `-1`) so we can re-extend the
