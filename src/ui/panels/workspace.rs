@@ -540,7 +540,7 @@ fn model_to_tree_items(model: &WorkspaceModel) -> Vec<TreeItem> {
                 let mut item = TreeItem::new(nav_item_id(t.doc, t.id), label);
                 for child in &t.children {
                     item = item.child(TreeItem::new(
-                        SharedString::from(format!("field-{}-{}", t.id, child.id)),
+                        nav_item_id(t.doc, child.id),
                         child.display(),
                     ));
                 }
@@ -610,7 +610,7 @@ fn model_to_row_meta(model: &WorkspaceModel) -> HashMap<SharedString, RowMetaKin
                 );
                 for child in &t.children {
                     meta.insert(
-                        SharedString::from(format!("field-{}-{}", t.id, child.id)),
+                        nav_item_id(t.doc, child.id),
                         RowMetaKind::Field {
                             offset: child.offset,
                             type_name: child.type_name.clone(),
@@ -656,6 +656,13 @@ pub struct WorkspacePanel {
     /// under the cursor"). Set on right-mouse-down over a type row; read by the
     /// context-menu action handlers. `None` when no row was right-clicked.
     context_target: Option<WorkspaceNav>,
+    /// The right-clicked row's display name (heads the context menu) and whether it
+    /// was a child FIELD row (vs a top-level type). Captured on right-mouse-down
+    /// alongside `context_target` so the single panel-root context menu can build
+    /// the right variant (empty-area / type / field) without per-row menus that
+    /// would overlap the panel-root one (gpui-component fires every hovered hitbox).
+    context_target_name: String,
+    context_target_is_field: bool,
     focus_handle: FocusHandle,
 }
 
@@ -678,6 +685,8 @@ impl WorkspacePanel {
             tree_state,
             row_meta: Rc::new(HashMap::new()),
             context_target: None,
+            context_target_name: String::new(),
+            context_target_is_field: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -760,6 +769,9 @@ impl WorkspacePanel {
                 current,
             });
         }
+        // Clear the recorded target so the empty-area New-X menu (shown when
+        // context_target is None) is reachable again after a row action.
+        self.context_target = None;
     }
 
     /// "Duplicate" — raise a [`WorkspaceTypeAction::Duplicate`] (the C++
@@ -776,6 +788,9 @@ impl WorkspacePanel {
                 node_id: nav.node_id,
             });
         }
+        // Clear the recorded target so the empty-area New-X menu (shown when
+        // context_target is None) is reachable again after a row action.
+        self.context_target = None;
     }
 
     /// "Pin / Unpin" — raise a [`WorkspaceTypeAction::TogglePin`] (the C++ Pin/Unpin
@@ -787,6 +802,9 @@ impl WorkspacePanel {
                 node_id: nav.node_id,
             });
         }
+        // Clear the recorded target so the empty-area New-X menu (shown when
+        // context_target is None) is reachable again after a row action.
+        self.context_target = None;
     }
 
     /// "Delete" — raise a [`WorkspaceTypeAction::Delete`] (the C++ `deleteType`).
@@ -797,6 +815,9 @@ impl WorkspacePanel {
                 node_id: nav.node_id,
             });
         }
+        // Clear the recorded target so the empty-area New-X menu (shown when
+        // context_target is None) is reachable again after a row action.
+        self.context_target = None;
     }
 
     /// "Add Member" — raise a [`WorkspaceTypeAction::AddMember`] for the targeted
@@ -808,6 +829,9 @@ impl WorkspacePanel {
                 node_id: nav.node_id,
             });
         }
+        // Clear the recorded target so the empty-area New-X menu (shown when
+        // context_target is None) is reachable again after a row action.
+        self.context_target = None;
     }
 
     // ── Empty-area "New …" actions (the C++ `newClass()/newStruct()/newEnum()`) ──
@@ -893,6 +917,26 @@ fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
         })
 }
 
+/// The child-FIELD row right-click menu — Rename / Duplicate / Delete acting on the
+/// field node (the workspace actions operate on `context_target`'s node id, which for
+/// a field row is the field itself). Omits the type-only items (Open in Tab / Add
+/// Member / Pin) that don't apply to a leaf field.
+fn field_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
+    use gpui_component::IconName;
+    menu.label(SharedString::from(target_name.to_string()))
+        .separator()
+        .menu_element_with_icon(IconName::Replace, Box::new(WsRenameType), |_w, cx| {
+            menu_row("Rename\u{2026}", "F2", cx)
+        })
+        .menu_element_with_icon(IconName::Copy, Box::new(WsDuplicateType), |_w, cx| {
+            menu_row("Duplicate", "", cx)
+        })
+        .separator()
+        .menu_element_with_icon(IconName::Delete, Box::new(WsDeleteType), |_w, cx| {
+            menu_row("Delete", "\u{2326}", cx)
+        })
+}
+
 /// One context-menu row body: the item `label` filling the row with a trailing
 /// right-aligned muted `keys` shortcut hint (Zed's label↔accelerator layout). The
 /// leading icon is supplied by `menu_element_with_icon`; this is the row's text.
@@ -951,7 +995,30 @@ impl Render for WorkspacePanel {
             // tree area (incl. an empty project with no types yet) opens it; a
             // right-click ON a type row hits that row's own `context_menu` (the
             // inner element wins), so the two never collide.
-            .context_menu(move |menu, _window, _cx| empty_area_menu(menu))
+            // ONE context menu for the whole panel. gpui-component opens a menu for
+            // every hovered hitbox, so a per-row menu would stack on top of this
+            // panel-root one (the reported "no Rename" — the empty-area menu overlapped
+            // the type menu). Instead, rows record their target on mouse-down and this
+            // single builder picks the variant. The build is DEFERRED (runs after the
+            // row's mouse-down), so `context_target` is current regardless of order.
+            .context_menu({
+                let panel = cx.entity();
+                move |menu, _window, mcx| {
+                    let (target, name, is_field) = {
+                        let p = panel.read(mcx);
+                        (
+                            p.context_target,
+                            p.context_target_name.clone(),
+                            p.context_target_is_field,
+                        )
+                    };
+                    match target {
+                        Some(_) if is_field => field_context_menu(menu, &name),
+                        Some(_) => type_context_menu(menu, &name),
+                        None => empty_area_menu(menu),
+                    }
+                }
+            })
             .size_full()
             .bg(color::panel_bg(cx))
             .text_color(color::text(cx))
@@ -1191,23 +1258,20 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                     .on_click(move |_e, _window, cx| {
                         nav_click.update(cx, |_this, cx| cx.emit(nav));
                     })
-                    // Record the right-clicked row so the context-menu action
-                    // handlers know which type fired (before the menu opens).
+                    // Record the right-clicked TYPE row (target + name + is_field=false)
+                    // so the single panel-root context menu builds the type variant.
+                    // (A per-row context menu would OVERLAP the panel-root one — gpui-
+                    // component opens a menu for EVERY hovered hitbox, so the row +
+                    // tree menus both fired and stacked, hiding the type menu's top.)
                     .on_mouse_down(MouseButton::Right, move |_e, _window, cx| {
                         nav_down.update(cx, |this, cx| {
                             this.context_target = Some(nav);
+                            this.context_target_name = menu_name.clone();
+                            this.context_target_is_field = false;
                             cx.notify();
                         });
                     });
             }
-
-            // Right-click context menu (header + Open in Tab / Rename / Duplicate
-            // / Add Member / Delete). Attached to the interactive content div, not
-            // the ListItem (which is RenderOnce, not InteractiveElement). The
-            // wrapped element is `IntoElement`, so it is used directly as the row
-            // child. The header names the right-clicked type (`menu_name`).
-            let row =
-                row.context_menu(move |menu, _window, _cx| type_context_menu(menu, &menu_name));
 
             ListItem::new(ix)
                 .w_full()
@@ -1234,7 +1298,14 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
             } else {
                 format!("{type_name} {field_name}")
             };
-            let row = gpui_component::h_flex()
+            // Name heading the field's right-click menu (field name, or its type when
+            // the field is unnamed).
+            let field_menu_name = if field_name.is_empty() {
+                type_name.clone()
+            } else {
+                field_name.clone()
+            };
+            let mut row = gpui_component::h_flex()
                 .id(("ws-field-row", ix))
                 .w_full()
                 .h(px(22.0))
@@ -1269,6 +1340,26 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                     )
                 })
                 .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx));
+
+            // A child field navigates (click → set the view root to its parent and
+            // scroll it into view, the C++ workspace double-click main.cpp:6914) and
+            // carries its own right-click menu (is_field=true → field_context_menu).
+            if let Some(nav) = nav {
+                let nav_click = view.clone();
+                let nav_down = view.clone();
+                row = row
+                    .on_click(move |_e, _window, cx| {
+                        nav_click.update(cx, |_this, cx| cx.emit(nav));
+                    })
+                    .on_mouse_down(MouseButton::Right, move |_e, _window, cx| {
+                        nav_down.update(cx, |this, cx| {
+                            this.context_target = Some(nav);
+                            this.context_target_name = field_menu_name.clone();
+                            this.context_target_is_field = true;
+                            cx.notify();
+                        });
+                    });
+            }
 
             ListItem::new(ix)
                 .w_full()

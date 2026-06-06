@@ -815,6 +815,17 @@ impl RcxEditor {
         cx.notify();
     }
 
+    /// Recompose for a VIEW change (set_view_root_id / scroll-to-node) WITHOUT
+    /// signalling a document edit. Navigation must NOT emit `DocumentEdited`, which
+    /// drives the host's workspace rebuild — that re-feeds the project tree via
+    /// `TreeState::set_items`, which resets every row to collapsed, so navigating
+    /// would snap the expanded tree shut. (Structural edits still use
+    /// `apply_document`; this is the no-edit recompose.)
+    pub fn recompose_view(&mut self, cx: &mut Context<Self>) {
+        self.controller.refresh();
+        cx.notify();
+    }
+
     /// The default base refresh cadence (ms) before the adaptive engine widens it.
     /// Matches the C++ default timer interval; the engine backs off to
     /// `refresh_interval_max_ms` when idle / blurred (`apply_adaptive_interval`).

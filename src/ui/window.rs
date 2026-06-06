@@ -5326,18 +5326,35 @@ impl MainWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Set the owning document's editor view-root to the chosen type and make
-        // its tab active (the C++ "Open in Current Tab": `setViewRootId` + raise).
-        self.document_area.update(cx, |area, cx| {
-            if let Some(editor) = area.active_editor().cloned() {
-                editor.update(cx, |ed, cx| {
-                    ed.controller_mut().set_view_root_id(nav.node_id);
-                    ed.apply_document(cx);
-                });
+        // The C++ workspace double-click (main.cpp:6914): a node WITH a parent (a
+        // field / nested member) navigates WITHIN its owner — set the view root to
+        // the PARENT and scroll the field into view; a top-level type sets the view
+        // root to the type itself ("Open in Current Tab": setViewRootId + raise).
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            return;
+        };
+        let parent_id = {
+            let ed = editor.read(cx);
+            let tree = ed.controller().tree();
+            let idx = tree.index_of_id(nav.node_id);
+            if idx >= 0 {
+                tree.nodes[idx as usize].parent_id
+            } else {
+                0
+            }
+        };
+        let view_root = if parent_id != 0 { parent_id } else { nav.node_id };
+        editor.update(cx, |ed, cx| {
+            ed.controller_mut().set_view_root_id(view_root);
+            // recompose_view, NOT apply_document: navigation must not emit
+            // DocumentEdited (which rebuilds the workspace and collapses its tree).
+            ed.recompose_view(cx);
+            if parent_id != 0 {
+                ed.scroll_to_node_id(nav.node_id, cx);
             }
         });
         if let Some(t) = self.state.active_tab_mut() {
-            t.view_root = Some(nav.node_id);
+            t.view_root = Some(view_root);
         }
         cx.notify();
     }
