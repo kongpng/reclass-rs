@@ -663,6 +663,9 @@ pub struct WorkspacePanel {
     /// would overlap the panel-root one (gpui-component fires every hovered hitbox).
     context_target_name: String,
     context_target_is_field: bool,
+    /// Set true by a row's right-mouse-down; read+reset by the panel-root's right
+    /// handler to tell a row right-click from a blank-area one (the menu variant).
+    right_hit_row: bool,
     focus_handle: FocusHandle,
 }
 
@@ -687,6 +690,7 @@ impl WorkspacePanel {
             context_target: None,
             context_target_name: String::new(),
             context_target_is_field: false,
+            right_hit_row: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -1001,17 +1005,38 @@ impl Render for WorkspacePanel {
             // the type menu). Instead, rows record their target on mouse-down and this
             // single builder picks the variant. The build is DEFERRED (runs after the
             // row's mouse-down), so `context_target` is current regardless of order.
+            // Reset the recorded target on a right-click that did NOT hit a row, so the
+            // empty-area New-X menu shows again. Rows set `right_hit_row` on their own
+            // right-mouse-down; bubble dispatches the inner row handler BEFORE this
+            // panel-root handler, so a row click keeps context_target while a blank
+            // click clears it (otherwise context_target stayed stale-Some and the
+            // empty area kept showing the last row's menu — "New X never shows").
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e, _w, cx| {
+                    if !this.right_hit_row {
+                        this.context_target = None;
+                    }
+                    this.right_hit_row = false;
+                    cx.notify();
+                }),
+            )
             .context_menu({
                 let panel = cx.entity();
                 move |menu, _window, mcx| {
-                    let (target, name, is_field) = {
+                    let (target, name, is_field, focus) = {
                         let p = panel.read(mcx);
                         (
                             p.context_target,
                             p.context_target_name.clone(),
                             p.context_target_is_field,
+                            p.focus_handle.clone(),
                         )
                     };
+                    // action_context routes the menu's Ws* actions to THIS panel's
+                    // on_action handlers; without it Rename/Duplicate/Delete dispatched
+                    // nowhere ("Rename doesn't work from that menu").
+                    let menu = menu.action_context(focus);
                     match target {
                         Some(_) if is_field => field_context_menu(menu, &name),
                         Some(_) => type_context_menu(menu, &name),
@@ -1268,6 +1293,7 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                             this.context_target = Some(nav);
                             this.context_target_name = menu_name.clone();
                             this.context_target_is_field = false;
+                            this.right_hit_row = true;
                             cx.notify();
                         });
                     });
@@ -1356,6 +1382,7 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                             this.context_target = Some(nav);
                             this.context_target_name = field_menu_name.clone();
                             this.context_target_is_field = true;
+                            this.right_hit_row = true;
                             cx.notify();
                         });
                     });

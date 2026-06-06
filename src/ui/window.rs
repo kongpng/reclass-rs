@@ -5323,7 +5323,7 @@ impl MainWindow {
     fn on_workspace_nav(
         &mut self,
         nav: WorkspaceNav,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The C++ workspace double-click (main.cpp:6914): a node WITH a parent (a
@@ -5353,6 +5353,14 @@ impl MainWindow {
                 ed.scroll_to_node_id(nav.node_id, cx);
             }
         });
+        if parent_id != 0 {
+            // Focus the editor so the just-selected field takes the caret and Enter /
+            // F2 edit it immediately (the user's "press enter to edit the value after"),
+            // rather than leaving keyboard focus in the workspace tree. Deferred so the
+            // focus lands AFTER this navigation's recompose re-render.
+            let focus = editor.read(cx).focus_handle(cx);
+            window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        }
         if let Some(t) = self.state.active_tab_mut() {
             t.view_root = Some(view_root);
         }

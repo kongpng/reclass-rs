@@ -1214,7 +1214,13 @@ impl RcxEditor {
         // is the pure `tab_cycle::edit_route` (unit-tested); a popup route sets
         // `m_lastTabTarget` (matching the C++ `beginInlineEdit`-returns-true Tab
         // bookkeeping) and returns before any inline-edit setup.
-        let is_enum = lm.node_idx >= 0 && self.node_is_enum(lm.node_idx as usize);
+        // Exclude enum MEMBER rows: their node_idx points at the enum node, so
+        // without `!is_member_line` a click on a member's VALUE routes to the enum
+        // member PICKER (which is for an enum-typed FIELD's value) instead of an
+        // inline edit of the member's own integer value (the reported "member values
+        // aren't editable, only names").
+        let is_enum =
+            lm.node_idx >= 0 && self.node_is_enum(lm.node_idx as usize) && !lm.is_member_line;
         match tab_cycle::edit_route(
             target,
             lm.line_kind,
@@ -3303,6 +3309,13 @@ impl RcxEditor {
             return;
         };
         self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+        // SELECT the node (not just set the caret) so the landed row is visibly
+        // highlighted and Enter / F2 act on it — the C++ `setCursorPosition`. Without
+        // this a workspace field-click scrolled to the field but left no cursor on it
+        // and Enter edited nothing.
+        self.controller
+            .handle_node_click(line as i64, node_id, CtrlMods::NONE);
+        let _ = self.controller.take_events();
         self.caret_line = Some(line);
         cx.notify();
     }
