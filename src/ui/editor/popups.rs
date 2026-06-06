@@ -27,6 +27,59 @@ impl super::RcxEditor {
         self.open_type_selector_in_mode(target, EditTarget::Type, window, cx);
     }
 
+    /// Workspace "Change Type…" on a field: bring it into view (a child → view its
+    /// parent struct), select it, then open the gutter Type Selector on it — the
+    /// same picker as the editor's Change Type / `T`, driven from the project
+    /// panel. The picker is a centered overlay, so it does not depend on the row's
+    /// pixel position; the scroll + select just keep the edited row visible behind it.
+    pub(crate) fn reveal_and_change_type(
+        &mut self,
+        node_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let idx0 = self.controller.tree().index_of_id(node_id);
+        if idx0 < 0 {
+            return;
+        }
+        let parent_id = self.controller.tree().nodes[idx0 as usize].parent_id;
+        // A child field → view its parent struct so the row is on screen; a
+        // top-level node is already its own view root.
+        if parent_id != 0 {
+            self.controller.set_view_root_id(parent_id);
+        }
+        self.recompose_view(cx);
+        // Locate the field's row + re-resolved index in the recomposed view.
+        let Some(line) = self
+            .controller
+            .last_result()
+            .meta
+            .iter()
+            .position(|lm| lm.node_id == node_id && !lm.is_continuation)
+        else {
+            return;
+        };
+        let idx = self.controller.tree().index_of_id(node_id);
+        if idx < 0 {
+            return;
+        }
+        let kind = self.controller.tree().nodes[idx as usize].kind;
+        self.controller
+            .handle_node_click(line as i64, node_id, crate::controller::Modifiers::NONE);
+        let _ = self.controller.take_events();
+        self.caret_line = Some(line);
+        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+        let target = ContextTarget {
+            line,
+            node_idx: idx as usize,
+            node_id,
+            kind,
+            sub_line: -1,
+        };
+        self.context_target = Some(target);
+        self.open_type_selector(target, window, cx);
+    }
+
     /// The full type catalogue: the built-in primitives + every user-declared
     /// composite (struct/class/enum) in the tree (item 6 — "composites + user
     /// structs"). Composites are appended after the primitives, mirroring the C++

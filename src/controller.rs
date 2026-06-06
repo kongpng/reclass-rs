@@ -2349,6 +2349,25 @@ impl RcxController {
         });
     }
 
+    /// Set a node's comment by id (the workspace "Comment…" path). Pushes the same
+    /// undoable `ChangeComment` the editor's inline comment edit commits; a no-op
+    /// when the comment is unchanged.
+    pub fn set_comment(&mut self, node_id: u64, comment: &str) {
+        let idx = self.doc.tree.index_of_id(node_id);
+        if idx < 0 {
+            return;
+        }
+        let old_comment = self.doc.tree.nodes[idx as usize].comment.clone();
+        if old_comment == comment {
+            return;
+        }
+        self.push_command(Command::ChangeComment {
+            node_id,
+            old_comment,
+            new_comment: comment.to_string(),
+        });
+    }
+
     /// `duplicateNode(nodeIdx)` (`controller.cpp:3151`).
     pub fn duplicate_node(&mut self, node_idx: usize) {
         if node_idx >= self.doc.tree.nodes.len() {

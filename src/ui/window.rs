@@ -5638,6 +5638,58 @@ impl MainWindow {
                 self.notify("Added member", window, cx);
                 cx.notify();
             }
+            WorkspaceTypeAction::ChangeType { doc, node_id } => {
+                // Bring the field into its editor and open the gutter Type Selector
+                // on it. The picker is a window-centered modal (`OpenModal` →
+                // `open_centered_modal`), so it shows regardless of the active tab;
+                // `reveal_and_change_type` re-roots via `recompose_view` (no
+                // DocumentEdited, so the workspace tree is not collapsed).
+                let Some(editor) = self.editor_for_doc(doc, cx) else {
+                    return;
+                };
+                editor.update(cx, |ed, cx| {
+                    ed.reveal_and_change_type(node_id, window, cx);
+                });
+                cx.notify();
+            }
+            WorkspaceTypeAction::Comment { doc, node_id } => {
+                // Edit the field's comment via a text prompt seeded from the node's
+                // current comment (the model carries none). Empty input clears it.
+                let Some(editor) = self.editor_for_doc(doc, cx) else {
+                    return;
+                };
+                let current = {
+                    let ed = editor.read(cx);
+                    let tree = ed.controller().tree();
+                    let idx = tree.index_of_id(node_id);
+                    if idx >= 0 {
+                        tree.nodes[idx as usize].comment.clone()
+                    } else {
+                        String::new()
+                    }
+                };
+                let this = cx.entity().downgrade();
+                self.open_text_prompt(
+                    "Edit Comment",
+                    "Comment",
+                    &current,
+                    window,
+                    cx,
+                    move |text, window, app| {
+                        let comment = text.trim().to_string();
+                        let _ = this.update(app, |me, cx| {
+                            editor.update(cx, |ed, cx| {
+                                ed.controller_mut().set_comment(node_id, &comment);
+                                ed.apply_document(cx);
+                            });
+                            me.rebuild_workspace(cx);
+                            me.sync_dirty_state(cx);
+                            me.notify("Comment updated", window, cx);
+                            cx.notify();
+                        });
+                    },
+                );
+            }
         }
     }
 

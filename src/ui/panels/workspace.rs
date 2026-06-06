@@ -61,6 +61,12 @@ actions!(
         WsDeleteType,
         WsAddMember,
         WsTogglePin,
+        // Field-row extras (the C++ member context actions): jump the editor to the
+        // field, change its type via the gutter's Type Selector, edit its comment,
+        // and copy its name to the clipboard.
+        WsChangeFieldType,
+        WsCommentField,
+        WsCopyName,
         // Empty-area (no type under the cursor) context menu — the C++
         // `main.cpp:6561` `!clickedIndex.isValid()` branch (New Class / New Struct
         // / New Enum), which calls `newClass()/newStruct()/newEnum()`.
@@ -108,6 +114,13 @@ pub enum WorkspaceTypeAction {
     /// Pin / unpin the targeted type (the C++ Pin/Unpin, main.cpp:6644-6650). The
     /// window owns the pinned-id set and rebuilds the PINNED section.
     TogglePin { doc: DocId, node_id: u64 },
+    /// Change the field's type: bring it into the editor and open the gutter's Type
+    /// Selector on it (the same picker as the editor's Change Type / `T`).
+    ChangeType { doc: DocId, node_id: u64 },
+    /// Edit the field's comment via a text prompt (the C++ comment edit). The
+    /// window seeds the dialog from the node's current comment (the model carries
+    /// no comments).
+    Comment { doc: DocId, node_id: u64 },
 }
 
 /// The badge a workspace row shows — the C++ `S`/`E`/`F` letter badge
@@ -847,6 +860,52 @@ impl WorkspacePanel {
         self.context_target = None;
     }
 
+    /// "Change Type…" — raise a [`WorkspaceTypeAction::ChangeType`]; the window
+    /// brings the field into the editor and opens the gutter Type Selector on it.
+    fn action_change_field_type(
+        &mut self,
+        _: &WsChangeFieldType,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(nav) = self.context_target {
+            cx.emit(WorkspaceTypeAction::ChangeType {
+                doc: nav.doc,
+                node_id: nav.node_id,
+            });
+        }
+        self.context_target = None;
+    }
+
+    /// "Comment…" — raise a [`WorkspaceTypeAction::Comment`]; the window seeds a
+    /// text prompt from the node's current comment and applies it on accept.
+    fn action_comment_field(
+        &mut self,
+        _: &WsCommentField,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(nav) = self.context_target {
+            cx.emit(WorkspaceTypeAction::Comment {
+                doc: nav.doc,
+                node_id: nav.node_id,
+            });
+        }
+        self.context_target = None;
+    }
+
+    /// "Copy Name" — copy the field's display name to the clipboard (panel-local;
+    /// no controller round-trip needed). Mirrors the editor Copy ▸ group.
+    fn action_copy_name(&mut self, _: &WsCopyName, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav) = self.context_target {
+            let name = self.model.display_name_of(nav.node_id).unwrap_or_default();
+            if !name.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(name));
+            }
+        }
+        self.context_target = None;
+    }
+
     // ── Empty-area "New …" actions (the C++ `newClass()/newStruct()/newEnum()`) ──
     // Each emits a [`WorkspaceNewType`] the window resolves like `File ▸ New …`.
 
@@ -938,11 +997,27 @@ fn field_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
     use gpui_component::IconName;
     menu.label(SharedString::from(target_name.to_string()))
         .separator()
+        // Jump the editor to this field (set the parent as view root + select it) —
+        // the same nav the row's click/Enter performs, reusing `WsOpenInTab`.
+        .menu_element_with_icon(IconName::ExternalLink, Box::new(WsOpenInTab), |_w, cx| {
+            menu_row("Reveal in Editor", "\u{21b5}", cx)
+        })
+        // Change the field's type via the gutter's Type Selector.
+        .menu_element_with_icon(IconName::Frame, Box::new(WsChangeFieldType), |_w, cx| {
+            menu_row("Change Type\u{2026}", "", cx)
+        })
+        .separator()
         .menu_element_with_icon(IconName::Replace, Box::new(WsRenameType), |_w, cx| {
             menu_row("Rename\u{2026}", "F2", cx)
         })
+        .menu_element_with_icon(IconName::SquareTerminal, Box::new(WsCommentField), |_w, cx| {
+            menu_row("Comment\u{2026}", "", cx)
+        })
         .menu_element_with_icon(IconName::Copy, Box::new(WsDuplicateType), |_w, cx| {
             menu_row("Duplicate", "", cx)
+        })
+        .menu_element_with_icon(IconName::Copy, Box::new(WsCopyName), |_w, cx| {
+            menu_row("Copy Name", "", cx)
         })
         .separator()
         .menu_element_with_icon(IconName::Delete, Box::new(WsDeleteType), |_w, cx| {
@@ -1000,6 +1075,9 @@ impl Render for WorkspacePanel {
             .on_action(cx.listener(Self::action_delete))
             .on_action(cx.listener(Self::action_add_member))
             .on_action(cx.listener(Self::action_toggle_pin))
+            .on_action(cx.listener(Self::action_change_field_type))
+            .on_action(cx.listener(Self::action_comment_field))
+            .on_action(cx.listener(Self::action_copy_name))
             .on_action(cx.listener(Self::action_new_class))
             .on_action(cx.listener(Self::action_new_struct))
             .on_action(cx.listener(Self::action_new_enum))
