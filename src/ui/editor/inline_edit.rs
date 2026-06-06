@@ -324,13 +324,24 @@ impl FieldInput {
         &self.content
     }
 
-    /// Build the commit payload from the current (trimmed) content.
+    /// Build the commit payload from the current content (trimmed, except in
+    /// overwrite mode).
     pub fn to_commit(&self) -> EditCommit {
+        // Skip trimming for an overwrite-mode commit, mirroring the C++
+        // `if (!m_editState.hexOverwrite) editedText = editedText.trimmed();`
+        // (editor.cpp:3929-3931). A fixed-length ASCII byte-overwrite whose first or
+        // last data byte is a space (0x20) must keep that space, or parse_ascii_value's
+        // exact-length contract rejects it and the edit silently no-ops.
+        let text = if self.hex_overwrite.is_some() {
+            self.content.to_string()
+        } else {
+            self.content.trim().to_string()
+        };
         EditCommit {
             node_idx: self.node_idx,
             sub_line: self.sub_line,
             target: self.target,
-            text: self.content.trim().to_string(),
+            text,
             resolved_addr: self.resolved_addr,
         }
     }

@@ -106,12 +106,11 @@ pub fn target_at_col(
         return None;
     }
 
-    // ── Static-field expression rows. ──
-    if lm.is_static_line && span_contains(compose::static_expr_span_for(text), col) {
-        return Some(EditTarget::StaticExpr);
-    }
-
     // ── Generic type / name / value / comment columns. ──
+    // NOTE: a static `return <expr>` row is a LineKind::Field and C++ hitTestTarget
+    // never probes staticExprSpanFor — a click on it resolves to the Type span
+    // (opening the Type picker), exactly like any field. StaticExpr editing stays
+    // reachable via the right-click "Edit Expression" menu + the edit-begin path.
     // Header redirect: array header Type → ArrayElementType (handled above);
     // plain header Type opens the picker, Name editable.
     if span_contains(
@@ -224,7 +223,10 @@ pub fn hit_test_row(
     name_w: i32,
 ) -> HitInfo {
     let col = metrics.col_containing_x(rel_x);
-    let in_fold_col = lm.fold_head && col >= 0 && col < compose::K_FOLD_COL;
+    // C++ uses `col < kFoldCol + 1` (cols 0-3) — the fold-toggle/cursor zone
+    // includes the first content column, so clicking the first glyph of a depth-0
+    // fold head toggles it rather than starting a Type edit (editor.cpp:2373).
+    let in_fold_col = lm.fold_head && col >= 0 && col < compose::K_FOLD_COL + 1;
     let target = if in_fold_col {
         None // a fold-prefix click toggles the fold, it is not an edit target
     } else {
