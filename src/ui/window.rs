@@ -5196,7 +5196,27 @@ impl MainWindow {
                 self.rebuild_menus(cx);
             }
             DocAreaEvent::NewDocumentRequested => {
-                // The center opened a fresh tab (`project_new`); mirror it.
+                // The center opened a fresh "Untitled" tab — the "+" sentinel,
+                // closing the last tab, or Close-All. `push_document` gave it an
+                // EMPTY editor (zero nodes → zero rows → every key/mouse handler
+                // early-returns on `count == 0`), so the gutter was inert: no
+                // expand, no Down, no right-click. Seed it with a root class —
+                // identical to File ▸ New Class — so it is a real, interactive
+                // document (the C++ "never leave a blank window" opens a fresh
+                // struct, not a dead blank). Guarded on `is_empty` so a path that
+                // later drives in a loaded doc is never clobbered.
+                if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+                    if editor.read(cx).controller().tree().nodes.is_empty() {
+                        editor.update(cx, |ed, cx| {
+                            ed.set_document(seed_root_doc(RootKind::Class), cx);
+                        });
+                        self.apply_view_opts_to_editor(&editor, cx);
+                        // Focus so arrow-nav / F2 / expand work immediately on the
+                        // fresh tab (mirrors `new_document`'s deferred focus).
+                        let handle = editor.read(cx).focus_handle(cx);
+                        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+                    }
+                }
                 self.state.open_document("Untitled");
                 self.rebuild_workspace(cx);
                 // The tab set grew — re-observe so the new editor's selections
