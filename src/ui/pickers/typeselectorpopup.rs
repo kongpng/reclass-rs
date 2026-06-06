@@ -459,7 +459,15 @@ impl TypeModel {
             last_filter: String::new(),
             recent_names: Vec::new(),
             current_node_size: 0,
-            active_groups: std::collections::BTreeSet::new(),
+            // The C++ seeds all four category chips CHECKED (typeselectorpopup.cpp:588);
+            // active_groups is the set of VISIBLE/checked chip-groups, so it starts
+            // full. Unchecking a chip removes its group (hides it); it is NOT an
+            // "only these" filter.
+            active_groups: KindGroup::ALL
+                .iter()
+                .filter(|g| g.has_chip())
+                .map(|g| g.key())
+                .collect(),
         };
         m.apply_filter("");
         m
@@ -586,9 +594,11 @@ impl TypeModel {
     ///   (only chip-bearing groups can be filtered out);
     /// - otherwise a chip-bearing group passes iff its key is active.
     fn group_allowed(&self, group: KindGroup) -> bool {
-        if self.active_groups.is_empty() {
-            return true;
-        }
+        // Groups without a chip toggle (Vec/Str/Ctr/Common) always pass; a
+        // chip-bearing group passes iff its chip is checked/active — exactly the
+        // C++ `catAllowed` (typeselectorpopup.cpp:1602-1608). active_groups is now
+        // the literal set of checked chips, so an empty set hides ALL chip groups
+        // (no special "empty = show all" case).
         if !group.has_chip() {
             return true;
         }
@@ -609,9 +619,13 @@ impl TypeModel {
         self.apply_filter(&q);
     }
 
-    /// "all" — clear the category filter (every group shown) and re-filter.
+    /// "all" — check every chip (every chip-group visible) and re-filter.
     pub fn select_all_groups(&mut self) {
-        self.active_groups.clear();
+        self.active_groups = KindGroup::ALL
+            .iter()
+            .filter(|g| g.has_chip())
+            .map(|g| g.key())
+            .collect();
         let q = self.last_filter.clone();
         self.apply_filter(&q);
     }
@@ -1787,7 +1801,11 @@ mod view {
             };
 
             let active_groups = self.model.active_groups();
-            let all_active = active_groups.is_empty();
+            // "all" lit when every chip-bearing group is checked (the C++ default).
+            let all_active = KindGroup::ALL
+                .iter()
+                .filter(|g| g.has_chip())
+                .all(|g| active_groups.contains(g.key()));
             // "none" = exactly the first chip-bearing group (Hex) is active — the
             // C++ keeps one group on (it never goes fully empty).
             let none_active =
@@ -2666,18 +2684,15 @@ mod tests {
     #[test]
     fn chip_off_excludes_group_from_bucketed_list() {
         let mut model = TypeModel::new(sample_entries());
-        // All groups visible by default.
-        assert!(model.active_groups().is_empty());
+        // All four chip groups are checked/visible by default (the C++ default —
+        // all chips setChecked(true)).
+        assert_eq!(model.active_groups().len(), 4);
         assert!(model
             .rows()
             .iter()
             .any(|r| r.entry.group == KindGroup::Int && r.entry.selectable()));
-        // Turn the Int chip OFF (toggling makes a non-empty active set without Int):
-        // the C++ catAllowed excludes the unchecked group. Start from "none" (Hex
-        // only on) then make the active set everything-but-Int by toggling chips on.
-        model.select_no_groups(); // active = {Hex}
-        model.toggle_group(KindGroup::Float); // active = {Hex, Float}
-        model.toggle_group(KindGroup::Ptr); // active = {Hex, Float, Ptr}
+        // Turn the Int chip OFF: the C++ catAllowed excludes the unchecked group.
+        model.toggle_group(KindGroup::Int); // active = {Hex, Float, Ptr}
                                             // Int is NOT in the active set → its rows are excluded.
         assert!(
             !model.rows().iter().any(|r| r.entry.group == KindGroup::Int),
@@ -2710,12 +2725,10 @@ mod tests {
             .collect();
         assert!(names.contains(&"int32_t"));
         assert!(names.contains(&"ptr64"));
-        // Restrict the active chips so Int is OFF: make the set {Ptr}. The Int
-        // group's "int32_t" must vanish from the ranked list; Ptr's "ptr64" stays;
-        // the chip-less Ctr "Trophy" is always allowed.
-        model.select_no_groups(); // {Hex}
-        model.toggle_group(KindGroup::Ptr); // {Hex, Ptr}
-        model.toggle_group(KindGroup::Hex); // {Ptr}  (Hex off too)
+        // Turn the Int chip OFF: the Int group's "int32_t" must vanish from the
+        // ranked list; Ptr's "ptr64" stays; the chip-less Ctr "Trophy" is always
+        // allowed.
+        model.toggle_group(KindGroup::Int); // active = {Hex, Float, Ptr}
         model.apply_filter("t");
         let names: Vec<&str> = model
             .rows()
