@@ -1129,7 +1129,10 @@ impl ScannerPanel {
         if self.generation > 1 {
             self.generation -= 1;
         }
-        self.show_previous = self.undo_stack.iter().count() > 0 || self.generation > 1;
+        // C++ popUndoSnapshot always calls populateTable(false) — Undo Scan
+        // unconditionally collapses back to Address/Value(+Module), hiding the
+        // Previous→Δ column (scannerpanel.cpp:2243).
+        self.show_previous = false;
         let n = self.results.len();
         self.status = super::count_status("Restored — ", n);
         self.selected_row = None;
@@ -1384,7 +1387,9 @@ impl ScannerPanel {
         for (addr, new_bytes) in results {
             if let Some(nb) = new_bytes {
                 if let Some(r) = self.results.iter_mut().find(|r| r.address == addr) {
-                    r.previous_value = r.scan_value.clone();
+                    // C++ Change All reassigns only scanValue (scannerpanel.cpp:984),
+                    // keeping previousValue as the last-rescan snapshot — do not
+                    // overwrite it here (would render a spurious Previous→Δ delta).
                     r.scan_value = nb;
                 }
                 wrote += 1;
@@ -1570,7 +1575,9 @@ impl ScannerPanel {
     /// the freshly-read bytes after a successful write, then refresh.
     pub fn apply_value_write(&mut self, row: usize, new_value: Vec<u8>, cx: &mut Context<Self>) {
         if let Some(r) = self.results.get_mut(row) {
-            r.previous_value = r.scan_value.clone();
+            // C++ onCellEdited reassigns only scanValue (scannerpanel.cpp:1888),
+            // leaving previousValue as the last-rescan snapshot — do not overwrite
+            // it (would render a spurious Previous→Δ delta on the edited row).
             r.scan_value = new_value;
             self.status = format!("Wrote {} bytes to 0x{:X}", r.scan_value.len(), r.address);
             self.refresh_table(cx);
