@@ -421,6 +421,9 @@ pub struct MainWindow {
     /// visibility — not from the shared open flag alone (the C++ ties each ✓ to
     /// its own dock's visibility; item 9).
     right_dock_panel: RightDockPanel,
+    /// Pinned type node-ids (the C++ `m_pinnedIds`) — drives the workspace PINNED
+    /// section; toggled via the project-explorer Pin/Unpin context action.
+    pinned_ids: std::collections::HashSet<u64>,
     /// Persisted MCP autostart preference (the C++ `autoStartMcp` setting). Owned
     /// here so Options can toggle + persist it; the MCP label reflects
     /// [`mcp_running`](Self::mcp_running) which this seeds on startup.
@@ -1369,6 +1372,7 @@ impl MainWindow {
             // The right dock defaults to the Modules tab (the first tabified
             // panel; docks.rs builds [modules, bookmarks]).
             right_dock_panel: RightDockPanel::Modules,
+            pinned_ids: std::collections::HashSet::new(),
             auto_start_mcp,
             brace_wrap,
             generator_asserts,
@@ -5538,6 +5542,14 @@ impl MainWindow {
                     cx,
                 );
             }
+            WorkspaceTypeAction::TogglePin { doc: _, node_id } => {
+                // Toggle membership in the pinned set + rebuild so the PINNED section
+                // (re)appears (the C++ m_pinnedIds toggle + rebuild, main.cpp:6858).
+                if !self.pinned_ids.remove(&node_id) {
+                    self.pinned_ids.insert(node_id);
+                }
+                self.rebuild_workspace(cx);
+            }
             WorkspaceTypeAction::AddMember { doc, node_id } => {
                 let Some(editor) = self.editor_for_doc(doc, cx) else {
                     return;
@@ -5606,7 +5618,8 @@ impl MainWindow {
                 tree: ed.controller().tree(),
             })
             .collect();
-        let model = WorkspaceModel::build(&docs, &[], &viewed);
+        let pins: Vec<u64> = self.pinned_ids.iter().copied().collect();
+        let model = WorkspaceModel::build(&docs, &pins, &viewed);
 
         self.workspace.update(cx, |ws, cx| {
             ws.set_model(model, cx);

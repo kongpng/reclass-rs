@@ -59,6 +59,7 @@ actions!(
         WsDuplicateType,
         WsDeleteType,
         WsAddMember,
+        WsTogglePin,
         // Empty-area (no type under the cursor) context menu — the C++
         // `main.cpp:6561` `!clickedIndex.isValid()` branch (New Class / New Struct
         // / New Enum), which calls `newClass()/newStruct()/newEnum()`.
@@ -103,6 +104,9 @@ pub enum WorkspaceTypeAction {
     Delete { doc: DocId, node_id: u64 },
     /// Append a new member field to the targeted struct (the C++ `addMember`).
     AddMember { doc: DocId, node_id: u64 },
+    /// Pin / unpin the targeted type (the C++ Pin/Unpin, main.cpp:6644-6650). The
+    /// window owns the pinned-id set and rebuilds the PINNED section.
+    TogglePin { doc: DocId, node_id: u64 },
 }
 
 /// The badge a workspace row shows — the C++ `S`/`E`/`F` letter badge
@@ -774,6 +778,17 @@ impl WorkspacePanel {
         }
     }
 
+    /// "Pin / Unpin" — raise a [`WorkspaceTypeAction::TogglePin`] (the C++ Pin/Unpin
+    /// context action, main.cpp:6644). The window owns the pinned set.
+    fn action_toggle_pin(&mut self, _: &WsTogglePin, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav) = self.context_target {
+            cx.emit(WorkspaceTypeAction::TogglePin {
+                doc: nav.doc,
+                node_id: nav.node_id,
+            });
+        }
+    }
+
     /// "Delete" — raise a [`WorkspaceTypeAction::Delete`] (the C++ `deleteType`).
     fn action_delete(&mut self, _: &WsDeleteType, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(nav) = self.context_target {
@@ -869,6 +884,9 @@ fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
         .menu_element_with_icon(IconName::Plus, Box::new(WsAddMember), |_w, cx| {
             menu_row("Add Member", "\u{2318}\u{21b5}", cx)
         })
+        .menu_element_with_icon(IconName::Frame, Box::new(WsTogglePin), |_w, cx| {
+            menu_row("Pin / Unpin", "", cx)
+        })
         .separator()
         .menu_element_with_icon(IconName::Delete, Box::new(WsDeleteType), |_w, cx| {
             menu_row("Delete", "\u{2326}", cx)
@@ -923,6 +941,7 @@ impl Render for WorkspacePanel {
             .on_action(cx.listener(Self::action_duplicate))
             .on_action(cx.listener(Self::action_delete))
             .on_action(cx.listener(Self::action_add_member))
+            .on_action(cx.listener(Self::action_toggle_pin))
             .on_action(cx.listener(Self::action_new_class))
             .on_action(cx.listener(Self::action_new_struct))
             .on_action(cx.listener(Self::action_new_enum))
