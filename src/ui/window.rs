@@ -4624,6 +4624,19 @@ impl MainWindow {
     /// lands on (gpui-component's `TabPanel` has no public "select tab N" API, so
     /// raising == open + focus the panel). Re-syncs the View ✓.
     fn raise_modules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Toggle, mirroring the C++ checkable Modules action whose toggled handler
+        // hides the dock on re-invoke (main.cpp:1480-1497): if the right dock is
+        // already showing Modules, hide it; otherwise open + raise + focus.
+        let right_open = self
+            .dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Right, cx);
+        if right_open && self.right_dock_panel == RightDockPanel::Modules {
+            self.set_right_dock_open(false, window, cx);
+            self.sync_view_menu_checked(cx);
+            cx.notify();
+            return;
+        }
         self.set_right_dock_open(true, window, cx);
         // Record which right-dock tab is now active so the View ✓ for Modules
         // (and NOT Bookmarks) lights up (item 9).
@@ -4638,6 +4651,19 @@ impl MainWindow {
     /// dock (the C++ `m_bookmarksDock->raise()`). Same open-+-focus behaviour as
     /// [`raise_modules`](Self::raise_modules) but targeting the Bookmarks panel.
     fn raise_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Toggle, mirroring the C++ checkable Bookmarks action (Qt toggleViewAction,
+        // main.cpp:1499-1503): if the right dock is already showing Bookmarks, hide
+        // it; otherwise open + raise + focus.
+        let right_open = self
+            .dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Right, cx);
+        if right_open && self.right_dock_panel == RightDockPanel::Bookmarks {
+            self.set_right_dock_open(false, window, cx);
+            self.sync_view_menu_checked(cx);
+            cx.notify();
+            return;
+        }
         self.set_right_dock_open(true, window, cx);
         // Record which right-dock tab is now active so the View ✓ for Bookmarks
         // (and NOT Modules) lights up (item 9).

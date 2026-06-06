@@ -4614,9 +4614,11 @@ impl RcxEditor {
     fn action_conv_hex(&mut self, _: &EditorConvHex, _w: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
         if let Some(t) = self.action_target() {
-            // Convert to the hex equivalent of the node's current byte size.
-            let kind = hex_kind_for_size(crate::core::size_for_kind(t.kind).max(1));
-            self.controller.change_node_kind(t.node_idx, kind);
+            // C++ single-node "Convert to Hex" REMOVES the node and refills its byte
+            // range with largest-first hex pads named pad_<offset> (controller.cpp:3713),
+            // rather than an in-place kind change that keeps the node's name/size. Use
+            // the faithful controller op (mirrors the sibling split-hex wiring).
+            self.controller.convert_to_hex(t.node_id);
             self.after_mutation(cx);
         }
     }
