@@ -6062,7 +6062,14 @@ impl MainWindow {
                 TextPromptEvent::Accept(text) => {
                     let text = text.clone();
                     window.close_dialog(cx);
-                    (on_accept)(text, window, cx);
+                    // DEFER the accept callback so it runs OUTSIDE this subscription's
+                    // MainWindow update. The callbacks re-acquire the window via
+                    // `this.update(...)`; calling that here (already inside a MainWindow
+                    // update via `subscribe_in`'s `&mut self`) panics with "cannot update
+                    // MainWindow while it is already being updated" — e.g. the workspace
+                    // Rename, whose action now actually dispatches.
+                    let on_accept = on_accept.clone();
+                    window.defer(cx, move |window, cx| (on_accept)(text, window, cx));
                 }
                 TextPromptEvent::Cancel => window.close_dialog(cx),
             },
