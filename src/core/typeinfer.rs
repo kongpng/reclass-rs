@@ -267,29 +267,6 @@ fn count_ptr_features64(val: u64) -> FeatureResult {
         };
     }
 
-    let low = val as u32;
-    let high = (val >> 32) as u32;
-
-    // Hard reject: "packed two-int32" sentinel patterns.
-    if low == 0xFFFFFFFF {
-        return FeatureResult {
-            passed: 0,
-            checked: 5,
-        };
-    }
-    if high == 0xFFFFFFFF {
-        return FeatureResult {
-            passed: 0,
-            checked: 5,
-        };
-    }
-    if low != 0 && (low & 0x000FFFFF) == 0 && high < 0x10000 {
-        return FeatureResult {
-            passed: 0,
-            checked: 5,
-        };
-    }
-
     let mut passed = 0;
     let checked = 5;
     // Feature 1: aligned to 8 (heap/vtable allocations)
@@ -387,10 +364,10 @@ fn feature_score(r: FeatureResult) -> i32 {
     (r.passed * 100) / r.checked
 }
 
-/// `strengthFromScore` (`typeinfer.h:300-309`).
+/// `strengthFromScore` (`typeinfer.h:280-285`).
 #[inline]
 fn strength_from_score(score: i32) -> i32 {
-    if score >= 85 {
+    if score >= 75 {
         3
     } else if score >= 50 {
         2

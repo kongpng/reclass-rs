@@ -777,11 +777,21 @@ fn seed_root_doc(kind: RootKind) -> crate::controller::RcxDocument {
     };
     root.id = doc.tree.reserve_id();
     let root_id = root.id;
+    // File > New Enum seeds an enum root with 5 named members and NO hex fields
+    // (the C++ `buildEmptyStruct` enum branch, main.cpp:3981-4000). Without this the
+    // empty-members render gate (`is_enum() && !enum_members.is_empty()`) fails and
+    // the 16 hex children would render as ordinary fields on screen and in exports.
+    if matches!(kind, RootKind::Enum) {
+        root.enum_members = (0..5).map(|i| (format!("Member{i}"), i as i64)).collect();
+        doc.tree.add_node(root);
+        doc.tree.touch();
+        return doc;
+    }
     doc.tree.add_node(root);
     for i in 0..16 {
         let mut c = Node {
             kind: hex_kind,
-            name: format!("field_{:04x}", i * stride),
+            name: format!("field_{:02x}", i * stride),
             parent_id: root_id,
             offset: i * stride,
             ..Node::default()
@@ -7290,14 +7300,25 @@ mod tests {
                 .collect();
             assert_eq!(roots.len(), 1, "{kind:?} should seed one root struct");
             assert_eq!(roots[0].class_keyword, kind.class_keyword());
-            // The 16-field hex body landed under the root.
-            let children = doc
+            let children: Vec<&crate::core::Node> = doc
                 .tree
                 .nodes
                 .iter()
                 .filter(|n| n.parent_id == roots[0].id)
-                .count();
-            assert_eq!(children, 16, "{kind:?} should seed 16 hex fields");
+                .collect();
+            if matches!(kind, RootKind::Enum) {
+                // New Enum: 5 named members, NO hex children (C++ buildEmptyStruct
+                // enum branch, main.cpp:3981-4000).
+                assert_eq!(children.len(), 0, "enum should seed no hex fields");
+                assert_eq!(roots[0].enum_members.len(), 5, "enum should seed 5 members");
+            } else {
+                // Class/Struct: the 16-field hex body landed under the root, named
+                // with 2-digit-min zero-padded hex offsets (field_00..field_78).
+                assert_eq!(children.len(), 16, "{kind:?} should seed 16 hex fields");
+                assert_eq!(children[0].name, "field_00");
+                assert_eq!(children[1].name, "field_08");
+                assert!(roots[0].enum_members.is_empty());
+            }
             // A sensible default base (the C++ template).
             assert_eq!(doc.tree.base_address, 0x0040_0000);
         }

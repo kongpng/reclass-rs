@@ -385,13 +385,17 @@ pub fn serialize_value(ty: ValueType, input: &str) -> Result<(Vec<u8>, Vec<u8>),
             Some(v) => pattern.extend_from_slice(&v.to_le_bytes()),
             None => return Err("Invalid uint64 value".to_string()),
         },
+        // Reject non-finite results (overflow-to-±inf, the "inf"/"infinity"/"nan"
+        // literals) — Rust's parse() returns Ok(inf) on overflow and accepts those
+        // literals, but Qt's QString::toFloat/toDouble set ok=false for all of them
+        // (scanner.cpp:328-345), so C++ shows a value error and runs no scan.
         ValueType::Float => match trimmed.parse::<f32>() {
-            Ok(v) => pattern.extend_from_slice(&v.to_le_bytes()),
-            Err(_) => return Err("Invalid float value".to_string()),
+            Ok(v) if v.is_finite() => pattern.extend_from_slice(&v.to_le_bytes()),
+            _ => return Err("Invalid float value".to_string()),
         },
         ValueType::Double => match trimmed.parse::<f64>() {
-            Ok(v) => pattern.extend_from_slice(&v.to_le_bytes()),
-            Err(_) => return Err("Invalid double value".to_string()),
+            Ok(v) if v.is_finite() => pattern.extend_from_slice(&v.to_le_bytes()),
+            _ => return Err("Invalid double value".to_string()),
         },
         ValueType::Vec2 => serialize_vec(trimmed, 2, &mut pattern)?,
         ValueType::Vec3 => serialize_vec(trimmed, 3, &mut pattern)?,
@@ -434,9 +438,10 @@ fn serialize_vec(trimmed: &str, n: usize, pattern: &mut Vec<u8>) -> Result<(), S
         return Err(format!("Vec{n} requires {n} space-separated floats"));
     }
     for p in parts {
+        // Reject non-finite (overflow/inf/nan) per-component, matching Qt toFloat.
         match p.parse::<f32>() {
-            Ok(v) => pattern.extend_from_slice(&v.to_le_bytes()),
-            Err(_) => return Err(format!("Invalid float in vec{n}: {p}")),
+            Ok(v) if v.is_finite() => pattern.extend_from_slice(&v.to_le_bytes()),
+            _ => return Err(format!("Invalid float in vec{n}: {p}")),
         }
     }
     Ok(())
