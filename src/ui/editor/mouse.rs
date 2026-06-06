@@ -217,10 +217,15 @@ impl super::RcxEditor {
                         return;
                     }
                     // Enum-value click → the EnumPickerPopup (item 8): an enum
-                    // field's Value column opens the member picker (pre-selecting
-                    // the current member) instead of a plain numeric edit.
+                    // *field's* Value column opens the member picker (pre-selecting
+                    // the current member) instead of a plain numeric edit. EXCLUDE an
+                    // enum MEMBER row (is_member_line) — its node_idx points at the
+                    // enum node itself, so without this guard a click on a member's
+                    // value opened the picker instead of editing the member's integer
+                    // value (the member name, a separate span, was always editable).
                     EditTarget::Value
                         if already_selected
+                            && !lm.is_member_line
                             && lm.node_idx >= 0
                             && self.node_is_enum(lm.node_idx as usize) =>
                     {
