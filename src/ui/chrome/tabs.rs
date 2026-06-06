@@ -51,7 +51,7 @@ use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
-use crate::ui::design::{color, icon, tokens, PopupMenuExt as _};
+use crate::ui::design::{color, icon, tokens};
 use crate::ui::editor::RcxEditor;
 use crate::ui::state::{DataSource, DocId, SourceKind, ViewMode};
 use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
@@ -1402,23 +1402,24 @@ fn tab_context_menu(menu: PopupMenu, has_path: bool, multi_tab: bool) -> PopupMe
     // `menu_element_with_icon` — the custom-element variant did not paint the hover
     // highlight, so the rows looked dead under the cursor. Plain labels: these are
     // menu-only actions with no real key binding to show.
+    // Built-in items; highlight comes from the visible theme `accent` wash.
     let menu = menu
-        .item_hl(IconName::Close, "Close", Box::new(TabClose))
+        .menu_with_icon("Close", IconName::Close, Box::new(TabClose))
         .separator()
-        .item_hl(IconName::Close, "Close All Tabs", Box::new(TabCloseAll));
+        .menu_with_icon("Close All Tabs", IconName::Close, Box::new(TabCloseAll));
     // Close All But This — only with more than one tab open.
     let menu = if multi_tab {
-        menu.item_hl(IconName::Close, "Close All But This", Box::new(TabCloseOthers))
+        menu.menu("Close All But This", Box::new(TabCloseOthers))
     } else {
         menu
     };
     // Copy Full Path / Open Containing Folder — only for a saved document.
     if has_path {
         menu.separator()
-            .item_hl(IconName::Copy, "Copy Full Path", Box::new(TabCopyPath))
-            .item_hl(
-                IconName::FolderOpen,
+            .menu_with_icon("Copy Full Path", IconName::Copy, Box::new(TabCopyPath))
+            .menu_with_icon(
                 "Open Containing Folder",
+                IconName::FolderOpen,
                 Box::new(TabRevealPath),
             )
     } else {

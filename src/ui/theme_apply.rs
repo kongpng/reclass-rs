@@ -654,6 +654,20 @@ pub fn apply_theme(theme: &Theme, window: &mut gpui::Window, cx: &mut gpui::App)
         apply_entry(&mut gtheme.colors, entry);
     }
 
+    // gpui-component paints its menu / dropdown / list HOVER + SELECTION with
+    // `colors.accent`. Our resolved Accent (a dark, low-contrast blue) read as "no
+    // highlight" on the dark menu surface, so every right-click menu — and its
+    // submenu rows — looked dead under the cursor (the menubar highlights because it
+    // uses its own `menu_highlight` wash, not `accent`). Override `accent` with that
+    // same soft brand-blue wash (primary @ 30%) so the BUILT-IN highlight reads for
+    // EVERY menu item type (incl. submenu heads), centrally, with no per-item styling
+    // and no element-hover flicker (selection is model-state, not element hover).
+    {
+        let mut accent = gtheme.colors.primary;
+        accent.a = 0.30;
+        gtheme.colors.accent = accent;
+    }
+
     // Zed-like global typography + surface geometry (design tokens). Comfortable
     // ~14px UI text, a real monospace for the editor, small radii on elevated
     // surfaces, restrained shadows. See `ui/design.rs` for the token source.

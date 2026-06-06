@@ -37,7 +37,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::tree::{tree, TreeItem, TreeState};
 
 use crate::core::{kind_to_string, NodeKind, NodeTree};
-use crate::ui::design::{color, icon, tokens, PopupMenuExt as _};
+use crate::ui::design::{color, icon, tokens};
 
 use crate::ui::state::DocId;
 
@@ -935,10 +935,9 @@ impl WorkspacePanel {
 /// look + leading kind icons, matching [`type_context_menu`].
 fn empty_area_menu(menu: PopupMenu) -> PopupMenu {
     use gpui_component::IconName;
-    // `item_hl` = hover-highlighting option (see `design::ctx_menu_row`).
-    menu.item_hl(IconName::Plus, "New Class", Box::new(WsNewClass))
-        .item_hl(IconName::Plus, "New Struct", Box::new(WsNewStruct))
-        .item_hl(IconName::Plus, "New Enum", Box::new(WsNewEnum))
+    menu.menu_with_icon("New Class", IconName::Plus, Box::new(WsNewClass))
+        .menu_with_icon("New Struct", IconName::Plus, Box::new(WsNewStruct))
+        .menu_with_icon("New Enum", IconName::Plus, Box::new(WsNewEnum))
 }
 
 /// Build the type-row right-click [`PopupMenu`] (the C++ workspace-tree `QMenu`,
@@ -957,22 +956,27 @@ fn empty_area_menu(menu: PopupMenu) -> PopupMenu {
 fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
     use gpui_component::IconName;
 
-    // `item_hl` items so each row highlights on hover (plain labels — these are
-    // menu-only actions with no real accelerator to show).
+    // Built-in `menu_with_icon` items: hover/selection highlight comes from the
+    // theme `accent` wash (set visible in `theme_apply`), so no per-item styling.
+    // Plain labels — these are menu-only actions with no real accelerator to show.
     menu
         // Dimmed, non-boxed section title naming the targeted type.
         .label(SharedString::from(target_name.to_string()))
         .separator()
-        .item_hl(IconName::ExternalLink, "Open in Tab", Box::new(WsOpenInTab))
+        .menu_with_icon("Open in Tab", IconName::ExternalLink, Box::new(WsOpenInTab))
         .separator()
-        .item_hl(IconName::Replace, "Rename\u{2026}", Box::new(WsRenameType))
-        .item_hl(IconName::SquareTerminal, "Comment\u{2026}", Box::new(WsCommentField))
-        .item_hl(IconName::Copy, "Duplicate", Box::new(WsDuplicateType))
-        .item_hl(IconName::Copy, "Copy Name", Box::new(WsCopyName))
-        .item_hl(IconName::Plus, "Add Member", Box::new(WsAddMember))
-        .item_hl(IconName::Frame, "Pin / Unpin", Box::new(WsTogglePin))
+        .menu_with_icon("Rename\u{2026}", IconName::Replace, Box::new(WsRenameType))
+        .menu_with_icon(
+            "Comment\u{2026}",
+            IconName::SquareTerminal,
+            Box::new(WsCommentField),
+        )
+        .menu_with_icon("Duplicate", IconName::Copy, Box::new(WsDuplicateType))
+        .menu_with_icon("Copy Name", IconName::Copy, Box::new(WsCopyName))
+        .menu_with_icon("Add Member", IconName::Plus, Box::new(WsAddMember))
+        .menu_with_icon("Pin / Unpin", IconName::Frame, Box::new(WsTogglePin))
         .separator()
-        .item_hl(IconName::Delete, "Delete", Box::new(WsDeleteType))
+        .menu_with_icon("Delete", IconName::Delete, Box::new(WsDeleteType))
 }
 
 /// The child-FIELD row right-click menu — Rename / Duplicate / Delete acting on the
@@ -981,22 +985,25 @@ fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
 /// Member / Pin) that don't apply to a leaf field.
 fn field_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
     use gpui_component::IconName;
-    // `item_hl` items so each row highlights on hover (see `design::ctx_menu_row`);
-    // the gpui-component built-ins rely on `group_hover`, which is inert here.
+    // Built-in items; highlight comes from the visible theme `accent` wash.
     menu.label(SharedString::from(target_name.to_string()))
         .separator()
         // Jump the editor to this field (set the parent as view root + select it) —
         // the same nav the row's click/Enter performs, reusing `WsOpenInTab`.
-        .item_hl(IconName::ExternalLink, "Reveal in Editor", Box::new(WsOpenInTab))
+        .menu_with_icon("Reveal in Editor", IconName::ExternalLink, Box::new(WsOpenInTab))
         // Change the field's type via the gutter's Type Selector.
-        .item_hl(IconName::Frame, "Change Type\u{2026}", Box::new(WsChangeFieldType))
+        .menu_with_icon("Change Type\u{2026}", IconName::Frame, Box::new(WsChangeFieldType))
         .separator()
-        .item_hl(IconName::Replace, "Rename\u{2026}", Box::new(WsRenameType))
-        .item_hl(IconName::SquareTerminal, "Comment\u{2026}", Box::new(WsCommentField))
-        .item_hl(IconName::Copy, "Duplicate", Box::new(WsDuplicateType))
-        .item_hl(IconName::Copy, "Copy Name", Box::new(WsCopyName))
+        .menu_with_icon("Rename\u{2026}", IconName::Replace, Box::new(WsRenameType))
+        .menu_with_icon(
+            "Comment\u{2026}",
+            IconName::SquareTerminal,
+            Box::new(WsCommentField),
+        )
+        .menu_with_icon("Duplicate", IconName::Copy, Box::new(WsDuplicateType))
+        .menu_with_icon("Copy Name", IconName::Copy, Box::new(WsCopyName))
         .separator()
-        .item_hl(IconName::Delete, "Delete", Box::new(WsDeleteType))
+        .menu_with_icon("Delete", IconName::Delete, Box::new(WsDeleteType))
 }
 
 impl Panel for WorkspacePanel {
