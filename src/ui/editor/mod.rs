@@ -2189,6 +2189,11 @@ impl RcxEditor {
             self.caret_line = Some(line);
             self.ensure_line_visible(line);
             self.after_mutation(cx);
+        } else if dir > 0 {
+            // C++ Key_Down's append branch fires regardless of held modifiers
+            // (editor.cpp:2965-2972): Ctrl+Down at the last node grows the struct,
+            // matching plain Down / Shift+Down which already append here.
+            self.append_tail_field(false, cx);
         }
     }
 
