@@ -307,11 +307,22 @@ mod view {
     /// (the C++ `.ui` column set). Stub rows are dimmed (non-attachable).
     struct ProcessDelegate {
         rows: Vec<ProcessRow>,
+        /// The Path column width, sized at construction to fill the table box.
+        /// gpui-component's table has no "stretch last section", so we compute the
+        /// fill width ourselves from the live card width (the C++
+        /// `setStretchLastSection(true)`, processpicker.cpp:58 — Path absorbs the
+        /// remaining width after the fixed PID/Name columns). Deriving it from
+        /// `clamp_width` keeps Path filled even when the dialog shrinks to a small
+        /// window, instead of a hardcoded width that left an empty strip / overflow.
+        path_width: Pixels,
     }
 
     impl ProcessDelegate {
-        fn new() -> Self {
-            ProcessDelegate { rows: Vec::new() }
+        fn new(path_width: Pixels) -> Self {
+            ProcessDelegate {
+                rows: Vec::new(),
+                path_width,
+            }
         }
     }
 
@@ -331,12 +342,11 @@ mod view {
                     .width(px(220.))
                     .sortable(),
                 // The Path column absorbs the remaining card width so the columns
-                // fill the table box (PID 72 + Name 220 + Path 394 ≈ the 720px
-                // card's inner table width); a narrower Path left an empty strip on
-                // the right where the header/row background stopped short of the
-                // box border (the "missing right bar").
-                COL_PATH => Column::new("path", "Path").width(px(394.)).sortable(),
-                _ => Column::new("path", "Path").width(px(394.)).sortable(),
+                // fill the table box exactly (no empty strip / overflow on the
+                // right). Width is computed from the live card width at
+                // construction (see `path_width`) rather than hardcoded.
+                COL_PATH => Column::new("path", "Path").width(self.path_width).sortable(),
+                _ => Column::new("path", "Path").width(self.path_width).sortable(),
             }
         }
 
@@ -450,8 +460,19 @@ mod view {
         ) -> Self {
             let filter =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name or PID..."));
-            let table = cx
-                .new(|cx| TableState::new(ProcessDelegate::new(), window, cx).row_selectable(true));
+            // Size the Path column to fill the table box after the fixed PID (72)
+            // and Name (220) columns — the C++ stretch-last-section. The box's inner
+            // width is the card minus 34px of chrome (card border 2 + modal body
+            // padding 16×2); Path takes the rest: card_w − 72 − 220 − 34 = card_w −
+            // 326 (= 394 at the 720 card, the empirically-correct fill where the
+            // Path sort-arrow sits exactly at the box's right edge). Derived from the
+            // live `clamp_width` so a small-window (clamped) dialog stays filled
+            // rather than leaving a strip; floored so a tiny window degrades to
+            // horizontal scroll instead of a negative width.
+            let path_w = px((f32::from(modal::clamp_width(720., window)) - 326.).max(160.));
+            let table = cx.new(|cx| {
+                TableState::new(ProcessDelegate::new(path_w), window, cx).row_selectable(true)
+            });
 
             let mut subs = Vec::new();
             subs.push(cx.subscribe(&filter, |this, _input, ev: &InputEvent, cx| {
