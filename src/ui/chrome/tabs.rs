@@ -51,7 +51,7 @@ use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
-use crate::ui::design::{color, icon, tokens};
+use crate::ui::design::{color, icon, tokens, PopupMenuExt as _};
 use crate::ui::editor::RcxEditor;
 use crate::ui::state::{DataSource, DocId, SourceKind, ViewMode};
 use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
@@ -328,6 +328,22 @@ impl DocumentArea {
             let id = self.tabs[ix].id;
             cx.emit(DocAreaEvent::Activated(id));
             cx.notify();
+        }
+    }
+
+    /// Activate the tab that owns `id`, returning whether such a tab exists. The
+    /// workspace lists types from EVERY open tab, so a nav target may live in a
+    /// non-active document; the caller activates it first, then reads
+    /// [`active_editor`](Self::active_editor) (set synchronously here) to drive the
+    /// view-root change against the right tab. A no-op (still `true`) when `id` is
+    /// already active.
+    pub fn activate_id(&mut self, id: DocId, cx: &mut Context<Self>) -> bool {
+        match self.index_of(id) {
+            Some(i) => {
+                self.activate_index(i, cx);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1382,43 +1398,32 @@ impl Render for DocumentArea {
 /// Copy Full Path / Open Containing Folder only appear for a saved document.
 /// `multi_tab` gates "Close All But This" (the C++ `m_docDocks.size() > 1`).
 fn tab_context_menu(menu: PopupMenu, has_path: bool, multi_tab: bool) -> PopupMenu {
+    // Built-in `menu_with_icon` / `menu` items (a `PopupMenuItem::Item`), NOT
+    // `menu_element_with_icon` — the custom-element variant did not paint the hover
+    // highlight, so the rows looked dead under the cursor. Plain labels: these are
+    // menu-only actions with no real key binding to show.
     let menu = menu
-        // Close — the right-clicked tab (trailing ⌘W hint, the editor accelerator).
-        .menu_element_with_icon(IconName::Close, Box::new(TabClose), |_w, cx| {
-            menu_row("Close", "\u{2318}W", cx)
-        })
+        .item_hl(IconName::Close, "Close", Box::new(TabClose))
         .separator()
-        // Close All Tabs.
-        .menu_element_with_icon(IconName::Close, Box::new(TabCloseAll), |_w, cx| {
-            menu_row("Close All Tabs", "", cx)
-        });
+        .item_hl(IconName::Close, "Close All Tabs", Box::new(TabCloseAll));
     // Close All But This — only with more than one tab open.
     let menu = if multi_tab {
-        menu.menu_element(Box::new(TabCloseOthers), |_w, cx| {
-            menu_row("Close All But This", "", cx)
-        })
+        menu.item_hl(IconName::Close, "Close All But This", Box::new(TabCloseOthers))
     } else {
         menu
     };
     // Copy Full Path / Open Containing Folder — only for a saved document.
     if has_path {
         menu.separator()
-            .menu_element_with_icon(IconName::Copy, Box::new(TabCopyPath), |_w, cx| {
-                menu_row("Copy Full Path", "", cx)
-            })
-            .menu_element_with_icon(IconName::FolderOpen, Box::new(TabRevealPath), |_w, cx| {
-                menu_row("Open Containing Folder", "", cx)
-            })
+            .item_hl(IconName::Copy, "Copy Full Path", Box::new(TabCopyPath))
+            .item_hl(
+                IconName::FolderOpen,
+                "Open Containing Folder",
+                Box::new(TabRevealPath),
+            )
     } else {
         menu
     }
-}
-
-/// One context-menu row body: the item `label` filling the row with a trailing
-/// right-aligned dim `keys` shortcut hint (Zed's label↔accelerator layout). The
-/// leading icon is supplied by `menu_element_with_icon`; this is the row's text.
-fn menu_row(label: &'static str, keys: &'static str, cx: &App) -> impl IntoElement {
-    crate::ui::design::menu_accel_row(label, keys, 184.0, cx)
 }
 
 /// The per-tab source-status tooltip text (the C++ per-tab source tooltip): the

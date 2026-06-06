@@ -5346,6 +5346,17 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The workspace lists types from EVERY open tab, so the row may belong to a
+        // document other than the active one. Switch to its owning tab FIRST (a
+        // no-op when already active), then operate on that now-active editor — else
+        // we'd re-root whatever tab happened to be active and the node lookup would
+        // miss (the C++ workspace activates the target's dock before raising it).
+        if !self
+            .document_area
+            .update(cx, |area, cx| area.activate_id(nav.doc, cx))
+        {
+            return; // stale row — its document is no longer open
+        }
         // The C++ workspace double-click (main.cpp:6914): a node WITH a parent (a
         // field / nested member) navigates WITHIN its owner — set the view root to
         // the PARENT and scroll the field into view; a top-level type sets the view

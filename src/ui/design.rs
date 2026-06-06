@@ -594,33 +594,74 @@ pub fn panel_header(title: impl Into<SharedString>, cx: &gpui::App) -> Div {
         )
 }
 
-/// A section caption label — the small uppercase muted divider used inside
-/// dialogs / option pages / the theme editor (the C++ `makeSectionLabel`:
-/// bold 11px, `textMuted`, bottom border). Group headers in a settings list.
-/// A context-menu row: a left label and a right-aligned accelerator hint (shown
-/// only when `keys` is non-empty). Shared by the tab-bar and workspace menus.
-pub fn menu_accel_row(
-    label: &'static str,
-    keys: &'static str,
-    min_w: f32,
+/// A context-menu option that highlights on hover — used by EVERY right-click
+/// menu (workspace / tab / editor). gpui-component's [`PopupMenu`] paints its
+/// hover + keyboard-selection state with gpui's `group_hover`, which does NOT
+/// render in this app's deferred menu overlays, so the built-in `menu_with_icon`
+/// rows looked dead under the cursor. The menubar dropdowns (which DO highlight)
+/// use an element-level `.hover()`; this mirrors that. Renders `[icon] label`
+/// filling the row with the soft-accent menu wash on hover. Pair with
+/// [`PopupMenuExt::item_hl`].
+fn ctx_menu_row(
+    icon: gpui_component::IconName,
+    label: SharedString,
     cx: &gpui::App,
-) -> Div {
+) -> gpui::Stateful<Div> {
+    use gpui_component::Sizable as _;
     gpui_component::h_flex()
+        // STABLE id is REQUIRED for a reliable hover here: gpui-component's
+        // MenuItemElement (which wraps this row) fires `on_hover` -> `notify` ->
+        // re-render, recreating the row. An ANONYMOUS row loses its hover on that
+        // re-render and only re-acquires it on the NEXT mouse-move event — so a SLOW
+        // move (sparse move events) flickers the wash off and it never shows; a fast
+        // move (dense events) keeps it on. The id makes gpui persist the row's hover
+        // state across the re-render (the menubar rows are id'd for the same reason).
+        .id(label.clone())
         .w_full()
-        .min_w(px(min_w))
-        .gap(px(tokens::space::LG))
         .items_center()
-        .justify_between()
+        .gap(px(6.0))
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(4.0))
+        .cursor_pointer()
+        // Element `.hover()` (not gpui-component's inert-in-overlays `group_hover`).
+        .hover(|s| s.bg(color::menu_highlight(cx)))
+        .child(
+            gpui_component::Icon::new(icon)
+                .small()
+                .text_color(color::text_muted(cx)),
+        )
         .child(div().flex_1().child(label))
-        .when(!keys.is_empty(), |row| {
-            row.child(
-                div()
-                    .flex_none()
-                    .text_size(px(tokens::font::UI_XS))
-                    .text_color(color::text_disabled(cx))
-                    .child(keys),
-            )
+}
+
+/// Extension that adds hover-highlighting options to gpui-component's
+/// [`PopupMenu`]. One place to get the wash right (see [`ctx_menu_row`]) so the
+/// right-click menus don't each re-implement the hover state per option — the
+/// gpui-component built-ins (`menu_with_icon` / `menu`) rely on `group_hover`,
+/// which is inert in this app's deferred menu overlays.
+pub trait PopupMenuExt {
+    /// Append an `[icon] label` option that dispatches `action` and highlights on
+    /// hover (the gpui-component built-ins do not, here).
+    fn item_hl(
+        self,
+        icon: gpui_component::IconName,
+        label: impl Into<SharedString>,
+        action: Box<dyn gpui::Action>,
+    ) -> Self;
+}
+
+impl PopupMenuExt for gpui_component::menu::PopupMenu {
+    fn item_hl(
+        self,
+        icon: gpui_component::IconName,
+        label: impl Into<SharedString>,
+        action: Box<dyn gpui::Action>,
+    ) -> Self {
+        let label = label.into();
+        self.menu_element(action, move |_w, cx| {
+            ctx_menu_row(icon.clone(), label.clone(), cx)
         })
+    }
 }
 
 /// Scroll a picker's selected row into view (no-op when nothing is selected).
