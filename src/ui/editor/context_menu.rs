@@ -34,7 +34,7 @@ fn append_node_submenus(
         sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
             .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
             .separator()
-            .menu_with_icon("Copy Line\tCtrl+X", IconName::Copy, Box::new(EditorCopyLine))
+            .menu_with_icon("Copy Line", IconName::Copy, Box::new(EditorCopyLine))
             .menu_with_icon(
                 "Copy All as Text",
                 IconName::Copy,
@@ -450,7 +450,7 @@ impl super::RcxEditor {
                 // Copy ▸ — Copy Line / Copy All as Text (no node ⇒ no Address/Offset).
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon(
-                        "Copy Line\tCtrl+X",
+                        "Copy Line",
                         IconName::Copy,
                         Box::new(EditorCopyLine),
                     )
@@ -952,7 +952,7 @@ impl super::RcxEditor {
                     .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
                     .separator()
                     .menu_with_icon(
-                        "Copy Line\tCtrl+X",
+                        "Copy Line",
                         IconName::Copy,
                         Box::new(EditorCopyLine),
                     )

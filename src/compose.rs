@@ -2952,10 +2952,16 @@ pub fn comment_span_for(lm: &LineMeta, line_length: i32, type_w: i32, name_w: i3
     let val_width = if is_hex { 23 } else { K_COL_VALUE };
     let prefix_w = type_w + name_w + 2 * K_SEP_WIDTH;
     let start = ind + prefix_w + val_width;
+    // This is the CREATION fallback (an existing comment is handled by its chip span
+    // in `resolved_span_for`), so it must stay valid even when the field has NO
+    // comment yet — there the line ends at the value, so `start >= line_length` and
+    // the old `valid: start < line_length` rejected the edit (Right-click ▸ Comment /
+    // `;` silently did nothing on a comment-less field). Return an empty span AT the
+    // comment column so `begin_inline_edit` opens an empty editor for the new comment.
     ColumnSpan {
         start,
-        end: line_length,
-        valid: start < line_length,
+        end: line_length.max(start + 1),
+        valid: true,
     }
 }
 
