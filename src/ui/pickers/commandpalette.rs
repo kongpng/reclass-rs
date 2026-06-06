@@ -554,6 +554,30 @@ impl PaletteModel {
         }
     }
 
+    /// Move the selection down by a page (PageDown), clamped to the last row. The
+    /// C++ palette forwards PageDown to the QListView's page-sized moveCursor; a
+    /// fixed PAGE step matches the other Rust pickers (exact viewport paging is
+    /// impractical in gpui).
+    pub fn page_down(&mut self, page: usize) {
+        if self.ranked.is_empty() {
+            return;
+        }
+        let last = self.ranked.len() - 1;
+        self.selected = Some(match self.selected {
+            Some(r) => (r + page).min(last),
+            None => 0,
+        });
+    }
+
+    /// Move the selection up by a page (PageUp), clamped to row 0.
+    pub fn page_up(&mut self, page: usize) {
+        if let Some(r) = self.selected {
+            self.selected = Some(r.saturating_sub(page));
+        } else if !self.ranked.is_empty() {
+            self.selected = Some(0);
+        }
+    }
+
     /// Activate a ranked row (`activateEntry`): returns the command id iff the row
     /// exists and its entry is enabled (`bounds + enabled` check). Disabled / OOB
     /// → `None`.
@@ -698,14 +722,28 @@ mod view {
         /// that forwarded these from the line-edit to the list (§8). Returns
         /// `true` when handled so the caller stops propagation.
         fn handle_nav_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+            // A fixed page step, consistent with the other pickers (enumpicker /
+            // typeselectorpopup). C++ forwards PageUp/PageDown to QListView's
+            // page-sized moveCursor (commandpalette.h:160-171).
+            const PAGE: usize = 10;
             match key {
-                "down" | "pagedown" => {
+                "down" => {
                     self.model.move_down();
                     cx.notify();
                     true
                 }
-                "up" | "pageup" => {
+                "pagedown" => {
+                    self.model.page_down(PAGE);
+                    cx.notify();
+                    true
+                }
+                "up" => {
                     self.model.move_up();
+                    cx.notify();
+                    true
+                }
+                "pageup" => {
+                    self.model.page_up(PAGE);
                     cx.notify();
                     true
                 }
