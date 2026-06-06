@@ -2326,6 +2326,29 @@ impl RcxController {
         });
     }
 
+    /// Rename a SPECIFIC composite's `struct_type_name` (the workspace "Rename" for a
+    /// type row — enum / class / struct — whose displayed name IS its type name, not
+    /// its instance `name`). `rename_root_class` only targets the viewed root; this
+    /// targets any node by id. Pushes the same undoable `ChangeStructTypeName`.
+    pub fn rename_struct_type(&mut self, node_id: u64, new_name: &str) {
+        if new_name.is_empty() {
+            return;
+        }
+        let idx = self.doc.tree.index_of_id(node_id);
+        if idx < 0 {
+            return;
+        }
+        let old_name = self.doc.tree.nodes[idx as usize].struct_type_name.clone();
+        if old_name == new_name {
+            return;
+        }
+        self.push_command(Command::ChangeStructTypeName {
+            node_id,
+            old_name,
+            new_name: new_name.to_string(),
+        });
+    }
+
     /// `duplicateNode(nodeIdx)` (`controller.cpp:3151`).
     pub fn duplicate_node(&mut self, node_idx: usize) {
         if node_idx >= self.doc.tree.nodes.len() {

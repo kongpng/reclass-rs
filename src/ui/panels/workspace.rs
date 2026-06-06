@@ -23,7 +23,8 @@
 //!
 //! Gated behind the `ui` feature.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
@@ -525,7 +526,7 @@ fn parse_nav_item_id(id: &str) -> Option<WorkspaceNav> {
 /// per type row (id = `"<doc>:<id>"`, label = `"Name — count"`), with its field
 /// children nested (non-navigable ids). Section headers are flattened into
 /// disabled marker items so the strip still shows the PINNED / ALL TYPES bands.
-fn model_to_tree_items(model: &WorkspaceModel) -> Vec<TreeItem> {
+fn model_to_tree_items(model: &WorkspaceModel, expanded: &HashSet<u64>) -> Vec<TreeItem> {
     let mut items = Vec::new();
     for (ri, row) in model.rows.iter().enumerate() {
         match row {
@@ -537,7 +538,8 @@ fn model_to_tree_items(model: &WorkspaceModel) -> Vec<TreeItem> {
             }
             WorkspaceRow::Type(t) => {
                 let label = format!("{} \u{2014} {}", t.name, t.field_count);
-                let mut item = TreeItem::new(nav_item_id(t.doc, t.id), label);
+                let mut item =
+                    TreeItem::new(nav_item_id(t.doc, t.id), label).expanded(expanded.contains(&t.id));
                 for child in &t.children {
                     item = item.child(TreeItem::new(
                         nav_item_id(t.doc, child.id),
@@ -666,6 +668,11 @@ pub struct WorkspacePanel {
     /// Set true by a row's right-mouse-down; read+reset by the panel-root's right
     /// handler to tell a row right-click from a blank-area one (the menu variant).
     right_hit_row: bool,
+    /// Node ids of currently-expanded type rows, captured live by the tree render
+    /// callback. A workspace REBUILD (`set_items`) resets every row to collapsed, so
+    /// `model_to_tree_items` re-applies this set — otherwise a rename/edit silently
+    /// collapsed the whole tree.
+    expanded_ids: Rc<RefCell<HashSet<u64>>>,
     focus_handle: FocusHandle,
 }
 
@@ -691,6 +698,7 @@ impl WorkspacePanel {
             context_target_name: String::new(),
             context_target_is_field: false,
             right_hit_row: false,
+            expanded_ids: Rc::new(RefCell::new(HashSet::new())),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -729,7 +737,8 @@ impl WorkspacePanel {
     /// (filtered) model.
     fn refresh_tree(&mut self, cx: &mut Context<Self>) {
         let filtered = self.model.filtered(&self.filter(cx));
-        let items = model_to_tree_items(&filtered);
+        let expanded = self.expanded_ids.borrow().clone();
+        let items = model_to_tree_items(&filtered, &expanded);
         self.row_meta = Rc::new(model_to_row_meta(&filtered));
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
@@ -977,6 +986,7 @@ impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let meta = self.row_meta.clone();
+        let expanded_ids = self.expanded_ids.clone();
 
         gpui_component::v_flex()
             .id("rcx-workspace-panel")
@@ -1058,6 +1068,20 @@ impl Render for WorkspacePanel {
                         let depth = entry.depth();
                         let is_folder = entry.is_folder();
                         let is_expanded = entry.is_expanded();
+
+                        // Capture live expansion so a workspace rebuild (`set_items`,
+                        // which collapses everything) can restore it. Keyed by the
+                        // type row's node id; only folder (type) rows toggle.
+                        if is_folder {
+                            if let Some(n) = nav.as_ref() {
+                                let mut ex = expanded_ids.borrow_mut();
+                                if is_expanded {
+                                    ex.insert(n.node_id);
+                                } else {
+                                    ex.remove(&n.node_id);
+                                }
+                            }
+                        }
 
                         render_row(RowCtx {
                             ix,
@@ -1876,7 +1900,7 @@ mod tests {
             tree: &tree,
         }];
         let m = WorkspaceModel::build(&docs, &[], &[]);
-        let items = model_to_tree_items(&m);
+        let items = model_to_tree_items(&m, &std::collections::HashSet::new());
 
         // First item is the ALL TYPES section (disabled / non-navigable).
         assert_eq!(items[0].label.as_ref(), "ALL TYPES");

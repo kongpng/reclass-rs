@@ -5493,7 +5493,19 @@ impl MainWindow {
                             editor.update(cx, |ed, cx| {
                                 let idx = ed.controller().tree().index_of_id(node_id);
                                 if idx >= 0 {
-                                    ed.controller_mut().rename_node(idx as usize, &name);
+                                    let node = &ed.controller().tree().nodes[idx as usize];
+                                    // A top-level composite (enum/class/struct) is shown
+                                    // by its struct_type_name — the C++ renameType renames
+                                    // the TYPE; a child field is shown by its `name`.
+                                    // Match the displayed name, else renaming a type wrote
+                                    // the hidden instance `name` and looked like a no-op.
+                                    let is_type =
+                                        node.parent_id == 0 && !node.struct_type_name.is_empty();
+                                    if is_type {
+                                        ed.controller_mut().rename_struct_type(node_id, &name);
+                                    } else {
+                                        ed.controller_mut().rename_node(idx as usize, &name);
+                                    }
                                     ed.apply_document(cx);
                                 }
                             });
