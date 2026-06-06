@@ -935,15 +935,10 @@ impl WorkspacePanel {
 /// look + leading kind icons, matching [`type_context_menu`].
 fn empty_area_menu(menu: PopupMenu) -> PopupMenu {
     use gpui_component::IconName;
-    menu.menu_element_with_icon(IconName::Plus, Box::new(WsNewClass), |_w, cx| {
-        menu_row("New Class", "\u{2318}N", cx)
-    })
-    .menu_element_with_icon(IconName::Plus, Box::new(WsNewStruct), |_w, cx| {
-        menu_row("New Struct", "\u{2318}T", cx)
-    })
-    .menu_element_with_icon(IconName::Plus, Box::new(WsNewEnum), |_w, cx| {
-        menu_row("New Enum", "\u{2318}E", cx)
-    })
+    // Built-in items so hover highlights (see field_context_menu).
+    menu.menu_with_icon("New Class", IconName::Plus, Box::new(WsNewClass))
+        .menu_with_icon("New Struct", IconName::Plus, Box::new(WsNewStruct))
+        .menu_with_icon("New Enum", IconName::Plus, Box::new(WsNewEnum))
 }
 
 /// Build the type-row right-click [`PopupMenu`] (the C++ workspace-tree `QMenu`,
@@ -962,31 +957,20 @@ fn empty_area_menu(menu: PopupMenu) -> PopupMenu {
 fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
     use gpui_component::IconName;
 
+    // Built-in `menu_with_icon` items (so hover highlights — see field_context_menu);
+    // plain labels (these actions are menu-only, no real accelerators to show).
     menu
         // Dimmed, non-boxed section title naming the targeted type.
         .label(SharedString::from(target_name.to_string()))
         .separator()
-        // Open in Tab — the one live wire; trailing ↵ hint (activate = open).
-        .menu_element_with_icon(IconName::ExternalLink, Box::new(WsOpenInTab), |_w, cx| {
-            menu_row("Open in Tab", "\u{21b5}", cx)
-        })
+        .menu_with_icon("Open in Tab", IconName::ExternalLink, Box::new(WsOpenInTab))
         .separator()
-        .menu_element_with_icon(IconName::Replace, Box::new(WsRenameType), |_w, cx| {
-            menu_row("Rename\u{2026}", "F2", cx)
-        })
-        .menu_element_with_icon(IconName::Copy, Box::new(WsDuplicateType), |_w, cx| {
-            menu_row("Duplicate", "\u{2318}D", cx)
-        })
-        .menu_element_with_icon(IconName::Plus, Box::new(WsAddMember), |_w, cx| {
-            menu_row("Add Member", "\u{2318}\u{21b5}", cx)
-        })
-        .menu_element_with_icon(IconName::Frame, Box::new(WsTogglePin), |_w, cx| {
-            menu_row("Pin / Unpin", "", cx)
-        })
+        .menu_with_icon("Rename\u{2026}", IconName::Replace, Box::new(WsRenameType))
+        .menu_with_icon("Duplicate", IconName::Copy, Box::new(WsDuplicateType))
+        .menu_with_icon("Add Member", IconName::Plus, Box::new(WsAddMember))
+        .menu_with_icon("Pin / Unpin", IconName::Frame, Box::new(WsTogglePin))
         .separator()
-        .menu_element_with_icon(IconName::Delete, Box::new(WsDeleteType), |_w, cx| {
-            menu_row("Delete", "\u{2326}", cx)
-        })
+        .menu_with_icon("Delete", IconName::Delete, Box::new(WsDeleteType))
 }
 
 /// The child-FIELD row right-click menu — Rename / Duplicate / Delete acting on the
@@ -995,45 +979,30 @@ fn type_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
 /// Member / Pin) that don't apply to a leaf field.
 fn field_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
     use gpui_component::IconName;
+    // NOTE: built-in `menu_with_icon` (a `PopupMenuItem::Item`), NOT
+    // `menu_element_with_icon` — the custom-element item variant did not paint the
+    // hover/selected highlight, so the rows looked dead under the cursor. Plain
+    // labels (no `\t` accelerator hints): these workspace actions are menu-only, so
+    // — unlike the editor menu, whose hints come from real key bindings — there is
+    // no accelerator to honestly show.
     menu.label(SharedString::from(target_name.to_string()))
         .separator()
         // Jump the editor to this field (set the parent as view root + select it) —
         // the same nav the row's click/Enter performs, reusing `WsOpenInTab`.
-        .menu_element_with_icon(IconName::ExternalLink, Box::new(WsOpenInTab), |_w, cx| {
-            menu_row("Reveal in Editor", "\u{21b5}", cx)
-        })
+        .menu_with_icon("Reveal in Editor", IconName::ExternalLink, Box::new(WsOpenInTab))
         // Change the field's type via the gutter's Type Selector.
-        .menu_element_with_icon(IconName::Frame, Box::new(WsChangeFieldType), |_w, cx| {
-            menu_row("Change Type\u{2026}", "", cx)
-        })
+        .menu_with_icon("Change Type\u{2026}", IconName::Frame, Box::new(WsChangeFieldType))
         .separator()
-        .menu_element_with_icon(IconName::Replace, Box::new(WsRenameType), |_w, cx| {
-            menu_row("Rename\u{2026}", "F2", cx)
-        })
-        .menu_element_with_icon(IconName::SquareTerminal, Box::new(WsCommentField), |_w, cx| {
-            menu_row("Comment\u{2026}", "", cx)
-        })
-        .menu_element_with_icon(IconName::Copy, Box::new(WsDuplicateType), |_w, cx| {
-            menu_row("Duplicate", "", cx)
-        })
-        .menu_element_with_icon(IconName::Copy, Box::new(WsCopyName), |_w, cx| {
-            menu_row("Copy Name", "", cx)
-        })
+        .menu_with_icon("Rename\u{2026}", IconName::Replace, Box::new(WsRenameType))
+        .menu_with_icon(
+            "Comment\u{2026}",
+            IconName::SquareTerminal,
+            Box::new(WsCommentField),
+        )
+        .menu_with_icon("Duplicate", IconName::Copy, Box::new(WsDuplicateType))
+        .menu_with_icon("Copy Name", IconName::Copy, Box::new(WsCopyName))
         .separator()
-        .menu_element_with_icon(IconName::Delete, Box::new(WsDeleteType), |_w, cx| {
-            menu_row("Delete", "\u{2326}", cx)
-        })
-}
-
-/// One context-menu row body: the item `label` filling the row with a trailing
-/// right-aligned muted `keys` shortcut hint (Zed's label↔accelerator layout). The
-/// leading icon is supplied by `menu_element_with_icon`; this is the row's text.
-/// The hint is dimmed (`text_disabled`) so it recedes behind the item label —
-/// these workspace actions are not globally key-bound (so the menu's built-in
-/// `render_key_binding` shows nothing), but the hint communicates the equivalent
-/// editor accelerator the way a Zed menu does.
-fn menu_row(label: &'static str, keys: &'static str, cx: &App) -> impl IntoElement {
-    crate::ui::design::menu_accel_row(label, keys, 168.0, cx)
+        .menu_with_icon("Delete", IconName::Delete, Box::new(WsDeleteType))
 }
 
 impl Panel for WorkspacePanel {
