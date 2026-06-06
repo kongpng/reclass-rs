@@ -1861,6 +1861,10 @@ impl Render for ScannerPanel {
         let has_undo = !self.undo_stack.is_empty();
         let reset_armed = self.reset_armed;
         let scanning = self.scanning;
+        // C++ syncScanEnabled greys out the Scan button when a value-requiring
+        // condition has an empty value field (scannerpanel.cpp:732-756). Mirror it so
+        // First Scan is disabled (not just an error-on-click) when input is missing.
+        let missing_input = vis.value_enabled && self.form.value_text.trim().is_empty();
         let progress = self.progress;
         let breadcrumb =
             stage_breadcrumb(self.generation, self.last_result_count, self.results.len());
@@ -2083,6 +2087,7 @@ impl Render for ScannerPanel {
                                                 .primary()
                                                 .small()
                                                 .label("First Scan")
+                                                .disabled(missing_input)
                                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                                     this.run_scan(cx)
                                                 })),
