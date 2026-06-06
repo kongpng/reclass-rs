@@ -5040,10 +5040,10 @@ impl RcxEditor {
         }
     }
 
-    /// Item 17: Append bytes… — append a single field to the enclosing container
-    /// of the current/target node, falling back to the view-root struct when no
-    /// node is selected (the C++ `appendSingleFieldRequested` / the no-node
-    /// "Append bytes" row).
+    /// Item 17: "Append bytes…" — append bytes (the C++ `appendBytesDialog` default
+    /// of 128, controller.cpp:2921-2947) to the VIEW-ROOT struct (`m_viewRootId`),
+    /// NOT a single 8-byte field at the selected node's enclosing container. (The
+    /// interactive count prompt is a follow-up; the count defaults to the C++ 128.)
     fn action_append_bytes(
         &mut self,
         _: &EditorAppendBytes,
@@ -5051,23 +5051,11 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.close_context_menu(cx);
-        let anchor = self
-            .action_target()
-            .map(|t| t.node_id)
-            .or_else(|| self.current_node().map(|(_, lm)| lm.node_id))
-            .unwrap_or_else(|| self.controller.view_root_id());
-        if anchor != 0 {
-            self.controller.append_single_field(anchor);
-        } else {
-            self.controller.insert_node(
-                self.controller.view_root_id(),
-                -1,
-                NodeKind::Hex64,
-                "field",
-            );
-        }
         self.context_target = None;
-        self.after_mutation(cx);
+        // append_bytes_to_struct rounds up to Hex64 fields (128 → 16 Hex64) and
+        // applies the document itself.
+        let root = self.controller.view_root_id();
+        self.append_bytes_to_struct(root, 128, cx);
     }
 
     /// Item 7: open the ASCII overwrite editor on the hex node at `(line,
