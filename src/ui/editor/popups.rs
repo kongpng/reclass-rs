@@ -285,7 +285,7 @@ impl super::RcxEditor {
         let recent = self.recent_type_names.clone();
         let popup = cx.new(|cx| {
             let mut p = TypeSelectorPopup::new_with_current(entries, target.kind, window, cx);
-            p.set_mode(mode, cx);
+            p.set_mode(mode, window, cx);
             p.set_sizes(node_size, ptr_size);
             p.set_recent_names(recent, cx);
             // Pre-highlight the composite the node already references, by structId

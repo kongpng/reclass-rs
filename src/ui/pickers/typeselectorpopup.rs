@@ -546,6 +546,26 @@ impl TypeModel {
         self.mode
     }
 
+    /// The mode-aware filter placeholder, carrying the total selectable-type
+    /// count (C++ `setTypes` dynamic placeholder, typeselectorpopup.cpp:1256-1267):
+    /// the noun tracks the mode and `count` is every non-section entry in the full
+    /// catalogue (not the live-filtered subset). The `(Ctrl+F)` focus hint is a
+    /// Rust addition — that shortcut is wired in the popup's key handler.
+    pub fn filter_placeholder(&self) -> String {
+        let count = self
+            .entries
+            .iter()
+            .filter(|e| e.entry_kind != EntryKind::Section)
+            .count();
+        let noun = match self.mode {
+            TypePopupMode::Root => "structs",
+            TypePopupMode::FieldType => "types",
+            TypePopupMode::ArrayElement => "element types",
+            TypePopupMode::PointerTarget => "targets",
+        };
+        format!("Filter {count} {noun}..  (Ctrl+F)")
+    }
+
     /// The current modifier.
     pub fn modifier(&self) -> Modifier {
         self.modifier
@@ -1162,8 +1182,12 @@ mod view {
         /// retyping an array element should pass [`TypePopupMode::ArrayElement`],
         /// and a pointer-target pick [`TypePopupMode::PointerTarget`] (which hides
         /// the modifiers). Clears any active modifier (per `setMode` semantics).
-        pub fn set_mode(&mut self, mode: TypePopupMode, cx: &mut Context<Self>) {
+        pub fn set_mode(&mut self, mode: TypePopupMode, window: &mut Window, cx: &mut Context<Self>) {
             self.model.set_mode(mode);
+            // Re-label the filter input for the new mode (noun + total type count).
+            let placeholder = self.model.filter_placeholder();
+            self.input
+                .update(cx, |s, cx| s.set_placeholder(placeholder, window, cx));
             cx.notify();
         }
 
@@ -2383,6 +2407,25 @@ mod tests {
         model.set_mode(TypePopupMode::PointerTarget);
         assert_eq!(model.modifier(), Modifier::None);
         assert!(!model.mode().allows_modifiers());
+    }
+
+    #[test]
+    fn filter_placeholder_tracks_mode_and_count() {
+        // P12 / C++ parity (typeselectorpopup.cpp:1256-1267): the placeholder noun
+        // follows the mode and carries the total non-section entry count (7 here),
+        // not the live-filtered subset.
+        let mut model = TypeModel::new(sample_entries());
+        model.set_mode(TypePopupMode::Root);
+        assert_eq!(model.filter_placeholder(), "Filter 7 structs..  (Ctrl+F)");
+        model.set_mode(TypePopupMode::FieldType);
+        assert_eq!(model.filter_placeholder(), "Filter 7 types..  (Ctrl+F)");
+        model.set_mode(TypePopupMode::ArrayElement);
+        assert_eq!(model.filter_placeholder(), "Filter 7 element types..  (Ctrl+F)");
+        model.set_mode(TypePopupMode::PointerTarget);
+        assert_eq!(model.filter_placeholder(), "Filter 7 targets..  (Ctrl+F)");
+        // The count ignores the live filter — narrowing to one match keeps "7".
+        model.apply_filter("int32");
+        assert_eq!(model.filter_placeholder(), "Filter 7 targets..  (Ctrl+F)");
     }
 
     #[test]
