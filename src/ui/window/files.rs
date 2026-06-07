@@ -5,6 +5,116 @@
 
 use super::*;
 
+/// File ▸ Import ▸ … target — picks the importer + the file-picker prompt text.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImportKind {
+    Source,
+    Xml,
+    Pdb,
+}
+
+impl ImportKind {
+    pub(crate) fn prompt(self) -> &'static str {
+        match self {
+            ImportKind::Source => "Import C/C++ source",
+            ImportKind::Xml => "Import ReClass XML",
+            ImportKind::Pdb => "Import PDB",
+        }
+    }
+}
+
+/// File ▸ Export ▸ … target — picks the [`crate::generator`] renderer + the
+/// suggested file extension.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExportKind {
+    Cpp,
+    Rust,
+    Defines,
+    CSharp,
+    Python,
+    Xml,
+}
+
+impl ExportKind {
+    /// The suggested save-file extension (incl. the leading dot).
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            ExportKind::Cpp => ".h",
+            ExportKind::Rust => ".rs",
+            ExportKind::Defines => ".h",
+            ExportKind::CSharp => ".cs",
+            ExportKind::Python => ".py",
+            ExportKind::Xml => ".xml",
+        }
+    }
+
+    /// The [`CodeFormat`](crate::generator::CodeFormat) this code export maps to,
+    /// or `None` for the ReClass-XML export (which goes through the importer's
+    /// file exporter, not the generator).
+    pub(crate) fn code_format(self) -> Option<crate::generator::CodeFormat> {
+        use crate::generator::CodeFormat;
+        Some(match self {
+            ExportKind::Cpp => CodeFormat::CppHeader,
+            ExportKind::Rust => CodeFormat::RustStruct,
+            ExportKind::Defines => CodeFormat::DefineOffsets,
+            ExportKind::CSharp => CodeFormat::CSharpStruct,
+            ExportKind::Python => CodeFormat::PythonCtypes,
+            ExportKind::Xml => return None,
+        })
+    }
+
+    /// The save-file dialog filter for this export (the C++
+    /// `codeFormatFileFilter(fmt)`; main.cpp:5758). XML uses a fixed ReClass-XML
+    /// filter; everything else routes through
+    /// [`code_format_file_filter`](crate::generator::code_format_file_filter).
+    pub(crate) fn file_filter(self) -> &'static str {
+        match self.code_format() {
+            Some(fmt) => crate::generator::code_format_file_filter(fmt),
+            None => "ReClass XML (*.xml);;All Files (*)",
+        }
+    }
+
+    /// Render the active document's tree to this format. Mirrors the C++
+    /// `exportToFile` (main.cpp:5752-5774), which always calls `renderCodeAll`
+    /// (the **full SDK** — every root struct, ignoring the current view root) with
+    /// the document's `typeAliases` and the persisted `generatorAsserts` flag.
+    /// Returns `None` when nothing was produced.
+    pub(crate) fn render(
+        self,
+        tree: &crate::core::NodeTree,
+        aliases: Option<&crate::generator::TypeAliases>,
+        emit_asserts: bool,
+    ) -> Option<String> {
+        let Some(fmt) = self.code_format() else {
+            return Self::render_xml(tree);
+        };
+        let text = crate::generator::render_code_all(fmt, tree, aliases, emit_asserts);
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// ReClass XML export goes through the importer module's exporter, which is
+    /// file-based — render to a temp file, read it back as the export text.
+    /// Gated on the `imports` feature.
+    #[cfg(feature = "imports")]
+    fn render_xml(tree: &crate::core::NodeTree) -> Option<String> {
+        let mut path = std::env::temp_dir();
+        path.push("reclass-export.xml");
+        crate::imports::export_reclass_xml(tree, &path).ok()?;
+        let text = std::fs::read_to_string(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        text.filter(|t| !t.trim().is_empty())
+    }
+
+    #[cfg(not(feature = "imports"))]
+    fn render_xml(_tree: &crate::core::NodeTree) -> Option<String> {
+        None
+    }
+}
+
 impl super::MainWindow {
     // (section comments + methods moved verbatim from the original impl)
     // ── File: open / import (native file pickers) ───────────────────────────
