@@ -1219,7 +1219,7 @@ impl ScannerPanel {
     fn copy_selected(&mut self, cx: &mut Context<Self>) {
         if let Some(address) = self.selected_address(cx) {
             cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{address:X}")));
-            self.status = format!("Copied 0x{address:X}");
+            self.status = format!("Copied: 0x{address:X}");
             cx.notify();
         }
     }
