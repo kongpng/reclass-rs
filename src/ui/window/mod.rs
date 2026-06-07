@@ -107,6 +107,12 @@ pub(crate) use lifecycle::{
     dirty_doc_name, unique_dirty_names, unsaved_changes_text, window_title_string,
 };
 
+// The menu-tree mutation helpers live in `menus.rs` (beside `rebuild_menus`, the
+// sole non-test caller, which uses them bare via `use super::*`); re-export so the
+// tests module's `super::relabel_command` / `super::inject_plugin_menu_items`
+// imports keep resolving.
+pub(crate) use menus::{inject_plugin_menu_items, relabel_command};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DiskSettings — the disk-backed app settings store (the QSettings replacement)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -520,26 +526,6 @@ enum RightDockPanel {
     Bookmarks,
 }
 
-/// Relabel the first leaf with the given command id, in place (used for the
-/// dynamic MCP Start/Stop label). Recurses into submenus.
-fn relabel_command(nodes: &mut [crate::ui::pickers::commandpalette::MenuNode], command: &str, new_label: &str) {
-    use crate::ui::pickers::commandpalette::MenuNode;
-    for node in nodes {
-        match node {
-            MenuNode::Item {
-                label, command: c, ..
-            } if c.as_str() == command => {
-                *label = new_label.to_string();
-                return;
-            }
-            MenuNode::Submenu { children, .. } => {
-                relabel_command(children, command, new_label);
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Map a plugin [`DockSide`](crate::plugin::DockSide) to the gpui-component
 /// [`DockPlacement`] a contributed panel mounts at (design §6 Phase 2). The demo's
 /// panel is `Right`, so it tabs in beside the Modules/Bookmarks right dock.
@@ -548,39 +534,6 @@ fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement {
         crate::plugin::DockSide::Left => DockPlacement::Left,
         crate::plugin::DockSide::Right => DockPlacement::Right,
         crate::plugin::DockSide::Bottom => DockPlacement::Bottom,
-    }
-}
-
-/// Inject one menu item per enabled plugin `Command` whose slot surfaces in the
-/// menu bar (`Menu`/`SourceMenu`/`Palette`) into the `&Plugins` submenu's children
-/// (design §6 Phase 2). Pure (no gpui) so the byte-identical-when-empty parity is
-/// unit-testable: with an empty `commands` list the tree is returned untouched
-/// (the `&Plugins` submenu keeps exactly its static `[Manage Plugins…]` row).
-/// `EditorContext`/`Toolbar` slots are not menu-bar surfaces, so they are skipped
-/// here (they'd be injected into the editor context menu / toolbar instead — those
-/// surfaces are intended-deferred for plugin contributions).
-fn inject_plugin_menu_items(
-    tree: &mut [crate::ui::pickers::commandpalette::MenuNode],
-    commands: &[crate::plugin::UiContribution],
-) {
-    use crate::ui::pickers::commandpalette::MenuNode;
-    use crate::plugin::{CommandSlot, UiContribution};
-    // Find the &Plugins submenu by its label (the static menu tree carries it).
-    let Some(MenuNode::Submenu { children, .. }) = tree
-        .iter_mut()
-        .find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == "&Plugins"))
-    else {
-        return;
-    };
-    for c in commands {
-        if let UiContribution::Command { id, title, slot } = c {
-            if matches!(
-                slot,
-                CommandSlot::Menu | CommandSlot::SourceMenu | CommandSlot::Palette
-            ) {
-                children.push(MenuNode::item(title, "", id));
-            }
-        }
     }
 }
 

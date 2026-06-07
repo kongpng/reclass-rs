@@ -5,6 +5,59 @@
 
 use super::*;
 
+/// Relabel the first leaf with the given command id, in place (used for the
+/// dynamic MCP Start/Stop label). Recurses into submenus.
+pub(crate) fn relabel_command(nodes: &mut [crate::ui::pickers::commandpalette::MenuNode], command: &str, new_label: &str) {
+    use crate::ui::pickers::commandpalette::MenuNode;
+    for node in nodes {
+        match node {
+            MenuNode::Item {
+                label, command: c, ..
+            } if c.as_str() == command => {
+                *label = new_label.to_string();
+                return;
+            }
+            MenuNode::Submenu { children, .. } => {
+                relabel_command(children, command, new_label);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Inject one menu item per enabled plugin `Command` whose slot surfaces in the
+/// menu bar (`Menu`/`SourceMenu`/`Palette`) into the `&Plugins` submenu's children
+/// (design §6 Phase 2). Pure (no gpui) so the byte-identical-when-empty parity is
+/// unit-testable: with an empty `commands` list the tree is returned untouched
+/// (the `&Plugins` submenu keeps exactly its static `[Manage Plugins…]` row).
+/// `EditorContext`/`Toolbar` slots are not menu-bar surfaces, so they are skipped
+/// here (they'd be injected into the editor context menu / toolbar instead — those
+/// surfaces are intended-deferred for plugin contributions).
+pub(crate) fn inject_plugin_menu_items(
+    tree: &mut [crate::ui::pickers::commandpalette::MenuNode],
+    commands: &[crate::plugin::UiContribution],
+) {
+    use crate::ui::pickers::commandpalette::MenuNode;
+    use crate::plugin::{CommandSlot, UiContribution};
+    // Find the &Plugins submenu by its label (the static menu tree carries it).
+    let Some(MenuNode::Submenu { children, .. }) = tree
+        .iter_mut()
+        .find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == "&Plugins"))
+    else {
+        return;
+    };
+    for c in commands {
+        if let UiContribution::Command { id, title, slot } = c {
+            if matches!(
+                slot,
+                CommandSlot::Menu | CommandSlot::SourceMenu | CommandSlot::Palette
+            ) {
+                children.push(MenuNode::item(title, "", id));
+            }
+        }
+    }
+}
+
 /// Generate a thin global-key-binding handler routing a gpui action to its MENU
 /// CONTRACT command via `run_menu_command`. Emits `pub(super)` so the generated
 /// handlers stay visible to `MainWindow::new`'s `.on_action` registrations in the
