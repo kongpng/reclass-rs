@@ -16,6 +16,12 @@ use crate::core::tree::NodeTree;
 
 use super::{largest_hex_cell_for_run, resolve_pending_refs, ImportError, PendingRef};
 
+/// Defensive cap on nested `union`/struct recursion. Pathological input (e.g.
+/// tens of thousands of nested `union {`) would otherwise overflow the stack
+/// via the mutually-recursive parse/build descent. Set well above any
+/// realistic hand-written nesting depth so legitimate inputs are unaffected.
+const MAX_NEST_DEPTH: usize = 128;
+
 // ── Built-in type alias table (cpp:10-124) ──
 
 /// `struct TypeInfo {NodeKind kind; int size;}` (`import_source.cpp:12-15`).
@@ -688,7 +694,7 @@ impl<'a> Parser<'a> {
             }
 
             if self.check_ident("union") {
-                self.parse_union(ps);
+                self.parse_union(ps, 0);
                 continue;
             }
 
@@ -767,7 +773,14 @@ impl<'a> Parser<'a> {
     }
 
     // parseUnion (cpp:603-682)
-    fn parse_union(&mut self, ps: &mut ParsedStruct) {
+    fn parse_union(&mut self, ps: &mut ParsedStruct, depth: usize) {
+        // Defensive: bound recursion against pathologically nested unions.
+        // Advance the cursor past this union (not a bare return) so outer
+        // parse loops still make progress and terminate.
+        if depth > MAX_NEST_DEPTH {
+            self.skip_to_semi_or_brace();
+            return;
+        }
         self.advance(); // skip "union"
         self.skip_align_macro();
 
@@ -788,7 +801,7 @@ impl<'a> Parser<'a> {
             // Nested unions
             if self.check_ident("union") {
                 let mut tmp = ParsedStruct::default();
-                self.parse_union(&mut tmp);
+                self.parse_union(&mut tmp, depth + 1);
                 for f in tmp.fields {
                     union_field.union_members.push(f);
                 }
@@ -1475,8 +1488,14 @@ fn build_fields(
     ctx: &mut BuildContext,
     parent_id: u64,
     base_offset: i32,
+    depth: usize,
     fields: &[ParsedField],
 ) {
+    // Defensive: bound recursion against pathologically nested unions so a
+    // deep parse tree cannot overflow the stack while building nodes.
+    if depth > MAX_NEST_DEPTH {
+        return;
+    }
     let mut computed_offset = 0i32;
 
     let mut fi = 0usize;
@@ -1543,7 +1562,7 @@ fn build_fields(
             let abs_union_offset = base_offset + union_offset;
             for member in &field.union_members {
                 let single = std::slice::from_ref(member);
-                build_fields(tree, ctx, union_id, abs_union_offset, single);
+                build_fields(tree, ctx, union_id, abs_union_offset, depth + 1, single);
             }
 
             let union_span = tree.struct_span(union_id);
@@ -1939,7 +1958,7 @@ pub fn import_from_source(source: &str, pointer_size: i32) -> Result<NodeTree, I
         let struct_id = tree.nodes[struct_idx].id;
         ctx.class_ids.insert(ps.name.clone(), struct_id);
 
-        build_fields(&mut tree, &mut ctx, struct_id, 0, &ps.fields);
+        build_fields(&mut tree, &mut ctx, struct_id, 0, 0, &ps.fields);
 
         // Union: all direct children overlap at offset 0 (cpp:1588-1592)
         if ps.keyword == "union" {
@@ -2158,5 +2177,45 @@ mod tests {
         // 1+2+3 = 6 bits -> 1 byte -> Hex8 container.
         assert_eq!(tree.nodes[kids[0]].element_kind, NodeKind::Hex8);
         assert_eq!(tree.nodes[kids[0]].bitfield_members.len(), 3);
+    }
+
+    #[test]
+    fn deeply_nested_unions_do_not_overflow_stack() {
+        // Regression for the defensive depth cap: tens of thousands of nested
+        // `union {` previously drove the mutually-recursive parse_union / build_fields
+        // descent off the end of the stack (SIGABRT). The MAX_NEST_DEPTH guard must
+        // turn this pathological input into a clean, finite import instead of aborting
+        // the process. We only require that it does not crash and that the call
+        // returns; the truncated shape past the cap is unspecified.
+        const LEVELS: usize = 50_000;
+        let mut src = String::from("struct S {\n");
+        for _ in 0..LEVELS {
+            src.push_str("union {\n");
+        }
+        src.push_str("int leaf;\n");
+        for _ in 0..LEVELS {
+            src.push_str("};\n");
+        }
+        src.push_str("};");
+
+        // Must not panic / SIGABRT. Either Ok or a graceful Err is acceptable;
+        // the point is that the bounded recursion terminates without a stack overflow.
+        let _ = import_from_source(&src, 8);
+    }
+
+    #[test]
+    fn shallow_nested_union_happy_path_unchanged() {
+        // Pin that the depth cap leaves ordinary nesting untouched: a single
+        // nested union still builds its member field as before.
+        let tree = import_from_source(
+            "struct S {\n  union {\n    union {\n      int a;\n    };\n  };\n};",
+            8,
+        )
+        .expect("normal nested unions must import cleanly");
+        // The root has exactly one direct child: the outer union container.
+        let kids = tree.children_of(tree.nodes[0].id);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(tree.nodes[kids[0]].kind, NodeKind::Struct);
+        assert_eq!(tree.nodes[kids[0]].class_keyword, "union");
     }
 }
