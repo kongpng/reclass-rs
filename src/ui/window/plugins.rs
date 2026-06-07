@@ -9,6 +9,23 @@
 // ancestor's private `use` aliases — so no further imports are needed here.
 use super::*;
 
+/// Map a plugin [`DockSide`](crate::plugin::DockSide) to the gpui-component
+/// [`DockPlacement`] a contributed panel mounts at (design §6 Phase 2). The demo's
+/// panel is `Right`, so it tabs in beside the Modules/Bookmarks right dock.
+pub(crate) fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement {
+    match side {
+        crate::plugin::DockSide::Left => DockPlacement::Left,
+        crate::plugin::DockSide::Right => DockPlacement::Right,
+        crate::plugin::DockSide::Bottom => DockPlacement::Bottom,
+    }
+}
+
+/// A command's own toast, unless the live host already surfaced it (dedup the
+/// `CommandResult.toast` against the host's drained toast list).
+pub(super) fn surface_command_toast(res_toast: Option<String>, already: &[String]) -> Option<String> {
+    res_toast.filter(|m| !already.iter().any(|t| t == m))
+}
+
 impl super::MainWindow {
     // ── F3 live declarative-UI host (design §6 Phase 2) ──
     //

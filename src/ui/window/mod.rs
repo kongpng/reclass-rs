@@ -113,6 +113,12 @@ pub(crate) use lifecycle::{
 // imports keep resolving.
 pub(crate) use menus::{inject_plugin_menu_items, relabel_command};
 
+// The plugin-host dock-side mapper lives in `plugins.rs` (beside `mount_plugin_panels`,
+// the sole non-test caller, which uses it bare via `use super::*`); re-export so the
+// tests module's `super::dock_placement_for` imports keep resolving.
+// (`surface_command_toast` stays private to plugins.rs — no test/external refs.)
+pub(crate) use plugins::dock_placement_for;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DiskSettings — the disk-backed app settings store (the QSettings replacement)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -526,27 +532,10 @@ enum RightDockPanel {
     Bookmarks,
 }
 
-/// Map a plugin [`DockSide`](crate::plugin::DockSide) to the gpui-component
-/// [`DockPlacement`] a contributed panel mounts at (design §6 Phase 2). The demo's
-/// panel is `Right`, so it tabs in beside the Modules/Bookmarks right dock.
-fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement {
-    match side {
-        crate::plugin::DockSide::Left => DockPlacement::Left,
-        crate::plugin::DockSide::Right => DockPlacement::Right,
-        crate::plugin::DockSide::Bottom => DockPlacement::Bottom,
-    }
-}
-
 /// The GitHub URL the Help ▸ About dialog advertises (the C++ About dialog's
 /// "Open GitHub" button opens `https://github.com/IChooseYou/Reclass`;
 /// main.cpp:4434). Was wrongly `github.com/reclassnet/reclass` (item 8).
 const ABOUT_GITHUB_URL: &str = "https://github.com/IChooseYou/Reclass";
-
-/// A command's own toast, unless the live host already surfaced it (dedup the
-/// `CommandResult.toast` against the host's drained toast list).
-fn surface_command_toast(res_toast: Option<String>, already: &[String]) -> Option<String> {
-    res_toast.filter(|m| !already.iter().any(|t| t == m))
-}
 
 impl MainWindow {
     /// Construct the main window view: build the [`DockArea`], assemble the
