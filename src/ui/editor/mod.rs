@@ -3711,7 +3711,7 @@ impl RcxEditor {
         let rows: Vec<minimap::MinimapRow> = result
             .meta
             .iter()
-            .map(|lm| minimap_row_for(lm, &palette))
+            .map(|lm| minimap::minimap_row_for(lm, &palette))
             .collect();
         let total = rows.len();
         let (visible_start, visible_end) = self.minimap_visible_range(total);
@@ -5457,46 +5457,6 @@ impl RcxEditor {
 
     // ── Change Type → TypeSelector popup (contract: menus agent PROVIDES) ──
 
-}
-
-/// Reduce a composed [`LineMeta`] to a minimap bar: a fill color (by node kind /
-/// line role) plus indent + width fractions so the overview reads the tree shape
-/// (item 4). Chrome rows (command/footer) render as faint full-width bars; node
-/// rows tint by kind (struct/array/pointer/fnptr/hex/value) and inset by depth.
-/// Pure (palette in, bar out) — unit-tested.
-fn minimap_row_for(lm: &LineMeta, palette: &EditorPalette) -> minimap::MinimapRow {
-    use crate::core::NodeKind::*;
-    // Depth → left indent fraction (cap so very deep rows still show a bar).
-    let indent = (lm.depth.max(0) as f32 * 0.08).min(0.5);
-    let (color, width) = match lm.line_kind {
-        LineKind::CommandRow => (with_alpha(palette.class_name, 0.85), 0.9),
-        LineKind::Footer => (with_alpha(palette.dim, 0.5), 0.5),
-        LineKind::Header => {
-            // Struct/array container headers: the loud type hue, near-full width.
-            let c = match lm.node_kind {
-                Array => palette.type_fg,
-                _ => palette.class_name,
-            };
-            (c, 0.85)
-        }
-        _ => {
-            // Field rows: color by kind, matching the gutter icon semantics.
-            let c = match lm.node_kind {
-                Struct => palette.class_name,
-                Array => palette.type_fg,
-                Pointer32 | Pointer64 => palette.keyword,
-                FuncPtr32 | FuncPtr64 => palette.fnptr_fg,
-                Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => palette.dim,
-                _ => palette.value_fg,
-            };
-            (c, 0.7)
-        }
-    };
-    minimap::MinimapRow {
-        color: with_alpha(color, color.a.max(0.7)),
-        indent,
-        width: (width - indent * 0.5).max(0.15),
-    }
 }
 
 /// A scalar type family for the Convert submenu (item 9): the requested int /

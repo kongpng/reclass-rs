@@ -15,6 +15,10 @@
 
 use gpui::*;
 
+use super::palette::EditorPalette;
+use crate::core::{LineKind, LineMeta, NodeKind};
+use crate::ui::design::color::with_alpha;
+
 /// One minimap bar: a single composed line reduced to a fill color + an indent
 /// fraction (so nested rows read as shorter, left-inset bars, like Zed's minimap
 /// glyph density). Built by the host from the line metas.
@@ -27,6 +31,46 @@ pub struct MinimapRow {
     pub indent: f32,
     /// `[0,1]` width fraction of the bar (how much of the column the bar spans).
     pub width: f32,
+}
+
+/// Reduce a composed [`LineMeta`] to a minimap bar: a fill color (by node kind /
+/// line role) plus indent + width fractions so the overview reads the tree shape
+/// (item 4). Chrome rows (command/footer) render as faint full-width bars; node
+/// rows tint by kind (struct/array/pointer/fnptr/hex/value) and inset by depth.
+/// Pure (palette in, bar out) — unit-tested.
+pub(crate) fn minimap_row_for(lm: &LineMeta, palette: &EditorPalette) -> MinimapRow {
+    use NodeKind::*;
+    // Depth → left indent fraction (cap so very deep rows still show a bar).
+    let indent = (lm.depth.max(0) as f32 * 0.08).min(0.5);
+    let (color, width) = match lm.line_kind {
+        LineKind::CommandRow => (with_alpha(palette.class_name, 0.85), 0.9),
+        LineKind::Footer => (with_alpha(palette.dim, 0.5), 0.5),
+        LineKind::Header => {
+            // Struct/array container headers: the loud type hue, near-full width.
+            let c = match lm.node_kind {
+                Array => palette.type_fg,
+                _ => palette.class_name,
+            };
+            (c, 0.85)
+        }
+        _ => {
+            // Field rows: color by kind, matching the gutter icon semantics.
+            let c = match lm.node_kind {
+                Struct => palette.class_name,
+                Array => palette.type_fg,
+                Pointer32 | Pointer64 => palette.keyword,
+                FuncPtr32 | FuncPtr64 => palette.fnptr_fg,
+                Hex8 | Hex16 | Hex32 | Hex64 | Hex128 => palette.dim,
+                _ => palette.value_fg,
+            };
+            (c, 0.7)
+        }
+    };
+    MinimapRow {
+        color: with_alpha(color, color.a.max(0.7)),
+        indent,
+        width: (width - indent * 0.5).max(0.15),
+    }
 }
 
 /// Resolved colors for the minimap chrome (column background + viewport box),
