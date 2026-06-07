@@ -38,10 +38,16 @@ pub fn last_selectable(mask: &[bool]) -> Option<usize> {
 /// direction, the current selection is kept.
 pub fn step(mask: &[bool], sel: Option<usize>, dir: i32) -> Option<usize> {
     if dir > 0 {
-        let from = sel.unwrap_or(0);
-        match next_selectable(mask, from, dir) {
+        // C++ `nextSelectableRow` (sourcechooserpopup.cpp:700-707) is INCLUSIVE
+        // of `from`, and the first Down from the unselected filter calls it with
+        // `from = 0` (sourcechooserpopup.cpp:623). So when nothing is selected,
+        // seed from the first selectable row inclusively — landing ON a selectable
+        // row 0 (the default popup's 'File') instead of skipping past it.
+        if sel.is_none() {
+            return first_selectable(mask);
+        }
+        match next_selectable(mask, sel.unwrap(), dir) {
             Some(n) => Some(n),
-            None if sel.is_none() => first_selectable(mask),
             None => sel,
         }
     } else {
@@ -109,6 +115,18 @@ mod tests {
         assert_eq!(step(M, None, 1), Some(1));
         assert_eq!(step(M, Some(1), 1), Some(2));
         assert_eq!(step(M, Some(5), 1), Some(5)); // at end, kept
+    }
+
+    #[test]
+    fn step_down_from_unselected_includes_a_selectable_row_0() {
+        // C++ nextSelectableRow(0, +1) is INCLUSIVE of row 0
+        // (sourcechooserpopup.cpp:700-707, called with from=0 at :623). When the
+        // first row IS selectable (the default SourceChooser popup's 'File'), the
+        // first Down must land ON it, not skip to row 1.
+        const SEL0: &[bool] = &[true, true, false, true];
+        assert_eq!(step(SEL0, None, 1), Some(0));
+        // The second Down then advances off row 0.
+        assert_eq!(step(SEL0, Some(0), 1), Some(1));
     }
 
     #[test]
