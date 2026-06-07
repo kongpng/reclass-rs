@@ -93,6 +93,12 @@ pub(crate) use files::{ExportKind, ImportKind};
 // globs and the tests module.
 pub(crate) use documents::{seed_root_doc, RootKind};
 
+// The pure tree/file-sniff helpers live in `helpers.rs` (beside `path_is_reclass_xml`,
+// which calls `sniff_is_reclass_xml`); re-export so `root_name_for_title` keeps
+// resolving for `dirty_doc_name` here + the sibling files/workspace/lifecycle globs,
+// and both keep resolving for the tests module's `super::` imports.
+pub(crate) use helpers::{root_name_for_title, sniff_is_reclass_xml};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DiskSettings — the disk-backed app settings store (the QSettings replacement)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -570,38 +576,6 @@ fn inject_plugin_menu_items(
     }
 }
 
-/// The struct name of the active **view root** for the window title (the C++
-/// `rootName(tree, viewRootId())`; main.cpp:5180). Climbs from the view-root
-/// node to its top-level parent and returns that node's `struct_type_name`
-/// (falling back to its `name`). Mirrors the status-bar's `root_name_of` climb.
-/// Returns an empty string when the index is out of range. Pure; unit-tested.
-fn root_name_for_title(tree: &crate::core::NodeTree, view_root_id: u64) -> String {
-    let mut cur = tree.index_of_id(view_root_id);
-    // A `0`/unknown view root means "the whole document" — start at the first
-    // top-level node so a fresh document still names its root struct.
-    if cur < 0 {
-        cur = tree
-            .nodes
-            .iter()
-            .position(|n| n.parent_id == 0)
-            .map_or(-1, |i| i as i32);
-    }
-    while cur >= 0 {
-        let Some(n) = tree.nodes.get(cur as usize) else {
-            break;
-        };
-        if n.parent_id == 0 {
-            return if n.struct_type_name.is_empty() {
-                n.name.clone()
-            } else {
-                n.struct_type_name.clone()
-            };
-        }
-        cur = tree.index_of_id(n.parent_id);
-    }
-    String::new()
-}
-
 /// The unsaved-changes display name for one dirty document (the C++ `closeEvent`
 /// per-doc name rule; main.cpp:8991-8993): the file name when the document has a
 /// path, else the view-root struct name. Pure; unit-tested. Returns `None` for a
@@ -625,19 +599,6 @@ fn dirty_doc_name(
         None => root_name_for_title(tree, view_root_id),
     };
     Some(name)
-}
-
-/// Detect a ReClass-XML file from its leading bytes (the C++ `project_open`
-/// signature sniff; main.cpp:6129): after trimming leading ASCII whitespace, the
-/// head starts with `<?xml` or `<ReClass`. The C++ used
-/// `head.trimmed().startsWith(...)` — `QByteArray::trimmed()` strips both ends,
-/// but only the leading run matters for a prefix test, so trimming the start is
-/// equivalent. Chosen by content, not by file *name*: a `.rcx` carrying XML is
-/// imported as XML and an `.xml` carrying JSON falls through to the native JSON
-/// load (the headline of this gap). Pure; unit-tested.
-fn sniff_is_reclass_xml(head: &[u8]) -> bool {
-    let trimmed = head.trim_ascii_start();
-    trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<ReClass")
 }
 
 /// Assemble the OS window-title string from a root name + dirty flag (the C++
