@@ -76,6 +76,12 @@ mod startpage;
 mod view;
 mod workspace;
 
+// The editor view-option types live in `view.rs` (beside the View-menu logic);
+// re-export so `super::ViewOpt`/`super::ViewOptions` keep resolving for the
+// `MainWindow::view_opts` field, the sibling menus/layout/workspace globs, and
+// the tests module.
+pub(crate) use view::{ViewOpt, ViewOptions};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DiskSettings — the disk-backed app settings store (the QSettings replacement)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -487,133 +493,6 @@ pub struct MainWindow {
 enum RightDockPanel {
     Modules,
     Bookmarks,
-}
-
-/// The seven checkable View-menu options (the C++ View menu defaults; the
-/// `[check]` items in the MENU CONTRACT). All default **on** except comments.
-/// `compact_columns`/`relative_offsets`/`hover_effects`/`minimap` are
-/// render-level (the editor view); `tree_lines`/`type_hints`/`show_comments` are
-/// compose flags (threaded through the controller's recompose).
-#[derive(Clone, Copy, Debug)]
-struct ViewOptions {
-    compact_columns: bool,
-    tree_lines: bool,
-    relative_offsets: bool,
-    type_hints: bool,
-    show_comments: bool,
-    hover_effects: bool,
-    minimap: bool,
-}
-
-impl Default for ViewOptions {
-    fn default() -> Self {
-        // Match the C++ persisted QSettings defaults (main.cpp:1336-1411):
-        //   compactColumns=true, treeLines=true, relativeOffsets=true,
-        //   typeHints=FALSE, showComments=false, hoverEffects=true, minimap=FALSE.
-        // The previous Rust defaults wrongly turned typeHints + minimap ON.
-        ViewOptions {
-            compact_columns: true,
-            tree_lines: true,
-            relative_offsets: true,
-            type_hints: false,
-            show_comments: false,
-            hover_effects: true,
-            minimap: false,
-        }
-    }
-}
-
-impl ViewOptions {
-    /// Load the persisted view-option toggles from the disk store, falling back
-    /// to the C++ defaults for any unset key (the C++ `settings.value(key,
-    /// default).toBool()` pattern; main.cpp:1336-1411).
-    fn load(store: &DiskSettings) -> Self {
-        let d = ViewOptions::default();
-        ViewOptions {
-            compact_columns: store.get_bool(settings_keys::COMPACT_COLUMNS, d.compact_columns),
-            tree_lines: store.get_bool(settings_keys::TREE_LINES, d.tree_lines),
-            relative_offsets: store.get_bool(settings_keys::RELATIVE_OFFSETS, d.relative_offsets),
-            type_hints: store.get_bool(settings_keys::TYPE_HINTS, d.type_hints),
-            show_comments: store.get_bool(settings_keys::SHOW_COMMENTS, d.show_comments),
-            hover_effects: store.get_bool(settings_keys::HOVER_EFFECTS, d.hover_effects),
-            minimap: store.get_bool(settings_keys::MINIMAP, d.minimap),
-        }
-    }
-
-    /// The QSettings key one option persists under (the C++ `setValue(key, …)`).
-    fn key(opt: ViewOpt) -> &'static str {
-        match opt {
-            ViewOpt::CompactColumns => settings_keys::COMPACT_COLUMNS,
-            ViewOpt::TreeLines => settings_keys::TREE_LINES,
-            ViewOpt::RelativeOffsets => settings_keys::RELATIVE_OFFSETS,
-            ViewOpt::TypeHints => settings_keys::TYPE_HINTS,
-            ViewOpt::ShowComments => settings_keys::SHOW_COMMENTS,
-            ViewOpt::HoverEffects => settings_keys::HOVER_EFFECTS,
-            ViewOpt::Minimap => settings_keys::MINIMAP,
-        }
-    }
-
-    fn get(&self, opt: ViewOpt) -> bool {
-        match opt {
-            ViewOpt::CompactColumns => self.compact_columns,
-            ViewOpt::TreeLines => self.tree_lines,
-            ViewOpt::RelativeOffsets => self.relative_offsets,
-            ViewOpt::TypeHints => self.type_hints,
-            ViewOpt::ShowComments => self.show_comments,
-            ViewOpt::HoverEffects => self.hover_effects,
-            ViewOpt::Minimap => self.minimap,
-        }
-    }
-
-    fn set(&mut self, opt: ViewOpt, value: bool) {
-        match opt {
-            ViewOpt::CompactColumns => self.compact_columns = value,
-            ViewOpt::TreeLines => self.tree_lines = value,
-            ViewOpt::RelativeOffsets => self.relative_offsets = value,
-            ViewOpt::TypeHints => self.type_hints = value,
-            ViewOpt::ShowComments => self.show_comments = value,
-            ViewOpt::HoverEffects => self.hover_effects = value,
-            ViewOpt::Minimap => self.minimap = value,
-        }
-    }
-}
-
-/// The seven checkable editor view options, used to drive a single
-/// [`MainWindow::toggle_view_option`] dispatch + the menu ✓ sync.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ViewOpt {
-    CompactColumns,
-    TreeLines,
-    RelativeOffsets,
-    TypeHints,
-    ShowComments,
-    HoverEffects,
-    Minimap,
-}
-
-impl ViewOpt {
-    const ALL: [ViewOpt; 7] = [
-        ViewOpt::CompactColumns,
-        ViewOpt::TreeLines,
-        ViewOpt::RelativeOffsets,
-        ViewOpt::TypeHints,
-        ViewOpt::ShowComments,
-        ViewOpt::HoverEffects,
-        ViewOpt::Minimap,
-    ];
-
-    /// The MENU CONTRACT command id whose ✓ this option drives.
-    fn command_id(self) -> &'static str {
-        match self {
-            ViewOpt::CompactColumns => "view.compact_columns",
-            ViewOpt::TreeLines => "view.tree_lines",
-            ViewOpt::RelativeOffsets => "view.relative_offsets",
-            ViewOpt::TypeHints => "view.type_hints",
-            ViewOpt::ShowComments => "view.comments",
-            ViewOpt::HoverEffects => "view.hover",
-            ViewOpt::Minimap => "view.minimap",
-        }
-    }
 }
 
 /// File ▸ Import ▸ … target — picks the importer + the file-picker prompt text.
