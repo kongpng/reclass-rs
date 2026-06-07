@@ -8,9 +8,6 @@
 //! a `List` with a custom `render_item`. This module ports the **load-bearing pure
 //! logic** (unit-tested, the parts the C++ tests lock) + a popover view:
 //!
-//! - [`parse_type_spec`] / [`TypeSpec`] — the type-text parser (`parseTypeSpec`):
-//!   `"int32_t[10]"` → array 10, `"Ball*"`/`"Ball**"` → pointer depth 1/2,
-//!   `"int32_t[0]"` → array 0. Test-locked (`test_type_selector.cpp`).
 //! - [`kind_group_for`] / [`KindGroup`] — `kindGroupFor(NodeKind)` → the colored
 //!   group bucket (Hex/Int/Float/Ptr/Vec/Str/Ctr) used for sorting + tinting.
 //! - [`kind_group_color`] — `kindGroupColor` against our [`Theme`] semantic colors.
@@ -63,64 +60,6 @@ impl TypePopupMode {
     pub fn allows_modifiers(self) -> bool {
         matches!(self, TypePopupMode::FieldType | TypePopupMode::ArrayElement)
     }
-}
-
-/// `struct TypeSpec` (`typeselectorpopup.h:59`) — a parsed type text.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct TypeSpec {
-    /// The base type name (everything before the modifier suffix).
-    pub base_name: String,
-    /// Whether a pointer suffix (`*`/`**`) was present.
-    pub is_pointer: bool,
-    /// Pointer depth: 1 for `*`, 2 for `**`, 0 if not a pointer.
-    pub ptr_depth: i32,
-    /// Array element count (0 = not an array, also `[0]`).
-    pub array_count: i32,
-}
-
-/// `parseTypeSpec(text)` (`typeselectorpopup.cpp:32-61`).
-///
-/// Trim. If it ends with `*`: pointer, chop, depth 1; if then ends with `*`:
-/// chop, depth 2; base = remaining (trimmed). Else if `[` at index > 0 and ends
-/// `]`: base = left of `[`, parse the count — **only `count > 0` sets
-/// `array_count`** (so `[0]` → 0). Else base = whole string.
-pub fn parse_type_spec(text: &str) -> TypeSpec {
-    let mut spec = TypeSpec::default();
-    let s = text.trim();
-    if s.is_empty() {
-        return spec;
-    }
-
-    // Pointer suffix.
-    if let Some(stripped) = s.strip_suffix('*') {
-        spec.is_pointer = true;
-        spec.ptr_depth = 1;
-        let stripped = if let Some(s2) = stripped.strip_suffix('*') {
-            spec.ptr_depth = 2;
-            s2
-        } else {
-            stripped
-        };
-        spec.base_name = stripped.trim().to_string();
-        return spec;
-    }
-
-    // Array suffix: "base[count]".
-    if let Some(bracket) = s.find('[') {
-        if bracket > 0 && s.ends_with(']') {
-            spec.base_name = s[..bracket].trim().to_string();
-            let count_str = &s[bracket + 1..s.len() - 1];
-            if let Ok(count) = count_str.trim().parse::<i32>() {
-                if count > 0 {
-                    spec.array_count = count;
-                }
-            }
-            return spec;
-        }
-    }
-
-    spec.base_name = s.to_string();
-    spec
 }
 
 /// The colored type-group buckets (`kindGroupFor` outputs; `typeselectorpopup`).
@@ -2193,9 +2132,10 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        kind_group_for, parse_type_spec, EntryKind, KindGroup, Modifier, SortMode, TypeEntry,
-        TypeModel, TypePopupMode,
+        kind_group_for, EntryKind, KindGroup, Modifier, SortMode, TypeEntry, TypeModel,
+        TypePopupMode,
     };
+    use crate::controller::parse_type_spec;
     use crate::core::kind::NodeKind;
 
     // ── parse_type_spec (test_type_selector.cpp) ──
