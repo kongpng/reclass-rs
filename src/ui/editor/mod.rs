@@ -36,6 +36,7 @@ use hover_popup::{HoverPopupKind, HoverPopupState};
 mod context_menu;
 mod debug_view;
 mod popups;
+pub(crate) use popups::push_recent_type_into;
 mod mouse;
 
 use gpui::prelude::FluentBuilder as _;
@@ -5562,19 +5563,6 @@ fn alt_kind_for(kind: NodeKind) -> NodeKind {
 /// kinds, exactly the C++ set (controller.cpp:3763): `Hex16..=Hex128`,
 /// `Int16..=UInt128`, `Float16`, `Float`, `Double`. Never Hex8, bool, ptr/fnptr,
 /// struct/array/enum/bitfield/string/vector.
-/// Push a picked type `display_name` to the FRONT of `list`, removing any prior
-/// occurrence (dedup-to-front) and capping the list at 8 entries — the C++
-/// `RcxController::pushRecentType` (controller.cpp:4819). Empty names are ignored.
-/// Free so it is unit-testable without a gpui view (item 3/11 recent-types list).
-fn push_recent_type_into(list: &mut Vec<String>, display_name: &str) {
-    if display_name.is_empty() {
-        return;
-    }
-    list.retain(|n| n != display_name);
-    list.insert(0, display_name.to_string());
-    list.truncate(8);
-}
-
 fn is_scalar_numeric_kind(kind: NodeKind) -> bool {
     use crate::core::NodeKind::*;
     matches!(

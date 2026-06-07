@@ -4,9 +4,22 @@
 //! `editor`, it keeps full access to RcxEditor's private fields and methods.
 
 use super::*;
-use super::{hex_kind_for_size, push_recent_type_into};
+use super::hex_kind_for_size;
 use crate::core::NodeKind;
 use gpui::*;
+
+/// Push a picked type `display_name` to the FRONT of `list`, removing any prior
+/// occurrence (dedup-to-front) and capping the list at 8 entries — the C++
+/// `RcxController::pushRecentType` (controller.cpp:4819). Empty names are ignored.
+/// Free so it is unit-testable without a gpui view (item 3/11 recent-types list).
+pub(crate) fn push_recent_type_into(list: &mut Vec<String>, display_name: &str) {
+    if display_name.is_empty() {
+        return;
+    }
+    list.retain(|n| n != display_name);
+    list.insert(0, display_name.to_string());
+    list.truncate(8);
+}
 
 /// The modifier the Type Selector should open pre-toggled with, so the footer
 /// preview reads the field's *current* shape instead of the bare base type.
