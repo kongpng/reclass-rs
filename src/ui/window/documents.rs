@@ -6,6 +6,100 @@
 
 use super::*;
 
+/// File ▸ New {Class / Struct / Enum} — the root kind a fresh document is seeded
+/// with (the C++ `project_new(keyword)`; main.cpp:4047). Determines the seed
+/// root's `class_keyword` and the tab title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootKind {
+    Class,
+    Struct,
+    Enum,
+}
+
+impl RootKind {
+    /// The C/C++ keyword stored on the seed root node ("class" / "struct" /
+    /// "enum"); the compose pipeline renders it verbatim.
+    pub(crate) fn class_keyword(self) -> &'static str {
+        match self {
+            RootKind::Class => "class",
+            RootKind::Struct => "struct",
+            RootKind::Enum => "enum",
+        }
+    }
+
+    /// The new tab's title — distinct per kind so the three commands don't all
+    /// land on an indistinguishable "Untitled".
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            RootKind::Class => "Untitled Class",
+            RootKind::Struct => "Untitled Struct",
+            RootKind::Enum => "Untitled Enum",
+        }
+    }
+
+    /// The seed root's type name.
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            RootKind::Class => "NewClass",
+            RootKind::Struct => "NewStruct",
+            RootKind::Enum => "NewEnum",
+        }
+    }
+}
+
+/// Build a fresh document seeded with a single root struct of the given kind
+/// (the C++ `project_new` template; main.cpp:6097 seeds a base address + a root
+/// struct with 16 hex fields). The root carries the kind's `class_keyword` so
+/// the rendered code reads `class` / `struct` / `enum`. Uses only the public
+/// [`NodeTree`] API — no logic-module change.
+pub(crate) fn seed_root_doc(kind: RootKind) -> crate::controller::RcxDocument {
+    use crate::core::{Node, NodeKind};
+    let mut doc = crate::controller::RcxDocument::new();
+    // The C++ template lands a sensible default base so addresses read naturally.
+    doc.tree.base_address = 0x0040_0000;
+    let is32 = doc.tree.pointer_size < 8;
+    let (hex_kind, stride) = if is32 {
+        (NodeKind::Hex32, 4)
+    } else {
+        (NodeKind::Hex64, 8)
+    };
+    let mut root = Node {
+        kind: NodeKind::Struct,
+        name: "instance".to_string(),
+        struct_type_name: kind.type_name().to_string(),
+        class_keyword: kind.class_keyword().to_string(),
+        parent_id: 0,
+        offset: 0,
+        ..Node::default()
+    };
+    root.id = doc.tree.reserve_id();
+    let root_id = root.id;
+    // File > New Enum seeds an enum root with 5 named members and NO hex fields
+    // (the C++ `buildEmptyStruct` enum branch, main.cpp:3981-4000). Without this the
+    // empty-members render gate (`is_enum() && !enum_members.is_empty()`) fails and
+    // the 16 hex children would render as ordinary fields on screen and in exports.
+    if matches!(kind, RootKind::Enum) {
+        root.enum_members = (0..5).map(|i| (format!("Member{i}"), i as i64)).collect();
+        doc.tree.add_node(root);
+        doc.tree.touch();
+        return doc;
+    }
+    doc.tree.add_node(root);
+    for i in 0..16 {
+        let mut c = Node {
+            kind: hex_kind,
+            name: format!("field_{:02x}", i * stride),
+            parent_id: root_id,
+            offset: i * stride,
+            ..Node::default()
+        };
+        c.id = doc.tree.reserve_id();
+        doc.tree.add_node(c);
+    }
+    doc.tree.touch();
+    doc
+}
+
 impl super::MainWindow {
     /// Open a fresh document tab seeded with the chosen root kind (the C++
     /// `project_new(keyword)` family: `newClass` passes "class", `newStruct`
