@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use crate::core::kind::NodeKind;
 use crate::core::NodeTree;
 use crate::provider::Provider;
 
@@ -105,6 +106,21 @@ pub(crate) fn resolve_pending_refs(
         if let Some(&id) = class_ids.get(&r.class_name) {
             tree.nodes[idx as usize].ref_id = id;
         }
+    }
+}
+
+/// Pick the largest evenly-dividing hex cell `(kind, cell_size)` for a `size`-byte
+/// run, walking the divisor ladder Hex64/32/16/8 (shared by `source.rs`'s
+/// `emit_hex_padding` and `reclass_xml.rs`'s custom-type expansion).
+pub(crate) fn largest_hex_cell_for_run(size: i32) -> (NodeKind, i32) {
+    if size >= 8 && size % 8 == 0 {
+        (NodeKind::Hex64, 8)
+    } else if size >= 4 && size % 4 == 0 {
+        (NodeKind::Hex32, 4)
+    } else if size >= 2 && size % 2 == 0 {
+        (NodeKind::Hex16, 2)
+    } else {
+        (NodeKind::Hex8, 1)
     }
 }
 

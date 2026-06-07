@@ -17,7 +17,7 @@ use crate::core::kind::{is_hex_node, kind_to_string, size_for_kind, NodeKind};
 use crate::core::node::Node;
 use crate::core::tree::NodeTree;
 
-use super::{resolve_pending_refs, ImportError, PendingRef};
+use super::{largest_hex_cell_for_run, resolve_pending_refs, ImportError, PendingRef};
 
 // ── Version-specific type maps (cpp:14-96) ──
 
@@ -369,15 +369,7 @@ fn handle_node<B: BufRead>(
 
     // (a) Custom type: expand to appropriate hex nodes (cpp:231-255)
     if is_custom_type(xml_type, version) && node_size > 0 {
-        let (hex_kind, hex_size) = if node_size >= 8 && node_size % 8 == 0 {
-            (NodeKind::Hex64, 8)
-        } else if node_size >= 4 && node_size % 4 == 0 {
-            (NodeKind::Hex32, 4)
-        } else if node_size >= 2 && node_size % 2 == 0 {
-            (NodeKind::Hex16, 2)
-        } else {
-            (NodeKind::Hex8, 1)
-        };
+        let (hex_kind, hex_size) = largest_hex_cell_for_run(node_size);
         let count = node_size / hex_size;
         for _ in 0..count {
             let n = Node {

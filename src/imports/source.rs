@@ -14,7 +14,7 @@ use crate::core::kind::{alignment_for, NodeKind};
 use crate::core::node::{BitfieldMember, Node};
 use crate::core::tree::NodeTree;
 
-use super::{resolve_pending_refs, ImportError, PendingRef};
+use super::{largest_hex_cell_for_run, resolve_pending_refs, ImportError, PendingRef};
 
 // ── Built-in type alias table (cpp:10-124) ──
 
@@ -1323,15 +1323,7 @@ fn emit_hex_padding(tree: &mut NodeTree, parent_id: u64, offset: i32, size: i32)
     if size <= 0 {
         return;
     }
-    let (hex_kind, hex_size) = if size >= 8 && size % 8 == 0 {
-        (NodeKind::Hex64, 8)
-    } else if size >= 4 && size % 4 == 0 {
-        (NodeKind::Hex32, 4)
-    } else if size >= 2 && size % 2 == 0 {
-        (NodeKind::Hex16, 2)
-    } else {
-        (NodeKind::Hex8, 1)
-    };
+    let (hex_kind, hex_size) = largest_hex_cell_for_run(size);
     let count = size / hex_size;
     for i in 0..count {
         let n = Node {
