@@ -1823,6 +1823,13 @@ pub fn extract_bits(
         _ => prov.read_u64(addr),
     };
     debug_assert!(u32::from(bit_offset) + u32::from(bit_width) <= 64);
+    // A crafted document can push bit_offset past the container width (the
+    // debug_assert documents the intended precondition but is a no-op in
+    // release); guard the shift so an out-of-range offset yields 0 rather than a
+    // debug-build panic / platform-dependent over-shift.
+    if bit_offset >= 64 {
+        return 0;
+    }
     if bit_width >= 64 {
         return container >> bit_offset;
     }

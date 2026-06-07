@@ -592,12 +592,17 @@ impl NodeTree {
     /// `int structSpan(...)` (`core.h:752-787`) — recursive, cycle-safe.
     pub fn struct_span(&self, struct_id: u64) -> i32 {
         let mut visited: HashSet<u64> = HashSet::new();
-        self.struct_span_inner(struct_id, &mut visited)
+        self.struct_span_inner(struct_id, &mut visited, 0)
     }
 
-    fn struct_span_inner(&self, struct_id: u64, visited: &mut HashSet<u64>) -> i32 {
-        if visited.contains(&struct_id) {
-            return 0; // cycle.
+    fn struct_span_inner(&self, struct_id: u64, visited: &mut HashSet<u64>, depth: i32) -> i32 {
+        // `visited` stops true cycles; the depth bound stops a crafted document's
+        // deep *distinct* nesting (a flat node array forming a thousands-deep
+        // parent/ref chain) from overflowing the stack here — the same class of
+        // fix applied to `compose`. Real layouts nest far below the cap.
+        const MAX_STRUCT_SPAN_DEPTH: i32 = 256;
+        if depth > MAX_STRUCT_SPAN_DEPTH || visited.contains(&struct_id) {
+            return 0; // cycle or pathological depth.
         }
         visited.insert(struct_id);
 
@@ -621,7 +626,7 @@ impl NodeTree {
                 continue;
             }
             let sz = if matches!(c.kind, NodeKind::Struct | NodeKind::Array) {
-                self.struct_span_inner(c.id, visited)
+                self.struct_span_inner(c.id, visited, depth + 1)
             } else {
                 c.byte_size()
             };
@@ -634,7 +639,7 @@ impl NodeTree {
         // Embedded struct reference.
         let node = &self.nodes[idx as usize];
         if kids.is_empty() && node.kind == NodeKind::Struct && node.ref_id != 0 {
-            max_end = max_end.max(self.struct_span_inner(node.ref_id, visited));
+            max_end = max_end.max(self.struct_span_inner(node.ref_id, visited, depth + 1));
         }
 
         declared_size.max(max_end)
@@ -948,6 +953,28 @@ mod tests {
         t.add_node(child(sid, NodeKind::UInt32, 0));
         t.add_node(child(sid, NodeKind::UInt64, 4));
         assert_eq!(t.struct_span(sid), 12);
+    }
+
+    #[test]
+    fn struct_span_deep_chain_is_bounded() {
+        // A crafted document can encode a flat node array whose parent_id links
+        // form a chain thousands of levels deep. Without the depth bound in
+        // struct_span_inner this recurses until the stack overflows (SIGSEGV);
+        // with it the walk truncates and returns. Build a chain far past both the
+        // 256 cap and any plausible stack limit, and confirm the span computation
+        // simply returns a finite, non-negative value.
+        let mut t = NodeTree::new();
+        let root = t.add_node(Node {
+            kind: NodeKind::Struct,
+            ..Node::default()
+        });
+        let mut parent_id = t.nodes[root].id;
+        for _ in 0..50_000 {
+            let idx = t.add_node(child(parent_id, NodeKind::Struct, 0));
+            parent_id = t.nodes[idx].id;
+        }
+        let span = t.struct_span(t.nodes[root].id);
+        assert!(span >= 0);
     }
 
     #[test]

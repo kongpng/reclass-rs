@@ -1464,6 +1464,15 @@ fn push_chip<F: FnOnce(&mut LineChip)>(
 // ───────────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+/// Hard cap on render-recursion depth (`compose_parent` ⇄ `compose_node`). A
+/// crafted document — a flat node array forming a deep `parent_id` chain, a long
+/// `ref_id`/pointer reference chain, or pre-materialized deep deref children —
+/// could otherwise drive this mutual recursion thousands of levels deep and
+/// overflow the stack on the first render (SIGABRT). The `visiting`/`ptr_visiting`
+/// sets already break true cycles; this bounds deep *distinct* nesting. Real
+/// layouts and hand exploration stay far below 256.
+const MAX_COMPOSE_DEPTH: i32 = 256;
+
 fn compose_parent(
     state: &mut ComposeState,
     tree: &NodeTree,
@@ -1477,6 +1486,9 @@ fn compose_parent(
     array_element_idx: i32,
     array_container_addr: u64,
 ) {
+    if depth > MAX_COMPOSE_DEPTH {
+        return;
+    }
     let node = tree.nodes[node_idx as usize].clone();
     let abs_addr = resolve_addr(state, tree, node_idx, base, root_id);
 
@@ -2386,6 +2398,9 @@ fn compose_node(
     array_element_idx: i32,
     array_container_addr: u64,
 ) {
+    if depth > MAX_COMPOSE_DEPTH {
+        return;
+    }
     let node = tree.nodes[node_idx as usize].clone();
     let abs_addr = resolve_addr(state, tree, node_idx, base, root_id);
 
