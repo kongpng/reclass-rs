@@ -80,6 +80,7 @@ mod workspace;
 // The About-dialog GitHub URL lives in `dialogs.rs` (beside `show_about`, the
 // sole non-test consumer, which uses it bare via `use super::*`); re-export so
 // the tests module's `super::ABOUT_GITHUB_URL` import keeps resolving.
+#[cfg(test)]
 pub(crate) use dialogs::ABOUT_GITHUB_URL;
 
 // The editor view-option types live in `view.rs` (beside the View-menu logic);
@@ -103,12 +104,15 @@ pub(crate) use documents::{seed_root_doc, RootKind};
 // which calls `sniff_is_reclass_xml`); re-export so `root_name_for_title` keeps
 // resolving for `dirty_doc_name` here + the sibling files/workspace/lifecycle globs,
 // and both keep resolving for the tests module's `super::` imports.
-pub(crate) use helpers::{root_name_for_title, sniff_is_reclass_xml};
+pub(crate) use helpers::root_name_for_title;
+#[cfg(test)]
+pub(crate) use helpers::sniff_is_reclass_xml;
 
 // The close-flow / window-title helpers live in `lifecycle.rs` (beside the
 // unsaved-changes guard + window-title computation that consume them); re-export
 // so the tests module's `super::` imports keep resolving (they are used bare from
 // lifecycle.rs via `use super::*`).
+#[cfg(test)]
 pub(crate) use lifecycle::{
     dirty_doc_name, unique_dirty_names, unsaved_changes_text, window_title_string,
 };
@@ -117,12 +121,14 @@ pub(crate) use lifecycle::{
 // sole non-test caller, which uses them bare via `use super::*`); re-export so the
 // tests module's `super::relabel_command` / `super::inject_plugin_menu_items`
 // imports keep resolving.
+#[cfg(test)]
 pub(crate) use menus::{inject_plugin_menu_items, relabel_command};
 
 // The plugin-host dock-side mapper lives in `plugins.rs` (beside `mount_plugin_panels`,
 // the sole non-test caller, which uses it bare via `use super::*`); re-export so the
 // tests module's `super::dock_placement_for` imports keep resolving.
 // (`surface_command_toast` stays private to plugins.rs — no test/external refs.)
+#[cfg(test)]
 pub(crate) use plugins::dock_placement_for;
 
 // The disk-backed settings store + the QSettings key-name constants live in

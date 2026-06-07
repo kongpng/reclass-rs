@@ -36,6 +36,7 @@ use hover_popup::{HoverPopupKind, HoverPopupState};
 mod context_menu;
 mod debug_view;
 mod popups;
+#[cfg(test)]
 pub(crate) use popups::push_recent_type_into;
 mod mouse;
 
