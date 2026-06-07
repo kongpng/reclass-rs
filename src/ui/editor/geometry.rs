@@ -256,8 +256,8 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
         LineKind::CommandRow => {
             // The command/header row chrome (PIC4/PIC5):
             //   "[▸] source▾  0x400000  class UnnamedClass0 {"
-            // chevron box (dim), source label (muted), base address (orange),
-            // the struct/class/enum keyword (magenta), class name (blue), `{` dim.
+            // chevron box (dim), source label (muted), base address (neutral),
+            // the struct/class/enum keyword (dim), class name (teal), `{` dim.
             push(
                 &mut layers,
                 compose::command_row_chevron_span(text),
@@ -277,10 +277,15 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
                 compose::command_row_addr_span(text),
                 SpanRole::Text,
             );
+            // C++ `applyCommandRowPills` ("Root class styling (type dim +
+            // class-name teal)") paints the root-type keyword span with
+            // `IND_HEX_DIM` (= theme.textFaint), so it reads as muted chrome —
+            // NOT the lexer's keyword/blue hue. Use `Dim` to match, like the
+            // sibling chevron/source/brace above.
             push(
                 &mut layers,
                 compose::command_row_root_type_span(text),
-                SpanRole::Keyword,
+                SpanRole::Dim,
             );
             push(
                 &mut layers,
@@ -1537,14 +1542,33 @@ mod tests {
     }
 
     #[test]
-    fn command_row_chrome_colors_keyword_address_and_name() {
+    fn command_row_chrome_dims_root_type_and_teals_name() {
         let lm = LineMeta {
             line_kind: LineKind::CommandRow,
             ..LineMeta::default()
         };
         let text = "[\u{25B8}] source\u{25BE}  0x400000  class Foo {";
         let runs = style_runs(&lm, text, 14, 22);
-        assert!(runs.iter().any(|r| r.role == SpanRole::Keyword));
+        // C++ `applyCommandRowPills` paints the root-type keyword span
+        // ("class") with `IND_HEX_DIM` (= theme.textFaint), NOT the lexer's
+        // keyword/blue hue — it reads as muted chrome. The run covering the
+        // root-type column must therefore be `Dim`.
+        let rt = compose::command_row_root_type_span(text);
+        assert!(rt.valid);
+        let rt_run = runs
+            .iter()
+            .find(|r| r.start <= rt.start && r.end >= rt.end)
+            .unwrap_or_else(|| panic!("no run covers root-type span {rt:?}: {runs:?}"));
+        assert_eq!(
+            rt_run.role,
+            SpanRole::Dim,
+            "command-row root-type keyword must be dim (C++ IND_HEX_DIM), not blue: {runs:?}"
+        );
+        // The command row has no keyword/blue chrome at all now.
+        assert!(
+            !runs.iter().any(|r| r.role == SpanRole::Keyword),
+            "command-row must have no Keyword (blue) runs: {runs:?}"
+        );
         // Item 11: the command-row base address is painted NEUTRAL (`SpanRole::Text`,
         // the C++ `IND_BASE_ADDR = theme.text`), OVERRIDING the orange number/address
         // hue — so there must be NO `Address` run on the command row.
@@ -1552,6 +1576,7 @@ mod tests {
             !runs.iter().any(|r| r.role == SpanRole::Address),
             "command-row address must be neutral Text, not Address: {runs:?}"
         );
+        // The root **name** ("Foo") stays teal (`ClassName` = IND_CLASS_NAME).
         assert!(runs.iter().any(|r| r.role == SpanRole::ClassName));
     }
 
