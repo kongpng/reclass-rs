@@ -76,6 +76,11 @@ mod startpage;
 mod view;
 mod workspace;
 
+// The About-dialog GitHub URL lives in `dialogs.rs` (beside `show_about`, the
+// sole non-test consumer, which uses it bare via `use super::*`); re-export so
+// the tests module's `super::ABOUT_GITHUB_URL` import keeps resolving.
+pub(crate) use dialogs::ABOUT_GITHUB_URL;
+
 // The editor view-option types live in `view.rs` (beside the View-menu logic);
 // re-export so `super::ViewOpt`/`super::ViewOptions` keep resolving for the
 // `MainWindow::view_opts` field, the sibling menus/layout/workspace globs, and
@@ -531,11 +536,6 @@ enum RightDockPanel {
     Modules,
     Bookmarks,
 }
-
-/// The GitHub URL the Help ▸ About dialog advertises (the C++ About dialog's
-/// "Open GitHub" button opens `https://github.com/IChooseYou/Reclass`;
-/// main.cpp:4434). Was wrongly `github.com/reclassnet/reclass` (item 8).
-const ABOUT_GITHUB_URL: &str = "https://github.com/IChooseYou/Reclass";
 
 impl MainWindow {
     /// Construct the main window view: build the [`DockArea`], assemble the

@@ -5,6 +5,11 @@
 
 use super::*;
 
+/// The GitHub URL the Help ▸ About dialog advertises (the C++ About dialog's
+/// "Open GitHub" button opens `https://github.com/IChooseYou/Reclass`;
+/// main.cpp:4434). Was wrongly `github.com/reclassnet/reclass` (item 8).
+pub(crate) const ABOUT_GITHUB_URL: &str = "https://github.com/IChooseYou/Reclass";
+
 impl super::MainWindow {
     // ── Tools / Help ──
 
