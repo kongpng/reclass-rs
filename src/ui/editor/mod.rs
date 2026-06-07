@@ -621,6 +621,10 @@ struct EditValidation {
     line: usize,
     /// The validator error message, or empty when the current text is valid.
     error: String,
+    /// A mode prefix for the valid-state hint: `"Hex edit: "` / `"ASCII edit: "`
+    /// while overwriting raw bytes, else empty (C++ `beginEdit` hint,
+    /// editor.cpp:3835-3844). Only decorates the valid hint, not the error line.
+    hint_prefix: &'static str,
 }
 
 /// Item 68/73: the floating expression-result popup state (the C++
@@ -1533,7 +1537,15 @@ impl RcxEditor {
             // validated inline (they are always structurally valid here).
             _ => String::new(),
         };
-        self.edit_validation = Some(EditValidation { line, error });
+        // The valid-state hint gains a mode prefix while overwriting raw bytes, so
+        // the active byte-edit mode stays visible the whole edit (C++ shows it only
+        // as the initial hint; keeping it for the edit's life is a small upgrade).
+        let hint_prefix = editing.field.read(_cx).overwrite_hint_prefix();
+        self.edit_validation = Some(EditValidation {
+            line,
+            error,
+            hint_prefix,
+        });
 
         // ── Expression-result popup (editor.cpp:4923) ──
         let is_addr = target == EditTarget::BaseAddress;
@@ -4285,7 +4297,10 @@ impl RcxEditor {
             // just past the line text so it sits where the row's `//` comment would.
             if let Some(v) = self.edit_validation.as_ref().filter(|v| v.line == idx) {
                 let (hint, color) = if v.error.is_empty() {
-                    ("Enter=Save Esc=Cancel".to_string(), palette.comment_green)
+                    (
+                        format!("{}Enter=Save Esc=Cancel", v.hint_prefix),
+                        palette.comment_green,
+                    )
                 } else {
                     (format!("! {}", v.error), palette.error_fg)
                 };

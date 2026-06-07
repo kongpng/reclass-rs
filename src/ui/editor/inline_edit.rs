@@ -229,6 +229,17 @@ impl FieldInput {
         matches!(self.hex_overwrite, Some(HexOverwrite::Hex { .. }))
     }
 
+    /// The mode prefix for the inline-edit hint comment while overwriting raw
+    /// bytes — `"Hex edit: "` for the hex column, `"ASCII edit: "` for the ASCII
+    /// column, `""` otherwise (the C++ `beginEdit` initial hint,
+    /// editor.cpp:3835-3844). Keyed off the [`HexOverwrite`] VARIANT, not the
+    /// edit target: an ASCII overwrite here is a `Value` edit switched to
+    /// [`HexOverwrite::Ascii`] (C++ routes ASCII through the `Name` target), so
+    /// the variant is the only reliable signal.
+    pub fn overwrite_hint_prefix(&self) -> &'static str {
+        overwrite_hint_prefix_for(self.hex_overwrite)
+    }
+
     /// Item 7: re-seed the content with the ASCII preview `seed` (one printable
     /// char per byte) and switch into [`HexOverwrite::Ascii`] mode. Used by the
     /// "Edit ASCII" context-menu entry, which opens a plain Value edit (whose seed
@@ -1731,16 +1742,46 @@ impl super::RcxEditor {
     }
 }
 
+/// The mode prefix for the inline-edit hint while overwriting raw bytes —
+/// `"Hex edit: "` / `"ASCII edit: "` / `""` (C++ `beginEdit` hint,
+/// editor.cpp:3835-3844). Free fn so it is testable without constructing a View.
+fn overwrite_hint_prefix_for(ow: Option<HexOverwrite>) -> &'static str {
+    match ow {
+        Some(HexOverwrite::Hex { .. }) => "Hex edit: ",
+        Some(HexOverwrite::Ascii { .. }) => "ASCII edit: ",
+        None => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Import only the items under test — NOT `super::*`, which would pull the
     // module's `gpui::*` glob into the `#[test]` hygiene expansion and explode
     // the type-recursion budget on this nightly+gpui combination.
     use super::{
-        next_word_boundary_in, overwrite_paste_into, ow_next_in, ow_prev_in, prev_word_boundary_in,
-        sanitize_inline_paste, splice_text, EditCommit,
+        next_word_boundary_in, overwrite_hint_prefix_for, overwrite_paste_into, ow_next_in,
+        ow_prev_in, prev_word_boundary_in, sanitize_inline_paste, splice_text, EditCommit,
+        HexOverwrite,
     };
     use crate::compose::EditTarget;
+
+    #[test]
+    fn overwrite_hint_prefix_tracks_mode() {
+        // P9 / C++ parity (editor.cpp:3835-3844): the inline-edit hint is prefixed
+        // by the active byte-overwrite mode — keyed off the HexOverwrite variant
+        // (an ASCII overwrite is a Value edit switched to Ascii, so the target
+        // alone can't distinguish it from a hex edit).
+        assert_eq!(
+            overwrite_hint_prefix_for(Some(HexOverwrite::Hex { byte_count: 4 })),
+            "Hex edit: "
+        );
+        assert_eq!(
+            overwrite_hint_prefix_for(Some(HexOverwrite::Ascii { byte_count: 8 })),
+            "ASCII edit: "
+        );
+        // A normal (non-overwrite) edit gets no prefix.
+        assert_eq!(overwrite_hint_prefix_for(None), "");
+    }
 
     #[test]
     fn paste_sanitize_strips_newlines_and_base_addr_backticks() {
