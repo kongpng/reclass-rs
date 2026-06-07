@@ -5738,8 +5738,38 @@ impl MainWindow {
                 tree: ed.controller().tree(),
             })
             .collect();
+        // P5: snapshot every document's top-level structs while the read-guards are
+        // still alive — the cross-document Type Selector composites (C++ m_projectDocs).
+        let per_doc: Vec<(DocId, Vec<crate::ui::editor::CrossDocComposite>)> = guards
+            .iter()
+            .map(|(id, ed)| {
+                (
+                    *id,
+                    crate::ui::editor::CrossDocComposite::top_level_in(ed.controller().tree()),
+                )
+            })
+            .collect();
         let pins: Vec<u64> = self.pinned_ids.iter().copied().collect();
         let model = WorkspaceModel::build(&docs, &pins, &viewed);
+
+        // The immutable editor borrows (guards/docs) end at the build above (NLL),
+        // so we can now hand each editor the union of every OTHER document's
+        // top-level structs (deduped by name) for its Type Selector catalogue.
+        for (id, ed) in &entries {
+            let mut others: Vec<crate::ui::editor::CrossDocComposite> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (other_id, comps) in &per_doc {
+                if other_id == id {
+                    continue;
+                }
+                for c in comps {
+                    if seen.insert(c.name.clone()) {
+                        others.push(c.clone());
+                    }
+                }
+            }
+            ed.update(cx, |e, _cx| e.set_cross_doc_composites(others));
+        }
 
         self.workspace.update(cx, |ws, cx| {
             ws.set_model(model, cx);

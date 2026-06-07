@@ -113,6 +113,16 @@ impl super::RcxEditor {
         self.open_type_selector(target, window, cx);
     }
 
+    /// Replace the cross-document composite snapshot — the top-level structs from
+    /// the OTHER open tabs — pushed by the window on every `rebuild_workspace` and
+    /// consumed by [`full_type_entries`](Self::full_type_entries). No `cx.notify`:
+    /// it only changes the NEXT Type Selector open, not the current frame.
+    pub fn set_cross_doc_composites(&mut self, items: Vec<CrossDocComposite>) {
+        if self.cross_doc_composites != items {
+            self.cross_doc_composites = items;
+        }
+    }
+
     /// The full type catalogue: the built-in primitives + every user-declared
     /// composite (struct/class/enum) in the tree (item 6 — "composites + user
     /// structs"). Composites are appended after the primitives, mirroring the C++
@@ -175,6 +185,21 @@ impl super::RcxEditor {
         composites.sort_by(|a, b| a.display_name.cmp(&b.display_name));
         composites.dedup_by(|a, b| a.display_name == b.display_name);
         entries.extend(composites);
+        // Cross-document composites: top-level structs from the OTHER open tabs,
+        // pushed by the window (the C++ `m_projectDocs` block, controller.cpp:4753-
+        // 4774). `struct_id == 0` ⇒ the apply path imports the type by NAME. Deduped
+        // by name against everything already present — a local struct (or primitive)
+        // of the same name wins — and runs in every mode, matching C++ (no mode gate).
+        if !self.cross_doc_composites.is_empty() {
+            let mut seen: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.display_name.to_string()).collect();
+            for c in self.cross_doc_composites.iter() {
+                if !seen.insert(c.name.clone()) {
+                    continue;
+                }
+                entries.push(TypeEntry::composite(0, &c.name, &c.keyword, c.size));
+            }
+        }
         // Built-in Common Types catalogue (~47 entries: UNICODE_STRING, std::string,
         // FVector, GUID, Matrix4x4, ...) — the C++ `addComposites` appends these
         // after the project's own composites (controller.cpp:4778). `struct_id == 0`

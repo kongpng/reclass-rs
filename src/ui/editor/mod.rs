@@ -418,6 +418,54 @@ pub enum EditorViewOption {
     RelativeOffsets,
 }
 
+/// A top-level struct/enum declared in ANOTHER open document, surfaced in this
+/// editor's Type Selector catalogue (the C++ `m_projectDocs` cross-doc composites,
+/// controller.cpp:4753-4774). There is intentionally no `struct_id`: a cross-doc
+/// pick imports by NAME (`find_or_create_struct_by_name`), exactly like the
+/// built-in Common Types, since the foreign struct has no id in *this* document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossDocComposite {
+    /// The struct's display name (`struct_type_name`, or `name` when that is empty).
+    pub name: String,
+    /// The class keyword (`struct`/`class`/`union`/`enum`); `struct` when unset.
+    pub keyword: String,
+    /// The struct's byte extent (`struct_span`) for the size bar/preview.
+    pub size: i32,
+}
+
+impl CrossDocComposite {
+    /// Every top-level (`parent_id == 0`) struct declaration in `tree`, as cross-doc
+    /// composites — the snapshot a sibling document contributes to another editor's
+    /// Type Selector. The name falls back to `name` when `struct_type_name` is empty
+    /// (the C++ `structTypeName.isEmpty() ? name : structTypeName`).
+    pub fn top_level_in(tree: &crate::core::NodeTree) -> Vec<CrossDocComposite> {
+        tree.nodes
+            .iter()
+            .filter(|n| n.parent_id == 0 && n.kind == NodeKind::Struct)
+            .filter_map(|n| {
+                let name = if n.struct_type_name.is_empty() {
+                    &n.name
+                } else {
+                    &n.struct_type_name
+                };
+                if name.is_empty() {
+                    return None;
+                }
+                let keyword = if n.class_keyword.is_empty() {
+                    "struct"
+                } else {
+                    n.class_keyword.as_str()
+                };
+                Some(CrossDocComposite {
+                    name: name.clone(),
+                    keyword: keyword.to_string(),
+                    size: tree.struct_span(n.id).max(0),
+                })
+            })
+            .collect()
+    }
+}
+
 /// The bespoke editor surface view.
 ///
 /// Holds the engine [`RcxController`] plus the purely-visual state the C++
@@ -598,6 +646,11 @@ pub struct RcxEditor {
     /// keeps this on the controller; the read-only file controller here exposes no
     /// such list, so the view owns it (purely a UI affordance).
     recent_type_names: Vec<String>,
+    /// Top-level structs from the OTHER open documents, refreshed by the window on
+    /// every `rebuild_workspace`. Appended to the Type Selector catalogue so a
+    /// struct can reference a type declared in a sibling tab (the C++ `m_projectDocs`
+    /// cross-doc composites, controller.cpp:4753).
+    cross_doc_composites: Vec<CrossDocComposite>,
     /// Item 13: set while the cursor is INSIDE the floating hover popup card. While
     /// set, `dispatch_row_hover` suppresses popup dismissal so moving onto the card
     /// (e.g. to click a value-history 'Set' button) does not clear it first (the
@@ -745,6 +798,7 @@ impl RcxEditor {
             cycle_macro_open: false,
             _cycle_macro_task: Task::ready(()),
             recent_type_names: Vec::new(),
+            cross_doc_composites: Vec::new(),
             popup_cursor_inside: false,
             pending_hint_convert: None,
             scroll: UniformListScrollHandle::new(),
@@ -6477,6 +6531,72 @@ mod tests {
             }
             assert_eq!(cur, k, "forward cycle of {k:?} closes the ring");
         }
+    }
+
+    #[test]
+    fn cross_doc_composites_lists_only_top_level_structs() {
+        // P5 / C++ parity (controller.cpp:4753-4774): a sibling document contributes
+        // only its TOP-LEVEL struct declarations to another editor's Type Selector —
+        // nested struct INSTANCES and non-struct children are excluded — with the
+        // name falling back to `name` when `struct_type_name` is empty.
+        use super::CrossDocComposite;
+        use crate::core::{Node, NodeKind};
+        let mut doc = RcxDocument::new();
+        // Top-level struct with a type name + explicit keyword + one child field.
+        let parent_idx = doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "PlayerInst".into(),
+            struct_type_name: "Player".into(),
+            class_keyword: "class".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+        let parent_id = doc.tree.nodes[parent_idx].id;
+        // A non-struct child — excluded.
+        doc.tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: "hp".into(),
+            parent_id,
+            offset: 0,
+            ..Node::default()
+        });
+        // A nested struct INSTANCE (parent_id != 0) — excluded despite its type name.
+        doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "embedded".into(),
+            struct_type_name: "Vec3".into(),
+            parent_id,
+            offset: 4,
+            ..Node::default()
+        });
+        // A second top-level struct with NO type name → falls back to `name`.
+        doc.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Bare".into(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        });
+
+        let comps = CrossDocComposite::top_level_in(&doc.tree);
+        let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Player"), "top-level struct_type_name listed");
+        assert!(
+            names.contains(&"Bare"),
+            "top-level without a type name falls back to its name"
+        );
+        assert!(!names.contains(&"Vec3"), "nested struct instance excluded");
+        assert!(!names.contains(&"hp"), "non-struct child excluded");
+        // Keyword resolution: explicit 'class' kept; the bare struct defaults 'struct'.
+        assert_eq!(
+            comps.iter().find(|c| c.name == "Player").unwrap().keyword,
+            "class"
+        );
+        assert_eq!(
+            comps.iter().find(|c| c.name == "Bare").unwrap().keyword,
+            "struct"
+        );
     }
 
     #[test]
