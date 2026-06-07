@@ -493,7 +493,13 @@ impl super::RcxEditor {
     ) {
         let cur_name = crate::core::kind_to_string(target.kind);
         let alt_name = crate::core::kind_to_string(alt_kind_for(target.kind));
-        let cycle_label = format!("\u{2190} {cur_name}  \u{2194}  {alt_name} \u{2192}");
+        let prev_name = crate::core::kind_to_string(prev_kind_for(target.kind));
+        // Two directional quick-cycler rows — forward (`→ next`) and backward
+        // (`← prev`) — mirroring the Left/Right keyboard cycler. C++ exposes the
+        // cycler only via the arrow keys; the Rust menu rows are an affordance on
+        // top, now symmetric so the menu can step the type either way (P7).
+        let cycle_next_label = format!("{cur_name}  \u{2192}  {alt_name}");
+        let cycle_prev_label = format!("{cur_name}  \u{2190}  {prev_name}");
         let is_container = crate::core::is_container_kind(target.kind);
         // Item 14: label the Fold entry by the container's live collapsed state —
         // 'Expand' when collapsed, 'Collapse' when expanded (the C++ `&Expand` /
@@ -690,12 +696,19 @@ impl super::RcxEditor {
                     )
                 })
                 .separator()
-                // The "← <curType> ↔ <altType> →" quick type-cycler row: clicking
-                // it cycles the node's kind forward (the C++ in-place type stepper).
+                // The quick type-cycler rows: `cur → next` steps the node's kind
+                // forward, `cur ← prev` steps it back (the C++ in-place type stepper
+                // bound to Right/Left). Two rows so both directions are reachable by
+                // mouse, not just the keyboard.
                 .menu_with_icon(
-                    cycle_label.clone(),
+                    cycle_next_label,
                     IconName::ChevronDown,
                     Box::new(EditorCycleTypeNext),
+                )
+                .menu_with_icon(
+                    cycle_prev_label,
+                    IconName::ChevronUp,
+                    Box::new(EditorCycleTypePrev),
                 )
                 .separator()
                 // Item 17: Edit Value (Enter) for writable, non-hex, non-container.
