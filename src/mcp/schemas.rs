@@ -576,12 +576,14 @@ fn tool_analysis_infer_types() -> Value {
 fn tool_analysis_import_header() -> Value {
     json!({
         "name": "analysis.import_header",
-        "description": "Import C/C++ struct definitions from source code into the active project. Accepts standard C/C++ struct/class/union/enum syntax with optional offset comments (// 0xNN). This is far more efficient than building structs field-by-field via tree.apply. Supports Windows types (DWORD, HANDLE, etc.), stdint types, pointers, arrays, bitfields, and nested structs.",
+        "description": "Import C/C++ struct definitions from source code into the active project. Accepts standard C/C++ struct/class/union/enum syntax with optional offset comments (// 0xNN). This is far more efficient than building structs field-by-field via tree.apply. Supports Windows types (DWORD, HANDLE, etc.), stdint types, pointers, arrays, bitfields, and nested structs. Set dryRun:true to preview only. Set mode:'replace' to remove existing root types with matching names before import.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "sourceCode": {"type": "string", "description": "C/C++ source code containing struct/class/union/enum definitions."},
                 "pointerSize": {"type": "integer", "description": "Pointer size: 4 for 32-bit, 8 for 64-bit (default 8)."},
+                "dryRun": {"type": "boolean", "description": "If true, parse and report what would be imported without mutating the project."},
+                "mode": {"type": "string", "enum": ["append", "replace"], "description": "append keeps existing matching types; replace removes matching root types before import. Default append."},
                 "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
             },
             "required": ["sourceCode"]
@@ -749,6 +751,49 @@ mod tests {
             assert!(d.get("description").and_then(|v| v.as_str()).is_some());
             assert_eq!(d["inputSchema"]["type"], "object");
         }
+    }
+
+    /// Verbatim parity: analysis.import_header must advertise dryRun + mode and
+    /// the full description, matching mcp_bridge.cpp (analysis.import_header
+    /// inputSchema.properties + description tail). Metadata-only; the tool stays
+    /// a stub on call.
+    #[test]
+    fn import_header_descriptor_matches_cpp() {
+        let d = tool_analysis_import_header();
+
+        // Full description, including the two trailing sentences the C++ appends.
+        assert_eq!(
+            d["description"].as_str().unwrap(),
+            "Import C/C++ struct definitions from source code into the active project. \
+Accepts standard C/C++ struct/class/union/enum syntax with optional offset comments (// 0xNN). \
+This is far more efficient than building structs field-by-field via tree.apply. \
+Supports Windows types (DWORD, HANDLE, etc.), stdint types, pointers, arrays, bitfields, and nested structs. \
+Set dryRun:true to preview only. Set mode:'replace' to remove existing root types with matching names before import."
+        );
+
+        let props = &d["inputSchema"]["properties"];
+        assert_eq!(props["dryRun"]["type"], "boolean");
+        assert_eq!(
+            props["dryRun"]["description"],
+            "If true, parse and report what would be imported without mutating the project."
+        );
+        assert_eq!(props["mode"]["type"], "string");
+        assert_eq!(
+            props["mode"]["enum"].as_array().unwrap(),
+            &[json!("append"), json!("replace")]
+        );
+        assert_eq!(
+            props["mode"]["description"],
+            "append keeps existing matching types; replace removes matching root types before import. Default append."
+        );
+        // The originally-present props are untouched.
+        assert_eq!(props["sourceCode"]["type"], "string");
+        assert_eq!(props["pointerSize"]["type"], "integer");
+        assert_eq!(props["tabIndex"]["type"], "integer");
+        assert_eq!(
+            d["inputSchema"]["required"].as_array().unwrap(),
+            &[json!("sourceCode")]
+        );
     }
 
     #[test]
