@@ -366,7 +366,7 @@ impl super::MainWindow {
             "Ctrl+B — Add Bookmark    Ctrl+Alt+B — Quick Bookmark".to_string(),
             "F5 — Refresh    Ctrl+G — Go to Address".to_string(),
             "Ctrl+K / Ctrl+Shift+P / F1 — Command Palette / Shortcuts".to_string(),
-            "Ctrl+Shift+S — Memory Scanner    Ctrl+Shift+Y — Modules".to_string(),
+            "Ctrl+Shift+M — Memory Scanner    Ctrl+Shift+Y — Modules".to_string(),
             "Ctrl+Shift+B — Bookmarks    Ctrl+\\ — Split Editor".to_string(),
         ];
         let mut spec = crate::ui::dialogs::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
