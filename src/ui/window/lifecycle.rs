@@ -6,6 +6,71 @@
 
 use super::*;
 
+/// The unsaved-changes display name for one dirty document (the C++ `closeEvent`
+/// per-doc name rule; main.cpp:8991-8993): the file name when the document has a
+/// path, else the view-root struct name. Pure; unit-tested. Returns `None` for a
+/// clean document so callers can filter in one pass (the C++ `if (modified ...)`
+/// gate; main.cpp:8989) — a clean set yields no names ⇒ the close is accepted.
+pub(crate) fn dirty_doc_name(
+    modified: bool,
+    file_path: Option<&std::path::Path>,
+    tree: &crate::core::NodeTree,
+    view_root_id: u64,
+) -> Option<String> {
+    if !modified {
+        return None;
+    }
+    let name = match file_path {
+        Some(p) => p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| root_name_for_title(tree, view_root_id)),
+        None => root_name_for_title(tree, view_root_id),
+    };
+    Some(name)
+}
+
+/// Assemble the OS window-title string from a root name + dirty flag (the C++
+/// `updateWindowTitle` formatting; main.cpp:5176-5186): `"<name>[ *] - Reclass"`,
+/// or plain `"Reclass"` when the name is empty (no document / unnamed root).
+/// Pure; unit-tested.
+pub(crate) fn window_title_string(root_name: &str, modified: bool) -> String {
+    if root_name.is_empty() {
+        return "Reclass".to_string();
+    }
+    let mut name = root_name.to_string();
+    if modified {
+        name.push_str(" *");
+    }
+    format!("{name} - Reclass")
+}
+
+/// The unsaved-changes guard's header sentence, picked by the count of distinct
+/// dirty documents (the C++ `closeEvent`: two complete sentences by count
+/// instead of in-string pluralization; main.cpp:9003-9006). Pure; unit-tested.
+pub(crate) fn unsaved_changes_text(dirty_count: usize) -> String {
+    if dirty_count == 1 {
+        "One project has unsaved changes:".to_string()
+    } else {
+        format!("{dirty_count} projects have unsaved changes:")
+    }
+}
+
+/// Dedup the dirty-document display names while preserving first-seen order (the
+/// C++ `closeEvent` builds `dirtyNames` from unique dirty docs, skipping repeats
+/// — multiple tabs can share a document; main.cpp:8988-8996). Pure; unit-tested.
+pub(crate) fn unique_dirty_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for n in names {
+        if seen.insert(n.clone()) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 impl super::MainWindow {
     // ── Unsaved-changes guard + quit (the C++ closeEvent + project_close) ──
 
