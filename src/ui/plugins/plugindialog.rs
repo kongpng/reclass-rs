@@ -181,9 +181,12 @@ impl Render for PluginDialog {
             }))
             .w(card_w)
             .h(card_h)
-            .child(
-                modal::header_with_close(self.title.clone(), "plugin-dialog-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx),
-            )
+            .child(modal::header_with_close(
+                self.title.clone(),
+                "plugin-dialog-close",
+                cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                cx,
+            ))
             .child(body)
             .child(footer)
     }

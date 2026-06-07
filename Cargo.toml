@@ -79,8 +79,15 @@ symbols = ["dep:cpp_demangle", "dep:msvc-demangler", "dep:regex", "dep:reqwest"]
 # JSON-RPC 2.0 MCP server over a local socket.
 mcp = ["dep:interprocess"]
 
-# OUT-OF-SCOPE live OS sources extension point + libloading loader. Off by
-# default: stubs only, so the package builds on Linux without them.
+# Compatibility alias: the memflow provider is always compiled now. Keep this so
+# older `--features memflow-provider` commands do not fail, but do not use a
+# Cargo feature to hide core live-memory behavior.
+memflow-provider = []
+
+# Legacy native-plugin loader seam (libloading) for the un-ported C++ ReClass
+# `plugins/*` sources (kernel / remote / WinDbg / ReClass.NET). Off by default:
+# stubs only, so the package builds on Linux without them. Live process/memory is
+# NOT here — it is provided unconditionally by the core `memflow` dependency.
 native-plugins = ["dep:libloading"]
 
 # Phase-3 stable-ABI native plugin boundary (design §2/§6 Phase 3). Pulls the
@@ -89,7 +96,7 @@ native-plugins = ["dep:libloading"]
 # crate `reclass-plugin-abi` (the single definition of the FFI types host and
 # plugin agree on). OFF by default → default app builds pull NONE of these and are
 # byte-for-byte unaffected. `native-plugins` is a SEPARATE, untouched feature (the
-# out-of-scope live-OS-source loader seam); the two do not overlap.
+# legacy native-plugin loader seam); the two do not overlap.
 #
 # Phase 5 also lists `dep:windows` here for the Windows-only ReClass.NET managed
 # CLR host. The `windows` dep is target-gated below
@@ -136,6 +143,11 @@ memmap2 = "0.9"
 # the user theme dir (AppDataLocation); `symbols` additionally uses it for the
 # SymbolCache. Pure Rust, tiny — no reason to feature-gate.
 directories = "6"
+
+# Live-process provider. This links only memflow core; connectors/OS layers such
+# as qemu, kvm, pcileech, winio, and win32 are discovered at runtime from memflow
+# plugin directories.
+memflow = "0.2.4"
 
 # ── feature-gated (optional) ──
 # disasm — pure Rust x86/x64 decoder+formatter (replaces fadec).

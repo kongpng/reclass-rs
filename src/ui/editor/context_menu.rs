@@ -28,7 +28,11 @@ fn append_node_submenus(
             IconName::ChevronRight,
             Box::new(EditorCollapseAll),
         )
-        .menu_with_icon("Expand All", IconName::ChevronDown, Box::new(EditorExpandAll))
+        .menu_with_icon(
+            "Expand All",
+            IconName::ChevronDown,
+            Box::new(EditorExpandAll),
+        )
     })
     .submenu("Copy", mw, mcx, |sub, _w, _cx| {
         sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
@@ -376,11 +380,7 @@ impl super::RcxEditor {
                 )
                 .separator()
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
-                    sub.menu_with_icon(
-                        "Copy Address",
-                        IconName::Copy,
-                        Box::new(EditorCopyAddress),
-                    )
+                    sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
                 })
         });
         self.show_context_menu_at(menu, pos, window, cx);
@@ -449,16 +449,12 @@ impl super::RcxEditor {
                 })
                 // Copy ▸ — Copy Line / Copy All as Text (no node ⇒ no Address/Offset).
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
-                    sub.menu_with_icon(
-                        "Copy Line",
-                        IconName::Copy,
-                        Box::new(EditorCopyLine),
-                    )
-                    .menu_with_icon(
-                        "Copy All as Text",
-                        IconName::Copy,
-                        Box::new(EditorCopyAllText),
-                    )
+                    sub.menu_with_icon("Copy Line", IconName::Copy, Box::new(EditorCopyLine))
+                        .menu_with_icon(
+                            "Copy All as Text",
+                            IconName::Copy,
+                            Box::new(EditorCopyAllText),
+                        )
                 })
                 // Tracking ▸ — Track Value Changes (checkable) / Clear All History.
                 .submenu("Tracking", mw, mcx, move |sub, _w, _cx| {
@@ -721,17 +717,9 @@ impl super::RcxEditor {
                 })
                 // Item 16/19: Rename omitted for hex nodes; F2 hint appended.
                 .when(show_rename, |menu| {
-                    menu.menu_with_icon(
-                        "Rename",
-                        IconName::SquareTerminal,
-                        Box::new(EditorRename),
-                    )
+                    menu.menu_with_icon("Rename", IconName::SquareTerminal, Box::new(EditorRename))
                 })
-                .menu_with_icon(
-                    "Change Type",
-                    IconName::Frame,
-                    Box::new(EditorChangeType),
-                )
+                .menu_with_icon("Change Type", IconName::Frame, Box::new(EditorChangeType))
                 // Item 17: Comment (;) only when the Comments toggle is on.
                 .when(show_comment, |menu| {
                     menu.menu_with_icon(
@@ -924,11 +912,7 @@ impl super::RcxEditor {
                     sub
                 })
                 .separator()
-                .menu_with_icon(
-                    "Duplicate",
-                    IconName::Copy,
-                    Box::new(EditorDuplicate),
-                )
+                .menu_with_icon("Duplicate", IconName::Copy, Box::new(EditorDuplicate))
                 .menu_with_icon("Delete", IconName::Delete, Box::new(EditorDelete))
                 .separator()
                 // Item 18: Fold submenu — Toggle Fold + Collapse All / Expand All
@@ -957,23 +941,15 @@ impl super::RcxEditor {
                 // as Text, with a separator between the address/offset group and the
                 // line/all group (the C++ separator), plus Ctrl+C/Ctrl+X hints.
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
-                    sub.menu_with_icon(
-                        "Copy Address",
-                        IconName::Copy,
-                        Box::new(EditorCopyAddress),
-                    )
-                    .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
-                    .separator()
-                    .menu_with_icon(
-                        "Copy Line",
-                        IconName::Copy,
-                        Box::new(EditorCopyLine),
-                    )
-                    .menu_with_icon(
-                        "Copy All as Text",
-                        IconName::Copy,
-                        Box::new(EditorCopyAllText),
-                    )
+                    sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
+                        .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
+                        .separator()
+                        .menu_with_icon("Copy Line", IconName::Copy, Box::new(EditorCopyLine))
+                        .menu_with_icon(
+                            "Copy All as Text",
+                            IconName::Copy,
+                            Box::new(EditorCopyAllText),
+                        )
                 })
                 .submenu("Tracking", mw, mcx, move |sub, _w, _cx| {
                     // Gap 20: live value-change tracking toggle + clear-history. The

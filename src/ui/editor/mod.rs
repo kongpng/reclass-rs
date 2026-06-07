@@ -26,12 +26,12 @@
 pub mod element;
 pub mod geometry;
 pub mod hit_test;
+mod hover_popup;
 pub mod inline_edit;
 pub mod minimap;
 pub mod palette;
 pub mod selection;
 pub mod tab_cycle;
-mod hover_popup;
 use hover_popup::{HoverPopupKind, HoverPopupState};
 mod context_menu;
 mod debug_view;
@@ -48,9 +48,9 @@ use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
 use crate::core::linemeta::K_COMMAND_ROW_ID;
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
+use crate::ui::design::color::with_alpha;
 use crate::ui::overlays::findbar::{FindBar, FindEvent};
 use crate::ui::pickers::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
-use crate::ui::design::color::with_alpha;
 use crate::ui::{design, overlays::tooltip};
 
 use element::{RowElement, RowPaint};
@@ -713,7 +713,6 @@ struct ContextTarget {
     sub_line: i32,
 }
 
-
 /// The active inline-edit: the field entity + the line it overlays (so the row
 /// builder can swap in the editable element on the right line/column).
 struct EditingField {
@@ -1101,7 +1100,6 @@ impl RcxEditor {
     }
 
     // ── Click routing (editor-surface.md §9) ──
-
 
     /// Bulk-append `count` auto-numbered enum members to the enum identified by
     /// `enum_id` (the footer `+10` pill — the C++ `appendEnumMembersRequested`,
@@ -4418,10 +4416,7 @@ impl RcxEditor {
         row.into_any_element()
     }
 
-
     // ── Hover popups (item 13, editor.cpp applyHoverCursor) ──
-
-
 
     /// The node a context-menu / accelerator action targets: the recorded
     /// right-click target, else the primary-selected row (so the accelerators work
@@ -5458,7 +5453,6 @@ impl RcxEditor {
     }
 
     // ── Change Type → TypeSelector popup (contract: menus agent PROVIDES) ──
-
 }
 
 /// A scalar type family for the Convert submenu (item 9): the requested int /
@@ -5896,7 +5890,6 @@ impl Render for RcxEditor {
             .children(self.render_hover_popup(cx))
     }
 }
-
 
 /// The address-format hover popover (reclass_address_hover.png + PIC5 "Base
 /// Address"): a small Zed elevated card listing the accepted base-address formats
@@ -6497,7 +6490,10 @@ mod tests {
 
         let comps = CrossDocComposite::top_level_in(&doc.tree);
         let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"Player"), "top-level struct_type_name listed");
+        assert!(
+            names.contains(&"Player"),
+            "top-level struct_type_name listed"
+        );
         assert!(
             names.contains(&"Bare"),
             "top-level without a type name falls back to its name"

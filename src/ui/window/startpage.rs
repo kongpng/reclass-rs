@@ -39,16 +39,23 @@ impl super::MainWindow {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             return;
         };
-        let is_empty = !editor.read(cx).controller().tree().nodes.iter().any(|n| {
-            n.parent_id == 0 && n.kind == crate::core::NodeKind::Struct
-        });
+        let is_empty = !editor
+            .read(cx)
+            .controller()
+            .tree()
+            .nodes
+            .iter()
+            .any(|n| n.parent_id == 0 && n.kind == crate::core::NodeKind::Struct);
         if !is_empty {
             return;
         }
-        editor.update(cx, |ed, cx| ed.set_document(seed_root_doc(RootKind::Class), cx));
+        editor.update(cx, |ed, cx| {
+            ed.set_document(seed_root_doc(RootKind::Class), cx)
+        });
         if let Some(id) = self.document_area.read(cx).active_id() {
-            self.document_area
-                .update(cx, |area, cx| area.set_title(id, RootKind::Class.title(), cx));
+            self.document_area.update(cx, |area, cx| {
+                area.set_title(id, RootKind::Class.title(), cx)
+            });
         }
         self.apply_view_opts_to_editor(&editor, cx);
         self.rebuild_workspace(cx);
@@ -89,7 +96,9 @@ impl super::MainWindow {
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| crate::ui::chrome::startpage::age_days_from_secs(now_secs, d.as_secs()))
+                    .map(|d| {
+                        crate::ui::chrome::startpage::age_days_from_secs(now_secs, d.as_secs())
+                    })
                     .unwrap_or(0);
                 RecentEntry {
                     path: p.to_string_lossy().into_owned(),

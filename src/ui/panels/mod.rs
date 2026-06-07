@@ -17,11 +17,11 @@
 //!
 //! Gated behind the `ui` feature (pulls gpui-component).
 
-pub mod workspace;
-pub mod scannerpanel;
-pub mod modulespanel;
 pub mod bookmarkspanel;
 pub mod docks;
+pub mod modulespanel;
+pub mod scannerpanel;
+pub mod workspace;
 
 use gpui::*;
 use gpui_component::{

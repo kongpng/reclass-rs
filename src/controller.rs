@@ -29,8 +29,7 @@ use crate::core::{
     alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node,
     is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string, size_for_kind,
     BitfieldMember, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree, OffsetAdj,
-    ValueHistory,
-    K_COMMON_TYPES,
+    ValueHistory, K_COMMON_TYPES,
 };
 use crate::format;
 use crate::provider::{
@@ -1235,12 +1234,22 @@ impl RcxController {
                 node_id,
                 old_name,
                 new_name,
-            } => apply_field!(*node_id, struct_type_name, old_name.clone(), new_name.clone()),
+            } => apply_field!(
+                *node_id,
+                struct_type_name,
+                old_name.clone(),
+                new_name.clone()
+            ),
             Command::ChangeClassKeyword {
                 node_id,
                 old_keyword,
                 new_keyword,
-            } => apply_field!(*node_id, class_keyword, old_keyword.clone(), new_keyword.clone()),
+            } => apply_field!(
+                *node_id,
+                class_keyword,
+                old_keyword.clone(),
+                new_keyword.clone()
+            ),
             Command::ChangeOffset {
                 node_id,
                 old_offset,
@@ -4633,7 +4642,9 @@ impl RcxController {
                 self.refresh();
             }
         }
-        // Plugin sources are out of scope (documented stub).
+        // Non-File kinds (buffer / snapshot / live memflow process) are not
+        // re-materialized by a saved-source switch — their original attach would
+        // have to be re-invoked.
         self.on_document_changed();
     }
 
@@ -4677,6 +4688,17 @@ impl RcxController {
         provider: Arc<dyn Provider + Send + Sync>,
         register_as_saved: bool,
     ) {
+        self.attach_provider_with_target(provider, register_as_saved, String::new());
+    }
+
+    /// Same attach bookkeeping as [`attach_provider`](Self::attach_provider), but
+    /// preserves a provider-specific target string for live/plugin sources.
+    pub fn attach_provider_with_target(
+        &mut self,
+        provider: Arc<dyn Provider + Send + Sync>,
+        register_as_saved: bool,
+        provider_target: String,
+    ) {
         self.undo.clear();
         let new_base = provider.base();
         let pointer_size = provider.pointer_size();
@@ -4697,14 +4719,15 @@ impl RcxController {
         self.reevaluate_base_address_formula();
         self.reset_snapshot();
         if register_as_saved {
-            // Dedup on (kind, providerTarget) — here providerTarget is empty.
+            // Dedup on (kind, providerTarget).
             let pos = self
                 .saved_sources
                 .iter()
-                .position(|s| s.kind == kind && s.provider_target.is_empty());
+                .position(|s| s.kind == kind && s.provider_target == provider_target);
             let entry = SavedSourceEntry {
                 kind: kind.clone(),
                 display_name: name,
+                provider_target,
                 base_address: self.doc.tree.base_address,
                 base_address_formula: self.doc.tree.base_address_formula.clone(),
                 ..Default::default()

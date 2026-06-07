@@ -541,7 +541,8 @@ mod view {
                 return false;
             }
             // Only plain printable single characters (never a shortcut chord).
-            if modifiers.control || modifiers.alt || modifiers.platform || key.chars().count() != 1 {
+            if modifiers.control || modifiers.alt || modifiers.platform || key.chars().count() != 1
+            {
                 return false;
             }
             let ch = key.chars().next().unwrap();
@@ -549,9 +550,9 @@ mod view {
                 return false;
             }
             let now = std::time::Instant::now();
-            let stale = self
-                .type_ahead_at
-                .map_or(true, |t| now.duration_since(t) > std::time::Duration::from_millis(800));
+            let stale = self.type_ahead_at.map_or(true, |t| {
+                now.duration_since(t) > std::time::Duration::from_millis(800)
+            });
             if stale {
                 self.type_ahead.clear();
             }
@@ -564,7 +565,10 @@ mod view {
                 } else {
                     self.themes.clone()
                 };
-                if let Some(ix) = themes.iter().position(|n| n.to_lowercase().starts_with(needle)) {
+                if let Some(ix) = themes
+                    .iter()
+                    .position(|n| n.to_lowercase().starts_with(needle))
+                {
                     self.result.theme_index = ix;
                     cx.notify();
                 }
@@ -907,7 +911,12 @@ mod view {
                 }))
                 .w(card_w)
                 .h(card_h)
-                .child(modal::header_with_close("Options", "opt-close", cx.listener(|this, _e, _window, cx| this.cancel(cx)), cx))
+                .child(modal::header_with_close(
+                    "Options",
+                    "opt-close",
+                    cx.listener(|this, _e, _window, cx| this.cancel(cx)),
+                    cx,
+                ))
                 .child(body)
                 .child(footer)
         }

@@ -551,13 +551,10 @@ fn model_to_tree_items(model: &WorkspaceModel, expanded: &HashSet<u64>) -> Vec<T
             }
             WorkspaceRow::Type(t) => {
                 let label = format!("{} \u{2014} {}", t.name, t.field_count);
-                let mut item =
-                    TreeItem::new(nav_item_id(t.doc, t.id), label).expanded(expanded.contains(&t.id));
+                let mut item = TreeItem::new(nav_item_id(t.doc, t.id), label)
+                    .expanded(expanded.contains(&t.id));
                 for child in &t.children {
-                    item = item.child(TreeItem::new(
-                        nav_item_id(t.doc, child.id),
-                        child.display(),
-                    ));
+                    item = item.child(TreeItem::new(nav_item_id(t.doc, child.id), child.display()));
                 }
                 items.push(item);
             }
@@ -990,9 +987,17 @@ fn field_context_menu(menu: PopupMenu, target_name: &str) -> PopupMenu {
         .separator()
         // Jump the editor to this field (set the parent as view root + select it) —
         // the same nav the row's click/Enter performs, reusing `WsOpenInTab`.
-        .menu_with_icon("Reveal in Editor", IconName::ExternalLink, Box::new(WsOpenInTab))
+        .menu_with_icon(
+            "Reveal in Editor",
+            IconName::ExternalLink,
+            Box::new(WsOpenInTab),
+        )
         // Change the field's type via the gutter's Type Selector.
-        .menu_with_icon("Change Type\u{2026}", IconName::Frame, Box::new(WsChangeFieldType))
+        .menu_with_icon(
+            "Change Type\u{2026}",
+            IconName::Frame,
+            Box::new(WsChangeFieldType),
+        )
         .separator()
         .menu_with_icon("Rename\u{2026}", IconName::Replace, Box::new(WsRenameType))
         .menu_with_icon(

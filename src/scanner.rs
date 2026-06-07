@@ -1229,7 +1229,9 @@ pub fn run_rescan(
 
         // Extend span while next result fits in the same chunk.
         while span_end + 1 < total {
-            let end_addr = results[order[span_end + 1]].address.saturating_add(read_size as u64);
+            let end_addr = results[order[span_end + 1]]
+                .address
+                .saturating_add(read_size as u64);
             if end_addr - span_base > K_RESCAN_CHUNK {
                 break;
             }
@@ -1237,7 +1239,9 @@ pub fn run_rescan(
         }
 
         let span_last = results[order[span_end]].address;
-        let chunk_len = span_last.saturating_add(read_size as u64).saturating_sub(span_base) as usize;
+        let chunk_len = span_last
+            .saturating_add(read_size as u64)
+            .saturating_sub(span_base) as usize;
         let mut chunk = vec![0u8; chunk_len];
         // Read return value ignored — failed reads leave zeros.
         let _ = prov.read(span_base, &mut chunk[..]);

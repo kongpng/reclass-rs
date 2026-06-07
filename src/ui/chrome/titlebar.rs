@@ -318,5 +318,4 @@ mod tests {
         assert_eq!(LayoutPreset::for_visible(true), LayoutPreset::Workspace);
         assert_eq!(LayoutPreset::for_visible(false), LayoutPreset::Off);
     }
-
 }

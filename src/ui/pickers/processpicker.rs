@@ -6,11 +6,12 @@
 //! filterable by name-or-PID, default-sorted highest-PID-first, with double-click
 //! / Attach to accept.
 //!
-//! **Live process enumeration is out of scope** (it is the live OS data source —
-//! ARCHITECTURE §7, a documented stub). So this picker is backed by the **provider
-//! registry's available sources** (the benign built-ins that *are* implemented)
-//! plus **clearly-labeled stub rows** for the live process/kernel/remote sources,
-//! so the surface is faithful and useful without enabling the blocked capability.
+//! This legacy picker does not enumerate live OS processes; live process attach is
+//! handled first-party by the memflow attach dialog (`documents.rs`
+//! `open_process_source`). So this surface is backed by the **provider registry's
+//! available sources** (the benign built-ins that *are* implemented) plus
+//! **clearly-labeled, non-attaching stub rows** for the legacy native
+//! process/kernel/remote sources, kept for menu parity with the C++.
 //!
 //! Split (gpui-free model + a thin view):
 //! - [`SourceAvailability`] — whether a row is an attachable built-in or a labeled
@@ -28,14 +29,15 @@
 
 use crate::provider::ProviderRegistry;
 
-/// Whether a picker row is an attachable source or a labeled out-of-scope stub.
+/// Whether a picker row is an attachable source or a labeled, non-attaching stub.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SourceAvailability {
     /// A benign, implemented built-in source (file/buffer/snapshot/null) — the
     /// row can be selected/attached.
     Available,
-    /// A live OS source (process/kernel/remote/WinDbg) — present for fidelity but
-    /// **out of scope**: shown disabled with a "(stub)" tag.
+    /// A legacy native source (process/kernel/remote/WinDbg) that this picker does
+    /// not attach — present for fidelity, shown disabled with a "(stub)" tag.
+    /// (Live process attach is provided by the memflow attach dialog.)
     Stub,
 }
 
@@ -44,7 +46,7 @@ impl SourceAvailability {
     pub fn tag(self) -> &'static str {
         match self {
             SourceAvailability::Available => "",
-            SourceAvailability::Stub => " (stub — out of scope)",
+            SourceAvailability::Stub => " (stub)",
         }
     }
 }
@@ -98,8 +100,9 @@ impl ProcessRow {
     }
 }
 
-/// The standard live-source stub rows (out of scope — ARCHITECTURE §7). Shown for
-/// fidelity with the C++ picker, clearly labeled and non-attachable.
+/// The standard legacy native-source stub rows (kept for fidelity with the C++
+/// picker, clearly labeled and non-attachable). Live process attach itself is the
+/// memflow path, not this picker.
 fn stub_rows() -> Vec<ProcessRow> {
     [
         (
@@ -263,9 +266,9 @@ pub use view::{ProcessPickEvent, ProcessPicker};
 
 #[cfg(feature = "ui")]
 mod view {
-    use crate::ui::overlays::contextmenu::process_row_menu;
     use crate::ui::design::{color, tokens};
     use crate::ui::dialogs::modal;
+    use crate::ui::overlays::contextmenu::process_row_menu;
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::button::{Button, ButtonVariants as _};
@@ -345,8 +348,12 @@ mod view {
                 // fill the table box exactly (no empty strip / overflow on the
                 // right). Width is computed from the live card width at
                 // construction (see `path_width`) rather than hardcoded.
-                COL_PATH => Column::new("path", "Path").width(self.path_width).sortable(),
-                _ => Column::new("path", "Path").width(self.path_width).sortable(),
+                COL_PATH => Column::new("path", "Path")
+                    .width(self.path_width)
+                    .sortable(),
+                _ => Column::new("path", "Path")
+                    .width(self.path_width)
+                    .sortable(),
             }
         }
 
@@ -780,8 +787,9 @@ mod view {
 
             let body = modal::body(cx)
                 .child(modal::help_text(
-                    "Select a data source to attach. Live process / kernel / remote \
-                     sources are out of scope in this build and shown as stubs.",
+                    "Select a data source to attach. The native sources here are \
+                     non-attaching stubs; live process attach is on the \
+                     File ▸ Data Source ▸ Process Memory menu.",
                     cx,
                 ))
                 .child(Input::new(&self.filter).w_full())
@@ -840,9 +848,12 @@ mod view {
                 }))
                 .w(card_w)
                 .h(card_h)
-                .child(
-                    modal::header_with_close("Attach to Process", "process-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx),
-                )
+                .child(modal::header_with_close(
+                    "Attach to Process",
+                    "process-close",
+                    cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                    cx,
+                ))
                 .child(body)
                 .child(footer)
                 .children(row_menu)
@@ -901,7 +912,7 @@ mod tests {
             availability: SourceAvailability::Stub,
             ..available(0, "Process Memory")
         };
-        assert_eq!(stub.display_name(), "Process Memory (stub — out of scope)");
+        assert_eq!(stub.display_name(), "Process Memory (stub)");
     }
 
     #[test]

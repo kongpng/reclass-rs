@@ -2864,11 +2864,12 @@ fn signature_wildcards() {
     }
 }
 
-// ── Out-of-scope live-process self-attach test (Windows only). ──
+// ── Live-process self-attach scan test (placeholder). ──
 
-#[cfg(windows)]
 #[test]
-#[ignore = "live-process WinSelfProvider source is out of scope (provider::native stub)"]
+#[ignore = "requires a live memflow connector at runtime; not wired in CI"]
 fn self_attach_find_mutate_revalidate() {
-    // Intentionally unimplemented: requires a live WinSelfProvider.
+    // Intentionally unimplemented: a future cross-platform live-memory scan test
+    // driven through `crate::provider::memflow`, gated at runtime on a discovered
+    // connector (not a compile-time platform).
 }

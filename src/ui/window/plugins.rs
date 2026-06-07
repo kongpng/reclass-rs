@@ -22,7 +22,10 @@ pub(crate) fn dock_placement_for(side: crate::plugin::DockSide) -> DockPlacement
 
 /// A command's own toast, unless the live host already surfaced it (dedup the
 /// `CommandResult.toast` against the host's drained toast list).
-pub(super) fn surface_command_toast(res_toast: Option<String>, already: &[String]) -> Option<String> {
+pub(super) fn surface_command_toast(
+    res_toast: Option<String>,
+    already: &[String],
+) -> Option<String> {
     res_toast.filter(|m| !already.iter().any(|t| t == m))
 }
 
@@ -77,7 +80,11 @@ impl super::MainWindow {
             let sub = cx.subscribe_in(
                 &panel,
                 window,
-                |this, panel, ev: &crate::ui::plugins::pluginpanel::PluginPanelEvent, window, cx| {
+                |this,
+                 panel,
+                 ev: &crate::ui::plugins::pluginpanel::PluginPanelEvent,
+                 window,
+                 cx| {
                     this.route_plugin_panel_event(panel, ev, window, cx);
                 },
             );
@@ -143,7 +150,12 @@ impl super::MainWindow {
     /// Re-pull a mounted panel's current `ViewTree` from its owning plugin and push
     /// it into the panel (the [`PluginHost::request_rerender`] resolution, design §3
     /// Elm loop). No-op if `view` isn't a mounted panel or the plugin yields no tree.
-    pub(super) fn rerender_plugin_panel(&mut self, view: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn rerender_plugin_panel(
+        &mut self,
+        view: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tree) = self.plugin_manager.view_tree(view) else {
             return;
         };
@@ -158,7 +170,12 @@ impl super::MainWindow {
     /// [`run_menu_command`](Self::run_menu_command) for an id
     /// [`is_plugin_command`](crate::plugin::PluginManager::is_plugin_command)
     /// recognizes (a contributed menu/palette item).
-    pub(super) fn dispatch_plugin_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn dispatch_plugin_command(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (cmd_toast, toasts, open_dialogs, rerenders) = {
             let mut host = self.live_host(window, cx);
             let res = self
@@ -185,7 +202,12 @@ impl super::MainWindow {
     /// via the proven `window.open_dialog` pattern, and subscribes (on the shared
     /// close-only [`goto_sub`](Self::goto_sub)) to route the dialog's Ui / Closed
     /// events through the manager. No-op if `id` isn't a contributed dialog.
-    pub(super) fn open_plugin_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_plugin_dialog(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(initial) = self.plugin_manager.view_tree(id) else {
             return;
         };
@@ -202,61 +224,69 @@ impl super::MainWindow {
             })
             .unwrap_or_else(|| id.to_string());
 
-        let dialog = crate::ui::plugins::plugindialog::PluginDialog::view(id, title, initial, window, cx);
+        let dialog =
+            crate::ui::plugins::plugindialog::PluginDialog::view(id, title, initial, window, cx);
         self.goto_sub = Some(cx.subscribe_in(
             &dialog,
             window,
-            |this, dialog, ev: &crate::ui::plugins::plugindialog::PluginDialogEvent, window, cx| match ev {
-                crate::ui::plugins::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
-                    let dialog_id = view_id.clone();
-                    let (tree, toasts, open_dialogs, close_dialogs, rerenders) = {
-                        let mut host = this.live_host(window, cx);
-                        let tree =
-                            this.plugin_manager
-                                .handle_ui_event(view_id, event.clone(), &mut host);
-                        let r = host.requests();
-                        (
-                            tree,
-                            r.take_toasts(),
-                            r.take_open_dialogs(),
-                            r.take_close_dialogs(),
-                            r.take_rerenders(),
-                        )
-                    };
-                    if let Some(tree) = tree {
-                        dialog.update(cx, |d, cx| d.set_tree(tree, window, cx));
+            |this, dialog, ev: &crate::ui::plugins::plugindialog::PluginDialogEvent, window, cx| {
+                match ev {
+                    crate::ui::plugins::plugindialog::PluginDialogEvent::Ui { view_id, event } => {
+                        let dialog_id = view_id.clone();
+                        let (tree, toasts, open_dialogs, close_dialogs, rerenders) = {
+                            let mut host = this.live_host(window, cx);
+                            let tree = this.plugin_manager.handle_ui_event(
+                                view_id,
+                                event.clone(),
+                                &mut host,
+                            );
+                            let r = host.requests();
+                            (
+                                tree,
+                                r.take_toasts(),
+                                r.take_open_dialogs(),
+                                r.take_close_dialogs(),
+                                r.take_rerenders(),
+                            )
+                        };
+                        if let Some(tree) = tree {
+                            dialog.update(cx, |d, cx| d.set_tree(tree, window, cx));
+                        }
+                        this.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
+                        // If the plugin asked to close THIS dialog (the demo's Attach),
+                        // dismiss the modal.
+                        if close_dialogs.iter().any(|id| *id == dialog_id) {
+                            window.close_dialog(cx);
+                        }
                     }
-                    this.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
-                    // If the plugin asked to close THIS dialog (the demo's Attach),
-                    // dismiss the modal.
-                    if close_dialogs.iter().any(|id| *id == dialog_id) {
+                    crate::ui::plugins::plugindialog::PluginDialogEvent::Closed {
+                        view_id,
+                        result,
+                    } => {
+                        let (cmd_toast, toasts, open_dialogs, rerenders) = {
+                            let mut host = this.live_host(window, cx);
+                            let res = this.plugin_manager.handle_dialog_closed(
+                                view_id,
+                                result.clone(),
+                                &mut host,
+                            );
+                            let r = host.requests();
+                            let toasts = r.take_toasts();
+                            // Surface the plugin's `CommandResult::toast` RETURN (the
+                            // footer-Submit path — the demo's submit returns "Attached
+                            // to …" rather than calling `host.show_toast`), unless the
+                            // handler already pushed the same message through the host
+                            // (mirror of `dispatch_plugin_command`'s dedup → no
+                            // double-toast).
+                            let cmd_toast = surface_command_toast(res.toast, &toasts);
+                            (cmd_toast, toasts, r.take_open_dialogs(), r.take_rerenders())
+                        };
+                        if let Some(msg) = cmd_toast {
+                            this.notify(msg, window, cx);
+                        }
+                        this.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
                         window.close_dialog(cx);
                     }
-                }
-                crate::ui::plugins::plugindialog::PluginDialogEvent::Closed { view_id, result } => {
-                    let (cmd_toast, toasts, open_dialogs, rerenders) = {
-                        let mut host = this.live_host(window, cx);
-                        let res = this.plugin_manager.handle_dialog_closed(
-                            view_id,
-                            result.clone(),
-                            &mut host,
-                        );
-                        let r = host.requests();
-                        let toasts = r.take_toasts();
-                        // Surface the plugin's `CommandResult::toast` RETURN (the
-                        // footer-Submit path — the demo's submit returns "Attached
-                        // to …" rather than calling `host.show_toast`), unless the
-                        // handler already pushed the same message through the host
-                        // (mirror of `dispatch_plugin_command`'s dedup → no
-                        // double-toast).
-                        let cmd_toast = surface_command_toast(res.toast, &toasts);
-                        (cmd_toast, toasts, r.take_open_dialogs(), r.take_rerenders())
-                    };
-                    if let Some(msg) = cmd_toast {
-                        this.notify(msg, window, cx);
-                    }
-                    this.drain_plugin_requests(toasts, open_dialogs, rerenders, window, cx);
-                    window.close_dialog(cx);
                 }
             },
         ));

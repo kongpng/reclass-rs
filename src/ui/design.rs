@@ -642,7 +642,10 @@ pub fn empty_state(
         .items_center()
         .justify_center()
         .gap(px(tokens::space::MD))
-        .child(icon.with_size(px(20.0)).text_color(color::text_disabled(cx)))
+        .child(
+            icon.with_size(px(20.0))
+                .text_color(color::text_disabled(cx)),
+        )
         .child(
             div()
                 .text_size(px(tokens::font::UI_SM))

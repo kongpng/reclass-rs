@@ -3,8 +3,8 @@
 //! the oversized editor/mod.rs into a second `impl RcxEditor`. A child module of
 //! `editor`, it keeps full access to RcxEditor's private fields and methods.
 
-use super::*;
 use super::hex_kind_for_size;
+use super::*;
 use crate::core::NodeKind;
 use gpui::*;
 
@@ -152,7 +152,9 @@ impl super::RcxEditor {
         exclude_id: u64,
         mode: crate::ui::pickers::typeselectorpopup::TypePopupMode,
     ) -> Vec<crate::ui::pickers::typeselectorpopup::TypeEntry> {
-        use crate::ui::pickers::typeselectorpopup::{default_type_entries, TypeEntry, TypePopupMode};
+        use crate::ui::pickers::typeselectorpopup::{
+            default_type_entries, TypeEntry, TypePopupMode,
+        };
         let mut entries: Vec<TypeEntry> = Vec::new();
         if mode == TypePopupMode::PointerTarget {
             // Synthetic "void" target — a Hex8-backed primitive applied as refId 0.
@@ -293,7 +295,9 @@ impl super::RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::ui::pickers::typeselectorpopup::{TypePopupMode, TypeSelectorEvent, TypeSelectorPopup};
+        use crate::ui::pickers::typeselectorpopup::{
+            TypePopupMode, TypeSelectorEvent, TypeSelectorPopup,
+        };
         // The popup opens pre-highlighting the node's ACTUAL current type (the C++
         // `setTypes(.., &currentEntry)`): for a composite that means the referenced
         // struct id (pre-select by structId), for a primitive the kind. Also compute
@@ -466,16 +470,15 @@ impl super::RcxEditor {
         // FieldType batches — Root re-roots a single view, and Array/PointerTarget
         // are single-node contextual edits. With no (or a single) selection this is
         // the plain single-node apply on `node_id`.
-        let batch_ids: Vec<u64> = if cmode == CMode::FieldType
-            && self.controller.selected_ids().len() > 1
-        {
-            self.selected_node_indices_ordered()
-                .iter()
-                .filter_map(|&idx| self.controller.tree().nodes.get(idx).map(|n| n.id))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let batch_ids: Vec<u64> =
+            if cmode == CMode::FieldType && self.controller.selected_ids().len() > 1 {
+                self.selected_node_indices_ordered()
+                    .iter()
+                    .filter_map(|&idx| self.controller.tree().nodes.get(idx).map(|n| n.id))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         if batch_ids.len() > 1 {
             self.controller
                 .apply_type_popup_result_batch(cmode, &batch_ids, choice);
@@ -597,7 +600,9 @@ impl super::RcxEditor {
         let resolved_addr = self.line_meta(line).map(|lm| lm.offset_addr).unwrap_or(0);
         let sub_line = self.line_meta(line).map(|lm| lm.sub_line).unwrap_or(0);
         let popup = cx.new(|cx| {
-            crate::ui::pickers::enumpicker::EnumPickerPopup::new(&enum_name, members, current, window, cx)
+            crate::ui::pickers::enumpicker::EnumPickerPopup::new(
+                &enum_name, members, current, window, cx,
+            )
         });
         let focus = popup.read(cx).focus_handle(cx);
         self._enum_picker_sub = Some(cx.subscribe_in(
@@ -637,7 +642,10 @@ impl super::RcxEditor {
 
     /// Build the [`HexPopupContext`] for the hex node at `idx`: its current kind +
     /// raw bytes + up to 15 adjacent same-parent hex nodes (for join previews).
-    fn build_hex_context(&self, idx: usize) -> Option<crate::ui::overlays::hextoolbar::HexPopupContext> {
+    fn build_hex_context(
+        &self,
+        idx: usize,
+    ) -> Option<crate::ui::overlays::hextoolbar::HexPopupContext> {
         use crate::ui::overlays::hextoolbar::{Adjacent, HexPopupContext};
         let tree = self.controller.tree();
         let n = tree.nodes.get(idx)?;
@@ -682,7 +690,12 @@ impl super::RcxEditor {
     /// Open the [`HexToolbarPopup`] for the hex node at `idx` (item 9). On
     /// `SizeSelected` apply the size change via `split_hex_node` (smaller) or
     /// `join_hex_nodes` (larger); Insert above/below + dismiss route accordingly.
-    pub(super) fn open_hex_toolbar(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_hex_toolbar(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use crate::ui::overlays::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
         let Some(ctx) = self.build_hex_context(idx) else {
             return;

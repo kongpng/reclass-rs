@@ -602,9 +602,12 @@ mod profiler_view {
                 }))
                 .w(card_w)
                 .h(card_h)
-                .child(
-                    modal::header_with_close("Performance Profiler", "prof-close", cx.listener(|this, _e, _window, cx| this.close(cx)), cx),
-                )
+                .child(modal::header_with_close(
+                    "Performance Profiler",
+                    "prof-close",
+                    cx.listener(|this, _e, _window, cx| this.close(cx)),
+                    cx,
+                ))
                 .child(body)
         }
     }

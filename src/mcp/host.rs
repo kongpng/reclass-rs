@@ -28,6 +28,7 @@ use crate::provider::{BufferProvider, NullProvider, Provider};
 pub struct SavedSource {
     pub kind: String,
     pub display_name: String,
+    pub provider_target: String,
 }
 
 /// A single undo entry: a flat list of commands applied as one macro
@@ -193,10 +194,53 @@ impl TabState {
     }
 
     /// `RcxDocument::loadData(path)` — load a binary file as a buffer provider
-    /// (the in-scope file source). Out-of-scope process attach is handled in
-    /// the tool layer.
+    /// (the in-scope file source). Live process attach is handled in the tool
+    /// layer via the memflow `source.switch` path.
     pub fn load_data(&mut self, path: &str) {
         self.data.provider = Arc::new(BufferProvider::from_file(path));
+        self.data.sources.push(SavedSource {
+            kind: "File".to_string(),
+            display_name: path.to_string(),
+            provider_target: String::new(),
+        });
+        self.data.active_source = (self.data.sources.len() - 1) as i32;
+    }
+
+    /// Attach a provider-backed source inside the MCP tab model. This mirrors the
+    /// controller's source-switch subset without depending on the UI controller.
+    pub fn attach_provider(
+        &mut self,
+        provider: Arc<dyn Provider + Send + Sync>,
+        provider_target: String,
+    ) {
+        let base = provider.base();
+        let pointer_size = provider.pointer_size();
+        let display_name = provider.name();
+        let kind = provider.kind();
+        self.data.provider = provider;
+        self.data.tree.pointer_size = pointer_size;
+        if (self.data.tree.base_address == 0 || self.data.tree.base_address == 0x0040_0000)
+            && base != 0
+        {
+            self.data.tree.base_address = base;
+        }
+        let entry = SavedSource {
+            kind: kind.clone(),
+            display_name,
+            provider_target: provider_target.clone(),
+        };
+        if let Some(pos) = self
+            .data
+            .sources
+            .iter()
+            .position(|s| s.kind == kind && s.provider_target == provider_target)
+        {
+            self.data.sources[pos] = entry;
+            self.data.active_source = pos as i32;
+        } else {
+            self.data.sources.push(entry);
+            self.data.active_source = (self.data.sources.len() - 1) as i32;
+        }
     }
 
     /// `RcxController::switchSource(idx)` — minimal: set the active index.

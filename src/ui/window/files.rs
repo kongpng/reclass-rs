@@ -147,7 +147,12 @@ impl super::MainWindow {
     /// a document from it via the importers and load it into the active tab.
     /// XML routes through [`open_project`](Self::open_project) (its `.xml` branch);
     /// Source/PDB go through [`import_into_active`](Self::import_into_active).
-    pub(super) fn prompt_import(&mut self, kind: ImportKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn prompt_import(
+        &mut self,
+        kind: ImportKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -224,7 +229,12 @@ impl super::MainWindow {
     /// File ▸ Save / Save As… — write the active document's tree as native `.rcx`
     /// JSON. "Save" reuses the known file path when present; "Save As…" (or a
     /// never-saved document) prompts for a new path via the native picker.
-    pub(super) fn save_active(&mut self, force_prompt: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn save_active(
+        &mut self,
+        force_prompt: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             return;
         };
@@ -294,7 +304,12 @@ impl super::MainWindow {
     /// flag, and offers the format's [`code_format_file_filter`] in the save
     /// dialog (GPUI's `prompt_for_new_path` has no filter slot, so the filter
     /// drives only the suggested extension).
-    pub(super) fn export_code(&mut self, kind: ExportKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn export_code(
+        &mut self,
+        kind: ExportKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             self.notify("No document to export.", window, cx);
             return;
@@ -403,11 +418,14 @@ impl super::MainWindow {
     /// provider's modules; for each, prefer an already-cached or module-adjacent
     /// PDB (the C++ `findCached`/`findLocal`, which need no network). A real
     /// network fetch needs each module's PE debug GUID/age — only obtainable from
-    /// a live process target (out of scope on this platform; see
-    /// `provider::native`), so report what was resolvable and how many modules
-    /// were seen. With no modules (a File source enumerates none) this guides the
-    /// user to attach a live source.
-    pub(super) fn download_all_module_symbols(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// a live process target (see `crate::provider::memflow`), so report what was
+    /// resolvable and how many modules were seen. With no modules (a File source
+    /// enumerates none) this guides the user to attach a live source.
+    pub(super) fn download_all_module_symbols(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             self.notify("Attach a data source first.", window, cx);
             return;

@@ -14,7 +14,9 @@
 //! All of this is pure (no gpui types), so it is unit-tested without a display.
 
 use crate::compose::{self, ColumnSpan, EditTarget, LineGeometry};
-use crate::core::debug_view::{annotate_line as debug_annotate_text, line_kind_index, LINE_KIND_NAMES};
+use crate::core::debug_view::{
+    annotate_line as debug_annotate_text, line_kind_index, LINE_KIND_NAMES,
+};
 use crate::core::{find_chip, is_hex_preview, ChipKind, LineKind, LineMeta};
 
 /// A monospace cell metric: every glyph advances by `cell_width` pixels and the
@@ -503,7 +505,12 @@ pub fn line_byte_range(text: &str, line_starts: &[i32], idx: usize) -> std::ops:
 /// The byte range of display span `[start, end)` in `text`. Command-row spans are
 /// UTF-16-unit scans (`utf16_to_byte`); every other line's span is a display
 /// column (`byte_for_col`). Shared by the inline-edit seed and keyword-hover.
-pub fn span_byte_range(text: &str, start: i32, end: i32, command_row: bool) -> std::ops::Range<usize> {
+pub fn span_byte_range(
+    text: &str,
+    start: i32,
+    end: i32,
+    command_row: bool,
+) -> std::ops::Range<usize> {
     if command_row {
         utf16_to_byte(text, start)..utf16_to_byte(text, end)
     } else {
@@ -1715,7 +1722,10 @@ mod tests {
         // 0+0x18 reads "+18", not the giant underflowed offset the old code clipped
         // to a garbage absolute-looking address.
         let null_child = fmt_margin_text(0x18, struct_base, 0, 8, false, true, true);
-        assert!(null_child.trim_start().ends_with("+18"), "got {null_child:?}");
+        assert!(
+            null_child.trim_start().ends_with("+18"),
+            "got {null_child:?}"
+        );
         // A PLAIN struct field (NOT under a pointer) with `ptr_base == 0` keeps
         // measuring from the struct base (child - base).
         let plain = fmt_margin_text(child_addr, struct_base, 0, 8, false, true, false);

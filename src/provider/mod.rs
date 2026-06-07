@@ -6,11 +6,13 @@
 //!
 //! **In scope (implemented):** [`BufferProvider`] (in-memory + file via
 //! `from_file`), [`FileProvider`] (mmap'd binary file), [`NullProvider`],
-//! [`SnapshotProvider`]. **Out of scope (documented stubs):** the live
-//! process / kernel / remote / WinDbg sources in [`native`].
+//! [`SnapshotProvider`], and [`memflow`] for live process sources through
+//! memflow's dynamic connector/OS plugins. The legacy process / kernel / remote
+//! / WinDbg native-plugin seam remains documented in [`native`] as stubs.
 
 mod buffer;
 mod file;
+pub mod memflow;
 pub mod native;
 mod null;
 mod registry;
@@ -18,6 +20,7 @@ mod snapshot;
 
 pub use buffer::BufferProvider;
 pub use file::FileProvider;
+pub use memflow::{MemflowAttachConfig, MemflowProvider};
 pub use null::NullProvider;
 pub use registry::{ProviderInfo, ProviderRegistry, SavedSourceDisplay};
 pub use snapshot::{PageMap, SnapshotProvider, K_PAGE_SIZE};

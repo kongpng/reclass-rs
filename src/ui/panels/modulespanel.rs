@@ -506,12 +506,11 @@ mod view {
         rows: Vec<ModuleRow>,
         cx: &App,
     ) -> impl IntoElement {
-        crate::ui::design::panel_list("rcx-modules-list")
-            .children(
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(ix, row)| module_row(view, ix, row, cx)),
-            )
+        crate::ui::design::panel_list("rcx-modules-list").children(
+            rows.into_iter()
+                .enumerate()
+                .map(|(ix, row)| module_row(view, ix, row, cx)),
+        )
     }
 
     /// One module row: a leading source glyph, the truncating module name, a
@@ -594,8 +593,8 @@ mod view {
 
     /// The Symbols list — one row per resolved symbol (name + `module+RVA`).
     fn symbol_list(rows: Vec<SymbolRow>, cx: &App) -> impl IntoElement {
-        crate::ui::design::panel_list("rcx-symbols-list")
-            .children(rows.into_iter().enumerate().map(|(ix, row)| {
+        crate::ui::design::panel_list("rcx-symbols-list").children(
+            rows.into_iter().enumerate().map(|(ix, row)| {
                 gpui_component::h_flex()
                     .id(("rcx-symbol-row", ix))
                     .w_full()
@@ -622,13 +621,14 @@ mod view {
                             .text_color(color::syntax_address(cx))
                             .child(SharedString::from(row.offset_text)),
                     )
-            }))
+            }),
+        )
     }
 
     /// The Types list — one row per imported PDB type (kind tag + name + size).
     fn type_list(rows: Vec<TypeRow>, cx: &App) -> impl IntoElement {
-        crate::ui::design::panel_list("rcx-types-list")
-            .children(rows.into_iter().enumerate().map(|(ix, row)| {
+        crate::ui::design::panel_list("rcx-types-list").children(rows.into_iter().enumerate().map(
+            |(ix, row)| {
                 gpui_component::h_flex()
                     .id(("rcx-type-row", ix))
                     .w_full()
@@ -664,7 +664,8 @@ mod view {
                                 .child(SharedString::from(row.size_text)),
                         )
                     })
-            }))
+            },
+        ))
     }
 
     /// The clean empty-state body: a centered muted caption (the Zed "nothing

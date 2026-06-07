@@ -46,21 +46,21 @@ use crate::ui::dialogs::window_dialogs::{
     TypeAliasesDialog, TypeAliasesEvent,
 };
 
-use crate::ui::panels::bookmarkspanel::BookmarksPanel;
-use crate::ui::panels::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
+use crate::theme::{SettingsStore, ThemeManager};
 use crate::ui::chrome::menubar::{MenuBar, MenuCommand};
-use crate::ui::panels::modulespanel::ModulesPanel;
 use crate::ui::chrome::startpage::{RecentEntry, StartPage, StartPageEvent};
-use crate::ui::state::{AppState, DocId, ViewMode};
 use crate::ui::chrome::statusbar::{render_status_bar, StatusInfo};
 use crate::ui::chrome::tabs::{DocAreaEvent, DocumentArea};
-use crate::ui::theme_apply::ThemeRegistryGlobal;
 use crate::ui::chrome::titlebar::{self, LayoutPreset};
+use crate::ui::panels::bookmarkspanel::BookmarksPanel;
+use crate::ui::panels::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
+use crate::ui::panels::modulespanel::ModulesPanel;
 use crate::ui::panels::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
     WorkspaceTypeAction,
 };
-use crate::theme::{SettingsStore, ThemeManager};
+use crate::ui::state::{AppState, DocId, ViewMode};
+use crate::ui::theme_apply::ThemeRegistryGlobal;
 
 // Cohesive method clusters extracted from the original single `impl MainWindow`
 // (mirrors src/ui/editor/): each sibling holds an `impl super::MainWindow` block.
@@ -137,8 +137,8 @@ pub(crate) use plugins::dock_placement_for;
 // so it is re-exported **publicly**. `settings_keys` is re-exported `pub(crate)`
 // so the siblings' `settings_keys::FOO` (via `use super::*` glob) and the tests
 // module's `super::settings_keys` import keep resolving.
-pub use settings::DiskSettings;
 pub(crate) use settings::settings_keys;
+pub use settings::DiskSettings;
 
 // App-level actions. Mirrors Zed: the command palette opens on Ctrl+Shift+P / F1
 // (`command_palette::Toggle` in Zed's default keymap). `ToggleScanner` shows/hides
@@ -293,7 +293,8 @@ pub struct MainWindow {
     editor_font: String,
     /// Whether the MCP bridge is "running" (Tools ▸ Start/Stop MCP Server). The
     /// C++ toggles `m_mcp` start/stop + flips the action label; here it owns the
-    /// flag + drives the dynamic menu label. No live bridge on this platform.
+    /// flag + drives the dynamic menu label. The UI does not embed a live bridge
+    /// (the MCP server runs via the `mcp` feature, not a platform-specific path).
     mcp_running: bool,
     /// Recent Go-to-Address formulas (the C++ `GotoAddressDialog` recent list).
     /// Most-recent-first, deduped, capped. Loaded into the dialog on open and
@@ -944,9 +945,7 @@ impl MainWindow {
             .collect();
         Some(div().absolute().inset_0().children(layers))
     }
-
 }
-
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1072,24 +1071,24 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_rtti))
             .on_action(cx.listener(Self::on_profiler))
             // Alt+letter menu-bar mnemonics → toggle the matching top-level menu.
-            .on_action(cx.listener(|this, _: &OpenMenuFile, _w, cx| {
-                this.toggle_menu_mnemonic('f', cx)
-            }))
-            .on_action(cx.listener(|this, _: &OpenMenuEdit, _w, cx| {
-                this.toggle_menu_mnemonic('e', cx)
-            }))
-            .on_action(cx.listener(|this, _: &OpenMenuView, _w, cx| {
-                this.toggle_menu_mnemonic('v', cx)
-            }))
-            .on_action(cx.listener(|this, _: &OpenMenuTools, _w, cx| {
-                this.toggle_menu_mnemonic('t', cx)
-            }))
-            .on_action(cx.listener(|this, _: &OpenMenuPlugins, _w, cx| {
-                this.toggle_menu_mnemonic('p', cx)
-            }))
-            .on_action(cx.listener(|this, _: &OpenMenuHelp, _w, cx| {
-                this.toggle_menu_mnemonic('h', cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &OpenMenuFile, _w, cx| this.toggle_menu_mnemonic('f', cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenMenuEdit, _w, cx| this.toggle_menu_mnemonic('e', cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenMenuView, _w, cx| this.toggle_menu_mnemonic('v', cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenMenuTools, _w, cx| this.toggle_menu_mnemonic('t', cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenMenuPlugins, _w, cx| this.toggle_menu_mnemonic('p', cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenMenuHelp, _w, cx| this.toggle_menu_mnemonic('h', cx)),
+            )
             // ── Row 1: the frameless titlebar (app label · menu bar · controls). ──
             // Dimmed in Presentation Mode (chrome fade).
             .child(div().opacity(chrome_opacity).child(titlebar))
@@ -1274,7 +1273,8 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // is open — letting the keystroke fall through to that input. Modified
     // accelerators (Ctrl+D, F2, …) and navigation keys (already shadowed by the
     // field's deeper `RcxFieldInput` bindings) are left untouched.
-    let mut bindings = scope_editor_text_keys_to_non_field(crate::ui::editor::editor_key_bindings());
+    let mut bindings =
+        scope_editor_text_keys_to_non_field(crate::ui::editor::editor_key_bindings());
     bindings.extend(crate::ui::editor::inline_edit::field_key_bindings());
     bindings.extend(crate::ui::chrome::startpage::start_page_key_bindings());
     bindings.extend(crate::ui::pickers::commandpalette::command_palette_key_bindings());

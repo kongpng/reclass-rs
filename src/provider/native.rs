@@ -1,22 +1,22 @@
-//! Live OS data sources — **OUT OF SCOPE** documented stubs.
+//! Legacy native data-source stubs (kernel / remote / WinDbg / ReClass.NET).
 //!
 //! The original Reclass ships process / kernel / remote / WinDbg memory
 //! providers (under the C++ `plugins/` tree) plus a ReClass.NET DLL/CLR compat
-//! layer. Per the port's scope note these are **not** implemented here: they are
-//! represented only as documented stubs behind the [`Provider`](super::Provider)
-//! trait, gated by the off-by-default `native-plugins` feature.
+//! layer. Live **process** memory is implemented first-party in
+//! [`crate::provider::memflow`]; the remaining ABI-shaped native providers
+//! (kernel / remote / WinDbg) are represented only as documented stubs here,
+//! gated by the off-by-default `native-plugins` feature.
 //!
-//! Reaching real implementations is blocked by Anthropic's automated cyber
-//! safeguard; they are unlockable via the Cyber Verification Program or by
-//! supplying your own code, without touching any other module. Every other
-//! subsystem talks to data sources purely through the abstract `Provider`
-//! trait, so dropping a real native source in here changes nothing elsewhere.
+//! Every other subsystem talks to data sources purely through the abstract
+//! [`Provider`](super::Provider) trait, so dropping another native source in
+//! here changes nothing elsewhere.
 
 use super::Provider;
 
-/// Stub for a live OS source (process / kernel / remote / WinDbg). Behaves like
-/// a null source until a real implementation is dropped in. Constructing one is
-/// the seam the `pluginmanager` / `ProviderRegistry` factory would use.
+/// Stub for a legacy native source (kernel / remote / WinDbg). Behaves like a
+/// null source until a real implementation is dropped in. Constructing one is
+/// the seam the `pluginmanager` / `ProviderRegistry` factory would use. (Live
+/// process memory is provided first-party by [`crate::provider::memflow`].)
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeProviderStub;
 

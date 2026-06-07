@@ -117,7 +117,11 @@ impl super::MainWindow {
     /// again; the [`closing`](Self::closing) re-entrancy guard (the C++
     /// `ClosingGuard m_closingAll`; app-shell.md:167) makes that second pass return
     /// `true` without re-prompting.
-    pub(super) fn guarded_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn guarded_window_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Re-entrant close from the Save/Discard branch below → allow it through
         // without re-prompting (the C++ closing-all guard).
         if self.closing {
@@ -258,7 +262,14 @@ impl super::MainWindow {
                 }
             },
         ));
-        self.present_modal(&dialog, crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
+        self.present_modal(
+            &dialog,
+            crate::ui::dialogs::messagebox::MSG_MAX_WIDTH,
+            80.,
+            Some(&focus),
+            window,
+            cx,
+        );
     }
 
     /// Open a two-button confirm whose DEFAULT button is honoured — Enter triggers
@@ -292,7 +303,14 @@ impl super::MainWindow {
                 }
             },
         ));
-        self.present_modal(&dialog, crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, 80., Some(&focus), window, cx);
+        self.present_modal(
+            &dialog,
+            crate::ui::dialogs::messagebox::MSG_MAX_WIDTH,
+            80.,
+            Some(&focus),
+            window,
+            cx,
+        );
     }
 
     /// Persist each editor's document to its known path (the C++

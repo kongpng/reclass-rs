@@ -454,7 +454,12 @@ impl super::MainWindow {
 
     /// Open/close the right dock to a specific state (drives `set_open` on the
     /// underlying `Dock`). Mirrors [`set_bottom_dock_open`](Self::set_bottom_dock_open).
-    pub(super) fn set_right_dock_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_right_dock_open(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dock_area = self.dock_area.clone();
         dock_area.update(cx, |area, cx| {
             if area.is_dock_open(DockPlacement::Right, cx) != open {
@@ -574,7 +579,12 @@ impl super::MainWindow {
     /// Set a split pane's view mode to an explicit target (the per-segment setter
     /// the split header's segmented control wires). Lands exactly on `mode`
     /// rather than cycling. No-op if `pane_ix` is stale or the mode is unchanged.
-    pub(super) fn set_split_pane_mode(&mut self, pane_ix: usize, mode: ViewMode, cx: &mut Context<Self>) {
+    pub(super) fn set_split_pane_mode(
+        &mut self,
+        pane_ix: usize,
+        mode: ViewMode,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(slot) = self.split_panes.get_mut(pane_ix) {
             if *slot != mode {
                 *slot = mode;

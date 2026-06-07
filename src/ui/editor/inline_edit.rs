@@ -252,21 +252,13 @@ impl FieldInput {
     /// Advance/clamp helper: the next caret offset moving right by one, skipping a
     /// space separator in hex mode, clamped to the last data position.
     fn ow_next(&self, off: usize) -> usize {
-        ow_next_in(
-            &self.content,
-            self.is_hex_mode(),
-            off,
-        )
+        ow_next_in(&self.content, self.is_hex_mode(), off)
     }
 
     /// The previous caret offset moving left by one, skipping a space separator in
     /// hex mode, clamped to 0.
     fn ow_prev(&self, off: usize) -> usize {
-        ow_prev_in(
-            &self.content,
-            self.is_hex_mode(),
-            off,
-        )
+        ow_prev_in(&self.content, self.is_hex_mode(), off)
     }
 
     /// Whether the caret quad should be painted this frame (BUG 2). Solid while

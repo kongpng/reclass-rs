@@ -30,18 +30,18 @@
 //! and panels can be filled in by the next workflows; the editor grid and real
 //! dialogs are deliberately NOT implemented here. Gated behind the `ui` feature.
 
+pub mod chrome;
 pub(crate) mod cpp_highlight;
 pub mod design;
 pub mod dialogs;
 pub mod editor;
-pub mod chrome;
-pub mod plugins;
-pub mod overlays;
-pub mod pickers;
 pub mod examples;
-mod navlist;
 pub mod fuzzy;
+mod navlist;
+pub mod overlays;
 pub mod panels;
+pub mod pickers;
+pub mod plugins;
 pub mod state;
 pub mod theme_apply;
 pub mod window;

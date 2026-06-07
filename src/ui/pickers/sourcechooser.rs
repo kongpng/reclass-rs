@@ -4,9 +4,10 @@
 //! Port of `SourceChooserPopup`: a popover of two-line cards (saved sources +
 //! provider actions + section headers + a clear action) with a fuzzy filter over
 //! a composed searchable string, liveness/stale tracking, and an accept rule that
-//! ignores the already-active source. Providers themselves are out-of-scope stubs
-//! in this port, but the popup UI is in scope (entries reference provider
-//! identifiers only). Per the cookbook (ARCHITECTURE §5) it maps onto a `Popover`
+//! ignores the already-active source. The file / buffer / snapshot / null and the
+//! memflow live-process providers are real; only the legacy native sources
+//! (kernel / remote / WinDbg / ReClass.NET) remain stubs. The popup UI references
+//! provider identifiers only. Per the cookbook (ARCHITECTURE §5) it maps onto a `Popover`
 //! + a `List` with a custom `render_item`. This ports the pure model + filter
 //! (unit-tested) + a popover view.
 //!
@@ -415,8 +416,10 @@ pub fn provider_entries_from_registry(
 /// registry with the canonical descriptors and rendering it through the shared
 /// [`provider_entries_from_registry`] path, so the menu and the inline popup share
 /// one code path even before the host wires its real `PluginManager` registry in
-/// (design §7.A [fix]). The native source families are out-of-scope stubs in this
-/// port but still listed (with their dll hint) for parity with the C++ menu.
+/// (design §7.A [fix]). The legacy native source families (kernel / remote /
+/// WinDbg / ReClass.NET) remain stubs in this port — live process is first-party
+/// via memflow — but they are still listed (with their dll hint) for parity with
+/// the C++ menu.
 pub fn provider_entries() -> Vec<SourceEntry> {
     let mut reg = crate::provider::ProviderRegistry::new();
     // "File" has no plugin dll hint in the screenshot.
@@ -667,8 +670,9 @@ mod view {
         /// Defer a one-shot liveness probe (`SourceModel::set_liveness`): the C++
         /// runs an async liveness check after `popup()` so stale sources get the
         /// "(exited)" badge. We probe each saved source's `file_path` for existence
-        /// (the in-scope analogue — process aliveness is the out-of-scope live data
-        /// source). Sources without a path are treated as alive (no false stale).
+        /// as a lightweight liveness signal (full process aliveness is available
+        /// through the memflow provider). Sources without a path are treated as
+        /// alive (no false stale).
         fn spawn_liveness_probe(&mut self, window: &Window, cx: &mut Context<Self>) {
             // Build (saved_index, file_path) pairs to probe off the entries.
             let probes: Vec<(usize, String)> = self
@@ -1074,7 +1078,10 @@ mod tests {
         assert_eq!(footer_status_text("zzz", 0, 6), "No matches for \"zzz\"");
         // The query is trimmed in the echo (the branch is only reached for a
         // non-blank filter).
-        assert_eq!(footer_status_text("  foo  ", 0, 6), "No matches for \"foo\"");
+        assert_eq!(
+            footer_status_text("  foo  ", 0, 6),
+            "No matches for \"foo\""
+        );
         // A non-empty result keeps the "N of M sources" count.
         assert_eq!(footer_status_text("fi", 2, 6), "2 of 6 sources");
         // An idle (blank) filter shows the plain total.

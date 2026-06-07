@@ -297,4 +297,3 @@ fn lerp_rgb(a: Hsla, b: Hsla, t: f32) -> Hsla {
     }
     .into()
 }
-

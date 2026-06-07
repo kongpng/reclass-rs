@@ -141,6 +141,7 @@ pub fn handle_tools_call(
         "project.state" => tools::tool_project_state(&args, host),
         "tree.apply" => tools::tool_tree_apply(&args, host),
         "source.switch" => tools::tool_source_switch(&args, host),
+        "source.modules" => tools::tool_source_modules(&args, host),
         "hex.read" => tools::tool_hex_read(&args, host),
         "hex.write" => tools::tool_hex_write(&args, host),
         "status.set" => tools::tool_status_set(&args, host),

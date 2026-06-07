@@ -7,6 +7,7 @@
 //! placeholder forward refs, the atomic undo macro) are ported 1:1.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -45,6 +46,23 @@ fn arg_str_default(args: &Map<String, Value>, k: &str, default: &str) -> String 
 
 fn arg_bool(args: &Map<String, Value>, k: &str) -> bool {
     arg(args, k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn arg_string_list(args: &Map<String, Value>, k: &str) -> Vec<String> {
+    match arg(args, k) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(s)) => s
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// `QString::toULongLong()` — decimal parse, 0 on failure.
@@ -806,6 +824,19 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
         return make_text_result("No active tab", true);
     };
 
+    let provider = arg_str(args, "provider").to_lowercase();
+    let memflow_requested = provider == "memflow"
+        || provider == "processmemory"
+        || args.contains_key("connector")
+        || args.contains_key("connectorArgs")
+        || args.contains_key("os")
+        || args.contains_key("osArgs")
+        || args.contains_key("pluginDirs")
+        || args.contains_key("writable");
+    if memflow_requested {
+        return tool_source_switch_memflow(idx, args, host);
+    }
+
     if args.contains_key("sourceIndex") {
         let sidx = parse_integer(arg(args, "sourceIndex"), 0) as i32;
         let all_views = arg_bool(args, "allViews");
@@ -835,8 +866,10 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
     }
 
     if args.contains_key("pid") {
-        // Live process attach — OUT OF SCOPE.
-        return make_text_result("Live process attach is not available in this build", true);
+        return make_text_result(
+            "Live process attach requires provider:\"memflow\" plus connector/os configuration",
+            true,
+        );
     }
 
     if args.contains_key("filePath") {
@@ -847,7 +880,92 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
         return make_text_result(&format!("Loaded file: {path}"), false);
     }
 
-    make_text_result("Provide sourceIndex, filePath, or pid", true)
+    make_text_result(
+        "Provide sourceIndex, filePath, or provider:\"memflow\"",
+        true,
+    )
+}
+
+// ════════════════════════════════════════════════════════════════════
+// source.modules
+// ════════════════════════════════════════════════════════════════════
+
+pub fn tool_source_modules(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        let modules = tab
+            .data
+            .provider
+            .enumerate_modules()
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "name": m.name,
+                    "fullPath": m.full_path,
+                    "base": format!("0x{:X}", m.base),
+                    "size": m.size,
+                })
+            })
+            .collect::<Vec<_>>();
+        out = make_text_result(&qt_pretty(&Value::Array(modules)), false);
+    });
+    if out.is_null() {
+        make_text_result("No active tab", true)
+    } else {
+        out
+    }
+}
+
+fn tool_source_switch_memflow(
+    idx: usize,
+    args: &Map<String, Value>,
+    host: &mut dyn McpHost,
+) -> Value {
+    use crate::provider::{MemflowAttachConfig, MemflowProvider};
+
+    let pid = if args.contains_key("pid") {
+        let raw = parse_integer(arg(args, "pid"), -1);
+        if raw < 0 || raw > u32::MAX as i64 {
+            return make_text_result("pid must be a non-negative u32", true);
+        }
+        Some(raw as u32)
+    } else {
+        None
+    };
+    let mut cfg = MemflowAttachConfig {
+        connector: arg_str(args, "connector"),
+        connector_args: arg_str(args, "connectorArgs"),
+        os: arg_str_default(args, "os", "win32"),
+        os_args: arg_str(args, "osArgs"),
+        pid,
+        process_name: arg_str(args, "processName"),
+        writable: arg_bool(args, "writable"),
+        inventory_dirs: arg_string_list(args, "pluginDirs"),
+    };
+    if cfg.os.trim().is_empty() {
+        cfg.os = "win32".to_string();
+    }
+    if let Err(err) = cfg.validate() {
+        return make_text_result(&err, true);
+    }
+    let target = match cfg.to_target() {
+        Ok(target) => target,
+        Err(err) => return make_text_result(&err, true),
+    };
+    let provider = match MemflowProvider::attach(cfg) {
+        Ok(provider) => provider,
+        Err(err) => return make_text_result(&format!("memflow attach failed: {err}"), true),
+    };
+    let name = provider.name();
+    let provider = Arc::new(provider);
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        tab.attach_provider(provider.clone(), target.clone());
+    });
+    make_text_result(&format!("Attached memflow process: {name}"), false)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -3387,19 +3505,19 @@ mod tests {
     fn source_switch_file_and_pid_stub() {
         let mut h = TestHost::new();
         h.project_new();
-        // pid → out-of-scope stub
+        // bare pid → explicit memflow config required
         let r = tool_source_switch(&map(json!({"pid": 1234})), &mut h);
         assert_eq!(r["isError"], json!(true));
         assert!(r["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("Live process attach"));
+            .contains("provider:\"memflow\""));
         // no args → error
         let r = tool_source_switch(&map(json!({})), &mut h);
         assert_eq!(r["isError"], json!(true));
         assert_eq!(
             r["content"][0]["text"],
-            "Provide sourceIndex, filePath, or pid"
+            "Provide sourceIndex, filePath, or provider:\"memflow\""
         );
     }
 
@@ -3413,6 +3531,15 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("out of range"));
+    }
+
+    #[test]
+    fn source_modules_empty_for_provider_without_modules() {
+        let mut h = TestHost::new();
+        h.project_new();
+        let r = tool_source_modules(&map(json!({})), &mut h);
+        assert!(r.get("isError").is_none());
+        assert_eq!(r["content"][0]["text"], "[]");
     }
 
     // ════════════════════════════════════════════════════════════════

@@ -227,7 +227,6 @@ mod view {
     use gpui::*;
     use gpui_component::input::{Input, InputEvent, InputState};
 
-
     /// The picker's outcome.
     #[derive(Clone, Debug)]
     pub enum EnumPickerEvent {

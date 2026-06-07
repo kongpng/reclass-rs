@@ -418,7 +418,9 @@ impl StartPage {
                                     .child(card.description()),
                             ),
                     )
-                    .when_some(card.shortcut(), |row, keys| row.child(crate::ui::design::key_cap(keys, cx))),
+                    .when_some(card.shortcut(), |row, keys| {
+                        row.child(crate::ui::design::key_cap(keys, cx))
+                    }),
             )
     }
 

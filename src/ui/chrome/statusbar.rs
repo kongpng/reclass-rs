@@ -297,7 +297,11 @@ fn variant_segments(kind: NodeKind, type_name: &str) -> (String, String) {
     // pos/total indicator can never drift from the actual ←/→ cycle ring.
     let ring = crate::core::kind::same_size_variants(kind);
     let total = ring.len();
-    let pos = ring.iter().position(|&k| k == kind).map(|i| i + 1).unwrap_or(0);
+    let pos = ring
+        .iter()
+        .position(|&k| k == kind)
+        .map(|i| i + 1)
+        .unwrap_or(0);
 
     let type_index = if total > 1 {
         format!("\u{2194} {type_name} ({pos}/{total})")

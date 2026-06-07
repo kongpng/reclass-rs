@@ -1,8 +1,8 @@
 //! Out-of-scope tool handlers (`mcp.md §5.12`).
 //!
 //! These tools are advertised verbatim in `tools/list` so MCP hosts present the
-//! same toolset, but their handlers depend on out-of-scope subsystems (live
-//! process plugins, PDB symbol store, scanner panel, type-inference UI, RTTI,
+//! same toolset, but their handlers depend on subsystems not wired into the MCP
+//! layer in this port (PDB symbol store, scanner panel, type-inference UI, RTTI,
 //! theme UI, bookmarks/refs). Each returns an `isError` "not available" result.
 
 use serde_json::Value;
@@ -17,7 +17,6 @@ pub fn stub_not_available(tool: &str) -> Value {
 /// The set of out-of-scope tool names that route to [`stub_not_available`]
 /// (`PORTING_mcp.md §7.5`).
 pub const STUB_TOOLS: &[&str] = &[
-    "source.modules",
     "scanner.scan",
     "scanner.scan_pattern",
     "process.info",

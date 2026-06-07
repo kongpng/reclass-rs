@@ -27,10 +27,10 @@ use gpui::*;
 use gpui_component::dock::{DockArea, DockItem};
 use std::sync::Arc;
 
+use crate::ui::chrome::tabs::DocumentArea;
 use crate::ui::panels::bookmarkspanel::BookmarksPanel;
 use crate::ui::panels::modulespanel::ModulesPanel;
 use crate::ui::panels::scannerpanel::ScannerPanel;
-use crate::ui::chrome::tabs::DocumentArea;
 use crate::ui::panels::workspace::WorkspacePanel;
 
 /// Identity + layout version for the main dock area, used as the `dump`/`load`

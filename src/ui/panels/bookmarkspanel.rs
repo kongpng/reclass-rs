@@ -423,7 +423,11 @@ mod view {
 
     /// The clean empty-state body: a centered muted caption (Zed panel state).
     fn empty_state(cx: &App) -> impl IntoElement {
-        crate::ui::design::empty_state(icon::pointer(), "No bookmarks — add one from an address", cx)
+        crate::ui::design::empty_state(
+            icon::pointer(),
+            "No bookmarks — add one from an address",
+            cx,
+        )
     }
 
     use gpui_component::Sizable as _;

@@ -292,7 +292,9 @@ fn inline_edit_round_trip() {
     // Drop the QScintilla key-event half; keep the controller `set_node_value`.
     let mut c = make_ctrl();
     c.refresh();
-    let result = c.document().compose(0, false, false, false, false, true, None);
+    let result = c
+        .document()
+        .compose(0, false, false, false, false, true, None);
     let field_line = result
         .meta
         .iter()

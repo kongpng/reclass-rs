@@ -10,7 +10,12 @@ use super::*;
 impl super::MainWindow {
     // ── Document-area event handling (app-shell §8 step 9) ──
 
-    pub(super) fn on_doc_area_event(&mut self, ev: DocAreaEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_doc_area_event(
+        &mut self,
+        ev: DocAreaEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match ev {
             DocAreaEvent::Activated(id) => {
                 // Mirror the activation into AppState if the id is known; the area
@@ -132,18 +137,8 @@ impl super::MainWindow {
                     // render it in OUR centered-modal overlay (no dialog focus_trap)
                     // and focus its input. The editor keeps its own outcome
                     // subscription; on Chosen/Cancel it emits `CloseModal` back.
-                    crate::ui::editor::RcxEditorEvent::OpenModal {
-                        view,
-                        focus,
-                        width,
-                    } => {
-                        this.open_centered_modal(
-                            view.clone(),
-                            focus.clone(),
-                            *width,
-                            window,
-                            cx,
-                        );
+                    crate::ui::editor::RcxEditorEvent::OpenModal { view, focus, width } => {
+                        this.open_centered_modal(view.clone(), focus.clone(), *width, window, cx);
                     }
                     crate::ui::editor::RcxEditorEvent::CloseModal => {
                         this.close_top_modal(window, cx);
@@ -200,7 +195,11 @@ impl super::MainWindow {
                 0
             }
         };
-        let view_root = if parent_id != 0 { parent_id } else { nav.node_id };
+        let view_root = if parent_id != 0 {
+            parent_id
+        } else {
+            nav.node_id
+        };
         editor.update(cx, |ed, cx| {
             ed.controller_mut().set_view_root_id(view_root);
             // recompose_view, NOT apply_document: navigation must not emit
@@ -233,7 +232,12 @@ impl super::MainWindow {
     /// root is set to `ref_id`. Without this the editor's
     /// [`RcxEditorEvent::OpenTypeInNewTab`] had no subscriber and the new tab was
     /// never created (item 5).
-    pub(super) fn open_type_in_new_tab(&mut self, ref_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_type_in_new_tab(
+        &mut self,
+        ref_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(active) = self.document_area.read(cx).active_editor().cloned() else {
             return;
         };
@@ -303,7 +307,11 @@ impl super::MainWindow {
     }
 
     /// The editor entity owning document `doc`, if it is open in a tab.
-    pub(super) fn editor_for_doc(&self, doc: DocId, cx: &App) -> Option<Entity<crate::ui::editor::RcxEditor>> {
+    pub(super) fn editor_for_doc(
+        &self,
+        doc: DocId,
+        cx: &App,
+    ) -> Option<Entity<crate::ui::editor::RcxEditor>> {
         self.document_area
             .read(cx)
             .tabs()

@@ -179,7 +179,12 @@ impl super::MainWindow {
     /// the value into EVERY open editor, mirror it into the window's `view_opts`,
     /// refresh the menu ✓, and persist it. Pushing to all panes is idempotent for
     /// the editor that originated an in-editor toggle.
-    pub(super) fn set_view_option_value(&mut self, opt: ViewOpt, value: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_view_option_value(
+        &mut self,
+        opt: ViewOpt,
+        value: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.view_opts.set(opt, value);
         // Push the new value into EVERY open editor via the EDITOR SETTER
         // CONTRACT (the C++ applies each view option to all open tabs, not just
@@ -363,7 +368,8 @@ impl super::MainWindow {
                     tree.base_address_formula = formula.to_string();
                     ed.apply_document(cx);
                 });
-                self.goto_recent = crate::ui::dialogs::gotoaddress::push_recent_list(&self.goto_recent, formula);
+                self.goto_recent =
+                    crate::ui::dialogs::gotoaddress::push_recent_list(&self.goto_recent, formula);
                 // Persist the recent formulas across launches (the C++
                 // `gotoAddress/recent` key) via the disk store.
                 crate::ui::dialogs::gotoaddress::store_recent(
@@ -392,7 +398,12 @@ impl super::MainWindow {
     /// index in the theme list and apply it, then check its menu row (clearing
     /// the others — the C++ exclusive `themeGroup`; main.cpp:1318). No-op
     /// (notified) if unknown.
-    pub(super) fn switch_theme_by_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn switch_theme_by_name(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let index = self
             .theme_manager
             .borrow()
@@ -540,7 +551,12 @@ impl super::MainWindow {
 
     /// Open/close the left workspace dock to a specific state (drives the
     /// `set_open` on the underlying `Dock`).
-    pub(super) fn set_left_dock_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_left_dock_open(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dock_area = self.dock_area.clone();
         dock_area.update(cx, |area, cx| {
             if area.is_dock_open(DockPlacement::Left, cx) != open {
@@ -594,7 +610,12 @@ impl super::MainWindow {
 
     /// Open/close the bottom scanner dock to a specific state (drives `set_open`
     /// on the underlying `Dock`). Mirrors [`Self::set_left_dock_open`].
-    pub(super) fn set_bottom_dock_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_bottom_dock_open(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dock_area = self.dock_area.clone();
         dock_area.update(cx, |area, cx| {
             if area.is_dock_open(DockPlacement::Bottom, cx) != open {

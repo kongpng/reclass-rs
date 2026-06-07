@@ -31,7 +31,7 @@ it in. Both feature sets build green on Linux.
 | Rust module | C++ source | Role |
 |---|---|---|
 | `core/` (`kind`, `node`, `tree`, `value_history`, `linemeta`, `command`, `commontypes`, `clipboard`, `typeinfer`) | `core.h`, `commontypes.h`, `typeinfer.h`, `clipboard.h` | Node tree, `NodeKind`/type system, `.rcx` serde, value-history heatmap, line/render metadata, undo/redo command model, predefined struct templates, clipboard codec. **Genuinely ported.** |
-| `provider/` (`mod`, `buffer`, `file`, `snapshot`, `null`, `registry`, `native`) | `providers/*`, `providerregistry.h`, `iplugin.h` | The `Provider` trait + built-in **file / buffer / snapshot / null** sources + registry. **Real for the benign sources.** Live OS sources = documented stubs in `native` (out of scope). |
+| `provider/` (`mod`, `buffer`, `file`, `snapshot`, `null`, `registry`, `native`) | `providers/*`, `providerregistry.h`, `iplugin.h` | The `Provider` trait + built-in **file / buffer / snapshot / null** sources + + **live process via `memflow`** (runtime-discovered connector/OS plugins) + registry. **Real**, including live process; only the legacy native-plugin seam in `native` (kernel / remote / WinDbg / ReClass.NET) is a documented stub. |
 | `compose.rs` | `compose.cpp` | Tree + Provider → rendered rows (text + `LineMeta`, column geometry). |
 | `format.rs` | `format.cpp` | Value formatting, hex/ASCII previews, value read/parse/validate. |
 | `addr.rs` | `addressparser.*` | Address-expression evaluator (`<mod>+0x10`, deref chains, symbols). |
@@ -46,7 +46,7 @@ it in. Both feature sets build green on Linux.
 | `ui/` (`mod`, `editor`) | `editor.*`, `widgets/*`, dialogs, popups, docks, `mainwindow.h`, `startpage.h`, `titlebar.*` | GPUI views: standard chrome via gpui-component + the bespoke raw-gpui editor `Element`. [feature: `ui`, default] |
 | `main.rs` | `main.cpp` | The `reclass` app binary: window, CLI, lifecycle, wiring. |
 | `bin/reclass-mcp-bridge.rs` | `tools/rcx-mcp-stdio.cpp` | stdio ↔ local-socket bridge binary. |
-| — (out of scope) | `plugins/*` | Live OS process / kernel / remote / WinDbg sources — documented stubs only, behind `provider::native`. |
+| `memflow` / — | `plugins/*` | **Live process** is first-party via `provider::memflow`. The legacy kernel / remote / WinDbg / ReClass.NET sources remain documented stubs behind `provider::native`. |
 
 ## Binaries
 
@@ -69,11 +69,16 @@ default = ["ui", "imports", "disasm", "symbols", "mcp"]
 | `disasm` | `iced-x86` | x86/x64 disassembly + hex dump |
 | `symbols` | `cpp_demangle`, `msvc-demangler`, `reqwest`, `directories`, `regex` | RTTI/demangle/symbol-server |
 | `mcp` | `interprocess` | JSON-RPC MCP server |
+| `memflow-provider` (compat) | nothing | no-op alias; the memflow live provider is always compiled |
 | `scanner-parallel` (off) | `rayon` | parallel scanner |
-| `native-plugins` (off) | `libloading` | OUT-OF-SCOPE live-source plugin loader (stubs only) |
+| `native-plugins` (off) | `libloading` | legacy native-plugin loader seam for un-ported C++ sources (stubs only) |
+
+The memflow live process provider is always compiled. Connector and OS support
+is still runtime/plugin based: qemu, kvm, pcileech, winio, and win32 are loaded
+from memflow plugin directories when available.
 
 `--no-default-features` yields a **headless engine** build (no gpui) for fast
-logic-only testing.
+logic-only testing; core providers, including memflow, remain available.
 
 ## Building
 
@@ -87,10 +92,11 @@ cargo build  --no-default-features
 cargo test   --no-default-features
 ```
 
-**Full build (default, incl. the GPUI UI):**
+**Full build (default, incl. the GPUI UI and memflow provider):**
 
 ```sh
 cargo build
+cargo run --release
 ```
 
 ### Linux build prerequisites (for the gpui link step)

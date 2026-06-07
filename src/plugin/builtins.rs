@@ -19,7 +19,10 @@ use std::sync::Arc;
 use crate::plugin::contract::{Contribution, Plugin};
 use crate::plugin::manifest::{Permission, PluginManifest};
 use crate::plugin::provider_spec::{ProviderSpec, SharedProvider};
-use crate::provider::{BufferProvider, FileProvider, NullProvider, SnapshotProvider};
+use crate::provider::{
+    BufferProvider, FileProvider, MemflowAttachConfig, MemflowProvider, NullProvider,
+    SnapshotProvider,
+};
 
 /// The "File" source (cpp_reference §3 — the only built-in the C++ surfaced).
 /// `can_handle` accepts any non-empty path; `create_provider` mmaps it via
@@ -160,11 +163,48 @@ impl Plugin for NullPlugin {
     }
 }
 
-/// The four in-tree built-in plugins, in the C++ registration order the Manage
-/// Plugins dialog lists (File, Buffer, Snapshot, Null — `window.rs::builtin_plugins`).
+/// The memflow-backed "Process Memory" source. The target is a JSON-encoded
+/// [`MemflowAttachConfig`] so the UI and MCP can share one provider factory.
+pub struct MemflowProcessPlugin {
+    manifest: PluginManifest,
+}
+
+impl Default for MemflowProcessPlugin {
+    fn default() -> Self {
+        MemflowProcessPlugin {
+            manifest: PluginManifest::builtin(
+                "Process Memory",
+                "Reads a live process through memflow connector and OS plugins.",
+                vec![Permission::AddProvider],
+            ),
+        }
+    }
+}
+
+impl Plugin for MemflowProcessPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn contributions(&self) -> Vec<Contribution> {
+        vec![Contribution::Provider(ProviderSpec::new(
+            |target| MemflowAttachConfig::from_target(target).is_ok(),
+            |target| {
+                let cfg = MemflowAttachConfig::from_target(target)?;
+                let provider = MemflowProvider::attach(cfg)?;
+                Ok(Arc::new(provider) as SharedProvider)
+            },
+        ))]
+    }
+}
+
+/// The in-tree built-in plugins, in the C++ registration order the Manage
+/// Plugins dialog lists. `Process Memory` is inserted after `File`, matching the
+/// data-source menu's user-facing order.
 pub fn builtin_plugins() -> Vec<Box<dyn Plugin>> {
     vec![
         Box::new(FilePlugin::default()),
+        Box::new(MemflowProcessPlugin::default()),
         Box::new(BufferPlugin::default()),
         Box::new(SnapshotPlugin::default()),
         Box::new(NullPlugin::default()),
@@ -198,6 +238,10 @@ mod tests {
             "snapshot"
         );
         assert_eq!(NullPlugin::default().manifest().identifier(), "null");
+        assert_eq!(
+            MemflowProcessPlugin::default().manifest().identifier(),
+            "processmemory"
+        );
     }
 
     #[test]
@@ -206,7 +250,7 @@ mod tests {
             .iter()
             .map(|p| p.manifest().identifier())
             .collect();
-        assert_eq!(ids, ["file", "buffer", "snapshot", "null"]);
+        assert_eq!(ids, ["file", "processmemory", "buffer", "snapshot", "null"]);
     }
 
     #[test]

@@ -45,11 +45,11 @@ use std::rc::Rc;
 
 use gpui::{App, Window};
 
-use crate::ui::state::SourceKind;
-use crate::ui::chrome::tabs::DocumentArea;
-use crate::ui::window::DiskSettings;
 use crate::plugin::PluginHost;
 use crate::theme::SettingsStore;
+use crate::ui::chrome::tabs::DocumentArea;
+use crate::ui::state::SourceKind;
+use crate::ui::window::DiskSettings;
 
 /// The namespaced prefix for a plugin's persisted scalar settings, completed with
 /// the plugin's key: `plugin.setting.<key>`. Kept distinct from the manager's

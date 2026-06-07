@@ -6,11 +6,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::*;
 use super::{
     K_IDLE_BACKOFF_TICKS, K_MAX_MAIN_EXTENT, K_PAGE_MASK, K_POINTER_SNAPSHOT_BYTE_BUDGET,
     K_STABILITY_THRESHOLD,
 };
-use super::*;
 use crate::provider::{Provider, SnapshotProvider, K_PAGE_SIZE};
 
 impl super::RcxController {

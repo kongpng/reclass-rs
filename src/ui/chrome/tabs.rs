@@ -51,10 +51,10 @@ use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
+use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
 use crate::ui::design::{color, icon, tokens};
 use crate::ui::editor::RcxEditor;
 use crate::ui::state::{DataSource, DocId, SourceKind, ViewMode};
-use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
 
 // ── Document-tab context-menu actions (the C++ doc-tab `QMenu`, `main.cpp:3652`)
 //
@@ -1803,8 +1803,8 @@ mod tests {
 
     #[test]
     fn source_status_label_describes_kind_and_target() {
-        use crate::ui::state::{DataSource, SourceKind};
         use super::source_status_label;
+        use crate::ui::state::{DataSource, SourceKind};
         // A live file source → "File: <target>".
         let s = DataSource::new(SourceKind::File, "game.bin");
         assert_eq!(

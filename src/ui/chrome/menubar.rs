@@ -44,8 +44,8 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Selectable as _, Sizable as _};
 
-use crate::ui::pickers::commandpalette::{default_menu_tree, CommandId, MenuNode};
 use crate::ui::design::{color, elevated_surface, icon, tokens};
+use crate::ui::pickers::commandpalette::{default_menu_tree, CommandId, MenuNode};
 
 /// The menu-bar's outcome — a top-level→leaf command was chosen. Routed by the
 /// owning [`MainWindow`](crate::ui::window::MainWindow) to `run_menu_command` (the
@@ -284,7 +284,9 @@ impl MenuBar {
         if sel.is_empty() {
             return;
         }
-        let pos = self.highlight.and_then(|h| sel.iter().position(|&i| i == h));
+        let pos = self
+            .highlight
+            .and_then(|h| sel.iter().position(|&i| i == h));
         let next = match pos {
             Some(p) => (p as i32 + delta).rem_euclid(sel.len() as i32) as usize,
             None if delta >= 0 => 0,
@@ -316,7 +318,10 @@ impl MenuBar {
     /// highlight to the first selectable row of the new panel.
     fn open_highlighted_submenu(&mut self, cx: &mut Context<Self>) {
         let Some(h) = self.highlight else { return };
-        if matches!(self.deepest_children().get(h), Some(MenuNode::Submenu { .. })) {
+        if matches!(
+            self.deepest_children().get(h),
+            Some(MenuNode::Submenu { .. })
+        ) {
             self.open_submenu.push(h);
             self.highlight = None;
             self.move_highlight(1, cx); // first selectable row of the fly-out
@@ -339,7 +344,12 @@ impl MenuBar {
     fn right_key(&mut self, cx: &mut Context<Self>) {
         let is_submenu = self
             .highlight
-            .map(|h| matches!(self.deepest_children().get(h), Some(MenuNode::Submenu { .. })))
+            .map(|h| {
+                matches!(
+                    self.deepest_children().get(h),
+                    Some(MenuNode::Submenu { .. })
+                )
+            })
             .unwrap_or(false);
         if is_submenu {
             self.open_highlighted_submenu(cx);
@@ -405,7 +415,10 @@ fn clean_title(label: &str) -> String {
 /// or `None` if the label has no `&`. Drives the Alt+letter menu accelerators.
 fn mnemonic_of(label: &str) -> Option<char> {
     let pos = label.find('&')?;
-    label[pos + 1..].chars().next().map(|c| c.to_ascii_lowercase())
+    label[pos + 1..]
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_lowercase())
 }
 
 /// Apply the C++ `applyMenuBarTitleCase` transform to a `&`-stripped title
@@ -477,7 +490,11 @@ impl Render for MenuBar {
                         checked.clone(),
                         dropdown_focus.clone(),
                         // Highlight only applies to the menu that is actually open.
-                        if open_index == Some(i) { highlight } else { None },
+                        if open_index == Some(i) {
+                            highlight
+                        } else {
+                            None
+                        },
                         cx,
                     )),
                     // Top-level leaves/separators don't appear in the C++ bar.
@@ -555,42 +572,40 @@ fn render_top_level(
                             // so it intercepts Tab / arrows BEFORE gpui's focus
                             // traversal or a window-level binding can swallow them
                             // (bubble-phase on_key_down only ever saw Escape).
-                            .capture_key_down(cx.listener(
-                                |this, ev: &KeyDownEvent, window, cx| {
-                                    let shift = ev.keystroke.modifiers.shift;
-                                    match ev.keystroke.key.as_str() {
-                                        "escape" => {
-                                            cx.stop_propagation();
-                                            this.close_menus_restoring(window, cx);
-                                        }
-                                        "down" => {
-                                            cx.stop_propagation();
-                                            this.move_highlight(1, cx);
-                                        }
-                                        "up" => {
-                                            cx.stop_propagation();
-                                            this.move_highlight(-1, cx);
-                                        }
-                                        "enter" | "space" => {
-                                            cx.stop_propagation();
-                                            this.activate_highlight(cx);
-                                        }
-                                        "right" => {
-                                            cx.stop_propagation();
-                                            this.right_key(cx);
-                                        }
-                                        "left" => {
-                                            cx.stop_propagation();
-                                            this.back_or_prev_menu(cx);
-                                        }
-                                        "tab" => {
-                                            cx.stop_propagation();
-                                            this.switch_menu(if shift { -1 } else { 1 }, cx);
-                                        }
-                                        _ => {}
+                            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                                let shift = ev.keystroke.modifiers.shift;
+                                match ev.keystroke.key.as_str() {
+                                    "escape" => {
+                                        cx.stop_propagation();
+                                        this.close_menus_restoring(window, cx);
                                     }
-                                },
-                            ))
+                                    "down" => {
+                                        cx.stop_propagation();
+                                        this.move_highlight(1, cx);
+                                    }
+                                    "up" => {
+                                        cx.stop_propagation();
+                                        this.move_highlight(-1, cx);
+                                    }
+                                    "enter" | "space" => {
+                                        cx.stop_propagation();
+                                        this.activate_highlight(cx);
+                                    }
+                                    "right" => {
+                                        cx.stop_propagation();
+                                        this.right_key(cx);
+                                    }
+                                    "left" => {
+                                        cx.stop_propagation();
+                                        this.back_or_prev_menu(cx);
+                                    }
+                                    "tab" => {
+                                        cx.stop_propagation();
+                                        this.switch_menu(if shift { -1 } else { 1 }, cx);
+                                    }
+                                    _ => {}
+                                }
+                            }))
                             .occlude()
                             .top(px(tokens::space::XS))
                             // Dismiss when the user clicks anywhere outside the
@@ -705,8 +720,16 @@ fn menu_panel(
                     None
                 };
                 rows.push(
-                    submenu_row(i, label, is_open, row_highlighted(i), abs_path, child_panel, cx)
-                        .into_any_element(),
+                    submenu_row(
+                        i,
+                        label,
+                        is_open,
+                        row_highlighted(i),
+                        abs_path,
+                        child_panel,
+                        cx,
+                    )
+                    .into_any_element(),
                 );
             }
         }

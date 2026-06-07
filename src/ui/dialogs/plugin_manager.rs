@@ -143,7 +143,11 @@ impl PluginManagerDialog {
     /// detail). Feature-gated: the default build has no loader, so neither the
     /// caller nor this setter exists there and `load_errors` stays empty.
     #[cfg(feature = "plugins")]
-    fn set_load_errors(&mut self, errs: Vec<(std::path::PathBuf, String)>, cx: &mut Context<Self>) {
+    pub(crate) fn set_load_errors(
+        &mut self,
+        errs: Vec<(std::path::PathBuf, String)>,
+        cx: &mut Context<Self>,
+    ) {
         self.load_errors = errs;
         cx.notify();
     }
@@ -416,7 +420,12 @@ impl Render for PluginManagerDialog {
             }))
             .w(card_w)
             .max_h(card_max_h)
-            .child(modal::header_with_close("Plugins", "plugins-x", cx.listener(|this, _e, _w, cx| this.close(cx)), cx))
+            .child(modal::header_with_close(
+                "Plugins",
+                "plugins-x",
+                cx.listener(|this, _e, _w, cx| this.close(cx)),
+                cx,
+            ))
             .child(body)
             .child(footer)
     }

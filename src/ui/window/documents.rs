@@ -107,7 +107,12 @@ impl super::MainWindow {
     /// `class_keyword` so the rendered C/C++ reads `class` / `struct` / `enum`,
     /// and the tab title reflects the kind so the three commands are visibly
     /// distinct (the bug: all three collapsed to one blank "Untitled").
-    pub(super) fn new_document(&mut self, kind: RootKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn new_document(
+        &mut self,
+        kind: RootKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.dismiss_start_page(cx);
 
         // C++ `project_new` adds the new struct to the active document and copies its
@@ -195,7 +200,8 @@ impl super::MainWindow {
     /// data source via the native file picker (the C++ `loadData(path)` /
     /// File-provider attach). Updates the tab source icon + window state.
     pub(super) fn prompt_data_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
             return;
         };
         let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -236,12 +242,74 @@ impl super::MainWindow {
         .detach();
     }
 
-    /// File ▸ Data Source ▸ Process Memory — open the live process picker (the
-    /// C++ `ProcessPicker` reached from `selectSource("process")`). On this
-    /// platform the registry exposes no live factories, so the picker surfaces
-    /// the (possibly stub) provider rows; a chosen row reports the selection.
+    /// File ▸ Data Source ▸ Process Memory — attach through the memflow-backed
+    /// live provider.
+    pub(super) fn open_process_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_memflow_attach_dialog(window, cx);
+    }
+
+    fn open_memflow_attach_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
+            return;
+        };
+        let dialog = crate::ui::dialogs::MemflowAttachDialog::view(window, cx);
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            move |this, _dialog, ev: &crate::ui::dialogs::MemflowAttachEvent, window, cx| match ev {
+                crate::ui::dialogs::MemflowAttachEvent::Cancel => window.close_dialog(cx),
+                crate::ui::dialogs::MemflowAttachEvent::Attach(cfg) => {
+                    let target = match cfg.to_target() {
+                        Ok(target) => target,
+                        Err(err) => {
+                            this.notify(err, window, cx);
+                            return;
+                        }
+                    };
+                    let provider = match this
+                        .plugin_manager
+                        .create_provider("processmemory", &target)
+                    {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            this.notify(format!("memflow attach failed: {err}"), window, cx);
+                            return;
+                        }
+                    };
+                    let display = provider.name();
+                    editor.update(cx, |ed, cx| {
+                        ed.controller_mut()
+                            .attach_provider_with_target(provider, true, target);
+                        ed.apply_document(cx);
+                    });
+                    let source = crate::ui::state::DataSource::new(
+                        crate::ui::state::SourceKind::Process,
+                        display.clone(),
+                    );
+                    this.set_active_source(source, window, cx);
+                    this.settings
+                        .borrow_mut()
+                        .set(settings_keys::LAST_ATTACHED_PROCESS, display.as_str());
+                    window.close_dialog(cx);
+                    this.notify(format!("Attached {display}"), window, cx);
+                }
+            },
+        ));
+        self.present_modal(&dialog, 720., 80., None, window, cx);
+    }
+
+    /// File ▸ Data Source ▸ Process Memory — open the legacy process picker (the
+    /// C++ `ProcessPicker` reached from `selectSource("process")`). Live process
+    /// attach is handled first-party by the sibling memflow path
+    /// (`open_process_source` → `open_memflow_attach_dialog`); this older picker
+    /// is a non-attaching fallback that surfaces registry rows and records the
+    /// selection as the document's logical source.
+    #[allow(dead_code)]
     pub(super) fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::ui::pickers::processpicker::{ProcessPickEvent, ProcessPicker, ProcessPickerModel};
+        use crate::ui::pickers::processpicker::{
+            ProcessPickEvent, ProcessPicker, ProcessPickerModel,
+        };
         // Build the picker's available-source rows from the SESSION-OWNED plugin
         // manager's registry (the in-tree File/Buffer/Snapshot/Null providers
         // registered through the contract) — the single source the rest of the app
@@ -273,8 +341,9 @@ impl super::MainWindow {
                     this.settings
                         .borrow_mut()
                         .set(settings_keys::LAST_ATTACHED_PROCESS, name);
-                    // No live provider factory on this platform — record the pick
-                    // as the document's logical source so the tab reflects it.
+                    // This legacy picker does not attach (live attach is the
+                    // memflow path); record the pick as the document's logical
+                    // source so the tab reflects it.
                     let source = crate::ui::state::DataSource::new(
                         crate::ui::state::SourceKind::Process,
                         format!("{name} (pid {pid})"),
@@ -288,11 +357,12 @@ impl super::MainWindow {
         self.present_modal(&picker, 720., 80., None, window, cx);
     }
 
-    /// File ▸ Data Source ▸ {Remote / WinDbg / ReClass.NET} — these live providers
-    /// have no factory on this platform. The C++ shows a blocking warning when a
-    /// source can't attach; mirror that with the themed modal message box (not a
-    /// transient toast). (No Kernel Memory case: the C++ Data Source menu has no
-    /// such row — see `report_unavailable_source`'s callers / `menu_tree_with`.)
+    /// File ▸ Data Source ▸ {Remote / WinDbg / ReClass.NET} — these legacy native
+    /// sources are not yet ported (the live *process* source is first-party via
+    /// memflow). The C++ shows a blocking warning when a source can't attach;
+    /// mirror that with the themed modal message box (not a transient toast). (No
+    /// Kernel Memory case: the C++ Data Source menu has no such row — see
+    /// `report_unavailable_source`'s callers / `menu_tree_with`.)
     pub(super) fn report_unavailable_source(
         &mut self,
         cmd: &str,
@@ -308,7 +378,7 @@ impl super::MainWindow {
         let spec = crate::ui::dialogs::messagebox::warn(
             "Source Unavailable",
             &format!(
-                "{label} is not available on this platform. Open a project with a saved \
+                "{label} is not available in this port. Open a project with a saved \
                  source, or attach a binary File instead."
             ),
         );
@@ -334,7 +404,8 @@ impl super::MainWindow {
     /// `promptAddBookmark`; main.cpp:8090). The themed prompt collects the name;
     /// the formula defaults to the current base.
     pub(super) fn prompt_add_bookmark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
             return;
         };
         let default_formula = {
@@ -378,7 +449,8 @@ impl super::MainWindow {
     /// Edit ▸ Quick Bookmark Here (Ctrl+Alt+B) — capture the current address as an
     /// auto-named `bookmark_NN` (no dialog; the C++ lambda at main.cpp:1197).
     pub(super) fn quick_bookmark_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
             return;
         };
         let formula = {
@@ -483,7 +555,8 @@ impl super::MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
             return;
         };
         editor.update(cx, |ed, cx| {
@@ -712,7 +785,12 @@ impl super::MainWindow {
     /// family (the C++ `setEditorFont` + settings("font"); main.cpp:5071). The
     /// editor surface owns no live family setter in this port, so the window owns
     /// the selection + persisted setting + the Font submenu ✓.
-    pub(super) fn set_editor_font(&mut self, family: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_editor_font(
+        &mut self,
+        family: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editor_font = family.to_string();
         // Persist the selection to the disk store so it survives a relaunch (the
         // C++ `settings.setValue("font", family)`; main.cpp:1311). Loaded back in

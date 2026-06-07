@@ -262,8 +262,7 @@ impl ScannerForm {
     pub fn field_visibility(&self) -> FieldVisibility {
         let is_sig = self.mode() == ScanMode::Signature;
         let cond = self.effective_condition();
-        let needs_value = is_sig
-            || consumes_typed_value(cond);
+        let needs_value = is_sig || consumes_typed_value(cond);
         let needs_range = cond == ScanCondition::Between && !is_sig;
         FieldVisibility {
             pattern_visible: is_sig,

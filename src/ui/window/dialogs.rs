@@ -35,7 +35,8 @@ impl super::MainWindow {
             resolve_field_vtable, resolve_rtti, RttiBrowserDialog, RttiBrowserEvent,
         };
 
-        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
             return;
         };
 
@@ -109,8 +110,9 @@ impl super::MainWindow {
     }
 
     /// Tools ▸ Start/Stop MCP Server — toggle the MCP bridge flag and flip the
-    /// menu label (the C++ `toggleMcp` + dynamic action text; main.cpp:1568). No
-    /// live bridge on this platform; the toggle + label are real.
+    /// menu label (the C++ `toggleMcp` + dynamic action text; main.cpp:1568). The
+    /// UI does not embed a live bridge (the MCP server runs via the `mcp` feature,
+    /// not a platform-specific path); the toggle + label are real.
     pub(super) fn toggle_mcp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mcp_running = !self.mcp_running;
         self.rebuild_menus(cx);
@@ -127,7 +129,8 @@ impl super::MainWindow {
     /// accept, apply the edited aliases to the document and recompose so the
     /// editor + generated code reflect the new type names.
     pub(super) fn open_type_aliases_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx) else {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
             return;
         };
         let current: std::collections::HashMap<crate::core::NodeKind, String> =
@@ -369,7 +372,8 @@ impl super::MainWindow {
             "Ctrl+Shift+M — Memory Scanner    Ctrl+Shift+Y — Modules".to_string(),
             "Ctrl+Shift+B — Bookmarks    Ctrl+\\ — Split Editor".to_string(),
         ];
-        let mut spec = crate::ui::dialogs::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
+        let mut spec =
+            crate::ui::dialogs::messagebox::info("Keyboard Shortcuts", "Bound accelerators:");
         spec.detail = detail;
         crate::ui::dialogs::messagebox::open_message(spec, window, cx);
     }

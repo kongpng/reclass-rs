@@ -22,7 +22,12 @@ pub(crate) struct RcxUnsavedDialog {
 }
 
 impl RcxUnsavedDialog {
-    pub(crate) fn new(title: &str, text: &str, dirty_names: Vec<String>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        title: &str,
+        text: &str,
+        dirty_names: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             spec: crate::ui::dialogs::messagebox::unsaved_changes(title, text, dirty_names),
             focus_handle: cx.focus_handle(),
@@ -33,7 +38,9 @@ impl RcxUnsavedDialog {
     /// `[Cancel, Discard, Save changes]` order [`messagebox::unsaved_changes`]
     /// builds.
     fn choose(&mut self, button_index: usize, cx: &mut Context<Self>) {
-        cx.emit(crate::ui::dialogs::messagebox::unsaved_choice_for(button_index));
+        cx.emit(crate::ui::dialogs::messagebox::unsaved_choice_for(
+            button_index,
+        ));
     }
 }
 
@@ -47,8 +54,8 @@ impl EventEmitter<crate::ui::dialogs::messagebox::UnsavedChoice> for RcxUnsavedD
 
 impl Render for RcxUnsavedDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::ui::dialogs::modal;
         use crate::ui::dialogs::messagebox::{ButtonVariant, DetailLayout};
+        use crate::ui::dialogs::modal;
         use gpui_component::button::{Button, ButtonVariants as _};
 
         let card_w = modal::clamp_width(crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, window);
@@ -138,7 +145,10 @@ pub(crate) struct RcxConfirmDialog {
 }
 
 impl RcxConfirmDialog {
-    pub(crate) fn new(spec: crate::ui::dialogs::messagebox::MessageSpec, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        spec: crate::ui::dialogs::messagebox::MessageSpec,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             spec,
             focus_handle: cx.focus_handle(),
@@ -172,8 +182,8 @@ impl EventEmitter<ConfirmChoice> for RcxConfirmDialog {}
 
 impl Render for RcxConfirmDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::ui::dialogs::modal;
         use crate::ui::dialogs::messagebox::{ButtonVariant, DefaultButton, DetailLayout};
+        use crate::ui::dialogs::modal;
         use gpui_component::button::{Button, ButtonVariants as _};
 
         let card_w = modal::clamp_width(crate::ui::dialogs::messagebox::MSG_MAX_WIDTH, window);
@@ -184,7 +194,9 @@ impl Render for RcxConfirmDialog {
                 .text_color(crate::ui::design::color::text(cx))
                 .child(self.spec.text.clone()),
         );
-        if let DetailLayout::Label(s) = crate::ui::dialogs::messagebox::format_detail(&self.spec.detail) {
+        if let DetailLayout::Label(s) =
+            crate::ui::dialogs::messagebox::format_detail(&self.spec.detail)
+        {
             body = body.child(
                 div()
                     .pl(px(crate::ui::design::tokens::space::MD))
@@ -366,9 +378,12 @@ impl Render for TextPromptDialog {
                 }
             }))
             .w(card_w)
-            .child(
-                modal::header_with_close(self.title.clone(), "prompt-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx),
-            )
+            .child(modal::header_with_close(
+                self.title.clone(),
+                "prompt-close",
+                cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                cx,
+            ))
             .child(body)
             .child(footer)
     }
@@ -455,7 +470,10 @@ impl TypeAliasesDialog {
     }
 
     /// Collect the edited alias map (empty fields are dropped — no alias).
-    pub(crate) fn collect(&self, cx: &App) -> std::collections::HashMap<crate::core::NodeKind, String> {
+    pub(crate) fn collect(
+        &self,
+        cx: &App,
+    ) -> std::collections::HashMap<crate::core::NodeKind, String> {
         let mut map = std::collections::HashMap::new();
         for (kind, _name, input) in &self.rows {
             let v = input.read(cx).value().to_string();
@@ -618,7 +636,12 @@ impl Render for TypeAliasesDialog {
             }))
             .w(card_w)
             .max_h(card_max_h)
-            .child(modal::header_with_close("Type Aliases", "alias-close", cx.listener(|this, _e, _w, cx| this.cancel(cx)), cx))
+            .child(modal::header_with_close(
+                "Type Aliases",
+                "alias-close",
+                cx.listener(|this, _e, _w, cx| this.cancel(cx)),
+                cx,
+            ))
             .child(body)
             .child(footer)
     }

@@ -26,29 +26,34 @@
 //!
 //! Gated behind the `ui` feature (the dialogs render via gpui-component).
 
-pub mod messagebox;
-pub mod plugin_manager;
-pub mod window_dialogs;
-pub mod optionsdialog;
 pub mod gotoaddress;
+pub mod memflow_attach;
+pub mod messagebox;
+pub mod optionsdialog;
+pub mod plugin_manager;
 pub mod profilerdialog;
+pub mod window_dialogs;
 
 // Re-export the implemented dialog/popup views + their event types under one
 // roof (the "open a dialog" entry point the window wires to).
 #[cfg(feature = "ui")]
-pub use crate::ui::pickers::commandpalette::{CommandPalette, PaletteEvent};
+pub use crate::ui::dialogs::gotoaddress::{GotoAddressDialog, GotoEvent};
 #[cfg(feature = "ui")]
-pub use crate::ui::pickers::enumpicker::{EnumPickerEvent, EnumPickerPopup};
+pub use crate::ui::dialogs::memflow_attach::{MemflowAttachDialog, MemflowAttachEvent};
+#[cfg(feature = "ui")]
+pub use crate::ui::dialogs::optionsdialog::{
+    OptionsDialog, OptionsEvent, OptionsPage, OptionsResult,
+};
+#[cfg(feature = "ui")]
+pub use crate::ui::dialogs::profilerdialog::{ProfilerDialog, ProfilerEvent};
 #[cfg(feature = "ui")]
 pub use crate::ui::overlays::findbar::{FindBar, FindEvent};
 #[cfg(feature = "ui")]
-pub use crate::ui::dialogs::gotoaddress::{GotoAddressDialog, GotoEvent};
-#[cfg(feature = "ui")]
 pub use crate::ui::overlays::hextoolbar::{HexToolbarEvent, HexToolbarPopup};
 #[cfg(feature = "ui")]
-pub use crate::ui::dialogs::optionsdialog::{OptionsDialog, OptionsEvent, OptionsPage, OptionsResult};
+pub use crate::ui::pickers::commandpalette::{CommandPalette, PaletteEvent};
 #[cfg(feature = "ui")]
-pub use crate::ui::dialogs::profilerdialog::{ProfilerDialog, ProfilerEvent};
+pub use crate::ui::pickers::enumpicker::{EnumPickerEvent, EnumPickerPopup};
 #[cfg(feature = "ui")]
 pub use crate::ui::pickers::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 #[cfg(feature = "ui")]

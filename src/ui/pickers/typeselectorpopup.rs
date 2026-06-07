@@ -1121,7 +1121,12 @@ mod view {
         /// retyping an array element should pass [`TypePopupMode::ArrayElement`],
         /// and a pointer-target pick [`TypePopupMode::PointerTarget`] (which hides
         /// the modifiers). Clears any active modifier (per `setMode` semantics).
-        pub fn set_mode(&mut self, mode: TypePopupMode, window: &mut Window, cx: &mut Context<Self>) {
+        pub fn set_mode(
+            &mut self,
+            mode: TypePopupMode,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
             self.model.set_mode(mode);
             // Re-label the filter input for the new mode (noun + total type count).
             let placeholder = self.model.filter_placeholder();
@@ -1446,9 +1451,10 @@ mod view {
                             )
                             .into_any_element()
                     } else {
-                        let group_color = crate::ui::theme_apply::to_hsla(
-                            super::kind_group_color(r.entry.group, &theme),
-                        );
+                        let group_color = crate::ui::theme_apply::to_hsla(super::kind_group_color(
+                            r.entry.group,
+                            &theme,
+                        ));
                         let is_sel = selected == Some(row);
                         // The node's CURRENT type — the C++ pre-selects it as the
                         // initial highlight rather than painting a separate, static
@@ -2360,7 +2366,10 @@ mod tests {
         model.set_mode(TypePopupMode::FieldType);
         assert_eq!(model.filter_placeholder(), "Filter 7 types..  (Ctrl+F)");
         model.set_mode(TypePopupMode::ArrayElement);
-        assert_eq!(model.filter_placeholder(), "Filter 7 element types..  (Ctrl+F)");
+        assert_eq!(
+            model.filter_placeholder(),
+            "Filter 7 element types..  (Ctrl+F)"
+        );
         model.set_mode(TypePopupMode::PointerTarget);
         assert_eq!(model.filter_placeholder(), "Filter 7 targets..  (Ctrl+F)");
         // The count ignores the live filter — narrowing to one match keeps "7".

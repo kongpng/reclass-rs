@@ -18,7 +18,9 @@ impl super::MainWindow {
 
     /// Map a loaded document's provider/data path to the UI [`DataSource`]
     /// summary (the tab source-icon; app-shell §8 `refreshDocTabSourceIcon`).
-    pub(super) fn source_for_doc(doc: &crate::controller::RcxDocument) -> crate::ui::state::DataSource {
+    pub(super) fn source_for_doc(
+        doc: &crate::controller::RcxDocument,
+    ) -> crate::ui::state::DataSource {
         use crate::ui::state::{DataSource, SourceKind};
         match &doc.data_path {
             Some(p) => DataSource::new(SourceKind::File, p.to_string_lossy().into_owned()),
@@ -34,7 +36,9 @@ impl super::MainWindow {
     /// controller ingested left the icon showing "no source" even when values
     /// loaded (the bug). For a File source we keep the on-disk path so the icon +
     /// tooltip match the attached binary.
-    pub(super) fn source_for_controller(ctrl: &crate::controller::RcxController) -> crate::ui::state::DataSource {
+    pub(super) fn source_for_controller(
+        ctrl: &crate::controller::RcxController,
+    ) -> crate::ui::state::DataSource {
         use crate::ui::state::{DataSource, SourceKind};
         let idx = ctrl.active_source_index();
         if idx >= 0 {
@@ -46,6 +50,12 @@ impl super::MainWindow {
                         entry.file_path.clone()
                     };
                     return DataSource::new(SourceKind::File, path);
+                } else if entry.kind == "Process" || entry.kind == "processmemory" {
+                    return DataSource::new(SourceKind::Process, entry.display_name.clone());
+                } else if entry.kind == "Buffer" {
+                    return DataSource::new(SourceKind::Buffer, entry.display_name.clone());
+                } else if entry.kind == "Snapshot" {
+                    return DataSource::new(SourceKind::Snapshot, entry.display_name.clone());
                 }
             }
         }

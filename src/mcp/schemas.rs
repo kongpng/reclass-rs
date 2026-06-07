@@ -109,15 +109,22 @@ fn tool_tree_apply() -> Value {
 fn tool_source_switch() -> Value {
     json!({
         "name": "source.switch",
-        "description": "Switch active data source (provider). Use sourceIndex for saved sources, filePath to load a binary file, or pid to attach to a live process.",
+        "description": "Switch active data source (provider). Use sourceIndex for saved sources, filePath to load a binary file, or provider:'memflow'/'processmemory' with connector/os settings to attach to a live process.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."},
                 "sourceIndex": {"type": "integer"},
                 "filePath": {"type": "string"},
+                "provider": {"type": "string", "description": "Use 'memflow' or 'processmemory' for live process memory."},
+                "connector": {"type": "string", "description": "memflow connector plugin name, e.g. qemu, kvm, pcileech, winio."},
+                "connectorArgs": {"type": "string", "description": "Raw memflow connector args without the connector name, e.g. 'win10' or 'win10:memmap=map'."},
+                "os": {"type": "string", "description": "memflow OS plugin name. Defaults to win32."},
+                "osArgs": {"type": "string", "description": "Raw memflow OS args without the OS name. For win32 extra args without a target, include the leading colon, e.g. ':dtb=0x1234'."},
                 "pid": {"type": "integer", "description": "Process ID to attach to for live memory reading."},
                 "processName": {"type": "string", "description": "Display name for the process (optional with pid)."},
+                "writable": {"type": "boolean", "description": "Allow writes through memflow. Defaults false."},
+                "pluginDirs": {"type": "array", "items": {"type": "string"}, "description": "Additional memflow plugin directories to scan for third-party connectors/OS layers."},
                 "allViews": {"type": "boolean"}
             }
         }
@@ -813,14 +820,16 @@ Set dryRun:true to preview only. Set mode:'replace' to remove existing root type
     fn advertised_set_has_no_phantom() {
         use crate::mcp::stubs::STUB_TOOLS;
 
-        // The 7 evidence/export tools dispatched to real handlers + the 9
-        // in-scope handlers (project.state, tree.apply, source.switch, hex.read,
-        // hex.write, status.set, ui.action, tree.search, node.history) +
+        // The 7 evidence/export tools dispatched to real handlers + the 10
+        // in-scope handlers (project.state, tree.apply, source.switch,
+        // source.modules, hex.read, hex.write, status.set, ui.action,
+        // tree.search, node.history) +
         // mcp.reconnect. Everything else is a stub.
         let real: &[&str] = &[
             "project.state",
             "tree.apply",
             "source.switch",
+            "source.modules",
             "hex.read",
             "hex.write",
             "status.set",

@@ -7,7 +7,11 @@ use super::*;
 
 /// Relabel the first leaf with the given command id, in place (used for the
 /// dynamic MCP Start/Stop label). Recurses into submenus.
-pub(crate) fn relabel_command(nodes: &mut [crate::ui::pickers::commandpalette::MenuNode], command: &str, new_label: &str) {
+pub(crate) fn relabel_command(
+    nodes: &mut [crate::ui::pickers::commandpalette::MenuNode],
+    command: &str,
+    new_label: &str,
+) {
     use crate::ui::pickers::commandpalette::MenuNode;
     for node in nodes {
         match node {
@@ -37,8 +41,8 @@ pub(crate) fn inject_plugin_menu_items(
     tree: &mut [crate::ui::pickers::commandpalette::MenuNode],
     commands: &[crate::plugin::UiContribution],
 ) {
-    use crate::ui::pickers::commandpalette::MenuNode;
     use crate::plugin::{CommandSlot, UiContribution};
+    use crate::ui::pickers::commandpalette::MenuNode;
     // Find the &Plugins submenu by its label (the static menu tree carries it).
     let Some(MenuNode::Submenu { children, .. }) = tree
         .iter_mut()
@@ -133,7 +137,11 @@ impl super::MainWindow {
     menu_action!(on_undo, UndoAction, "edit.undo");
     menu_action!(on_redo, RedoAction, "edit.redo");
     menu_action!(on_add_bookmark, AddBookmarkAction, "edit.add_bookmark");
-    menu_action!(on_quick_bookmark, QuickBookmarkAction, "edit.quick_bookmark");
+    menu_action!(
+        on_quick_bookmark,
+        QuickBookmarkAction,
+        "edit.quick_bookmark"
+    );
     menu_action!(on_shortcuts, ShortcutsAction, "help.shortcuts");
     // The Tools accelerator handlers — the RTTI Browser (Ctrl+Shift+R;
     // main.cpp:1524) and Performance Profiler (Ctrl+Shift+F; main.cpp:1565) were
@@ -195,11 +203,12 @@ impl super::MainWindow {
 
             // ── File: data source (the active-source picker; data_options.png) ──
             // The C++ `m_sourceMenu` triggers route to controller->selectSource /
-            // clearSources. File attaches a binary; Process opens the picker; the
-            // remaining live providers have no factory on this platform.
+            // clearSources. File attaches a binary; Process attaches a live target
+            // through memflow; the remaining legacy native sources (remote /
+            // WinDbg / ReClass.NET) are not yet ported.
             "source.clear" => self.clear_active_source(window, cx),
             "source.file" => self.prompt_data_file(window, cx),
-            "source.process" => self.open_process_picker(window, cx),
+            "source.process" => self.open_process_source(window, cx),
             // The C++ Data Source set is File + the registered providers only — no
             // Kernel Memory row (kernelmemory is a Browse-Page-Tables provider id,
             // never a Data Source entry; see commandpalette.rs `menu_tree_with`).
@@ -358,7 +367,12 @@ impl super::MainWindow {
     }
 
     /// Reopen a recent file from its `file.recent.<index>` command id.
-    pub(super) fn open_recent_by_command(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_recent_by_command(
+        &mut self,
+        cmd: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if cmd == "file.recent.empty" {
             return;
         }
@@ -417,7 +431,9 @@ impl super::MainWindow {
     /// `updateRecentFilesMenu` / `populateSourceMenu` / MCP label flip). Preserves
     /// the checkmark state (held separately on the menu bar).
     pub(super) fn rebuild_menus(&mut self, cx: &mut Context<Self>) {
-        use crate::ui::pickers::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        use crate::ui::pickers::commandpalette::{
+            menu_tree_with, RecentMenuEntry, SourceMenuEntry,
+        };
         // Skip entries whose file no longer exists (the C++
         // `updateRecentFilesMenu` exists-filter); the command carries the
         // ORIGINAL stored index so a reopen targets the right path.
