@@ -928,7 +928,12 @@ pub fn compute_delta(vt: ValueType, prev: &[u8], cur: &[u8]) -> DeltaInfo {
             if prev.len() >= $w && cur.len() >= $w {
                 let a = <$t>::from_le_bytes(prev[..$w].try_into().unwrap()) as i64;
                 let b = <$t>::from_le_bytes(cur[..$w].try_into().unwrap()) as i64;
-                fmt_int(b - a);
+                // Wrapping matches the C++ `(long long)(int64_t)(b - a)` and the
+                // UInt64 arm. For the narrower instantiations the i64 cast keeps
+                // `b - a` well inside range, so this is bit-identical; for Int64 it
+                // turns a debug-build overflow panic into the wrapped value release
+                // already produces.
+                fmt_int(b.wrapping_sub(a));
                 return d;
             }
         }};
@@ -1421,6 +1426,30 @@ mod tests {
         let same = compute_delta(ValueType::Int32, &7i32.to_le_bytes(), &7i32.to_le_bytes());
         assert_eq!(same.direction, 0);
         assert_eq!(same.text, "+0");
+    }
+
+    #[test]
+    fn compute_delta_int64_extremes_wrap_without_panic() {
+        // prev/cur differing by more than i64::MAX would overflow a checked `b - a`
+        // and panic in debug builds; wrapping_sub yields the same value release
+        // produces. i64::MAX - i64::MIN wraps to -1.
+        let d = compute_delta(
+            ValueType::Int64,
+            &i64::MIN.to_le_bytes(),
+            &i64::MAX.to_le_bytes(),
+        );
+        assert!(d.ok);
+        assert_eq!(d.direction, -1);
+        assert_eq!(d.text, "-1");
+        // The mirrored direction (MIN - MAX) wraps to +1.
+        let d = compute_delta(
+            ValueType::Int64,
+            &i64::MAX.to_le_bytes(),
+            &i64::MIN.to_le_bytes(),
+        );
+        assert!(d.ok);
+        assert_eq!(d.direction, 1);
+        assert_eq!(d.text, "+1");
     }
 
     #[test]
