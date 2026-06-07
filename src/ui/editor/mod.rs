@@ -5493,12 +5493,20 @@ fn same_size_variants(kind: NodeKind) -> Vec<NodeKind> {
     if size <= 0 {
         return vec![kind];
     }
+    // Keep the ring within the same family: a non-string/non-vector kind must not
+    // cycle onto string (UTF8/UTF16) or vector (Vec2/3/4) kinds of the same byte
+    // size (the C++ cycle filter; statusbar.rs:299-310 already applies it, so its
+    // pos/total indicator now agrees with the real ring length).
+    let cur_is_string = crate::core::is_string_kind(kind);
+    let cur_is_vector = crate::core::is_vector_kind(kind);
     let ring: Vec<NodeKind> = crate::core::K_KIND_META
         .iter()
         .map(|m| m.kind)
         .filter(|&k| {
             !matches!(k, NodeKind::Struct | NodeKind::Array)
                 && crate::core::size_for_kind(k) == size
+                && (cur_is_string || !crate::core::is_string_kind(k))
+                && (cur_is_vector || !crate::core::is_vector_kind(k))
         })
         .collect();
     if ring.is_empty() {
@@ -6492,10 +6500,12 @@ mod tests {
         use crate::core::{size_for_kind, NodeKind};
         for &k in &[
             NodeKind::Int8,
+            NodeKind::Int16,
             NodeKind::Int32,
             NodeKind::UInt32,
             NodeKind::Float,
             NodeKind::Int64,
+            NodeKind::Int128,
             NodeKind::Pointer64,
         ] {
             let size = size_for_kind(k);
@@ -6515,6 +6525,18 @@ mod tests {
                 !matches!(next, NodeKind::Struct | NodeKind::Array),
                 "cycle never lands on a container"
             );
+            // From a numeric kind the ring stays numeric — never a same-byte-size
+            // string (UTF8/UTF16) or vector (Vec2/3/4) variant (P6 / C++ parity).
+            for v in [next, prev] {
+                assert!(
+                    !crate::core::is_string_kind(v),
+                    "cycle of {k:?} must not land on a string kind ({v:?})"
+                );
+                assert!(
+                    !crate::core::is_vector_kind(v),
+                    "cycle of {k:?} must not land on a vector kind ({v:?})"
+                );
+            }
             // Cycling forward `ring.len()` times returns to the start.
             let ring = same_size_variants(k);
             let mut cur = k;
