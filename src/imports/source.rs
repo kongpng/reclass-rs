@@ -953,7 +953,7 @@ impl<'a> Parser<'a> {
         if self.check(TokKind::Colon) {
             self.advance();
             if self.check(TokKind::Number) {
-                field.bitfield_width = self.peek(0).text.parse::<i32>().unwrap_or(0);
+                field.bitfield_width = self.peek(0).text.parse::<i32>().unwrap_or(0).clamp(0, 64);
                 self.advance();
             }
         }
@@ -1347,9 +1347,9 @@ fn emit_bitfield_group(
 ) {
     let mut total_bits = 0i32;
     for f in &fields[start_idx..end_idx] {
-        total_bits += f.bitfield_width;
+        total_bits = total_bits.saturating_add(f.bitfield_width);
     }
-    let bytes = (total_bits + 7) / 8;
+    let bytes = total_bits.saturating_add(7) / 8;
     let container_kind = if bytes <= 1 {
         NodeKind::Hex8
     } else if bytes <= 2 {
@@ -1495,14 +1495,14 @@ fn build_fields(
             let start_idx = fi;
             let mut total_bits = 0i32;
             while fi < fields.len() && fields[fi].bitfield_width >= 0 {
-                total_bits += fields[fi].bitfield_width;
+                total_bits = total_bits.saturating_add(fields[fi].bitfield_width);
                 fi += 1;
             }
             // fi now points past the group; emit covers [start_idx, fi)
             if total_bits > 0 {
                 emit_bitfield_group(tree, parent_id, group_offset, fields, start_idx, fi);
             }
-            let bytes = (total_bits + 7) / 8;
+            let bytes = total_bits.saturating_add(7) / 8;
             let node_size = if bytes <= 1 {
                 1
             } else if bytes <= 2 {
@@ -2119,5 +2119,44 @@ mod tests {
         let sa = sized.children_of(sized.nodes[0].id);
         assert_eq!(sized.nodes[sa[0]].kind, NodeKind::Array);
         assert_eq!(sized.nodes[sa[0]].array_len, 16);
+    }
+
+    #[test]
+    fn adversarial_bitfield_widths_do_not_overflow() {
+        // Regression: summing attacker-controlled bitfield widths used to be a
+        // plain `total_bits += ...` over an i32, so widths near i32::MAX would
+        // overflow (debug panic) while accumulating the group and again in the
+        // `total_bits + 7` byte computation. The parse-time clamp(0,64) plus
+        // saturating accumulation make import total, never panicking. A bitfield
+        // wider than 64 bits is invalid C, so clamping only touches pathological
+        // input. This input must import cleanly rather than abort the process.
+        let src = format!(
+            "struct S {{\n  int a : {max};\n  int b : {max};\n  int c : {max};\n}};",
+            max = i32::MAX
+        );
+        let tree = import_from_source(&src, 8).expect("adversarial widths must import, not panic");
+        let kids = tree.children_of(tree.nodes[0].id);
+        // The three over-wide fields collapse into one clamped bitfield group.
+        assert_eq!(kids.len(), 1);
+        assert_eq!(tree.nodes[kids[0]].kind, NodeKind::Struct);
+        assert_eq!(tree.nodes[kids[0]].class_keyword, "bitfield");
+    }
+
+    #[test]
+    fn normal_bitfield_group_still_emits_one_bitfield_node() {
+        // Pin happy-path parity: ordinary in-range widths are unaffected by the
+        // clamp and still coalesce into a single "bitfield" struct container.
+        let tree = import_from_source(
+            "struct S {\n  unsigned int a : 1;\n  unsigned int b : 2;\n  unsigned int c : 3;\n};",
+            8,
+        )
+        .unwrap();
+        let kids = tree.children_of(tree.nodes[0].id);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(tree.nodes[kids[0]].kind, NodeKind::Struct);
+        assert_eq!(tree.nodes[kids[0]].class_keyword, "bitfield");
+        // 1+2+3 = 6 bits -> 1 byte -> Hex8 container.
+        assert_eq!(tree.nodes[kids[0]].element_kind, NodeKind::Hex8);
+        assert_eq!(tree.nodes[kids[0]].bitfield_members.len(), 3);
     }
 }
