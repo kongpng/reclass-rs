@@ -176,6 +176,14 @@ struct PdbCtx<'t> {
     /// union definition name → typeIndex.
     union_def_by_name: HashMap<String, u32>,
     udt_def_index_built: bool,
+    /// Current depth of the mutually-recursive type-import descent
+    /// (`import_member_type` ⇄ `import_field_list` ⇄ `import_udt`). Bounded by
+    /// `MAX_PDB_IMPORT_DEPTH` so a crafted PDB type graph — a modifier cycle
+    /// (M0→M1→M0) or a multi-thousand-deep by-value nesting chain — truncates
+    /// the import instead of overflowing the stack (SIGABRT). `import_udt`'s
+    /// per-type cache already breaks true UDT cycles; this also bounds the
+    /// non-memoized modifier/nesting paths.
+    import_depth: u32,
 }
 
 /// Whether a name is "anonymous" / compiler-generated (cpp: `name[0] == '<'` /
@@ -192,6 +200,12 @@ fn member_offset_u16(offset: u64) -> i32 {
     (offset as u16) as i32
 }
 
+/// Hard ceiling on type-import recursion depth (combined `import_member_type` /
+/// `import_field_list` frames). Real C/C++ type nesting is far below this; the
+/// cap only ever fires on a degenerate or crafted PDB type graph, where it
+/// truncates the import rather than letting the descent overflow the stack.
+const MAX_PDB_IMPORT_DEPTH: u32 = 500;
+
 impl<'t> PdbCtx<'t> {
     fn new(tt: &'t TypeTable<'t>) -> Self {
         PdbCtx {
@@ -201,6 +215,7 @@ impl<'t> PdbCtx<'t> {
             struct_def_by_name: HashMap::new(),
             union_def_by_name: HashMap::new(),
             udt_def_index_built: false,
+            import_depth: 0,
         }
     }
 
@@ -386,7 +401,20 @@ impl<'t> PdbCtx<'t> {
     }
 
     /// `importFieldList(idx, parentId)` (cpp:413-555).
+    ///
+    /// Depth-guarding wrapper: every level of type nesting passes through here
+    /// or `import_member_type`, so bounding both bounds the whole descent. At the
+    /// ceiling the import simply stops expanding (the struct keeps any fields
+    /// emitted so far) rather than recursing into a stack overflow.
     fn import_field_list(&mut self, field_list_index: u32, parent_id: u64) {
+        self.import_depth += 1;
+        if self.import_depth <= MAX_PDB_IMPORT_DEPTH {
+            self.import_field_list_inner(field_list_index, parent_id);
+        }
+        self.import_depth -= 1;
+    }
+
+    fn import_field_list_inner(&mut self, field_list_index: u32, parent_id: u64) {
         let fl = match self.tt.get(field_list_index) {
             Some(TypeData::FieldList(fl)) => fl,
             _ => return,
@@ -465,7 +493,25 @@ impl<'t> PdbCtx<'t> {
 
     /// `importMemberType(idx, offset, name, parentId)` (cpp:557-899) — emit
     /// exactly one node.
+    ///
+    /// Depth-guarding wrapper (see `import_field_list`): the Modifier arm recurses
+    /// here with no memoization, so a crafted modifier cycle would otherwise spin
+    /// the stack until it overflows. At the ceiling the member is skipped.
     fn import_member_type(&mut self, type_index: u32, offset: i32, name: String, parent_id: u64) {
+        self.import_depth += 1;
+        if self.import_depth <= MAX_PDB_IMPORT_DEPTH {
+            self.import_member_type_inner(type_index, offset, name, parent_id);
+        }
+        self.import_depth -= 1;
+    }
+
+    fn import_member_type_inner(
+        &mut self,
+        type_index: u32,
+        offset: i32,
+        name: String,
+        parent_id: u64,
+    ) {
         // Primitive type indices (< firstIndex) (cpp:559-602)
         if type_index < self.tt.first_index() {
             let ptr_mode = (type_index >> 8) & 0xF;

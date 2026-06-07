@@ -135,7 +135,13 @@ pub fn extract_pdb_debug_info(prov: &dyn Provider, module_base: u64) -> PdbDebug
         return result;
     }
 
-    let num_entries = dd_size / SIZEOF_DEBUG_DIRECTORY as u32;
+    // `dd_size` is attacker-controlled (read from the PE debug data directory),
+    // so an absurd value would otherwise drive up to ~153M failing Provider::read
+    // calls — a multi-minute hang on a live target. No real PE has more than a
+    // handful of debug entries; bound the scan to the project's loop-safety
+    // ceiling (K_MAX_ARRAY_LEN), mirroring the ReClass-XML/JSON import clamps.
+    let num_entries =
+        (dd_size / SIZEOF_DEBUG_DIRECTORY as u32).min(crate::core::K_MAX_ARRAY_LEN as u32);
     for i in 0..num_entries {
         let entry_addr =
             module_base + dd_virtual_address as u64 + i as u64 * SIZEOF_DEBUG_DIRECTORY;
