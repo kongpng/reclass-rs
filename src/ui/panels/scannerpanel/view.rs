@@ -960,7 +960,10 @@ impl ScannerPanel {
         self.selected_row = None;
         self.form = form.clone();
         let n = self.results.len();
-        self.status = super::count_status("", n);
+        // C++ onScanFinished (scannerpanel.cpp:1473-1479): a 0-result first
+        // scan shows the "try widening the filters" guidance, not a bare
+        // "0 results". Non-empty scans keep the plain result count.
+        self.status = super::first_scan_status(n);
         self.refresh_table(cx);
         cx.notify();
     }

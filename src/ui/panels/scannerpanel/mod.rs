@@ -1051,6 +1051,19 @@ pub fn count_status(prefix: &str, n: usize) -> String {
     format!("{prefix}{n} {noun}")
 }
 
+/// The status line after a first scan (`scannerpanel.cpp:1473-1479`): a 0-result
+/// scan shows the "try widening the filters" guidance; otherwise the plain
+/// result count. The empty result set is identical either way — this is the
+/// UX hint the C++ `onScanFinished` surfaces so an empty scan doesn't read as a
+/// dead end.
+pub fn first_scan_status(n: usize) -> String {
+    if n == 0 {
+        "0 results — try widening the filters above or checking the value/pattern.".to_string()
+    } else {
+        count_status("", n)
+    }
+}
+
 /// The status line after a Re-scan (`scannerpanel.cpp:1716-1735`): the
 /// `Narrowed N → M (eliminated K)` / `All N still match` / `M results` variants.
 /// `before` is the pre-rescan count (0 = no narrowing context).
@@ -1317,7 +1330,7 @@ mod view;
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_delta, delete_rows, deserialize_results_json, filter_rows,
+        compute_delta, delete_rows, deserialize_results_json, filter_rows, first_scan_status,
         format_addresses_for_clipboard, format_float, format_value, parse_change_all_bytes,
         previous_delta_text, rescan_status, serialize_results_json, shortcut_scan_target,
         split_address_dim, stage_breadcrumb, truncation_banner, value_type_entries, CondEntry,
@@ -1428,6 +1441,19 @@ mod tests {
         assert_eq!(previous_delta_text("AB", &none, false), "AB");
         // No previous value: empty.
         assert_eq!(previous_delta_text("", &inc, true), "");
+    }
+
+    #[test]
+    fn first_scan_status_zero_gives_widen_hint() {
+        // 0-result first scan surfaces the C++ "try widening the filters"
+        // guidance (scannerpanel.cpp:1473-1475), not a bare "0 results".
+        assert_eq!(
+            first_scan_status(0),
+            "0 results — try widening the filters above or checking the value/pattern."
+        );
+        // Non-empty scans keep the plain count.
+        assert_eq!(first_scan_status(1), "1 result");
+        assert_eq!(first_scan_status(42), "42 results");
     }
 
     #[test]
