@@ -109,6 +109,25 @@ impl super::MainWindow {
     /// distinct (the bug: all three collapsed to one blank "Untitled").
     pub(super) fn new_document(&mut self, kind: RootKind, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_start_page(cx);
+
+        // C++ `project_new` adds the new struct to the active document and copies its
+        // saved sources (main.cpp:6058-6090, `copySavedSources`) so File ▸ New can
+        // immediately read the same target. The Rust model keeps documents
+        // independent, so instead INHERIT the active source onto the fresh doc:
+        // capture it BEFORE the new tab becomes active, and only when one exists.
+        let inherited = self.document_area.read(cx).active_editor().and_then(|ed| {
+            let ed = ed.read(cx);
+            let ctrl = ed.controller();
+            (!ctrl.saved_sources().is_empty()).then(|| {
+                (
+                    ctrl.saved_sources().to_vec(),
+                    ctrl.active_source_index(),
+                    ctrl.provider().clone(),
+                    Self::source_for_controller(ctrl),
+                )
+            })
+        });
+
         let title = kind.title();
         let doc = seed_root_doc(kind);
         let mut new_editor: Option<Entity<crate::ui::editor::RcxEditor>> = None;
@@ -122,8 +141,8 @@ impl super::MainWindow {
         });
         // Realign the fresh editor to the window's (persisted) view options so a
         // new tab honours the current compact-columns/tree-lines/etc. state.
-        if let Some(editor) = new_editor {
-            self.apply_view_opts_to_editor(&editor, cx);
+        if let Some(editor) = &new_editor {
+            self.apply_view_opts_to_editor(editor, cx);
             // Focus the fresh editor so the keyboard (arrow-nav, F2 rename, …) works
             // immediately without a click — the C++ `m_sci->setFocus()` on a new
             // tab. Deferred so the focus lands once the editor has mounted.
@@ -132,8 +151,24 @@ impl super::MainWindow {
         }
         self.state.open_document(title);
         self.rebuild_workspace(cx);
-        // A fresh doc has the NullProvider — clear the docks accordingly.
-        self.refresh_docks_for_active(cx);
+
+        if let Some((sources, active_idx, provider, source)) = inherited {
+            // Carry the saved-source list/index (copySavedSources) and SHARE the live
+            // provider (an `Arc`), then recompose so the New Class reads the inherited
+            // target. `set_active_source` re-feeds the docks + Data-Source menu + the
+            // tab source icon for the now-active new document.
+            if let Some(editor) = &new_editor {
+                editor.update(cx, |ed, cx| {
+                    ed.controller_mut().copy_saved_sources(sources, active_idx);
+                    ed.controller_mut().attach_provider(provider, false);
+                    ed.apply_document(cx);
+                });
+            }
+            self.set_active_source(source, window, cx);
+        } else {
+            // A fresh doc has the NullProvider — clear the docks accordingly.
+            self.refresh_docks_for_active(cx);
+        }
         self.observe_editors(window, cx);
     }
 
