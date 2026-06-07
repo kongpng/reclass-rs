@@ -110,7 +110,15 @@ impl super::RcxEditor {
         for n in tree.nodes.iter() {
             // Named composite declarations (a struct with a type name), excluding
             // the self-reference target.
-            if n.kind == NodeKind::Struct && !n.struct_type_name.is_empty() && n.id != exclude_id {
+            // `parent_id == 0`: only TOP-LEVEL declarations belong in the catalogue
+            // (the C++ `addComposites` guard, controller.cpp:4605). Embedded struct
+            // INSTANCES also carry a struct_type_name but live under a parent and
+            // would otherwise leak in with a non-canonical (instance) struct_id.
+            if n.kind == NodeKind::Struct
+                && n.parent_id == 0
+                && !n.struct_type_name.is_empty()
+                && n.id != exclude_id
+            {
                 // Composite size is the struct's actual byte extent (sum/extent of
                 // its children) — matching C++ `e.sizeBytes = structSpan(n.id)`
                 // (controller.cpp:4555) which feeds the popup size bar/preview
@@ -134,6 +142,25 @@ impl super::RcxEditor {
         composites.sort_by(|a, b| a.display_name.cmp(&b.display_name));
         composites.dedup_by(|a, b| a.display_name == b.display_name);
         entries.extend(composites);
+        // Built-in Common Types catalogue (~47 entries: UNICODE_STRING, std::string,
+        // FVector, GUID, Matrix4x4, ...) — the C++ `addComposites` appends these
+        // after the project's own composites (controller.cpp:4778). `struct_id == 0`
+        // makes the apply path import-by-name (find_or_create_struct_by_name).
+        // Excluded from Root mode (cannot make the viewed struct a built-in); deduped
+        // by name so a project struct of the same name wins.
+        if mode != TypePopupMode::Root {
+            use crate::ui::pickers::typeselectorpopup::KindGroup;
+            let seen: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.display_name.to_string()).collect();
+            for ct in crate::core::K_COMMON_TYPES.iter() {
+                if seen.contains(ct.name) {
+                    continue;
+                }
+                let mut e = TypeEntry::composite(0, ct.name, ct.class_keyword, ct.total_size);
+                e.group = KindGroup::Common;
+                entries.push(e);
+            }
+        }
         entries
     }
 
