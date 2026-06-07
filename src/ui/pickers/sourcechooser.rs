@@ -484,6 +484,22 @@ pub fn default_entries(recent: &[(String, String, bool)]) -> Vec<SourceEntry> {
     entries
 }
 
+/// The right-aligned source-chooser footer status count (the C++ `m_footerLabel`
+/// count text). While filtering: an empty result echoes the typed query as
+/// `No matches for "<query>"` (matching the C++ `No matches for "%1"`,
+/// `sourcechooserpopup.cpp:526-528`), else `N of M sources`. When idle (the
+/// always-on navigate hint is a separate footer child, item 14): `M sources`.
+pub fn footer_status_text(query: &str, shown_sources: usize, total_sources: usize) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        format!("{total_sources} sources")
+    } else if shown_sources == 0 {
+        format!("No matches for \"{trimmed}\"")
+    } else {
+        format!("{shown_sources} of {total_sources} sources")
+    }
+}
+
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
@@ -788,9 +804,9 @@ mod view {
             let sel_bg = color::selected_bg(cx);
             let border = color::border(cx);
             let query = self.input.read(cx).value().to_string();
-            let filtering = !query.trim().is_empty();
-            // Footer counts (the C++ `m_statusLabel`): "N of M sources" while
-            // filtering / "No matches" on an empty result / "M sources" otherwise.
+            // Footer counts (the C++ `m_statusLabel`, via `footer_status_text`):
+            // "N of M sources" while filtering / `No matches for "<query>"` on an
+            // empty result / "M sources" otherwise.
             let total_sources = self
                 .model
                 .entries()
@@ -1020,15 +1036,11 @@ mod view {
                             "\u{2191}\u{2193} navigate \u{00B7} \u{21B5} select \u{00B7} Esc close",
                         ))
                         .child(div().flex_1())
-                        .child(div().flex_none().child(if filtering {
-                            if shown_sources == 0 {
-                                "No matches".to_string()
-                            } else {
-                                format!("{shown_sources} of {total_sources} sources")
-                            }
-                        } else {
-                            format!("{total_sources} sources")
-                        }))
+                        .child(div().flex_none().child(super::footer_status_text(
+                            &query,
+                            shown_sources,
+                            total_sources,
+                        )))
                         .child(
                             div()
                                 .id("source-esc")
@@ -1050,9 +1062,24 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_entries, kind_label_for, provider_entries, provider_entries_from_registry,
-        SourceEntryKind,
+        default_entries, footer_status_text, kind_label_for, provider_entries,
+        provider_entries_from_registry, SourceEntryKind,
     };
+
+    #[test]
+    fn footer_status_echoes_query_on_no_matches() {
+        // Empty filtered result echoes the typed query, matching the C++ footer
+        // `No matches for "%1"` (sourcechooserpopup.cpp:526-528) — not a bare
+        // "No matches".
+        assert_eq!(footer_status_text("zzz", 0, 6), "No matches for \"zzz\"");
+        // The query is trimmed in the echo (the branch is only reached for a
+        // non-blank filter).
+        assert_eq!(footer_status_text("  foo  ", 0, 6), "No matches for \"foo\"");
+        // A non-empty result keeps the "N of M sources" count.
+        assert_eq!(footer_status_text("fi", 2, 6), "2 of 6 sources");
+        // An idle (blank) filter shows the plain total.
+        assert_eq!(footer_status_text("   ", 6, 6), "6 sources");
+    }
 
     #[test]
     fn provider_entries_from_registry_is_the_shared_model() {
