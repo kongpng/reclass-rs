@@ -302,6 +302,11 @@ impl DocumentArea {
         }
     }
 
+    /// The id of the currently-active tab, if any.
+    pub fn active_id(&self) -> Option<DocId> {
+        self.tabs.get(self.active).map(|t| t.id)
+    }
+
     /// Rename a tab (the `rootName(tree)` change → tab title).
     pub fn set_title(&mut self, id: DocId, title: impl Into<SharedString>, cx: &mut Context<Self>) {
         if let Some(i) = self.index_of(id) {
