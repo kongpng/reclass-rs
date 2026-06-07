@@ -370,7 +370,12 @@ fn handle_node<B: BufRead>(
     // (a) Custom type: expand to appropriate hex nodes (cpp:231-255)
     if is_custom_type(xml_type, version) && node_size > 0 {
         let (hex_kind, hex_size) = largest_hex_cell_for_run(node_size);
-        let count = node_size / hex_size;
+        // Clamp the expanded-node count to the C++ array-length ceiling so a
+        // malformed, attacker-controlled `Size` attribute can't drive an unbounded
+        // allocation loop (a `Size` near i32::MAX → ~2e9 nodes → OOM/hang, even in
+        // release). Mirrors the K_MAX_ARRAY_LEN qbound the JSON load applies to
+        // arrayLen/strLen (core/node.rs:230-232; C++ kMaxArrayLen).
+        let count = (node_size / hex_size).min(crate::core::K_MAX_ARRAY_LEN);
         for _ in 0..count {
             let n = Node {
                 kind: hex_kind,
