@@ -1159,6 +1159,14 @@ mod view {
             cx.notify();
         }
 
+        /// Pre-toggle an arbitrary modifier (`*`/`**`/`[]`) — the opener uses this
+        /// to mirror the field's current shape when the selector launches (C++
+        /// `setModifier(preModId, preArrayCount)`, controller.cpp:4511).
+        pub fn set_modifier(&mut self, modifier: Modifier, cx: &mut Context<Self>) {
+            self.model.set_modifier(modifier);
+            cx.notify();
+        }
+
         /// Set the node's current type size + pointer size for the footer size
         /// diff (`setCurrentNodeSize`/`setPointerSize`). The current node size is
         /// also pushed into the model so the group-bucketed same-size-first

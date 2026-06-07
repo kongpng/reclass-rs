@@ -8,6 +8,39 @@ use super::{hex_kind_for_size, push_recent_type_into};
 use crate::core::NodeKind;
 use gpui::*;
 
+/// The modifier the Type Selector should open pre-toggled with, so the footer
+/// preview reads the field's *current* shape instead of the bare base type.
+/// Mirrors the C++ `showTypePopup` preset (controller.cpp:4466-4474): only
+/// `FieldType` mode carries modifiers; a primitive pointer lights `*`/`**` by
+/// `ptr_depth`, a typed pointer (references a composite) always `*`, and an
+/// array `[array_len]`.
+pub(super) fn modifier_preset_for(
+    mode: crate::ui::pickers::typeselectorpopup::TypePopupMode,
+    kind: NodeKind,
+    ptr_depth: i32,
+    ref_id: u64,
+    array_len: i32,
+) -> Option<crate::ui::pickers::typeselectorpopup::Modifier> {
+    use crate::ui::pickers::typeselectorpopup::{Modifier, TypePopupMode};
+    if mode != TypePopupMode::FieldType {
+        return None;
+    }
+    let is_ptr = matches!(kind, NodeKind::Pointer32 | NodeKind::Pointer64);
+    if is_ptr && ptr_depth > 0 && ref_id == 0 {
+        Some(if ptr_depth >= 2 {
+            Modifier::PointerPointer
+        } else {
+            Modifier::Pointer
+        })
+    } else if is_ptr && ref_id != 0 {
+        Some(Modifier::Pointer)
+    } else if kind == NodeKind::Array {
+        Some(Modifier::Array(array_len))
+    } else {
+        None
+    }
+}
+
 impl super::RcxEditor {
     /// Open the [`TypeSelectorPopup`](crate::ui::pickers::typeselectorpopup::TypeSelectorPopup)
     /// over `target`'s current kind and subscribe to its outcome. On
@@ -229,7 +262,7 @@ impl super::RcxEditor {
         // the C++ footer-size baseline (`nodeSize = sizeForKind(node.kind)`, or the
         // ELEMENT kind in ArrayElement mode) + the tree's pointer size, and feed the
         // recent-type names so the "Recent" section appears (items 38/39/40/41).
-        let (node_size, ptr_size, cur_struct_id) = {
+        let (node_size, ptr_size, cur_struct_id, preset) = {
             let tree = self.controller.tree();
             let ps = tree.pointer_size;
             let idx = tree.index_of_id(target.node_id);
@@ -241,10 +274,12 @@ impl super::RcxEditor {
                     crate::core::size_for_kind(n.kind)
                 };
                 // The node already references a composite when its `ref_id` is set
-                // (typed pointer / embedded struct / array-of-struct).
-                (sz, ps, n.ref_id)
+                // (typed pointer / embedded struct / array-of-struct). Also derive
+                // the modifier preset so the selector opens lit for the node's shape.
+                let preset = modifier_preset_for(mode, n.kind, n.ptr_depth, n.ref_id, n.array_len);
+                (sz, ps, n.ref_id, preset)
             } else {
-                (crate::core::size_for_kind(target.kind), ps, 0u64)
+                (crate::core::size_for_kind(target.kind), ps, 0u64, None)
             }
         };
         let recent = self.recent_type_names.clone();
@@ -259,6 +294,13 @@ impl super::RcxEditor {
             // stands.
             if cur_struct_id != 0 {
                 p.set_current_struct(cur_struct_id, cx);
+            }
+            // Pre-toggle the modifier matching the field's current shape (C++
+            // showTypePopup preModId/preArrayCount) — applied LAST, since set_mode
+            // clears any modifier. A typed/primitive pointer opens with `*`/`**`
+            // lit, an array with `[len]`, so the footer reads the node's real type.
+            if let Some(m) = preset {
+                p.set_modifier(m, cx);
             }
             p
         });
@@ -781,5 +823,70 @@ impl super::RcxEditor {
             self.controller.join_hex_nodes(node_id, target);
         }
         self.apply_document(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::modifier_preset_for;
+    use crate::core::NodeKind;
+    use crate::ui::pickers::typeselectorpopup::{Modifier, TypePopupMode};
+
+    // P4 / C++ parity (controller.cpp:4466-4474): opening the Type Selector on an
+    // existing field pre-toggles the modifier matching the field's current shape.
+    #[test]
+    fn modifier_preset_mirrors_cpp_show_type_popup() {
+        // Single primitive pointer (ptr_depth 1, no ref) → `*`.
+        assert_eq!(
+            modifier_preset_for(TypePopupMode::FieldType, NodeKind::Pointer64, 1, 0, 0),
+            Some(Modifier::Pointer)
+        );
+        // Double primitive pointer (ptr_depth ≥ 2, no ref) → `**`.
+        assert_eq!(
+            modifier_preset_for(TypePopupMode::FieldType, NodeKind::Pointer64, 2, 0, 0),
+            Some(Modifier::PointerPointer)
+        );
+        // Typed pointer (references a composite) is always a single `*`, even at
+        // depth ≥ 2 — the C++ isTypedPtr branch wins before the depth check.
+        assert_eq!(
+            modifier_preset_for(TypePopupMode::FieldType, NodeKind::Pointer64, 2, 42, 0),
+            Some(Modifier::Pointer)
+        );
+        assert_eq!(
+            modifier_preset_for(TypePopupMode::FieldType, NodeKind::Pointer32, 1, 7, 0),
+            Some(Modifier::Pointer)
+        );
+        // Array carries its element count.
+        assert_eq!(
+            modifier_preset_for(TypePopupMode::FieldType, NodeKind::Array, 0, 0, 16),
+            Some(Modifier::Array(16))
+        );
+        // A plain primitive field gets no modifier.
+        assert_eq!(
+            modifier_preset_for(TypePopupMode::FieldType, NodeKind::Int32, 0, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn modifier_preset_only_in_field_type_mode() {
+        // ArrayElement / PointerTarget / Root modes hide the modifiers, so even a
+        // pointer node yields no preset (C++ guards the whole block on FieldType).
+        for mode in [
+            TypePopupMode::ArrayElement,
+            TypePopupMode::PointerTarget,
+            TypePopupMode::Root,
+        ] {
+            assert_eq!(
+                modifier_preset_for(mode, NodeKind::Pointer64, 2, 42, 0),
+                None,
+                "mode {mode:?} must not preset a modifier"
+            );
+            assert_eq!(
+                modifier_preset_for(mode, NodeKind::Array, 0, 0, 8),
+                None,
+                "mode {mode:?} must not preset a modifier"
+            );
+        }
     }
 }
