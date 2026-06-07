@@ -292,7 +292,7 @@ fn inline_edit_round_trip() {
     // Drop the QScintilla key-event half; keep the controller `set_node_value`.
     let mut c = make_ctrl();
     c.refresh();
-    let result = c.document().compose(0, false, false, false, false, true);
+    let result = c.document().compose(0, false, false, false, false, true, None);
     let field_line = result
         .meta
         .iter()
@@ -303,6 +303,50 @@ fn inline_edit_round_trip() {
     let addr = c.tree().compute_offset(u8_idx as i32) as u64;
     let b = c.document().provider.read_bytes(addr, 1);
     assert_eq!(b[0], 0xFF);
+}
+
+// ── RcxDocument::compose forwards the symbol-lookup callback ──
+//
+// Parity with C++ `RcxDocument::compose(..., SymbolLookupFn)` (`controller.cpp:171`):
+// when a `Some` lookup is passed, each hex/pointer row with no user comment gets a
+// `// module!symbol` annotation (`compose.cpp:403-411`). Before the wiring fix the
+// Rust wrapper hardcoded no lookup, so the annotation could never appear.
+#[test]
+fn document_compose_forwards_symbol_lookup() {
+    let mut doc = RcxDocument::new();
+    build_small_tree(&mut doc.tree);
+    doc.provider = Arc::new(BufferProvider::new(vec![0u8; 64], ""));
+    // `field_hex` is a Hex32 at offset 12 (base_address 0 → abs addr 12).
+    let hex_addr = 12u64;
+
+    // None → no symbol annotation (old behavior, still the default).
+    let plain = doc.compose(0, false, false, false, false, true, None);
+    assert!(
+        !plain.text.contains("// testmod!sym"),
+        "no annotation without a lookup:\n{}",
+        plain.text
+    );
+
+    // Some → the hex row carries the `// module!symbol` suffix.
+    let lookup: crate::compose::SymbolLookupFn<'_> = Some(Box::new(move |addr: u64| {
+        if addr == hex_addr {
+            "testmod!sym".to_string()
+        } else {
+            String::new()
+        }
+    }));
+    let annotated = doc.compose(0, false, false, false, false, true, lookup);
+    // The Hex32 row renders a dot-preview in the name column (`hex32  ....  …`),
+    // not the literal field name, so select it by the `hex32` type label.
+    let hex_line = annotated
+        .text
+        .split('\n')
+        .find(|l| l.contains("hex32"))
+        .expect("hex32 line present");
+    assert!(
+        hex_line.contains("// testmod!sym"),
+        "hex row must carry the symbol annotation, got: {hex_line:?}"
+    );
 }
 
 #[test]

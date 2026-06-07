@@ -325,6 +325,12 @@ impl RcxDocument {
     /// `compose::compose`. (The thread-local doc/`ComposeDocGuard` of the C++ is
     /// dropped: aliases are resolved through `format`'s type-name hook, which
     /// the headless build leaves unset.)
+    ///
+    /// `symbol_lookup` is the trailing optional PDB symbol-lookup callback
+    /// (`SymbolLookupFn symbolLookup = {}`, `controller.h:75`); when `Some`,
+    /// hex/pointer rows with no user comment are annotated with `// module!symbol`.
+    /// `RcxController::refresh` wires it from the global `SymbolStore`; the other
+    /// callers (hover popup, tests) pass `None`, matching the C++ default arg.
     pub fn compose(
         &self,
         view_root_id: u64,
@@ -333,8 +339,9 @@ impl RcxDocument {
         brace_wrap: bool,
         type_hints: bool,
         show_comments: bool,
+        symbol_lookup: compose::SymbolLookupFn<'_>,
     ) -> ComposeResult {
-        compose::compose(
+        compose::compose_with_symbols(
             &self.tree,
             &*self.provider,
             view_root_id,
@@ -343,6 +350,7 @@ impl RcxDocument {
             brace_wrap,
             type_hints,
             show_comments,
+            symbol_lookup,
             true,
             true,
         )
@@ -4095,9 +4103,44 @@ impl RcxController {
     /// steps 1-6 (compose + change-highlight + value-tracking + selection-prune)
     /// run; the editor-apply tail (steps 7-9) is a no-op without a real editor.
     pub fn refresh(&mut self) {
+        // Build the PDB symbol-lookup callback (`controller.cpp:1911-1918`). The
+        // C++ builds `symLookup` whenever a provider is attached and passes it
+        // into compose in BOTH branches, so each hex/pointer row with no user
+        // comment gets a `// module!symbol` annotation. The closure always
+        // captures the REAL provider (`m_doc->provider`) — never the snapshot —
+        // because module-base resolution must run against the live source.
+        //
+        // The headless build has no `g_nameLookupHook`, so this mirrors the C++
+        // test-build fallback (`SymbolStore::getSymbolForAddress` directly). It
+        // is gated on the `symbols` feature (where `SymbolStore` lives) and on a
+        // real, non-`NullProvider` source (`provider.size() > 0`, the Rust
+        // analogue of C++'s non-null `m_doc->provider`); without symbols loaded
+        // `get_symbol_for_address` returns empty anyway, so output is unchanged.
+        #[cfg(feature = "symbols")]
+        let sym: compose::SymbolLookupFn<'_> = {
+            use crate::rtti::symbol_store::SymbolStore;
+            let has_syms = SymbolStore::global()
+                .lock()
+                .map(|s| s.has_symbols())
+                .unwrap_or(false);
+            if has_syms && self.doc.provider.size() > 0 {
+                let prov = Arc::clone(&self.doc.provider);
+                Some(Box::new(move |addr: u64| {
+                    SymbolStore::global()
+                        .lock()
+                        .map(|s| s.get_symbol_for_address(addr, Some(&*prov)))
+                        .unwrap_or_default()
+                }) as Box<dyn Fn(u64) -> String>)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "symbols"))]
+        let sym: compose::SymbolLookupFn<'_> = None;
+
         // Compose against snapshot if active, else real provider.
         self.last_result = if let Some(snap) = &self.snapshot {
-            compose::compose(
+            compose::compose_with_symbols(
                 &self.doc.tree,
                 snap.as_ref(),
                 self.view_root_id,
@@ -4106,6 +4149,7 @@ impl RcxController {
                 self.brace_wrap,
                 self.type_hints,
                 self.show_comments,
+                sym,
                 self.show_rtti,
                 self.show_enum_chips,
             )
@@ -4117,6 +4161,7 @@ impl RcxController {
                 self.brace_wrap,
                 self.type_hints,
                 self.show_comments,
+                sym,
             )
         };
 

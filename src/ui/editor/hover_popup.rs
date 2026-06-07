@@ -378,6 +378,7 @@ impl super::RcxEditor {
             true,
             self.type_hints(),
             self.show_comments(),
+            None,
         );
         // Skip line 0 (the command row); take the first few non-empty data lines.
         const MAX_LINES: usize = 5;
