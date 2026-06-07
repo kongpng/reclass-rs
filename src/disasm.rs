@@ -134,7 +134,7 @@ pub fn hex_dump(bytes: &[u8], base_addr: u64, max_bytes: i32) -> String {
 
     // disasm.cpp:52 — `wide` from `baseAddr + len` (loop-invariant in C++, so
     // compute once before the loop here).
-    let wide = base_addr + (len as u64) > 0xFFFF_FFFF;
+    let wide = base_addr.saturating_add(len as u64) > 0xFFFF_FFFF;
     let aw = if wide { 16 } else { 8 };
 
     let mut result = String::new(); // disasm.cpp:43
@@ -149,7 +149,7 @@ pub fn hex_dump(bytes: &[u8], base_addr: u64, max_bytes: i32) -> String {
         }
 
         // disasm.cpp:53 — address column: `"%1  "` (addr + two spaces).
-        let _ = write!(result, "{:0aw$x}  ", base_addr + off as u64);
+        let _ = write!(result, "{:0aw$x}  ", base_addr.wrapping_add(off as u64));
 
         // disasm.cpp:56-64 — exactly 16 hex slots.
         for i in 0..16 {
@@ -452,6 +452,23 @@ mod tests {
     fn hexdump_wide_addr() {
         // test_disasm.cpp:118 — 0x100000000 + 16 > 0xFFFFFFFF → 16-digit addr.
         assert!(hex_dump(&[0u8; 16], 0x100000000, 128).starts_with("0000000100000000"));
+    }
+
+    #[test]
+    fn hexdump_base_near_u64_max_no_panic() {
+        // Regression: a Pointer64/Hex64 node whose stored pointer is near
+        // u64::MAX previously panicked here in debug builds because the display
+        // address used unchecked `base_addr + len`. Saturating/wrapping adds
+        // make this total: `wide` saturates (→ 16-digit width) and the per-row
+        // address wraps explicitly. 32 bytes → two rows, so the second row's
+        // address wraps past u64::MAX.
+        let base = u64::MAX - 7;
+        let r = hex_dump(&[0xCC; 32], base, 128);
+        let lines = split_lines(&r);
+        assert_eq!(lines.len(), 2);
+        // 16-digit (wide) address column for both rows.
+        assert!(lines[0].starts_with(&format!("{:016x}", base)));
+        assert!(lines[1].starts_with(&format!("{:016x}", base.wrapping_add(16))));
     }
 
     #[test]
