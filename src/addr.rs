@@ -150,6 +150,14 @@ fn clean(formula: &str) -> String {
 /// `QChar('\0')`); never appears in cleaned ASCII input.
 const NUL: char = '\0';
 
+/// Defensive cap on recursive-descent nesting depth. The C++ parser has no
+/// such guard and relies on the native stack, so a pathologically nested input
+/// (`((((…))))`, `[[[[…]]]]`, long `----`/`~~~~` chains, nested function args)
+/// can overflow the stack and abort (SIGABRT). This cap is far above any
+/// legitimate ReClass formula, so no happy-path or C++-parity case is affected;
+/// it only converts a would-be crash into a clean `fail()` parse error.
+const MAX_PARSE_DEPTH: usize = 256;
+
 struct ExpressionParser<'a> {
     /// The cleaned input as a char buffer. Positions are char indices; for all
     /// ASCII inputs (everything the tests and real usage produce) these match
@@ -164,6 +172,11 @@ struct ExpressionParser<'a> {
     /// Position recorded at the last `fail()` (or overridden in hex parsing).
     /// (`m_errorPos`, `addressparser.cpp:63`)
     error_pos: i32,
+    /// Current recursive-descent nesting depth, guarded against
+    /// [`MAX_PARSE_DEPTH`]. Not present in the C++ original; purely defensive.
+    /// `evaluate()`/`validate()` build a fresh parser per top-level parse, so
+    /// this resets to 0 for each call.
+    depth: usize,
 }
 
 impl<'a> ExpressionParser<'a> {
@@ -175,6 +188,7 @@ impl<'a> ExpressionParser<'a> {
             pos: 0,
             error: String::new(),
             error_pos: 0,
+            depth: 0,
         }
     }
 
@@ -291,8 +305,20 @@ impl<'a> ExpressionParser<'a> {
     // ── Recursive descent parsing ──
 
     /// `bitwiseOr = bitwiseXor ('|' bitwiseXor)*` (`addressparser.cpp:113-127`).
+    ///
+    /// This is the single shared re-entry point for every nested construct
+    /// (`(...)`, `[...]`, function arguments), so the recursion-depth guard lives
+    /// here. The C++ original has no such guard; the cap only turns a stack
+    /// overflow on pathological nesting into a clean parse error.
     fn parse_bitwise_or(&mut self, result: &mut u64) -> bool {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return self.fail("expression too deeply nested");
+        }
+
         if !self.parse_bitwise_xor(result) {
+            self.depth -= 1;
             return false;
         }
         loop {
@@ -303,10 +329,12 @@ impl<'a> ExpressionParser<'a> {
             self.advance();
             let mut rhs: u64 = 0;
             if !self.parse_bitwise_xor(&mut rhs) {
+                self.depth -= 1;
                 return false;
             }
             *result |= rhs;
         }
+        self.depth -= 1;
         true
     }
 
@@ -438,29 +466,45 @@ impl<'a> ExpressionParser<'a> {
     }
 
     /// `unary = '-' unary | '~' unary | atom` (`addressparser.cpp:234-253`).
+    ///
+    /// `-`/`~` self-recurse, so a long `----…`/`~~~~…` chain is a second way to
+    /// blow the native stack; guard it with the same depth cap as
+    /// [`parse_bitwise_or`]. Defensive only — not present in the C++ original.
     fn parse_unary(&mut self, result: &mut u64) -> bool {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return self.fail("expression too deeply nested");
+        }
+
         self.skip_spaces();
         if self.peek() == '-' {
             self.advance();
             let mut inner: u64 = 0;
             if !self.parse_unary(&mut inner) {
+                self.depth -= 1;
                 return false;
             }
             // static_cast<uint64_t>(-static_cast<int64_t>(inner)) — two's
             // complement negation. (addressparser.cpp:241)
             *result = inner.wrapping_neg();
+            self.depth -= 1;
             return true;
         }
         if self.peek() == '~' {
             self.advance();
             let mut inner: u64 = 0;
             if !self.parse_unary(&mut inner) {
+                self.depth -= 1;
                 return false;
             }
             *result = !inner;
+            self.depth -= 1;
             return true;
         }
-        self.parse_atom(result)
+        let r = self.parse_atom(result);
+        self.depth -= 1;
+        r
     }
 
     /// `atom` dispatch (`addressparser.cpp:256-272`). Identifiers are checked
@@ -1310,5 +1354,54 @@ mod tests {
         let r = eval("vtop(1)");
         assert!(!r.ok);
         assert!(r.error.contains("vtop() requires 2 arguments"));
+    }
+
+    // -- Defensive: recursion-depth guard (not in C++; prevents stack overflow) --
+
+    #[test]
+    fn deeply_nested_parens_does_not_overflow() {
+        // ((((…0…))))  far beyond MAX_PARSE_DEPTH. Without the guard this
+        // recurses through parse_grouping → parse_bitwise_or unbounded and
+        // aborts the process (SIGABRT). With the guard it must return a clean
+        // parse error rather than crash.
+        let depth = MAX_PARSE_DEPTH + 50;
+        let expr = format!("{}0{}", "(".repeat(depth), ")".repeat(depth));
+        let r = eval(&expr);
+        assert!(!r.ok);
+        assert!(r.error.contains("too deeply nested"));
+    }
+
+    #[test]
+    fn deeply_nested_brackets_does_not_overflow() {
+        // [[[[…0…]]]] re-enters via parse_dereference → parse_bitwise_or.
+        let depth = MAX_PARSE_DEPTH + 50;
+        let expr = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        let r = eval(&expr);
+        assert!(!r.ok);
+        assert!(r.error.contains("too deeply nested"));
+    }
+
+    #[test]
+    fn long_unary_chain_does_not_overflow() {
+        // ----…0 / ~~~~…0 self-recurse through parse_unary.
+        let depth = MAX_PARSE_DEPTH + 50;
+        let r = eval(&format!("{}0", "-".repeat(depth)));
+        assert!(!r.ok);
+        assert!(r.error.contains("too deeply nested"));
+
+        let r = eval(&format!("{}0", "~".repeat(depth)));
+        assert!(!r.ok);
+        assert!(r.error.contains("too deeply nested"));
+    }
+
+    #[test]
+    fn moderate_nesting_still_succeeds() {
+        // Nesting comfortably under the cap must evaluate normally — the guard
+        // does not regress any legitimate (deeply) parenthesised formula.
+        let depth = 64;
+        let expr = format!("{}0x140000000{}", "(".repeat(depth), ")".repeat(depth));
+        let r = eval(&expr);
+        assert!(r.ok, "error: {}", r.error);
+        assert_eq!(r.value, 0x140000000);
     }
 }
