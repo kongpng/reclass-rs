@@ -582,9 +582,13 @@ pub fn tool_tree_apply(args: &Map<String, Value>, host: &mut dyn McpHost) -> Val
                         }
                     }
                     if ids.len() >= 2 {
-                        // Direct controller call (NOT undo command); out-of-scope
-                        // controller groupIntoUnion — count as applied for parity.
-                        applied += 1;
+                        // Controller groupIntoUnion is out-of-scope for the MCP
+                        // TabState (no Controller surface here), so unlike C++
+                        // we cannot restructure the tree. Skip honestly rather
+                        // than reporting a false "Applied".
+                        skipped.push(format!(
+                            "op[{i}]: group_into_union not available in this build"
+                        ));
                     } else {
                         skipped.push(format!("op[{i}]: group_into_union needs >= 2 nodeIds"));
                     }
@@ -593,7 +597,13 @@ pub fn tool_tree_apply(args: &Map<String, Value>, host: &mut dyn McpHost) -> Val
                     let (nid, _) = resolve_node_arg(op_obj, "nodeId", &placeholders);
                     let union_id = to_u64(&nid);
                     if tab.data.tree.index_of_id(union_id) >= 0 {
-                        applied += 1;
+                        // Controller dissolveUnion is out-of-scope for the MCP
+                        // TabState (no Controller surface here), so unlike C++
+                        // we cannot restructure the tree. Skip honestly rather
+                        // than reporting a false "Applied".
+                        skipped.push(format!(
+                            "op[{i}]: dissolve_union not available in this build"
+                        ));
                     } else {
                         skipped.push(format!("op[{i}]: dissolve_union nodeId '{nid}' not found"));
                     }
@@ -2986,6 +2996,69 @@ mod tests {
         assert!(txt.contains("Applied 0 operations"));
         assert!(txt.contains("Skipped 1:"));
         assert!(txt.contains("rename nodeId '999' not found"));
+    }
+
+    #[test]
+    fn tree_apply_union_ops_skip_not_applied() {
+        // The MCP TabState holds no Controller, so the C++ controller calls
+        // (groupIntoUnion / dissolveUnion at controller.cpp:1876/1959) are
+        // out-of-scope here. Unlike C++ — which restructures and counts these
+        // as applied — Rust must skip honestly rather than report a false
+        // "Applied". applied stays 0 (isError) and the tree is untouched.
+        let mut tab = TabState::new();
+        let pi = tab.data.tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "S".into(),
+            ..Node::default()
+        });
+        let parent_id = tab.data.tree.nodes[pi].id;
+        let a = tab.data.tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: "a".into(),
+            parent_id,
+            ..Node::default()
+        });
+        let b = tab.data.tree.add_node(Node {
+            kind: NodeKind::Int32,
+            name: "b".into(),
+            parent_id,
+            ..Node::default()
+        });
+        let id_a = tab.data.tree.nodes[a].id;
+        let id_b = tab.data.tree.nodes[b].id;
+        let before = tab.data.tree.nodes.len();
+        let mut h = TestHost::with_tab(tab);
+
+        // group_into_union with two valid sibling ids → skipped, not applied.
+        let ops = json!({
+            "operations": [
+                {"op": "group_into_union", "nodeIds": [id_a.to_string(), id_b.to_string()]}
+            ]
+        });
+        let r = tool_tree_apply(&map(ops), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        assert!(txt.contains("Applied 0 operations"));
+        assert!(txt.contains("group_into_union not available in this build"));
+
+        // dissolve_union on an existing node → skipped, not applied.
+        let ops = json!({
+            "operations": [
+                {"op": "dissolve_union", "nodeId": parent_id.to_string()}
+            ]
+        });
+        let r = tool_tree_apply(&map(ops), &mut h);
+        assert_eq!(r["isError"], json!(true));
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        assert!(txt.contains("Applied 0 operations"));
+        assert!(txt.contains("dissolve_union not available in this build"));
+
+        // Tree was never restructured: node count is unchanged (the empty
+        // tool_tree_apply macro still records an undo entry, as in C++
+        // QUndoStack, so can_undo() is not a meaningful signal here).
+        h.with_tab(0, &mut |t| {
+            assert_eq!(t.data.tree.nodes.len(), before);
+        });
     }
 
     #[test]
