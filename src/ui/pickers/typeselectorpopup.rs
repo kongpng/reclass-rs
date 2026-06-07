@@ -957,6 +957,20 @@ mod view {
         }
     }
 
+    /// The leading glyph for a row. Enum composites get the dedicated enum symbol
+    /// (the C++ `symbol-enum.svg` chosen for `category == CatEnum`,
+    /// typeselectorpopup.cpp:353-356); every other entry keeps its group glyph —
+    /// struct/class composites the container icon, primitives their kind glyph.
+    fn entry_icon(entry: &TypeEntry) -> Icon {
+        if entry.entry_kind == EntryKind::Composite
+            && entry.class_keyword.eq_ignore_ascii_case("enum")
+        {
+            icon::enum_()
+        } else {
+            group_icon(entry.group)
+        }
+    }
+
     /// Render a type name with fuzzy-matched chars emphasized (accent + semibold),
     /// the rest in `base`. `positions` are char indices into `name`.
 
@@ -1580,7 +1594,7 @@ mod view {
                                 div()
                                     .flex_none()
                                     .text_color(group_color)
-                                    .child(group_icon(r.entry.group).size_3()),
+                                    .child(entry_icon(&r.entry).size_3()),
                             )
                             .child(
                                 gpui_component::h_flex()
