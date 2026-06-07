@@ -9,26 +9,6 @@ use crate::rtti::demangle::humanize_symbol_name;
 use crate::rtti::names::{NameProvider, NamedAddress};
 use crate::rtti::symbol_store::SymbolStore;
 
-/// `moduleBaseFor(active, canonical)` (static, `pdb_name_provider.cpp:14`) —
-/// `symbol_to_address` + `.exe/.dll/.sys` cascade.
-fn module_base_for(active: Option<&dyn Provider>, canonical: &str) -> u64 {
-    let p = match active {
-        Some(p) => p,
-        None => return 0,
-    };
-    let mut base = p.symbol_to_address(canonical);
-    if base == 0 {
-        base = p.symbol_to_address(&format!("{canonical}.exe"));
-    }
-    if base == 0 {
-        base = p.symbol_to_address(&format!("{canonical}.dll"));
-    }
-    if base == 0 {
-        base = p.symbol_to_address(&format!("{canonical}.sys"));
-    }
-    base
-}
-
 /// `class PdbNameProvider` (`pdb_name_provider.h:9`).
 #[derive(Default)]
 pub struct PdbNameProvider;
@@ -51,7 +31,7 @@ impl NameProvider for PdbNameProvider {
                 Some(s) => s,
                 None => continue,
             };
-            let base = module_base_for(active, &module);
+            let base = crate::rtti::symbol_store::module_base_for(active, &module);
             for (sym_name, rva) in &set.name_to_rva {
                 out.push(NamedAddress {
                     name: sym_name.clone(),

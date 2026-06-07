@@ -72,6 +72,28 @@ impl Default for SymbolStore {
     }
 }
 
+/// `getModuleBase(provider, canonical)` (`symbolstore.cpp:7`) — `symbol_to_address`
+/// + `.exe/.dll/.sys` cascade. Free fn so name providers can resolve a module base
+/// without a `SymbolStore` (the C++ static helper duplicated in
+/// `pdb_name_provider.cpp:14`).
+pub(crate) fn module_base_for(provider: Option<&dyn Provider>, canonical: &str) -> u64 {
+    let p = match provider {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut base = p.symbol_to_address(canonical);
+    if base == 0 {
+        base = p.symbol_to_address(&format!("{canonical}.exe"));
+    }
+    if base == 0 {
+        base = p.symbol_to_address(&format!("{canonical}.dll"));
+    }
+    if base == 0 {
+        base = p.symbol_to_address(&format!("{canonical}.sys"));
+    }
+    base
+}
+
 impl SymbolStore {
     /// Constructor seeds the common Windows kernel aliases (`symbolstore.h:110`).
     pub fn new() -> Self {
@@ -104,21 +126,7 @@ impl SymbolStore {
 
     /// `getModuleBase(provider, canonical)` (`symbolstore.cpp:7`).
     fn get_module_base(&self, provider: Option<&dyn Provider>, canonical: &str) -> u64 {
-        let p = match provider {
-            Some(p) => p,
-            None => return 0,
-        };
-        let mut base = p.symbol_to_address(canonical);
-        if base == 0 {
-            base = p.symbol_to_address(&format!("{canonical}.exe"));
-        }
-        if base == 0 {
-            base = p.symbol_to_address(&format!("{canonical}.dll"));
-        }
-        if base == 0 {
-            base = p.symbol_to_address(&format!("{canonical}.sys"));
-        }
-        base
+        module_base_for(provider, canonical)
     }
 
     /// `addModule(moduleName, pdbPath, symbols)` (`symbolstore.cpp:20`). Returns
