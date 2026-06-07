@@ -15,6 +15,7 @@ use crate::core::kind::{alignment_for, kind_from_string, kind_to_string};
 use crate::core::node::{
     BitfieldMember, EvidenceEvent, EvidenceHypothesis, EvidenceProposal, Node, K_MAX_ARRAY_LEN,
 };
+use crate::core::value_history::now_ms;
 use crate::core::{Command, NodeKind, NodeTree};
 use crate::provider::Provider;
 
@@ -1374,15 +1375,6 @@ pub fn tool_node_history(args: &Map<String, Value>, host: &mut dyn McpHost) -> V
 // ════════════════════════════════════════════════════════════════════
 // evidence.* — event-sourced reversing evidence (mcp_bridge.cpp:87-209, 2543-3087)
 // ════════════════════════════════════════════════════════════════════
-
-/// `QDateTime::currentMSecsSinceEpoch()`.
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// `stringListFromJson(value)` (`mcp_bridge.cpp:87-99`). Accepts an array of
 /// strings or a single string; drops empties.
