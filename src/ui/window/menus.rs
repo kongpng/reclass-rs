@@ -257,3 +257,216 @@ impl super::MainWindow {
         }
     }
 }
+
+// Recent-files persistence + the menu (re)builder + saved-source command switch
+// — kept with the menu dispatch above.
+impl super::MainWindow {
+    // ── Recent files (the C++ recentFiles QSettings list) ──
+
+    /// Record an opened project path as the most-recent (the C++ `addRecentFile`;
+    /// main.cpp:8765): dedup, most-recent-first, capped at 10. Rebuilds the menus
+    /// + the start-page list.
+    pub(super) fn record_recent_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent_files.retain(|p| p != &abs);
+        self.recent_files.insert(0, abs);
+        self.recent_files.truncate(10);
+        // Persist the list to the disk store (the C++ `addRecentFile` →
+        // `settings.setValue("recentFiles", recent)`; main.cpp:8765) so Open
+        // Recent survives a relaunch. Loaded back in the ctor.
+        self.persist_recent_files();
+        self.rebuild_menus(cx);
+    }
+
+    /// Write the in-memory recent-files list to the disk store as a
+    /// `\n`-joined `QStringList` (the C++ `recentFiles` key).
+    pub(super) fn persist_recent_files(&self) {
+        let values: Vec<String> = self
+            .recent_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        self.settings
+            .borrow_mut()
+            .set_list(settings_keys::RECENT_FILES, &values);
+    }
+
+    /// The recent-files paths that still exist on disk, most-recent-first. Both
+    /// the Recent Files submenu and the start page skip entries whose file no
+    /// longer exists (the C++ `updateRecentFilesMenu` `if (!QFile::exists(path))
+    /// continue;`; main.cpp:8789). Indices map back into the stored vec so a
+    /// reopen targets the right path.
+    pub(super) fn existing_recent_files(&self) -> Vec<(usize, &std::path::PathBuf)> {
+        self.recent_files
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.exists())
+            .collect()
+    }
+
+    /// Reopen a recent file from its `file.recent.<index>` command id.
+    pub(super) fn open_recent_by_command(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if cmd == "file.recent.empty" {
+            return;
+        }
+        let Some(idx) = cmd
+            .strip_prefix("file.recent.")
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            return;
+        };
+        let Some(path) = self.recent_files.get(idx).cloned() else {
+            return;
+        };
+        self.open_project(&path, None, window, cx);
+    }
+
+    /// Switch the active saved data source from a `source.saved.<index>` command
+    /// id (the C++ `m_sourceMenu` saved-source row → `switchToSavedSource(idx)`).
+    /// Recomposes the editor, re-derives the tab source icon, re-feeds the docks,
+    /// and rebuilds the menus so the new active row is checked.
+    pub(super) fn switch_saved_source_by_command(
+        &mut self,
+        cmd: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = cmd
+            .strip_prefix("source.saved.")
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            return;
+        };
+        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
+            return;
+        };
+        editor.update(cx, |ed, cx| {
+            ed.controller_mut().switch_to_saved_source(idx);
+            ed.apply_document(cx);
+        });
+        // Re-derive the tab source icon + re-feed the docks from the new source.
+        let source = Self::source_for_controller(editor.read(cx).controller());
+        if let Some(active_id) = self.active_doc_id(cx) {
+            self.document_area.update(cx, |area, cx| {
+                area.set_source(active_id, source.clone(), cx);
+            });
+            self.state.set_source(active_id, source);
+        }
+        self.refresh_docks_for_active(cx);
+        self.rebuild_menus(cx);
+        cx.notify();
+    }
+
+    // ── Dynamic menu rebuild (the C++ aboutToShow rebuilders) ──
+
+    /// Rebuild the menu tree with the live Recent-Files + Data-Source rows and the
+    /// dynamic MCP Start/Stop label, then push it into the menu bar (the C++
+    /// `updateRecentFilesMenu` / `populateSourceMenu` / MCP label flip). Preserves
+    /// the checkmark state (held separately on the menu bar).
+    pub(super) fn rebuild_menus(&mut self, cx: &mut Context<Self>) {
+        use crate::ui::pickers::commandpalette::{menu_tree_with, RecentMenuEntry, SourceMenuEntry};
+        // Skip entries whose file no longer exists (the C++
+        // `updateRecentFilesMenu` exists-filter); the command carries the
+        // ORIGINAL stored index so a reopen targets the right path.
+        let existing = self.existing_recent_files();
+        // Two recent entries can be different files that share a base name
+        // (e.g. /tmp/parity/png.rcx vs /tmp/example/png.rcx). The C++ leans on a
+        // per-action tooltip to disambiguate (main.cpp:8793), but this port's
+        // menu rows have no hover tooltip, so a bare "png.rcx" twice is visually
+        // identical. When a file name repeats among the visible entries, append a
+        // parent-directory hint so each row is distinguishable, e.g.
+        // "png.rcx — parity" / "png.rcx — example".
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut hint_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (_, p) in &existing {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                *name_counts.entry(name).or_insert(0) += 1;
+            }
+            if let Some(dir) = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|s| s.to_str())
+            {
+                *hint_counts.entry(dir).or_insert(0) += 1;
+            }
+        }
+        let recent: Vec<RecentMenuEntry> = existing
+            .into_iter()
+            .map(|(i, p)| {
+                let file_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("(file)");
+                let label = if name_counts.get(file_name).copied().unwrap_or(0) > 1 {
+                    // Prefer the short parent-dir name as the hint, but if that
+                    // name itself is shared by another visible entry it would not
+                    // disambiguate — fall back to the full parent path.
+                    let short = p
+                        .parent()
+                        .and_then(|d| d.file_name())
+                        .and_then(|s| s.to_str());
+                    let hint = match short {
+                        Some(dir) if hint_counts.get(dir).copied().unwrap_or(0) <= 1 => {
+                            Some(dir.to_string())
+                        }
+                        _ => p.parent().map(|d| d.to_string_lossy().into_owned()),
+                    };
+                    match hint {
+                        Some(h) => format!("{file_name} \u{2014} {h}"),
+                        None => file_name.to_string(),
+                    }
+                } else {
+                    file_name.to_string()
+                };
+                RecentMenuEntry {
+                    label,
+                    command: format!("file.recent.{i}"),
+                }
+            })
+            .collect();
+        // Saved sources from the active document's controller (the active one is
+        // rendered checked via the host's checked-set).
+        let sources: Vec<SourceMenuEntry> = self
+            .document_area
+            .read(cx)
+            .active_editor()
+            .map(|ed| {
+                let ctrl = ed.read(cx).controller();
+                let active = ctrl.active_source_index();
+                ctrl.saved_sources()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| SourceMenuEntry {
+                        label: format!("{} '{}'", s.kind, s.display_name),
+                        command: format!("source.saved.{i}"),
+                        active: i as i32 == active,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tree = menu_tree_with(&recent, &sources);
+        // Flip the MCP label (the dynamic Start/Stop text; main.cpp:1568).
+        let mcp_label = if self.mcp_running {
+            "Stop MCP Server"
+        } else {
+            "Start MCP Server"
+        };
+        relabel_command(&mut tree, "tools.mcp", mcp_label);
+        // Inject any enabled plugin-contributed menu commands into the &Plugins
+        // submenu (design §6 Phase 2). With no contributing plugin loaded (the
+        // default build) `ui_contributions()` is empty, so the tree is byte-identical
+        // to before — the &Plugins submenu keeps only [Manage Plugins…].
+        let plugin_commands = self.plugin_manager.ui_contributions();
+        inject_plugin_menu_items(&mut tree, &plugin_commands);
+        self.menubar.update(cx, |mb, cx| mb.set_menus(tree, cx));
+        // After rebuilding the tree, re-push the active-source checkmark so the
+        // saved-source row stays checked across the rebuild.
+        let active_cmd = sources
+            .iter()
+            .position(|s| s.active)
+            .map(|i| format!("source.saved.{i}"));
+        if let Some(cmd) = active_cmd {
+            self.menubar
+                .update(cx, |mb, cx| mb.set_command_checked(&cmd, true, cx));
+        }
+    }
+}
