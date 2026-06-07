@@ -226,7 +226,7 @@ impl FieldInput {
 
     /// Whether the active overwrite mode writes per-byte HEX (vs raw ASCII).
     fn is_hex_mode(&self) -> bool {
-        self.is_hex_mode()
+        matches!(self.hex_overwrite, Some(HexOverwrite::Hex { .. }))
     }
 
     /// Item 7: re-seed the content with the ASCII preview `seed` (one printable
