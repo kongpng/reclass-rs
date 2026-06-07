@@ -632,7 +632,16 @@ fn qstring_number_g(v: f64, precision: i32) -> String {
         precision as usize
     };
     if v == 0.0 {
-        return "0".to_string();
+        // Qt's `QString::number(..,'g',..)` preserves the sign of negative zero
+        // (snprintf `%g` emits "-0"); since `-0.0 == 0.0` in Rust, a plain
+        // early-return would silently drop it. Mirror Qt so `fmt_double(-0.0)`
+        // reads "-0.0" and `fmt_float16` keeps its sign (cf. C++ fmtDouble via
+        // QString::number, and fmtFloat's explicit `-0.000f` handling).
+        return if v.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
     }
 
     // Determine decimal exponent X (as in C `%g`: choose `%e` if X < -4 or X >= P).
@@ -2103,6 +2112,18 @@ mod tests {
     #[test]
     fn test_fmt_double_integer_value() {
         assert!(fmt_double(42.0).contains('.'));
+    }
+
+    // ── Negative-zero keeps its sign (Qt QString::number emits "-0"; cf. C++
+    // fmtDouble via QString::number + fmtFloat's explicit -0 handling). fmt_double
+    // and fmt_float16 both route through qstring_number_g; fmt_float already had it.
+    #[test]
+    fn test_fmt_negative_zero_keeps_sign() {
+        assert_eq!(fmt_double(-0.0), "-0.0");
+        assert_eq!(fmt_double(0.0), "0.0");
+        // half-precision negative zero = 0x8000, positive zero = 0x0000.
+        assert!(fmt_float16(0x8000).starts_with('-'));
+        assert!(!fmt_float16(0x0000).starts_with('-'));
     }
 
     // ── Round-half-AWAY-from-zero parity with Qt QString::number ──
