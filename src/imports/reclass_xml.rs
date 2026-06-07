@@ -384,7 +384,7 @@ fn handle_node<B: BufRead>(
                 ..Node::default()
             };
             tree.add_node(n);
-            *child_offset += hex_size;
+            *child_offset = child_offset.saturating_add(hex_size);
         }
         return Ok(());
     }
@@ -463,7 +463,7 @@ fn handle_node<B: BufRead>(
             });
         }
 
-        *child_offset += if node_size > 0 { node_size } else { 0 };
+        *child_offset = child_offset.saturating_add(if node_size > 0 { node_size } else { 0 });
         return Ok(());
     }
 
@@ -494,11 +494,11 @@ fn handle_node<B: BufRead>(
             node_id,
             class_name: ptr_class,
         });
-        *child_offset += if node_size > 0 {
+        *child_offset = child_offset.saturating_add(if node_size > 0 {
             node_size
         } else {
             size_for_kind(kind)
-        };
+        });
         return Ok(());
     }
 
@@ -522,16 +522,16 @@ fn handle_node<B: BufRead>(
         } else {
             tree.add_node(n);
         }
-        *child_offset += if node_size > 0 { node_size } else { 0 };
+        *child_offset = child_offset.saturating_add(if node_size > 0 { node_size } else { 0 });
         return Ok(());
     }
 
     tree.add_node(n);
-    *child_offset += if node_size > 0 {
+    *child_offset = child_offset.saturating_add(if node_size > 0 {
         node_size
     } else {
         size_for_kind(kind)
-    };
+    });
     Ok(())
 }
 
@@ -1065,6 +1065,57 @@ mod tests {
         // Inner <Array Total="5"> overrides the node-level Total="2".
         assert_eq!(arr.array_len, 5);
         assert_eq!(arr.struct_type_name, "Elem");
+    }
+
+    // ── Defensive: absurd Size attributes must not overflow child_offset ──
+
+    #[test]
+    fn absurd_node_sizes_saturate_child_offset_instead_of_overflowing() {
+        // `Size` is parsed via attr_int (parse::<i32>().unwrap_or(0)) with no
+        // clamping, so a malformed file can supply values near i32::MAX on
+        // successive sibling nodes. The running i32 `child_offset` accumulation
+        // would then overflow — a debug-build panic, or a release-build wrap to a
+        // NEGATIVE offset that corrupts every computed address downstream. With
+        // saturating accumulation the import must succeed and offsets stay
+        // monotonic and non-negative, pinned at i32::MAX.
+        let huge = i32::MAX - 1; // 2_147_483_646
+        let xml = format!(
+            "\
+<ReClass>
+  <Class Name=\"A\">
+    <Node Type=\"10\" Name=\"a0\" Size=\"{huge}\"/>
+    <Node Type=\"10\" Name=\"a1\" Size=\"{huge}\"/>
+    <Node Type=\"10\" Name=\"a2\" Size=\"{huge}\"/>
+  </Class>
+</ReClass>
+"
+        );
+        let tree = import_str(&xml).expect("import must not panic on absurd sizes");
+
+        let a_idx = tree
+            .nodes
+            .iter()
+            .position(|n| n.parent_id == 0 && n.name == "A")
+            .unwrap();
+        let a_id = tree.nodes[a_idx].id;
+        let children = tree.children_of(a_id);
+        assert_eq!(children.len(), 3, "all three nodes must import");
+
+        // a0 sits at offset 0; a1 at `huge`; a2 must be clamped at i32::MAX
+        // (huge + huge saturates), never negative and never wrapped.
+        let offsets: Vec<i32> = children.iter().map(|&ci| tree.nodes[ci].offset).collect();
+        assert_eq!(offsets[0], 0);
+        assert_eq!(offsets[1], huge);
+        assert_eq!(
+            offsets[2],
+            i32::MAX,
+            "second accumulation must saturate, got {:?}",
+            offsets
+        );
+        assert!(
+            offsets.iter().all(|&o| o >= 0),
+            "no offset may be negative after saturation, got {offsets:?}"
+        );
     }
 
     // ── Item 4: XML declaration has no standalone attribute ──
