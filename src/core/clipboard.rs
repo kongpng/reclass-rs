@@ -207,9 +207,20 @@ fn dump_node(tree: &NodeTree, idx: usize, depth: i32, out: &mut Vec<String>) {
     let n = &tree.nodes[idx];
     let indent = " ".repeat((depth * 2) as usize);
     let kind_name = kind_to_string(n.kind);
+    // Qt's `QString::arg(offset, 4, 16, '0')` renders the offset as
+    // sign-magnitude: a negative value emits a leading '-' and zero-pads the
+    // magnitude within the width-4 field (the sign occupies one slot), e.g.
+    // `-001` for -1, `-0ff` for -255. Rust's `{:04x}` on an i32 would instead
+    // print the two's-complement pattern (`ffffffff`), so format the magnitude
+    // explicitly and reserve a field slot for the sign.
+    let sign = if n.offset < 0 { "-" } else { "" };
+    let width = 4usize.saturating_sub(sign.len());
     out.push(format!(
-        "{indent}+0x{:04x}  {:<8}  {}",
-        n.offset, kind_name, n.name
+        "{indent}+0x{sign}{:0width$x}  {:<8}  {}",
+        n.offset.unsigned_abs(),
+        kind_name,
+        n.name,
+        width = width
     ));
     for ci in tree.children_of(n.id) {
         dump_node(tree, ci, depth + 1, out);
@@ -265,5 +276,37 @@ mod tests {
         assert_eq!(res.root_ids.len(), 1);
         // ids must have been re-minted (no collision with dest's id space).
         assert!(res.nodes.iter().all(|n| n.id != 0));
+    }
+
+    /// `dumpNode` must render the offset like Qt's `QString::arg(off,4,16,'0')`,
+    /// i.e. sign-magnitude with the magnitude zero-padded inside the width-4
+    /// field (the sign takes one slot) — not Rust's two's-complement `{:04x}`.
+    #[test]
+    fn dump_offset_is_qt_sign_magnitude() {
+        use crate::core::kind::NodeKind;
+        let cases = [
+            (-1i32, "+0x-001"),
+            (-255, "+0x-0ff"),
+            (-16, "+0x-010"),
+            (-4096, "+0x-1000"), // magnitude already >= 4 digits: no extra pad
+            (0, "+0x0000"),
+            (1, "+0x0001"),
+            (255, "+0x00ff"),
+            (4096, "+0x1000"),
+        ];
+        for (off, expected) in cases {
+            let mut tree = NodeTree::new();
+            let n = tree.add_node(Node {
+                kind: NodeKind::Hex64,
+                offset: off,
+                ..Node::default()
+            });
+            let id = tree.nodes[n].id;
+            let dump = plain_dump(&tree, &[id]);
+            assert!(
+                dump.starts_with(expected),
+                "offset {off}: expected prefix {expected:?}, got {dump:?}"
+            );
+        }
     }
 }
