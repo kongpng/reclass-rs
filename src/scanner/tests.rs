@@ -2388,6 +2388,50 @@ fn rescan_empty_seed() {
     assert_eq!(out.len(), 0);
 }
 
+/// Regression: a saved-scan results file can carry an attacker-controlled
+/// address parsed via `from_str_radix(..).unwrap_or(0)` (scannerpanel parsing),
+/// so `address` may be `u64::MAX` ("ffffffffffffffff"). `run_rescan`'s span math
+/// (`address + read_size` when extending a span, and `span_last + read_size -
+/// span_base` when sizing the chunk) must not overflow-panic in debug or wrap.
+/// Two adjacent addresses pinned to the top of the address space exercise both
+/// the span-extension add (line ~1232) and the chunk-length add (line ~1240);
+/// the read fails gracefully (out of bounds → zeros) and, with no filter, both
+/// seeds are preserved.
+#[test]
+fn rescan_address_overflow_does_not_panic() {
+    let prov = crate::provider::BufferProvider::new(vec![0u8; 16], "x");
+    let seed = vec![
+        ScanResult {
+            address: u64::MAX - 8,
+            scan_value: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            region_module: String::new(),
+            previous_value: Vec::new(),
+        },
+        ScanResult {
+            address: u64::MAX,
+            scan_value: vec![0x11, 0x22, 0x33, 0x44],
+            region_module: String::new(),
+            previous_value: Vec::new(),
+        },
+    ];
+    // UnknownValue applies no filter, so both seeds are carried through; the
+    // point is that the span arithmetic for addresses near u64::MAX neither
+    // panics in debug nor wraps.
+    let out = sync_rescan(
+        &prov,
+        seed,
+        4,
+        ScanCondition::UnknownValue,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].address, u64::MAX - 8);
+    assert_eq!(out[1].address, u64::MAX);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ScanResult JSON shape projection (test_scanner.cpp:2809)
 // ═════════════════════════════════════════════════════════════════════════════
