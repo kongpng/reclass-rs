@@ -1510,7 +1510,9 @@ impl RcxEditor {
     ///   comment / type — are never invalid here, so they validate clean).
     /// - Expression result: when editing a BaseAddress, or a Value whose text
     ///   contains an arithmetic operator (`+ - * / << >> & | ^ ~`), evaluate the
-    ///   text via `parse_base_address` and float a `→ 0xHEX` / `Result: N` popup.
+    ///   text via the controller's real address parser
+    ///   ([`resolve_address_expr_full`](crate::controller::RcxController::resolve_address_expr_full))
+    ///   and float a `→ 0xHEX` / `Result: 0xHEX` popup.
     fn update_edit_validation(&mut self, _cx: &mut Context<Self>) {
         let Some(editing) = self.editing.as_ref() else {
             self.edit_validation = None;
@@ -1556,18 +1558,18 @@ impl RcxEditor {
         // Address edits always show the resolved value; value edits only when the
         // text reads as an expression (otherwise it is a plain literal).
         if (is_addr || (is_val && has_operator)) && !text.is_empty() {
-            let base = self.controller.tree().base_address;
-            let (value, formula) = parse_base_address(&text, base);
-            // A pure formula we cannot resolve numerically (no provider) keeps the
-            // fallback base; only float a result when the text actually evaluated to
-            // a number (formula empty) OR resolved to a non-fallback value.
-            let resolved = formula.is_empty() || value != base;
-            if resolved {
+            // Evaluate through the controller's real address parser (module bases,
+            // [ptr] derefs, symbols) — the C++ `m_exprEvaluator` (controller.cpp:1102,
+            // editor.cpp:4944). On a successful parse float `→ 0xHEX` (address) /
+            // `Result: 0xHEX` (value); on failure hide the popup (the parser's error
+            // surfaces in the edit comment, not here — matching C++).
+            let result = self.controller.resolve_address_expr_full(&text);
+            if result.ok {
                 let label = if is_addr { "→" } else { "Result:" };
                 self.expr_result = Some(ExprResult {
                     line,
                     col,
-                    text: format!("{label} 0x{value:X}"),
+                    text: format!("{label} 0x{:X}", result.value),
                 });
             } else {
                 self.expr_result = None;
@@ -5593,51 +5595,6 @@ fn prev_kind_for(kind: NodeKind) -> NodeKind {
     ring[(pos + ring.len() - 1) % ring.len()]
 }
 
-/// Parse a typed base-address string into `(numeric_base, formula)` for the
-/// command-row `ChangeBase` commit (BUG 1). A pure hex literal (`0x7FF6...`,
-/// `7FF6...`, or a plain decimal) sets the numeric base and clears the formula;
-/// anything containing an operator / module name (`app.exe + 0x1A0`,
-/// `[app.exe + 0x58]`, `ntdll!Sym`) is kept as a *formula* string (the numeric
-/// base is left at `fallback` until a live source resolves it). Empty input
-/// resets to base 0 with no formula. Pure (no gpui) — unit-tested below.
-fn parse_base_address(text: &str, fallback: u64) -> (u64, String) {
-    let t = text.trim();
-    if t.is_empty() {
-        return (0, String::new());
-    }
-    // A bare numeric literal: hex (`0x…`/`…h`/plain hex) or decimal.
-    if let Some(n) = parse_pure_number(t) {
-        return (n, String::new());
-    }
-    // Otherwise treat the whole thing as a base-address formula; keep the current
-    // numeric base so the gutter math stays sane until a source resolves it.
-    (fallback, t.to_string())
-}
-
-/// Parse a *bare* numeric literal as a `u64`, or `None` if it is not a plain
-/// number (so the caller can treat it as a formula). Accepts `0x`-prefixed hex, a
-/// trailing-`h` hex, all-hex-digit strings, and plain decimal.
-fn parse_pure_number(t: &str) -> Option<u64> {
-    let t = t.trim();
-    if t.is_empty() {
-        return None;
-    }
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(hex) = t.strip_suffix('h').or_else(|| t.strip_suffix('H')) {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    // All hex digits (no operators / module chars) → hex; else plain decimal.
-    if t.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Prefer hex when any a-f digit is present; otherwise it is ambiguous
-        // decimal/hex — addresses are hex by convention (the tooltip says "all
-        // numbers are hexadecimal"), so parse as hex.
-        return u64::from_str_radix(t, 16).ok();
-    }
-    None
-}
-
 impl Focusable for RcxEditor {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -6463,46 +6420,6 @@ mod tests {
             .selected_ids()
             .iter()
             .any(|&id| crate::controller::strip_sel_pub(id) == node_id));
-    }
-
-    #[test]
-    fn parse_base_address_hex_decimal_and_formula() {
-        // BUG 1: the base-address commit parses the typed string into
-        // (numeric_base, formula). Pure number → numeric base, empty formula; an
-        // expression / module reference → formula kept, numeric base falls back.
-        use super::parse_base_address;
-        let fallback = 0x1000u64;
-        // 0x-prefixed hex.
-        assert_eq!(
-            parse_base_address("0x7FF60BF02B80", fallback),
-            (0x7FF6_0BF0_2B80, String::new())
-        );
-        // Trailing-h hex.
-        assert_eq!(
-            parse_base_address("400000h", fallback),
-            (0x40_0000, String::new())
-        );
-        // Bare hex digits (addresses are hex by convention).
-        assert_eq!(
-            parse_base_address("ABCD", fallback),
-            (0xABCD, String::new())
-        );
-        // Empty → reset to 0, no formula.
-        assert_eq!(parse_base_address("", fallback), (0, String::new()));
-        assert_eq!(parse_base_address("   ", fallback), (0, String::new()));
-        // A formula (operator / module) → kept verbatim, base = fallback.
-        assert_eq!(
-            parse_base_address("app.exe + 0x1A0", fallback),
-            (fallback, "app.exe + 0x1A0".to_string())
-        );
-        assert_eq!(
-            parse_base_address("[app.exe + 0x58]", fallback),
-            (fallback, "[app.exe + 0x58]".to_string())
-        );
-        assert_eq!(
-            parse_base_address("ntdll!Sym", fallback),
-            (fallback, "ntdll!Sym".to_string())
-        );
     }
 
     #[test]

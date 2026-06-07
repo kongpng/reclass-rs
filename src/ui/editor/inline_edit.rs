@@ -22,8 +22,6 @@ use gpui::*;
 use crate::compose::EditTarget;
 use crate::core::{is_hex_preview, NodeKind};
 
-use super::parse_base_address;
-
 /// Caret blink half-period (on→off or off→on). Matches the gpui-component input
 /// blink cadence (500ms) so the inline field caret feels native.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -1665,11 +1663,12 @@ impl super::RcxEditor {
 
     /// Apply a committed **command-row** edit (the synthetic class-header row,
     /// `node_idx < 0`) against the active/root class (BUG 1):
-    /// - `BaseAddress` → parse the typed hex/expression and push the controller's
-    ///   `ChangeBase` command (undoable). A bare hex literal sets the numeric base
-    ///   and clears the formula; anything else is kept as the base-address
-    ///   *formula* string (`app.exe + 0x1A0`, `[app.exe + 0x58]`, …) so the
-    ///   command row redisplays it verbatim (the address tooltip documents these).
+    /// - `BaseAddress` → resolve the typed hex/expression through the controller's
+    ///   real address parser and push `ChangeBase` (undoable). A bare hex/decimal
+    ///   literal sets the numeric base and clears the formula; a resolvable
+    ///   expression (`app.exe + 0x1A0`, `[app.exe + 0x58]`, `ntdll!Sym`) sets the
+    ///   resolved base and keeps the expression as the formula; an unresolvable
+    ///   expression is dropped (C++ `controller.cpp:1243-1302`).
     /// - `RootClassName` → rename the view-root struct node via the existing
     ///   `rename_node` op.
     /// - other command-row targets (source / keyword / chevron) have no plain-text
@@ -1677,19 +1676,12 @@ impl super::RcxEditor {
     fn apply_command_row_commit(&mut self, commit: &EditCommit, cx: &mut Context<Self>) {
         match commit.target {
             EditTarget::BaseAddress => {
-                let text = commit.text.trim();
-                let old_base = self.controller.tree().base_address;
-                let old_formula = self.controller.document().tree.base_address_formula.clone();
-                let (new_base, new_formula) = parse_base_address(text, old_base);
-                if new_base != old_base || new_formula != old_formula {
-                    self.controller
-                        .push_command(crate::core::Command::ChangeBase {
-                            old_base,
-                            new_base,
-                            old_formula,
-                            new_formula,
-                        });
-                }
+                // Resolve + commit through the controller's real address parser —
+                // module bases, [ptr] derefs, symbols, kernel paging — matching C++
+                // (controller.cpp:1243-1302). A bare hex/decimal literal collapses
+                // the formula; a resolvable expression keeps it verbatim; an
+                // unresolvable one is dropped (no ChangeBase), as C++ does.
+                self.controller.commit_base_address(&commit.text);
             }
             EditTarget::RootClassName => {
                 // B3 / item 4: rename the viewed root struct's `struct_type_name`
