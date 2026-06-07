@@ -38,11 +38,9 @@ const COL_COMMENT: i32 = 28; // "// Enter=Save Esc=Cancel" fits
 /// `SEP = QStringLiteral(" ")` (`format.cpp:65`).
 const SEP: &str = " ";
 
-/// `kTreeIndent` — ReClass uses 2; widened to 3 for clearer nested indentation
-/// (kept in sync with [`crate::core::linemeta::K_TREE_INDENT`]).
-const K_TREE_INDENT: i32 = 3;
-/// `kSepWidth = 1` (`core.h:1136`).
-const K_SEP_WIDTH: i32 = 1;
+/// `kTreeIndent` (ReClass uses 2; widened to 3 for clearer nested indentation)
+/// and `kSepWidth = 1` (`core.h:1136`) — canonical definitions in `core::linemeta`.
+use crate::core::linemeta::{K_SEP_WIDTH, K_TREE_INDENT};
 
 // ── UTF-16-unit helpers ──
 // Qt `QString` counts code units (UTF-16). All our column/width math mirrors

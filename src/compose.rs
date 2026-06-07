@@ -41,42 +41,25 @@ struct RttiInfo {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Column layout constants (`core.h:1129-1148`). Re-declared here because the
-// composition engine OWNS the column geometry (ARCHITECTURE.md §3) and the
-// existing `core::linemeta` exposes the same constants; we mirror the values
-// 1:1 so callers can use either set interchangeably.
+// Column layout constants (`core.h:1129-1148`). The composition engine OWNS the
+// column geometry (ARCHITECTURE.md §3) and re-exports the canonical definitions
+// from `core::linemeta` so callers can keep using `compose::K_*` interchangeably.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// 3-char fold indicator prefix per line (`core.h:1130`).
-pub const K_FOLD_COL: i32 = 3;
-/// chars per nesting-level indent (ReClass `core.h:1131` uses 2; widened to 3 for
-/// clearer nested indentation — kept in sync with the `linemeta`/`format` copies).
-pub const K_TREE_INDENT: i32 = 3;
-/// Max type column width (`core.h:1132`).
-pub const K_COL_TYPE: i32 = 14;
-pub const K_COL_NAME: i32 = 22;
-pub const K_COL_VALUE: i32 = 96;
-pub const K_COL_COMMENT: i32 = 28;
-pub const K_COL_BASE_ADDR: i32 = 12;
-pub const K_SEP_WIDTH: i32 = 1;
-pub const K_MIN_TYPE_W: i32 = 9;
-pub const K_MAX_TYPE_W: i32 = 128;
-pub const K_MIN_NAME_W: i32 = 10;
-pub const K_MAX_NAME_W: i32 = 128;
-pub const K_COMPACT_TYPE_W: i32 = 20;
-pub const K_DEFAULT_REFRESH_MS: i32 = 200;
+pub use crate::core::linemeta::{
+    K_COL_BASE_ADDR, K_COL_COMMENT, K_COL_NAME, K_COL_TYPE, K_COL_VALUE, K_COMPACT_TYPE_W,
+    K_DEFAULT_REFRESH_MS, K_FOLD_COL, K_MAX_NAME_W, K_MAX_TYPE_W, K_MIN_NAME_W, K_MIN_TYPE_W,
+    K_SEP_WIDTH, K_TREE_INDENT,
+};
 
 // Scintilla fold constants (`compose.cpp:67-69`).
 const SC_FOLDLEVELBASE: i32 = 0x400;
 const SC_FOLDLEVELHEADERFLAG: i32 = 0x2000;
 const GOLDEN_RATIO: u64 = 0x9E37_79B9_7F4A_7C15;
 
-// Marker bit indices (`core.h:182-193`) — duplicated locally for the markerMask
-// math (the same values are in `core::linemeta`).
-const M_CONT: u32 = 0;
-const M_CYCLE: u32 = 3;
-const M_ERR: u32 = 4;
-const M_STRUCT_BG: u32 = 5;
+// Marker bit indices (`core.h:182-193`) — the canonical definitions live in
+// `core::linemeta`; imported here for the markerMask math.
+use crate::core::linemeta::{M_CONT, M_CYCLE, M_ERR, M_STRUCT_BG};
 
 // ───────────────────────────────────────────────────────────────────────────
 // `Utf16Buf` — a UTF-16 code-unit buffer (mirrors Qt `QString` for column math).
