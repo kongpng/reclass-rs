@@ -65,7 +65,7 @@ const K_MAX_MAIN_EXTENT: i64 = 16 * 1024 * 1024;
 
 /// `using PageMap = QHash<uint64_t, QByteArray>` (`controller.h:312`). Each
 /// value is a 4096-byte page (padded/truncated by the read worker).
-pub type PageMap = HashMap<u64, Vec<u8>>;
+pub use crate::provider::PageMap;
 
 /// `Qt::KeyboardModifiers` subset used by selection (`handleNodeClick`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

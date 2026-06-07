@@ -20,7 +20,7 @@ pub use buffer::BufferProvider;
 pub use file::FileProvider;
 pub use null::NullProvider;
 pub use registry::{ProviderInfo, ProviderRegistry, SavedSourceDisplay};
-pub use snapshot::{SnapshotProvider, K_PAGE_SIZE};
+pub use snapshot::{PageMap, SnapshotProvider, K_PAGE_SIZE};
 
 /// `enum class RegionType : uint8_t` (`provider.h:13-17`).
 #[repr(u8)]
