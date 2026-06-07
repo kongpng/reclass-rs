@@ -574,34 +574,8 @@ fn host_bridge<'a>(host: &'a mut dyn PluginHost) -> PluginHost_TO_TO<'a, RBox<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::example_plugin_path;
     use crate::plugin::manager::PluginManager;
-
-    /// Locate a built example-plugin cdylib under the cargo target dir(s). Returns
-    /// `None` if it hasn't been built (so the load test skips rather than fails in
-    /// an environment where the example wasn't compiled).
-    fn example_plugin_path(crate_name: &str) -> Option<std::path::PathBuf> {
-        let ext = if cfg!(target_os = "windows") {
-            "dll"
-        } else if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        };
-        let lib_prefix = if cfg!(target_os = "windows") {
-            ""
-        } else {
-            "lib"
-        };
-        let file = format!("{lib_prefix}{}.{ext}", crate_name.replace('-', "_"));
-
-        // CARGO_MANIFEST_DIR is the repo root (the `reclass` package).
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let candidates = [
-            root.join("target/debug").join(&file),
-            root.join("target/release").join(&file),
-        ];
-        candidates.into_iter().find(|p| p.is_file())
-    }
 
     #[test]
     fn loads_example_provider_so_and_reads_through_the_abi() {

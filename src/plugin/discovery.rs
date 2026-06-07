@@ -306,6 +306,7 @@ pub fn load_from_dirs(dirs: &[PathBuf]) -> (Vec<Box<dyn Plugin>>, Vec<(PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::example_plugin_path;
 
     #[test]
     fn candidate_filter_honors_extension_and_rcx_payload_skip() {
@@ -473,26 +474,6 @@ mod tests {
             "lib"
         };
         let file = format!("{lib_prefix}reclassnet_fake_native.{ext}");
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        [
-            root.join("target/debug").join(&file),
-            root.join("target/release").join(&file),
-        ]
-        .into_iter()
-        .find(|p| p.is_file())
-    }
-
-    /// Locate a built example-plugin cdylib (the P3 `example-provider`), to prove
-    /// the sniff funnel classifies **our** abi_stable format first (it wins to
-    /// avoid a same-process collision — design §4). Returns `None` if not built.
-    fn example_plugin_path(crate_name: &str) -> Option<PathBuf> {
-        let ext = platform_lib_extension();
-        let lib_prefix = if cfg!(target_os = "windows") {
-            ""
-        } else {
-            "lib"
-        };
-        let file = format!("{lib_prefix}{}.{ext}", crate_name.replace('-', "_"));
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         [
             root.join("target/debug").join(&file),

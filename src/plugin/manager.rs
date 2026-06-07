@@ -873,6 +873,8 @@ fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "plugins")]
+    use crate::plugin::example_plugin_path;
 
     #[test]
     fn with_builtins_registers_four_providers_in_order() {
@@ -1365,28 +1367,6 @@ mod tests {
         assert!(!detail.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Locate a built example-plugin cdylib under the cargo target dir(s) (mirrors
-    /// the loader-test helper). `None` when it hasn't been built, so the
-    /// successful-load assertion skips rather than failing in an environment where
-    /// the example wasn't compiled.
-    #[cfg(feature = "plugins")]
-    fn example_plugin_path(crate_name: &str) -> Option<std::path::PathBuf> {
-        let ext = crate::plugin::discovery::platform_lib_extension();
-        let lib_prefix = if cfg!(target_os = "windows") {
-            ""
-        } else {
-            "lib"
-        };
-        let file = format!("{lib_prefix}{}.{ext}", crate_name.replace('-', "_"));
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        [
-            root.join("target/debug").join(&file),
-            root.join("target/release").join(&file),
-        ]
-        .into_iter()
-        .find(|p| p.is_file())
     }
 
     /// The F4 startup folder-scan path: a single scan both LOADS a recognized
