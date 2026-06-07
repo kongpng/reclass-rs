@@ -37,14 +37,14 @@ use crate::core::kind_to_string;
 /// `lineKindNames[]` (`main.cpp:5541`) — the abbreviated `LineKind` labels used
 /// only by the debug dump (note `CmdRow` / `ArrSep`, distinct from the engine's
 /// full enum-variant names).
-const LINE_KIND_NAMES: [&str; 7] = [
+pub(crate) const LINE_KIND_NAMES: [&str; 7] = [
     "CmdRow", "Blank", "Header", "Field", "Cont", "Footer", "ArrSep",
 ];
 
 /// The numeric `LineKind` index the C++ debug dump reads (`(int)lm->lineKind`),
 /// used to index [`LINE_KIND_NAMES`]. Mirrors the `#[repr(u8)]` discriminant
 /// order of [`LineKind`].
-fn line_kind_index(k: LineKind) -> i32 {
+pub(crate) fn line_kind_index(k: LineKind) -> i32 {
     match k {
         LineKind::CommandRow => 0,
         LineKind::Blank => 1,
@@ -61,7 +61,7 @@ fn line_kind_index(k: LineKind) -> i32 {
 /// space into a visible middle-dot `·`. Specifically `▸`→`[>]`, `▾`→`[v]`,
 /// `│`→`[|]`, `├`→`[+]`, `└`→`[L]`, `…`→`[..]`, `→`→`[->]`, an existing margin
 /// `·`→`[.]`, a plain space → `·`, everything else passthrough.
-fn annotate_line(line: &str) -> String {
+pub(crate) fn annotate_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len() * 2);
     for ch in line.chars() {
         match ch {

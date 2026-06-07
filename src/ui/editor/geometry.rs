@@ -14,6 +14,7 @@
 //! All of this is pure (no gpui types), so it is unit-tested without a display.
 
 use crate::compose::{self, ColumnSpan, EditTarget, LineGeometry};
+use crate::core::debug_view::{annotate_line as debug_annotate_text, line_kind_index, LINE_KIND_NAMES};
 use crate::core::{find_chip, is_hex_preview, ChipKind, LineKind, LineMeta};
 
 /// A monospace cell metric: every glyph advances by `cell_width` pixels and the
@@ -606,44 +607,12 @@ pub fn local_offset_overlay(
     Some((parent_type_col, slot_width, text))
 }
 
-/// Item 75 (pure): the human label for a [`LineKind`] in the Debug view (the C++
-/// `lineKindNames`, main.cpp:5541).
-pub fn debug_line_kind_name(k: LineKind) -> &'static str {
-    match k {
-        LineKind::CommandRow => "CmdRow",
-        LineKind::Blank => "Blank",
-        LineKind::Header => "Header",
-        LineKind::Field => "Field",
-        LineKind::Continuation => "Cont",
-        LineKind::Footer => "Footer",
-        LineKind::ArrayElementSeparator => "ArrSep",
-    }
-}
-
-/// Item 75 (pure): annotate a composed line for the Debug view — spell out the
-/// special Unicode glyphs and turn each space into a visible middle-dot `·` (the
-/// C++ `generateDebugText` char switch, main.cpp:5556). So `▸`→`[>]`, `▾`→`[v]`,
-/// `│`→`[|]`, `├`→`[+]`, `└`→`[L]`, `…`→`[..]`, `→`→`[->]`, a margin `·`→`[.]`,
-/// and a plain space → `·`.
-pub fn debug_annotate_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() * 2);
-    for ch in text.chars() {
-        match ch {
-            '\u{25B8}' => out.push_str("[>]"),  // ▸ fold collapsed
-            '\u{25BE}' => out.push_str("[v]"),  // ▾ fold expanded
-            '\u{2502}' => out.push_str("[|]"),  // │ tree vertical
-            '\u{251C}' => out.push_str("[+]"),  // ├ tree branch
-            '\u{2514}' => out.push_str("[L]"),  // └ tree corner
-            '\u{2026}' => out.push_str("[..]"), // … ellipsis
-            '\u{2192}' => out.push_str("[->]"), // → arrow
-            '\u{00B7}' => out.push_str("[.]"),  // · existing middle dot (margin)
-            ' ' => out.push('\u{00B7}'),        // space → visible dot
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
+/// Item 75 (pure): the human label for a [`LineKind`] in the Debug view comes
+/// from the canonical core helper (`LINE_KIND_NAMES` / `line_kind_index`, the C++
+/// `lineKindNames`, main.cpp:5541); annotating a composed line (spelling out the
+/// special Unicode glyphs / spaces→`·`) reuses core's `annotate_line` (re-exported
+/// here as [`debug_annotate_text`]). Both live in [`crate::core::debug_view`].
+///
 /// Item 75 (pure): build the one-line Debug dump for line `line_idx` (the C++
 /// `generateDebugText` per-line composition, main.cpp:5545). Returns
 /// `margin|<annotated text>  ## L=N <LineKind> nKind=<kind> depth=N nIdx=N
@@ -662,7 +631,7 @@ pub fn debug_line(
     let mut meta = format!(
         "  ## L={} {} nKind={} depth={} nIdx={} tW={} nW={}",
         line_idx,
-        debug_line_kind_name(lm.line_kind),
+        LINE_KIND_NAMES[line_kind_index(lm.line_kind) as usize],
         crate::core::kind_to_string(lm.node_kind),
         lm.depth,
         lm.node_idx,
