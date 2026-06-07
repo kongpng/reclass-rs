@@ -885,7 +885,7 @@ pub fn run_scan_in_regions(
             continue;
         }
         let mut r_start = r.base;
-        let mut r_end = r.base + r.size;
+        let mut r_end = r.base.saturating_add(r.size);
         if has_range {
             if r_end <= req.start_address || r_start >= req.end_address {
                 continue;
@@ -916,7 +916,7 @@ pub fn run_scan_in_regions(
 
         // Clip region to requested address range.
         let mut reg_start = region.base;
-        let mut reg_end = region.base + region.size;
+        let mut reg_end = region.base.saturating_add(region.size);
         if has_range {
             if reg_end <= req.start_address || reg_start >= req.end_address {
                 continue;
@@ -1140,7 +1140,7 @@ fn intersect_constraints(
 
     let mut clipped: Vec<MemoryRegion> = Vec::new();
     for region in &regions {
-        let r_end = region.base + region.size;
+        let r_end = region.base.saturating_add(region.size);
         for c in &merged {
             if c.end <= region.base || c.start >= r_end {
                 continue;

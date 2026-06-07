@@ -1412,6 +1412,28 @@ fn scan_constrain_regions_overlapping_constraints() {
     assert_eq!(sync_scan(&prov, &req).len(), 3);
 }
 
+/// Regression: a region whose `base + size` overflows u64 (e.g. a corrupt or
+/// hostile ReClass.NET plugin section reporting an absurd size) must not panic
+/// the clip. `intersect_constraints` clamps the region end to `u64::MAX` via
+/// `saturating_add`, so the intersection uses the true upper bound instead of
+/// the wrapped (tiny) value. Before the fix this overflowed `region.base +
+/// region.size`, panicking in debug / wrapping in release.
+#[test]
+fn intersect_constraints_saturates_overflowing_region_end() {
+    // base + size = (u64::MAX - 9) + 100 overflows; saturates to u64::MAX.
+    let regions = vec![region(u64::MAX - 9, 100, true, false, false, "")];
+    let constraints = [AddressRange {
+        start: u64::MAX - 5,
+        end: u64::MAX,
+    }];
+    let clipped = intersect_constraints(regions, &constraints);
+    // Intersection of [u64::MAX-9, u64::MAX) with [u64::MAX-5, u64::MAX)
+    // is [u64::MAX-5, u64::MAX): a single 5-byte sub-region.
+    assert_eq!(clipped.len(), 1);
+    assert_eq!(clipped[0].base, u64::MAX - 5);
+    assert_eq!(clipped[0].size, 5);
+}
+
 #[test]
 fn scan_constrain_regions_pattern_at_first_byte() {
     let mut data = vec![0u8; 64];
