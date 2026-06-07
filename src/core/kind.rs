@@ -220,6 +220,36 @@ pub fn is_string_kind(k: NodeKind) -> bool {
     matches!(k, NodeKind::UTF8 | NodeKind::UTF16)
 }
 
+/// The same-byte-size "variant ring" for the ←/→ type cycler and the statusbar
+/// pos/total indicator (the C++ cycle filter): every fixed-size kind of the SAME
+/// byte size as `kind`, in `K_KIND_META` table order, EXCLUDING containers and —
+/// unless `kind` is itself one — string (UTF8/UTF16) and vector (Vec2/3/4) kinds.
+/// A dynamic/0-byte kind, or a kind with no same-size peers, returns just `[kind]`.
+/// Single source of the filter shared by the editor cycler and the status bar.
+pub(crate) fn same_size_variants(kind: NodeKind) -> Vec<NodeKind> {
+    let size = size_for_kind(kind);
+    if size <= 0 {
+        return vec![kind];
+    }
+    let cur_is_string = is_string_kind(kind);
+    let cur_is_vector = is_vector_kind(kind);
+    let ring: Vec<NodeKind> = K_KIND_META
+        .iter()
+        .map(|m| m.kind)
+        .filter(|&k| {
+            !is_container_kind(k)
+                && size_for_kind(k) == size
+                && (cur_is_string || !is_string_kind(k))
+                && (cur_is_vector || !is_vector_kind(k))
+        })
+        .collect();
+    if ring.is_empty() {
+        vec![kind]
+    } else {
+        ring
+    }
+}
+
 /// `isValidPrimitivePtrTarget` (`core.h:164-170`).
 pub fn is_valid_primitive_ptr_target(k: NodeKind) -> bool {
     if is_hex_node(k) || is_pointer_kind(k) || is_func_ptr(k) {

@@ -42,10 +42,7 @@
 use std::collections::HashSet;
 
 use crate::controller::RcxController;
-use crate::core::{
-    is_container_kind, is_string_kind, is_vector_kind, kind_meta, size_for_kind, NodeKind,
-    NodeTree, K_KIND_META,
-};
+use crate::core::{kind_meta, size_for_kind, NodeKind, NodeTree};
 
 /// The resolved status-bar readout — the pure product of
 /// [`StatusInfo::for_controller`] / [`StatusInfo::from_tree`].
@@ -296,25 +293,11 @@ fn variant_segments(kind: NodeKind, type_name: &str) -> (String, String) {
         return (String::new(), String::new());
     }
 
-    let cur_is_string = is_string_kind(kind);
-    let cur_is_vector = is_vector_kind(kind);
-    let mut pos = 0;
-    let mut total = 0;
-    for m in &K_KIND_META {
-        if m.size != sz || is_container_kind(m.kind) {
-            continue;
-        }
-        if !cur_is_string && is_string_kind(m.kind) {
-            continue;
-        }
-        if !cur_is_vector && is_vector_kind(m.kind) {
-            continue;
-        }
-        total += 1;
-        if m.kind == kind {
-            pos = total;
-        }
-    }
+    // Share the editor's ring filter (core::kind::same_size_variants) so this
+    // pos/total indicator can never drift from the actual ←/→ cycle ring.
+    let ring = crate::core::kind::same_size_variants(kind);
+    let total = ring.len();
+    let pos = ring.iter().position(|&k| k == kind).map(|i| i + 1).unwrap_or(0);
 
     let type_index = if total > 1 {
         format!("\u{2194} {type_name} ({pos}/{total})")

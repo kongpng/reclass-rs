@@ -5514,47 +5514,13 @@ fn hex_kind_for_size(bytes: i32) -> NodeKind {
     }
 }
 
-/// The ordered list of kinds that share `kind`'s byte size (item 16): the
-/// same-size variant ring the quick type-cycler steps through. Only primitive,
-/// fixed-size scalar/pointer kinds participate — containers (Struct/Array) and
-/// dynamic-size kinds (size 0) are excluded so the cycler never lands on a
-/// container or a string/dynamic type of a different footprint. Table order is
-/// preserved so the ring is stable.
-fn same_size_variants(kind: NodeKind) -> Vec<NodeKind> {
-    let size = crate::core::size_for_kind(kind);
-    if size <= 0 {
-        return vec![kind];
-    }
-    // Keep the ring within the same family: a non-string/non-vector kind must not
-    // cycle onto string (UTF8/UTF16) or vector (Vec2/3/4) kinds of the same byte
-    // size (the C++ cycle filter; statusbar.rs:299-310 already applies it, so its
-    // pos/total indicator now agrees with the real ring length).
-    let cur_is_string = crate::core::is_string_kind(kind);
-    let cur_is_vector = crate::core::is_vector_kind(kind);
-    let ring: Vec<NodeKind> = crate::core::K_KIND_META
-        .iter()
-        .map(|m| m.kind)
-        .filter(|&k| {
-            !matches!(k, NodeKind::Struct | NodeKind::Array)
-                && crate::core::size_for_kind(k) == size
-                && (cur_is_string || !crate::core::is_string_kind(k))
-                && (cur_is_vector || !crate::core::is_vector_kind(k))
-        })
-        .collect();
-    if ring.is_empty() {
-        vec![kind]
-    } else {
-        ring
-    }
-}
-
 /// The "alternate" kind for the quick type-cycler (`← cur ↔ alt →`) and the
 /// forward `T`-less cycle (item 16): steps to the NEXT same-byte-size variant,
 /// wrapping. Cycling between equal-footprint primitives (e.g. int32_t → uint32_t →
 /// float → hex32 …) never lands on a different size / container / string — the C++
 /// in-place stepper keeps the node's byte layout fixed.
 fn alt_kind_for(kind: NodeKind) -> NodeKind {
-    let ring = same_size_variants(kind);
+    let ring = crate::core::kind::same_size_variants(kind);
     let pos = ring.iter().position(|&k| k == kind).unwrap_or(0);
     ring[(pos + 1) % ring.len()]
 }
@@ -5592,7 +5558,7 @@ fn is_scalar_numeric_kind(kind: NodeKind) -> bool {
 
 /// The previous same-size variant (the `←` half of the cycler), wrapping (item 16).
 fn prev_kind_for(kind: NodeKind) -> NodeKind {
-    let ring = same_size_variants(kind);
+    let ring = crate::core::kind::same_size_variants(kind);
     let pos = ring.iter().position(|&k| k == kind).unwrap_or(0);
     ring[(pos + ring.len() - 1) % ring.len()]
 }
@@ -6430,7 +6396,8 @@ mod tests {
         // same-byte-size variant, never a different size / container / string. From
         // any fixed-size primitive, both alt (next) and prev land on a kind of the
         // SAME byte size, and the ring closes (cycling len times returns home).
-        use super::{alt_kind_for, prev_kind_for, same_size_variants};
+        use super::{alt_kind_for, prev_kind_for};
+        use crate::core::kind::same_size_variants;
         use crate::core::{size_for_kind, NodeKind};
         for &k in &[
             NodeKind::Int8,
