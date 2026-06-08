@@ -33,17 +33,20 @@ The local C++ tree carries two small local modifications on top of that commit
 
 ## Upstream tracking
 
-As of this writing, upstream `origin/main` was at **`b7baced`** (2026-06-06),
-**20 commits ahead** of the `f9171af` base. That delta (`f9171af..b7baced`) is
-the set of upstream changes being ported into the Rust version.
+The `f9171af..b7baced` delta — **20 upstream commits** (`b7baced` was
+`origin/main` HEAD, 2026-06-06) — **has been ported into the Rust version**, each
+landed as its own commit matched to its upstream source(s); pure build/CI/Qt-only
+commits were skipped as having no Rust analogue. So the Rust port now tracks
+**`b7baced`**, even though the local C++ snapshot at `/home/loke/reclass-cpp`
+remains at `f9171af`.
 
-To recompute the delta against a fresh upstream (from any clone of
-`IChooseYou/Reclass` — e.g. `/home/loke/Documents/Reclass`):
+The next delta is therefore measured from `b7baced`. To recompute it against a
+fresh upstream (from any clone of `IChooseYou/Reclass` — e.g.
+`/home/loke/Documents/Reclass`):
 
 ```sh
 git -C <clone> fetch origin
-git -C <clone> log --oneline --reverse f9171af..origin/main
+git -C <clone> log --oneline --reverse b7baced..origin/main
 ```
 
-When the port catches up to a newer upstream commit, bump the **Base revision**
-above to that commit so the next delta is measured from the right point.
+When the port catches up again, bump this tracking point to the new HEAD.
