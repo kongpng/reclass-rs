@@ -76,7 +76,7 @@ ui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-component
 
 # Source / ReClass-XML import+export, PDB import, and PE-debug extraction.
 # pdb2/object are pure Rust ⇒ build on all OSes.
-imports = ["dep:quick-xml", "dep:regex", "dep:zerocopy", "dep:object", "dep:pdb2"]
+imports = ["dep:quick-xml", "dep:regex", "dep:zerocopy", "dep:object", "dep:pdb2", "dep:zip"]
 
 # x86/x64 disassembly + hex dump (replaces fadec). Pure Rust.
 disasm = ["dep:iced-x86"]
@@ -172,6 +172,8 @@ regex = { version = "1", optional = true }
 zerocopy = { version = "0.8", optional = true, features = ["derive"] }
 object = { version = "0.39", optional = true }
 pdb2 = { version = "0.10", optional = true }
+# ReClass.NET `.rcnet` = a ZIP (standard DEFLATE) wrapping Data.xml — `deflate` only.
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
 cpp_demangle = { version = "0.5", optional = true }
 msvc-demangler = { version = "0.11", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }

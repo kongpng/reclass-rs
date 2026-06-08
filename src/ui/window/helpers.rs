@@ -207,5 +207,10 @@ pub(crate) fn root_name_for_title(tree: &crate::core::NodeTree, view_root_id: u6
 /// load (the headline of this gap). Pure; unit-tested.
 pub(crate) fn sniff_is_reclass_xml(head: &[u8]) -> bool {
     let trimmed = head.trim_ascii_start();
-    trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<ReClass")
+    // `PK\x03\x04` = a ZIP local-file header → a ReClass.NET `.rcnet` archive,
+    // which the XML importer unzips to its inner Data.xml. Routing it here (vs.
+    // the native-JSON load) closes the gap where a `.rcnet` sniffed false.
+    trimmed.starts_with(b"<?xml")
+        || trimmed.starts_with(b"<ReClass")
+        || trimmed.starts_with(b"PK\x03\x04")
 }

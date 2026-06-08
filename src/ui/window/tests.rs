@@ -1018,6 +1018,9 @@ fn sniff_detects_reclass_xml_signatures() {
     // Leading whitespace is trimmed before the prefix test → still XML.
     assert!(sniff_is_reclass_xml(b"  <ReClass>"));
     assert!(sniff_is_reclass_xml(b"\n\t <?xml"));
+    // A `PK\x03\x04` ZIP header → a ReClass.NET `.rcnet` archive, routed to the
+    // XML importer (which unzips it) instead of the native-JSON load.
+    assert!(sniff_is_reclass_xml(b"PK\x03\x04\x14\x00"));
     // A JSON document is NOT XML (the native `.rcx` load path).
     assert!(!sniff_is_reclass_xml(b"{\"json\": true}"));
     // Empty / non-matching bytes → not XML.

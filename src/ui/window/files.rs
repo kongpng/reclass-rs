@@ -17,7 +17,7 @@ impl ImportKind {
     pub(crate) fn prompt(self) -> &'static str {
         match self {
             ImportKind::Source => "Import C/C++ source",
-            ImportKind::Xml => "Import ReClass XML",
+            ImportKind::Xml => "Import ReClass / ReClass.NET",
             ImportKind::Pdb => "Import PDB",
         }
     }

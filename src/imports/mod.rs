@@ -44,6 +44,10 @@ pub enum ImportError {
     CannotOpenWrite(String),
     #[error("XML parse error at line {line}: {msg}")]
     XmlParse { line: u64, msg: String },
+    #[error("File looks like a .rcnet archive but couldn't be opened")]
+    RcnetUnreadable,
+    #[error("ReClass.NET archive doesn't contain a Data.xml entry")]
+    RcnetNoXml,
     #[error("No classes found in file")]
     NoClasses,
     #[error("No nodes to export")]

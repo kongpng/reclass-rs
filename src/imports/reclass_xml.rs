@@ -188,6 +188,30 @@ fn byte_pos_to_line(content: &[u8], pos: u64) -> u64 {
     1 + content[..end].iter().filter(|&&b| b == b'\n').count() as u64
 }
 
+/// Unzip a ReClass.NET `.rcnet` archive (a ZIP wrapping `Data.xml`) and return
+/// the bytes of its first non-empty `*.xml` entry. ReClass.NET writes the inner
+/// XML via `System.IO.Compression` (standard DEFLATE), so the existing
+/// 2016/ReClassEx parser handles the unzipped buffer verbatim.
+fn extract_rcnet_xml(bytes: &[u8]) -> Result<Vec<u8>, ImportError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|_| ImportError::RcnetUnreadable)?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|_| ImportError::RcnetUnreadable)?;
+        if entry.name().to_ascii_lowercase().ends_with(".xml") {
+            let mut out = Vec::new();
+            entry
+                .read_to_end(&mut out)
+                .map_err(|_| ImportError::RcnetUnreadable)?;
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+    Err(ImportError::RcnetNoXml)
+}
+
 pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, ImportError> {
     let mut file =
         File::open(path).map_err(|_| ImportError::CannotOpen(path.display().to_string()))?;
@@ -197,6 +221,20 @@ pub fn import_reclass_xml(path: &Path, pointer_size: i32) -> Result<NodeTree, Im
     let mut content: Vec<u8> = Vec::new();
     file.read_to_end(&mut content)
         .map_err(|_| ImportError::CannotOpen(path.display().to_string()))?;
+
+    // ReClass.NET `.rcnet` files are ZIP archives wrapping a single `Data.xml`.
+    // Detect the PK magic (or a `.rcnet` extension) and swap `content` for the
+    // inner XML before parsing — the numeric Type codes already match, so the
+    // parser below is unchanged (cpp:142 unzips via QZipReader). Line numbers in
+    // any parse error then refer to the inner Data.xml, matching the C++.
+    let is_rcnet = content.starts_with(b"PK\x03\x04")
+        || path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rcnet"));
+    if is_rcnet {
+        content = extract_rcnet_xml(&content)?;
+    }
+
     let mut reader = Reader::from_reader(content.as_slice());
     reader.config_mut().trim_text(false);
 
@@ -891,6 +929,71 @@ mod tests {
         let s = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         s
+    }
+
+    fn rcnet_tmp(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("rcx_rcnet_unit_{tag}_{nanos}.rcnet"));
+        p
+    }
+
+    /// Build a `.rcnet` (a ZIP wrapping a single `Data.xml`, DEFLATE like
+    /// ReClass.NET) and import it — the tree must match importing the XML directly.
+    #[test]
+    fn imports_rcnet_zip_like_plain_xml() {
+        let xml = "\
+<ReClass>
+  <Class Name=\"Foo\">
+    <Node Type=\"10\" Name=\"x\" Size=\"4\"/>
+    <Node Type=\"10\" Name=\"y\" Size=\"4\"/>
+  </Class>
+</ReClass>
+";
+        let plain = import_str(xml).expect("plain xml imports");
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file(
+                "Data.xml",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            zw.write_all(xml.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let path = rcnet_tmp("ok");
+        std::fs::File::create(&path).unwrap().write_all(&buf).unwrap();
+        let zipped = import_reclass_xml(&path, 8).expect("rcnet imports");
+        let _ = std::fs::remove_file(&path);
+
+        let key = |t: &NodeTree| -> Vec<(String, NodeKind)> {
+            t.nodes.iter().map(|n| (n.name.clone(), n.kind)).collect()
+        };
+        assert_eq!(key(&zipped), key(&plain));
+    }
+
+    /// A ZIP archive with no `*.xml` entry yields `RcnetNoXml`.
+    #[test]
+    fn rcnet_without_xml_entry_errors() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("notes.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"not xml").unwrap();
+            zw.finish().unwrap();
+        }
+        let path = rcnet_tmp("noxml");
+        std::fs::File::create(&path).unwrap().write_all(&buf).unwrap();
+        let r = import_reclass_xml(&path, 8);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(r, Err(ImportError::RcnetNoXml)), "got {r:?}");
     }
 
     // ── Item 6: byte position → 1-based line ──
