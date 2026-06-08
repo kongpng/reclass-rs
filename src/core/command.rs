@@ -20,10 +20,9 @@ pub struct OffsetAdj {
 
 /// `using Command = std::variant<...>` (`core.h:1080-1115`).
 ///
-/// 19 variants (the `OffsetAdj` POD is a helper, not a command). Note
-/// `ToggleRelative` is declared but **not handled** in the C++
-/// `applyCommand` — preserve the latent no-op for fidelity (documented in the
-/// controller).
+/// 19 variants (the `OffsetAdj` POD is a helper, not a command).
+/// `ToggleRelative` toggles a node's RVA flag and is handled in
+/// `applyCommand` (used by the type chooser's "Pointer32 (RVA)" entries).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// `cmd::ChangeKind` (`core.h:1083-1084`).
@@ -107,7 +106,7 @@ pub enum Command {
         old_members: Vec<(String, i64)>,
         new_members: Vec<(String, i64)>,
     },
-    /// `cmd::ToggleRelative` (`core.h`) — declared but unhandled in C++.
+    /// `cmd::ToggleRelative` (`core.h`) — toggles a node's RVA flag.
     ToggleRelative {
         node_id: u64,
         old_val: bool,

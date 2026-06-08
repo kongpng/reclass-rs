@@ -387,9 +387,16 @@ fn apply_command(tab: &mut TabData, cmd: &Command, is_undo: bool) {
                 new_members.clone()
             }
         }),
-        // ToggleRelative is declared but UNHANDLED in the C++ applyCommand
-        // (latent no-op) — preserve that.
-        Command::ToggleRelative { .. } => {}
+        // ToggleRelative toggles the node's RVA flag (matches the C++
+        // applyCommand arm). Used by the type chooser's "Pointer32 (RVA)"
+        // entries so picks round-trip through undo/redo.
+        Command::ToggleRelative {
+            node_id,
+            old_val,
+            new_val,
+        } => set_field(tree, *node_id, |n| {
+            n.is_relative = if is_undo { *old_val } else { *new_val }
+        }),
         Command::ToggleBigEndian {
             node_id,
             old_val,

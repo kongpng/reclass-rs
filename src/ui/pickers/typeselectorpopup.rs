@@ -36,7 +36,20 @@ pub fn default_type_entries() -> Vec<TypeEntry> {
     K_KIND_META
         .iter()
         .filter(|m| !matches!(m.kind, NodeKind::Struct | NodeKind::Array))
-        .map(|m| TypeEntry::primitive(m.kind, m.type_name))
+        .flat_map(|m| {
+            let entry = TypeEntry::primitive(m.kind, m.type_name);
+            // For Pointer32 / Pointer64, append an RVA variant immediately
+            // after the absolute one so users can pick "Pointer32 (RVA)"
+            // from the same list — no modifier checkbox needed.
+            if matches!(m.kind, NodeKind::Pointer32 | NodeKind::Pointer64) {
+                let mut rva = entry.clone();
+                rva.is_relative = true;
+                rva.display_name = format!("{} (RVA)", m.type_name);
+                vec![entry, rva]
+            } else {
+                vec![entry]
+            }
+        })
         .collect()
 }
 
@@ -224,6 +237,13 @@ pub struct TypeEntry {
     pub struct_id: u64,
     /// The display name (e.g. "int32_t", "Player", "EFlags").
     pub display_name: String,
+    /// RVA variant of a pointer entry. When true, picking this entry sets
+    /// `node.is_relative = true` so the pointer dereferences as
+    /// `(base_address + value)` instead of value-as-absolute-address.
+    /// Surfaced as a separate entry like "Pointer32 (RVA)" rather than a
+    /// modifier toggle so it's discoverable from the same flow as
+    /// Pointer32 / FuncPtr32 — no new UI surface.
+    pub is_relative: bool,
     /// "struct"/"class"/"enum" for composites; empty for primitives.
     pub class_keyword: String,
     /// false → grayed + unselectable (still shown).
@@ -242,6 +262,7 @@ impl TypeEntry {
             primitive_kind: kind,
             struct_id: 0,
             display_name: display_name.to_string(),
+            is_relative: false,
             class_keyword: String::new(),
             enabled: true,
             size_bytes: size_for_kind(kind),
@@ -256,6 +277,7 @@ impl TypeEntry {
             primitive_kind: NodeKind::Struct,
             struct_id,
             display_name: name.to_string(),
+            is_relative: false,
             class_keyword: keyword.to_string(),
             enabled: true,
             size_bytes: size,
@@ -271,6 +293,7 @@ impl TypeEntry {
             primitive_kind: NodeKind::Struct,
             struct_id: 0,
             display_name: label.to_string(),
+            is_relative: false,
             class_keyword: String::new(),
             enabled: false,
             size_bytes: 0,
@@ -845,6 +868,26 @@ impl TypeModel {
         found
     }
 
+    /// Pre-select the primitive row matching `kind`, and for pointer kinds the
+    /// variant whose `is_relative == relative` (the C++ `setTypes` pointer
+    /// branch: `if (isPtr && e.isRelative != node->isRelative) continue;`). The
+    /// catalogue ships two pointer entries per width (absolute + RVA); this
+    /// pins the one mirroring `node.is_relative` so opening the chooser on an
+    /// existing RVA pointer pre-selects the "(RVA)" row. Returns the row index.
+    pub fn select_kind_relative(&mut self, kind: NodeKind, relative: bool) -> Option<usize> {
+        let is_ptr = is_pointer_kind(kind);
+        let found = self.rows.iter().position(|r| {
+            r.entry.selectable()
+                && r.entry.entry_kind == EntryKind::Primitive
+                && r.entry.primitive_kind == kind
+                && (!is_ptr || r.entry.is_relative == relative)
+        });
+        if let Some(i) = found {
+            self.selected = Some(i);
+        }
+        found
+    }
+
     /// Pre-select the row matching a COMPOSITE `struct_id` (`setTypes`
     /// current-entry pre-select for composites, `typeselectorpopup.cpp:1280`:
     /// `entry.structId == m_currentEntry.structId`). Scan for a composite row
@@ -891,7 +934,7 @@ mod view {
         default_type_entries, EntryKind, KindGroup, Modifier, SortMode, TypeEntry, TypeModel,
         TypePopupMode,
     };
-    use crate::core::kind::NodeKind;
+    use crate::core::kind::{is_pointer_kind, NodeKind};
     use crate::theme::model::Theme;
     use crate::ui::design::{color, highlighted_spans, icon, tokens};
     use gpui::prelude::FluentBuilder as _;
@@ -967,6 +1010,11 @@ mod view {
             /// the editor can record it in the recent-types list and import a
             /// built-in composite by name. The C++ `TypeEntry::displayName`.
             display_name: String,
+            /// Whether the picked row is the RVA variant of a pointer entry
+            /// (`TypeEntry::isRelative`). The editor sets
+            /// `TypePopupChoice::is_relative` from this so picking
+            /// "Pointer32 (RVA)" toggles `node.is_relative`.
+            is_relative: bool,
         },
         /// Dismissed (the `×`, Esc, or clicking outside).
         Cancel,
@@ -981,6 +1029,10 @@ mod view {
         /// opens pre-highlighting that row by id (the C++ `m_currentEntry.structId`
         /// branch in `setTypes`). 0 ⇒ the node is a primitive (use `current`).
         current_struct_id: u64,
+        /// The node's current RVA flag (`node.is_relative`). For pointer kinds the
+        /// popup pre-selects the catalogue entry whose `is_relative` matches this,
+        /// so opening on an existing RVA pointer pins the "(RVA)" row.
+        current_relative: bool,
         input: Entity<InputState>,
         /// The array-element count input (the `[]` modifier's `n` box,
         /// `m_arrayCountEdit`); shown only when the array modifier is active.
@@ -1035,7 +1087,10 @@ mod view {
             let mut model = TypeModel::new(entries);
             // Pre-select the node's current type so the picker opens highlighting
             // the existing kind (B7 / item 7) rather than the default first row.
-            model.select_kind(current);
+            // `current_relative` defaults false here; the host calls
+            // `set_current_relative` for an existing RVA pointer to pin the
+            // "(RVA)" variant instead.
+            model.select_kind_relative(current, false);
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Filter types..  (Ctrl+F)"));
             let array_count_input = cx.new(|cx| InputState::new(window, cx).placeholder("n"));
@@ -1068,6 +1123,7 @@ mod view {
                 model,
                 current,
                 current_struct_id: 0,
+                current_relative: false,
                 input,
                 array_count_input,
                 focus_handle: cx.focus_handle(),
@@ -1178,6 +1234,15 @@ mod view {
             cx.notify();
         }
 
+        /// Set the node's current RVA flag so a pointer node pre-selects the
+        /// matching catalogue variant (absolute vs "(RVA)"). The C++ `setTypes`
+        /// pointer branch matches `e.isRelative == node->isRelative`. Re-pins.
+        pub fn set_current_relative(&mut self, relative: bool, cx: &mut Context<Self>) {
+            self.current_relative = relative;
+            self.re_pin_current();
+            cx.notify();
+        }
+
         /// Pre-select the row for the node's current type — a composite by
         /// `current_struct_id` when set (the C++ structId match), else the
         /// primitive `current` kind. Shared by every rows-rebuild path.
@@ -1187,7 +1252,8 @@ mod view {
                     return;
                 }
             }
-            self.model.select_kind(self.current);
+            self.model
+                .select_kind_relative(self.current, self.current_relative);
         }
 
         /// Toggle a category chip (Hex/Int/Float/Ptr) — delegated to the model,
@@ -1240,6 +1306,7 @@ mod view {
                 entry_kind: entry.entry_kind,
                 struct_id: entry.struct_id,
                 display_name: entry.display_name.clone(),
+                is_relative: entry.is_relative,
             });
         }
 
@@ -1295,6 +1362,7 @@ mod view {
                 entry_kind: EntryKind::Composite,
                 struct_id: 0,
                 display_name: String::new(),
+                is_relative: false,
             });
         }
 
@@ -1462,9 +1530,14 @@ mod view {
                         // and as a subtle dotted edge that can never be mistaken for
                         // the (now strongly-painted) active selection (B2: the static
                         // ring on `current` used to read as a "frozen" highlight).
+                        // For pointer kinds the catalogue ships two rows (absolute
+                        // + RVA) sharing `primitive_kind`; badge only the variant
+                        // matching the node's `is_relative` so both don't light up.
                         let is_current = !is_sel
                             && r.entry.primitive_kind == self.current
-                            && r.entry.entry_kind != EntryKind::Composite;
+                            && r.entry.entry_kind != EntryKind::Composite
+                            && (!is_pointer_kind(self.current)
+                                || r.entry.is_relative == self.current_relative);
                         // Selected rows use the C++ readout: full `selected` fill +
                         // the group-color name turns to plain text. Keep the group
                         // color when not selected.

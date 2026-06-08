@@ -2198,8 +2198,15 @@ fn compose_node(
                 }
             }
 
+            // Relative pointer (RVA): target = tree.base_address + value.
+            // Matches PE/COFF/ELF RVA convention — values are offsets from
+            // the document's base (imageBase when attached at module load),
+            // NOT from the recursion-time parent base. Using `base` (the
+            // recursion arg) here made top-level RVA pointers resolve to the
+            // literal `value` since base=0 at root, which read e.g.
+            // NT_HEADERS at 0x78 instead of imageBase+0x78.
             if node.is_relative && ptr_val != 0 {
-                ptr_val = ptr_val.wrapping_add(base);
+                ptr_val = ptr_val.wrapping_add(tree.base_address);
             }
 
             // Follow extra indirection levels (** struct pointers).

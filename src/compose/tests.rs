@@ -16,7 +16,7 @@ use super::{
 };
 use crate::core::linemeta::{find_chip, K_COMMAND_ROW_ID};
 use crate::core::{ChipKind, LineKind, LineMeta, Node, NodeKind, NodeTree};
-use crate::provider::{BufferProvider, NullProvider};
+use crate::provider::{BufferProvider, NullProvider, Provider};
 
 // ── shared builders ─────────────────────────────────────────────────────────
 
@@ -788,6 +788,242 @@ fn pointer_default_void_32() {
     let prov = NullProvider;
     let r = compose_default(&tree, &prov);
     assert!(lines(&r).iter().any(|l| l.contains("void*")));
+}
+
+/// A base-translating provider: `read(addr)` maps `addr → data[addr - img_base]`
+/// (mirrors the C++ `TestPeProvider` / a real PE attach where reads come in as
+/// absolute VAs and the OS does the VA→file-offset mapping). Required because
+/// the RVA fix would be invisible to a `base_address = 0` test — adding 0 is a
+/// no-op, so the broken and fixed paths would render identically.
+struct TestPeProvider {
+    data: Vec<u8>,
+    img_base: u64,
+}
+impl crate::provider::Provider for TestPeProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        if addr < self.img_base {
+            return false;
+        }
+        let off = (addr - self.img_base) as usize;
+        if off + buf.len() > self.data.len() {
+            return false;
+        }
+        buf.copy_from_slice(&self.data[off..off + buf.len()]);
+        true
+    }
+    fn size(&self) -> i32 {
+        self.data.len() as i32
+    }
+    // The default `is_readable` assumes `addr` is a file offset; override so the
+    // base-translation maths matches `read()` above.
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        if len < 0 {
+            return false;
+        }
+        if addr < self.img_base {
+            return false;
+        }
+        let off = (addr - self.img_base) as u64;
+        off + (len as u64) <= self.data.len() as u64
+    }
+    fn base(&self) -> u64 {
+        self.img_base
+    }
+    fn kind(&self) -> String {
+        "Process".to_string()
+    }
+}
+
+/// Regression for the broken-at-top-level RVA pointer semantics. Before the fix:
+/// `target = recursion-time base parameter + value`. At the top level `base == 0`,
+/// so the target collapsed to just `value`, which sent reads to a literal address
+/// like 0x78 instead of imageBase+0x78. PE_Headers.rcx looked correct in tree
+/// shape but every dereferenced Signature read 0x00000000 because 0x78 was
+/// unmapped. Fix: `target = tree.base_address + value` (PE RVA convention).
+#[test]
+fn top_level_rva_pointer_resolves_against_tree_base_address() {
+    const IMAGE_BASE: u64 = 0x1_4000_0000;
+    const ELFANEW: u32 = 0x78;
+    const PE_SIG: u32 = 0x0000_4550; // 'PE\0\0'
+
+    let mut buf = vec![0u8; 0x400];
+    buf[0x3C..0x40].copy_from_slice(&ELFANEW.to_le_bytes());
+    buf[0x78..0x7C].copy_from_slice(&PE_SIG.to_le_bytes());
+
+    let prov = TestPeProvider {
+        data: buf,
+        img_base: IMAGE_BASE,
+    };
+
+    let mut tree = NodeTree::new();
+    tree.base_address = IMAGE_BASE;
+
+    let di = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "IMAGE_DOS_HEADER".into(),
+        name: "dos".into(),
+        collapsed: false,
+        ..Node::default()
+    });
+    let dos_id = tree.nodes[di].id;
+
+    let ni = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "IMAGE_NT_HEADERS64".into(),
+        name: "nt".into(),
+        collapsed: true,
+        ..Node::default()
+    });
+    let nt_id = tree.nodes[ni].id;
+
+    tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "Signature".into(),
+        parent_id: nt_id,
+        offset: 0,
+        ..Node::default()
+    });
+
+    tree.add_node(Node {
+        kind: NodeKind::Pointer32,
+        name: "e_lfanew".into(),
+        parent_id: dos_id,
+        offset: 0x3C,
+        ref_id: nt_id,
+        is_relative: true,
+        collapsed: false, // expand the pointer so Signature renders
+        ..Node::default()
+    });
+
+    let r = compose_default(&tree, &prov);
+
+    // The Signature row's resolved address must be imageBase + e_lfanew, NOT just
+    // e_lfanew. Look up the meta entry whose node is the Signature field.
+    let expected = IMAGE_BASE + ELFANEW as u64;
+    let mut found = false;
+    for lm in &r.meta {
+        if lm.line_kind != LineKind::Field {
+            continue;
+        }
+        let idx = lm.node_idx;
+        if idx < 0 || idx as usize >= tree.nodes.len() {
+            continue;
+        }
+        if tree.nodes[idx as usize].name != "Signature" {
+            continue;
+        }
+        found = true;
+        assert_eq!(lm.offset_addr, expected);
+        break;
+    }
+    assert!(
+        found,
+        "Signature line never appeared in compose output — Pointer32 RVA \
+         expansion is silently broken"
+    );
+
+    // The bytes read at that target should be the PE magic (would read 0 if we
+    // sent the provider 0x78 instead of 0x140000078).
+    assert_eq!(prov.read_u32(expected), PE_SIG);
+
+    // The expanded e_lfanew header must surface the raw stored RVA (0x78).
+    // Without this a user can't see the value that drove the resolved target.
+    // The header line is the one that ends in "{" and contains "e_lfanew".
+    let mut found_header = false;
+    for line in lines(&r) {
+        if !line.contains("e_lfanew") {
+            continue;
+        }
+        if !line.trim_end().ends_with('{') {
+            continue;
+        }
+        found_header = true;
+        assert!(
+            line.contains("0x78"),
+            "expanded e_lfanew header must show the raw stored RVA value '0x78'; \
+             got:\n  {line}"
+        );
+        break;
+    }
+    assert!(
+        found_header,
+        "expanded e_lfanew header line ending with '{{' not found"
+    );
+}
+
+/// Regression: the non-RVA case of the same rendering change. Expanded absolute
+/// Pointer64 headers also now show their raw stored value before '{' — keeping
+/// the header informative when a pointer's target is known but the user wants to
+/// confirm what address it lives at without scanning the next line.
+#[test]
+fn expanded_absolute_pointer_header_shows_value() {
+    const PTR_SLOT: u64 = 0x10;
+    const PTR_VALUE: u64 = 0x0000_0ABC_DEF0_1234;
+
+    let mut buf = vec![0u8; 0x80];
+    buf[PTR_SLOT as usize..PTR_SLOT as usize + 8].copy_from_slice(&PTR_VALUE.to_le_bytes());
+    let prov = BufferProvider::new(buf, "");
+
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Owner".into(),
+        name: "owner".into(),
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+
+    let ti = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Target".into(),
+        name: "target".into(),
+        collapsed: true,
+        ..Node::default()
+    });
+    let target_id = tree.nodes[ti].id;
+
+    tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "x".into(),
+        parent_id: target_id,
+        offset: 0,
+        ..Node::default()
+    });
+
+    tree.add_node(Node {
+        kind: NodeKind::Pointer64,
+        name: "next".into(),
+        parent_id: root_id,
+        offset: PTR_SLOT as i32,
+        ref_id: target_id,
+        collapsed: false, // expanded
+        ..Node::default()
+    });
+
+    let r = compose_default(&tree, &prov);
+
+    // fmt_pointer64 hex output is lower-case; compare case-insensitively.
+    let stored = format!("0x{PTR_VALUE:x}");
+    let mut found = false;
+    for line in lines(&r) {
+        if !line.contains("next") {
+            continue;
+        }
+        if !line.trim_end().ends_with('{') {
+            continue;
+        }
+        found = true;
+        assert!(
+            line.to_lowercase().contains(&stored),
+            "expanded absolute Pointer header must show its stored value before \
+             '{{'; got:\n  {line}"
+        );
+        break;
+    }
+    assert!(found, "expanded 'next' header line not found");
 }
 
 #[test]

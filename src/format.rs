@@ -847,7 +847,21 @@ pub fn fmt_pointer_header(
         let val = fit(&read_value(node, prov, addr, 0), COL_VALUE);
         return format!("{ind}{ty}{SEP}{name}{SEP}{val}");
     }
-    format!("{ind}{ty}{SEP}{}{SEP}{{", node.name)
+    // Expanded: still show the raw stored pointer value, then open the
+    // brace. For an absolute pointer the value matches the first child's
+    // offset column (helpful confirmation). For an RVA pointer the raw
+    // value (e.g. 0x78 for e_lfanew) differs from the resolved target —
+    // surfacing it here is the only way a user can diagnose a shifted or
+    // wrong RVA without diving into raw bytes.
+    //
+    // The value lines up with sibling rows' value columns via the
+    // fixed-width name pad (fit(node.name, col_name)). DO NOT also pad the
+    // value to COL_VALUE — that would push the trailing '{' all the way to
+    // the right edge of the value column, visually disconnecting the brace
+    // from its row (C++ keeps the brace attached).
+    let name = fit(&node.name, col_name);
+    let val = read_value(node, prov, addr, 0);
+    format!("{ind}{ty}{SEP}{name}{SEP}{val} {{")
 }
 
 // ── Hex / ASCII preview ──

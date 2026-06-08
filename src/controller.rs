@@ -27,9 +27,9 @@ use crate::core::linemeta::{
 };
 use crate::core::{
     alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node,
-    is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string, size_for_kind,
-    BitfieldMember, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree, OffsetAdj,
-    ValueHistory, K_COMMON_TYPES,
+    is_pointer_kind, is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string,
+    size_for_kind, BitfieldMember, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree,
+    OffsetAdj, ValueHistory, K_COMMON_TYPES,
 };
 use crate::format;
 use crate::provider::{
@@ -187,6 +187,11 @@ pub struct TypePopupChoice {
     /// "+ New" marker (popup item 15): materialize a fresh named composite rather
     /// than the existing generic `Struct` primitive.
     pub create_new: bool,
+    /// RVA variant of a pointer pick (`TypeEntry::isRelative`). When the chosen
+    /// primitive is a pointer kind, this sets `node.is_relative` so the pointer
+    /// dereferences as `(base_address + value)`. Sourced from the catalogue's
+    /// "Pointer32 (RVA)" entry; ignored for non-pointer picks.
+    pub is_relative: bool,
 }
 
 impl TypePopupChoice {
@@ -199,6 +204,7 @@ impl TypePopupChoice {
             display_name: display_name.into(),
             full_text: String::new(),
             create_new: false,
+            is_relative: false,
         }
     }
     /// A composite choice referencing an existing struct id.
@@ -210,6 +216,7 @@ impl TypePopupChoice {
             display_name: display_name.into(),
             full_text: String::new(),
             create_new: false,
+            is_relative: false,
         }
     }
 }
@@ -1278,10 +1285,18 @@ impl RcxController {
                     };
                 }
             }
-            // FIXME-parity: `cmd::ToggleRelative` has NO arm in C++
-            // `applyCommand` (`controller.cpp:2890-3049`) — the flag never
-            // toggles via this command. Preserved as a no-op for fidelity.
-            Command::ToggleRelative { .. } => {}
+            // `cmd::ToggleRelative` (`controller.cpp` applyCommand): toggles
+            // the node's RVA flag. Used by the type chooser's "Pointer32
+            // (RVA)" entries so picks round-trip through undo/redo.
+            Command::ToggleRelative {
+                node_id,
+                old_val,
+                new_val,
+            } => {
+                if let Some(n) = self.node_mut(*node_id) {
+                    n.is_relative = if is_undo { *old_val } else { *new_val };
+                }
+            }
             Command::ToggleBigEndian {
                 node_id,
                 old_val,
@@ -2769,8 +2784,30 @@ impl RcxController {
                         self.refresh();
                     }
                 }
-            } else if pk != node_kind {
-                self.change_node_kind(node_idx, pk);
+            } else {
+                // Modifier-less primitive pick (catalogue row, no `*`/`[]`).
+                if pk != node_kind {
+                    self.change_node_kind(node_idx, pk);
+                }
+                // Apply the RVA flag from the catalogue entry. The catalogue
+                // ships two pointer entries per width — "Pointer32" and
+                // "Pointer32 (RVA)" — that differ only in `is_relative`. Honour
+                // the pick explicitly so switching RVA→absolute clears the flag
+                // and vice versa. The change rides its own ToggleRelative command
+                // so it round-trips through undo/redo (controller.cpp RVA block).
+                if is_pointer_kind(pk) {
+                    let idx = self.doc.tree.index_of_id(node_id);
+                    if idx >= 0 {
+                        let old_rel = self.doc.tree.nodes[idx as usize].is_relative;
+                        if old_rel != choice.is_relative {
+                            self.push_command(Command::ToggleRelative {
+                                node_id,
+                                old_val: old_rel,
+                                new_val: choice.is_relative,
+                            });
+                        }
+                    }
+                }
             }
         } else {
             // Composite target.
@@ -2824,6 +2861,26 @@ impl RcxController {
                         self.push_command(Command::ChangePointerRef {
                             node_id,
                             old_ref_id: oref,
+                            new_ref_id: struct_id,
+                        });
+                    }
+                }
+            } else if is_pointer_kind(node_kind) {
+                // Composite picked (no `*`/`[]` modifier) on a node that is
+                // ALREADY a pointer kind — set only `ref_id` (the pointer's
+                // struct target) WITHOUT changing the node's kind, ptr_depth, or
+                // is_relative. This is the second step of the "Pointer32 (RVA) →
+                // MyStruct" workflow: the user picks ptr32 (RVA) first (setting
+                // kind + is_relative), then reopens the chooser and picks the
+                // target struct here. Preserving kind/is_relative means they
+                // don't get clobbered back to an inline Struct (controller.cpp).
+                let idx = self.doc.tree.index_of_id(node_id);
+                if idx >= 0 {
+                    let old_ref = self.doc.tree.nodes[idx as usize].ref_id;
+                    if old_ref != struct_id {
+                        self.push_command(Command::ChangePointerRef {
+                            node_id,
+                            old_ref_id: old_ref,
                             new_ref_id: struct_id,
                         });
                     }
@@ -3125,6 +3182,7 @@ impl RcxController {
             display_name: String::new(),
             full_text: String::new(),
             create_new: true,
+            is_relative: false,
         };
         let mode = if node_id != 0 && self.doc.tree.index_of_id(node_id) >= 0 {
             TypePopupMode::FieldType
@@ -3150,6 +3208,7 @@ impl RcxController {
                 display_name: ct.name.to_string(),
                 full_text: String::new(),
                 create_new: false,
+                is_relative: false,
             })
             .collect()
     }

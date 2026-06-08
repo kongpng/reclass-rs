@@ -304,7 +304,7 @@ impl super::RcxEditor {
         // the C++ footer-size baseline (`nodeSize = sizeForKind(node.kind)`, or the
         // ELEMENT kind in ArrayElement mode) + the tree's pointer size, and feed the
         // recent-type names so the "Recent" section appears (items 38/39/40/41).
-        let (node_size, ptr_size, cur_struct_id, preset) = {
+        let (node_size, ptr_size, cur_struct_id, preset, cur_relative) = {
             let tree = self.controller.tree();
             let ps = tree.pointer_size;
             let idx = tree.index_of_id(target.node_id);
@@ -319,9 +319,9 @@ impl super::RcxEditor {
                 // (typed pointer / embedded struct / array-of-struct). Also derive
                 // the modifier preset so the selector opens lit for the node's shape.
                 let preset = modifier_preset_for(mode, n.kind, n.ptr_depth, n.ref_id, n.array_len);
-                (sz, ps, n.ref_id, preset)
+                (sz, ps, n.ref_id, preset, n.is_relative)
             } else {
-                (crate::core::size_for_kind(target.kind), ps, 0u64, None)
+                (crate::core::size_for_kind(target.kind), ps, 0u64, None, false)
             }
         };
         let recent = self.recent_type_names.clone();
@@ -330,6 +330,10 @@ impl super::RcxEditor {
             p.set_mode(mode, window, cx);
             p.set_sizes(node_size, ptr_size);
             p.set_recent_names(recent, cx);
+            // For a pointer node, pre-select the catalogue variant matching the
+            // node's RVA flag so opening on an existing "(RVA)" pointer pins the
+            // "(RVA)" row (the C++ `setTypes` pointer-isRelative match).
+            p.set_current_relative(cur_relative, cx);
             // Pre-highlight the composite the node already references, by structId
             // (the C++ `m_currentEntry.entryKind == Composite` branch). For a plain
             // primitive node this is 0 and the kind pre-select (in new_with_current)
@@ -359,6 +363,7 @@ impl super::RcxEditor {
                     entry_kind,
                     struct_id,
                     display_name,
+                    is_relative,
                 } => {
                     cx.emit(RcxEditorEvent::CloseModal);
                     this._type_selector_sub = None;
@@ -377,6 +382,7 @@ impl super::RcxEditor {
                             *entry_kind,
                             *struct_id,
                             display_name,
+                            *is_relative,
                             cx,
                         );
                     }
@@ -419,6 +425,7 @@ impl super::RcxEditor {
         entry_kind: crate::ui::pickers::typeselectorpopup::EntryKind,
         struct_id: u64,
         display_name: &str,
+        is_relative: bool,
         cx: &mut Context<Self>,
     ) {
         use crate::controller::{TypeEntryKind, TypePopupChoice, TypePopupMode as CMode};
@@ -459,6 +466,9 @@ impl super::RcxEditor {
             display_name: base_name.clone(),
             full_text,
             create_new: false,
+            // Carry the "(RVA)" pick so the controller toggles node.is_relative
+            // for a pointer kind (apply_field_type Primitive branch).
+            is_relative,
         };
 
         // Record the pick in the recent-types list (the C++ `pushRecentType` on

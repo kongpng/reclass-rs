@@ -99,6 +99,10 @@ const EXAMPLES: &[(&str, &str)] = &[
         "PageTables",
         include_str!("../../assets/examples/PageTables.rcx"),
     ),
+    (
+        "PE_Headers",
+        include_str!("../../assets/examples/PE_Headers.rcx"),
+    ),
     ("png", include_str!("../../assets/examples/png.rcx")),
 ];
 
