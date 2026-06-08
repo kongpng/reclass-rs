@@ -849,7 +849,8 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
         return tool_source_switch_process(idx, args, host);
         #[cfg(not(feature = "process-provider"))]
         return make_text_result(
-            "local Process Memory provider is not enabled in this build",
+            "local Process Memory provider is not enabled in this build; \
+             use provider:\"memflow\" with a pid for live process access",
             true,
         );
     }
@@ -3699,7 +3700,8 @@ mod tests {
         let mut h = TestHost::new();
         h.project_new();
         // bare pid routes to the local process provider when compiled in; in
-        // feature sets without it, the tool reports the explicit provider choices.
+        // feature sets without it, the tool points the user at the core memflow
+        // provider (the always-compiled live-process path).
         let r = tool_source_switch(&map(json!({"pid": 1234})), &mut h);
         #[cfg(feature = "process-provider")]
         assert_eq!(r["isError"], json!(true));
@@ -3709,7 +3711,7 @@ mod tests {
             assert!(r["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("provider:\"processmemory\""));
+                .contains("provider:\"memflow\""));
         }
         // no args → error
         let r = tool_source_switch(&map(json!({})), &mut h);
