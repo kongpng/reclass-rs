@@ -352,23 +352,22 @@ fn document_compose_forwards_symbol_lookup() {
 }
 
 #[test]
-fn source_switch_preserves_base() {
+fn source_switch_adopts_base_on_new_target() {
+    // The "adopt new provider's base on attach" fix (1a75104): switching to a
+    // brand-new target adopts that provider's base even when the doc already
+    // carries a stale, non-default base — the old policy wrongly kept the stale
+    // base (0x1000) instead of the provider's 0x400000.
     let mut doc = RcxDocument::new();
     build_small_tree(&mut doc.tree);
-    doc.tree.base_address = 0x1000;
+    doc.tree.base_address = 0x1000; // stale, non-default
+    doc.tree.base_address_formula.clear();
     let mut c = RcxController::new(doc);
     let prov = Arc::new(BaseAwareProvider {
         data: make_small_buffer(),
         base: 0x400000,
     });
-    let new_base = prov.base();
-    assert_eq!(new_base, 0x400000);
-    c.document_mut().provider = prov;
-    // Controller logic: keep existing base when non-zero.
-    if c.tree().base_address == 0 {
-        c.tree_mut().base_address = new_base;
-    }
-    assert_eq!(c.tree().base_address, 0x1000);
+    c.attach_provider_with_identifier_and_target(prov, "Process", true, "pid:1".to_string());
+    assert_eq!(c.tree().base_address, 0x400000);
     assert_eq!(c.document().provider.base(), 0x400000);
 }
 
@@ -377,17 +376,41 @@ fn source_switch_fresh_doc_uses_provider_base() {
     let mut doc = RcxDocument::new();
     build_small_tree(&mut doc.tree);
     doc.tree.base_address = 0;
+    doc.tree.base_address_formula.clear();
     let mut c = RcxController::new(doc);
     let prov = Arc::new(BaseAwareProvider {
         data: make_small_buffer(),
         base: 0x7FFE0000,
     });
-    let new_base = prov.base();
-    c.document_mut().provider = prov;
-    if c.tree().base_address == 0 {
-        c.tree_mut().base_address = new_base;
-    }
+    c.attach_provider_with_identifier_and_target(prov, "Process", true, "pid:2".to_string());
     assert_eq!(c.tree().base_address, 0x7FFE0000);
+}
+
+#[test]
+fn source_switch_existing_target_keeps_base() {
+    // Re-attaching an already-saved (kind, target) must NOT clobber the doc's
+    // current base with the provider base — the saved source keeps its own base
+    // (the C++ `existingIdx` branch / the guard 08dd696 added a test for).
+    let mut doc = RcxDocument::new();
+    build_small_tree(&mut doc.tree);
+    doc.tree.base_address = 0;
+    let mut c = RcxController::new(doc);
+    let prov1 = Arc::new(BaseAwareProvider {
+        data: make_small_buffer(),
+        base: 0x400000,
+    });
+    // First attach is a NEW target → adopts the provider base.
+    c.attach_provider_with_identifier_and_target(prov1, "Process", true, "pid:9".to_string());
+    assert_eq!(c.tree().base_address, 0x400000);
+    // The user sets a custom base, then re-attaches the SAME (kind, target).
+    c.tree_mut().base_address = 0x55AA;
+    let prov2 = Arc::new(BaseAwareProvider {
+        data: make_small_buffer(),
+        base: 0x400000,
+    });
+    c.attach_provider_with_identifier_and_target(prov2, "Process", true, "pid:9".to_string());
+    // is_existing → no adoption → the custom base is retained.
+    assert_eq!(c.tree().base_address, 0x55AA);
 }
 
 #[test]

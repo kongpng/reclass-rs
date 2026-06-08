@@ -4749,11 +4749,25 @@ impl RcxController {
         self.doc.provider = provider;
         self.doc.data_path = None;
         self.doc.tree.pointer_size = pointer_size;
-        // Base-address policy: fresh/default doc adopts the provider base.
-        if self.doc.tree.base_address == 0 || self.doc.tree.base_address == 0x0040_0000 {
-            if new_base != 0 {
+        // Base-address policy (`controller.cpp:5167-5208`, the "adopt new provider's
+        // base on attach" fix): the UI selectSource path (register_as_saved) adopts
+        // the new provider's base UNLESS this exact (kind, target) is already a saved
+        // source — re-attaching a saved source keeps its own base. The programmatic
+        // attachViaPlugin path keeps the existing fresh/default-only adoption so a
+        // stale non-default base no longer sticks when switching to a brand-new
+        // target.
+        let is_existing = self
+            .saved_sources
+            .iter()
+            .any(|s| s.kind == kind && s.provider_target == provider_target);
+        if register_as_saved {
+            if !is_existing && new_base != 0 {
                 self.doc.tree.base_address = new_base;
             }
+        } else if (self.doc.tree.base_address == 0 || self.doc.tree.base_address == 0x0040_0000)
+            && new_base != 0
+        {
+            self.doc.tree.base_address = new_base;
         }
         // Re-evaluate a stored module-relative / `[ptr]` formula against the new
         // provider so a project saved with a module-relative base relocates to the
