@@ -228,6 +228,22 @@ actions!(
         // can't carry the dynamic kind), and these read it back.
         EditorHintConvert,
         EditorHintSplit,
+        // Part D: the amalgamated "Selected bytes (N) ▸" submenu actions (the C++
+        // `addByteSubmenu`, controller.cpp). Each acts on the editor's live byte
+        // selection via the controller's byte-op handlers. Copy/Paste/Zero-fill/
+        // Save read or write the selected byte range; Edit hex opens the inline
+        // hex-overwrite editor; Break into new class extracts the range.
+        EditorByteCopyHex,
+        EditorByteCopyCArray,
+        EditorByteCopyPython,
+        EditorByteEditHex,
+        EditorByteZeroFill,
+        EditorBytePasteHex,
+        EditorByteSaveBinary,
+        EditorByteBreakClass,
+        // Bottom "Clear selection" — clears the byte selection AND the mirrored row
+        // selection together when either is non-empty (the C++ menu tail).
+        EditorClearSelection,
     ]
 );
 
@@ -473,6 +489,10 @@ pub struct RcxEditor {
     editing: Option<EditingField>,
     /// The per-byte hex selection (address-based, survives refresh; §12).
     byte_sel: ByteSelection,
+    /// Last set of covered-row sel-ids mirrored into the controller via
+    /// `on_byte_selection_rows` (`m_lastByteRows`). De-dups the sync so a
+    /// multi-pixel drag only re-mirrors when it crosses a row boundary.
+    last_byte_rows: std::collections::HashSet<u64>,
     /// The line the mouse is hovering (for the hover-row background; §7).
     hovered_line: Option<usize>,
     /// Item 9: the NODE id under the pointer (the C++ `m_hoveredNodeId`). The hover
@@ -651,6 +671,13 @@ pub struct RcxEditor {
     /// (e.g. to click a value-history 'Set' button) does not clear it first (the
     /// C++ `m_hoverInside` / geometry-contains guard, editor.cpp:2815/4531).
     popup_cursor_inside: bool,
+    /// Esc-dismiss hover latch (the C++ `m_hoverDwellElapsed` reset + timer stop in
+    /// `dismissAllPopups`): set when Esc dismisses all popups so the hover preview
+    /// does NOT immediately reappear on the next mouse twitch within the SAME row.
+    /// Released the moment the cursor moves onto a different node/line (or leaves
+    /// the viewport), so the preview returns only after the user re-dwells
+    /// elsewhere — Esc "sticks" without globally disabling hover effects.
+    hover_dwell_suppressed: bool,
     /// Item 11: the type-inference quick-convert payload captured when the node
     /// context menu is built — `(node_id, [hint kinds])`. The `EditorHintConvert` /
     /// `EditorHintSplit` actions read this so the dynamic suggested kind(s) survive
@@ -746,6 +773,7 @@ impl RcxEditor {
             controller,
             editing: None,
             byte_sel: ByteSelection::new(),
+            last_byte_rows: std::collections::HashSet::new(),
             hovered_line: None,
             hovered_node_id: 0,
             hover_popup: None,
@@ -794,6 +822,7 @@ impl RcxEditor {
             recent_type_names: Vec::new(),
             cross_doc_composites: Vec::new(),
             popup_cursor_inside: false,
+            hover_dwell_suppressed: false,
             pending_hint_convert: None,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
@@ -825,6 +854,7 @@ impl RcxEditor {
         self.controller.refresh();
         self.editing = None;
         self.byte_sel.clear();
+        self.last_byte_rows.clear();
         self.close_context_menu(cx);
         self.context_target = None;
         cx.notify();
@@ -936,6 +966,56 @@ impl RcxEditor {
 
     pub fn byte_selection(&self) -> &ByteSelection {
         &self.byte_sel
+    }
+
+    /// The set of encoded row sel-ids the current byte selection covers — every
+    /// hex-preview Field row whose `[offset_addr, offset_addr + count)` overlaps
+    /// the byte range, mapped through `sel_id_for_line` so the ids match exactly
+    /// what a click would store (`applyByteSelectionOverlay`'s `covered` set). An
+    /// empty set when there is no byte selection. Reuses the same per-row overlap
+    /// geometry as `build_row_paint`.
+    fn covered_byte_rows(&self) -> std::collections::HashSet<u64> {
+        let mut covered = std::collections::HashSet::new();
+        let Some(sel) = self.byte_sel.range() else {
+            return covered;
+        };
+        for lm in &self.controller.last_result().meta {
+            if !is_hex_preview(lm.node_kind) || lm.line_kind != LineKind::Field {
+                continue;
+            }
+            let count = if lm.line_byte_count > 0 {
+                lm.line_byte_count
+            } else {
+                crate::core::size_for_kind(lm.node_kind)
+            };
+            if selection::row_byte_overlap(lm.offset_addr, count, sel).is_some() {
+                covered.insert(crate::core::sel_id_for_line(lm));
+            }
+        }
+        covered
+    }
+
+    /// Mirror the byte selection into the controller's row selection: recompute
+    /// the covered rows and, when they differ from the last mirrored set, push
+    /// them via `on_byte_selection_rows` (`byteSelectionRowsChanged` →
+    /// `onByteSelectionRows`). An empty set clears the row selection. De-duped so
+    /// a multi-pixel drag only re-syncs on a row-boundary crossing. Call after
+    /// every byte-selection mutation.
+    fn sync_byte_rows(&mut self) {
+        let covered = self.covered_byte_rows();
+        if covered == self.last_byte_rows {
+            return;
+        }
+        self.last_byte_rows = covered.clone();
+        self.controller.on_byte_selection_rows(covered);
+    }
+
+    /// Clear the byte selection AND its mirrored row selection together (the
+    /// coupled-selection contract: byte + rows go as one). `sync_byte_rows` then
+    /// pushes the now-empty covered set, clearing `sel_ids`.
+    fn clear_byte_selection(&mut self) {
+        self.byte_sel.clear();
+        self.sync_byte_rows();
     }
 
     /// Whether the address margin shows relative `"+<HEX>"` offsets (the reclass
@@ -1683,6 +1763,22 @@ impl RcxEditor {
         cx.notify();
     }
 
+    /// Drain the controller's pending events and surface any `StatusHint` as a host
+    /// `RcxEditorEvent::Status` (the C++ `statusHint` → status bar). Used by the
+    /// byte-op copy actions, which emit a hint but don't recompose.
+    fn drain_status(&mut self, cx: &mut Context<Self>) {
+        for ev in self.controller.take_events() {
+            if let crate::controller::ControllerEvent::StatusHint(msg) = ev {
+                cx.emit(RcxEditorEvent::Status { message: msg });
+            }
+        }
+    }
+
+    /// Emit a host status message directly (the C++ `setAppStatus`).
+    fn set_status(&mut self, message: String, cx: &mut Context<Self>) {
+        cx.emit(RcxEditorEvent::Status { message });
+    }
+
     /// Re-feed the find bar the current line texts after a recompose (item 4) so the
     /// search set tracks the document. No-op when the bar is closed.
     fn sync_find_bar_lines(&mut self, cx: &mut Context<Self>) {
@@ -1710,9 +1806,14 @@ impl RcxEditor {
         self.tab_to_next_field(true, window, cx);
     }
     fn action_escape(&mut self, _: &EditorEscape, window: &mut Window, cx: &mut Context<Self>) {
-        // Two-stage Esc (§10): close the find bar first, then drop byte selection,
-        // else clear node selection. An active edit is cancelled by the field's own
-        // Esc binding.
+        // Single-stage Esc (§10): close the find bar first, then cancel an active
+        // edit — those keep their precedence. Otherwise Esc clears the selection in
+        // one gesture: with byte↔row coupling, dropping the byte selection clears
+        // the mirrored grey rows too (clear_byte_selection → on_byte_selection_rows
+        // (empty)), so byte + rows go together; the trailing clear_selection then
+        // also handles a row selection made without a byte selection. No early
+        // return between the two — the old two-stage Esc (first drop bytes, second
+        // drop rows) is gone.
         if self.find_bar.is_some() {
             self.close_find_bar(cx);
             return;
@@ -1723,12 +1824,20 @@ impl RcxEditor {
             cx.notify();
             return;
         }
-        if self.byte_sel.is_active() {
-            self.byte_sel.clear();
-            cx.notify();
-            return;
-        }
         let _ = window;
+        // Part E: dismiss any open hover preview and LATCH it closed so it doesn't
+        // immediately reappear on the next mouse twitch in the same row (the C++
+        // `dismissAllPopups` + `m_hoverDwellElapsed = false`). The latch releases
+        // when the cursor moves to a different node/line. Keep the hover band so
+        // the latch can tell "same row" from "moved" on the next mouse-move.
+        if self.hover_popup.is_some() {
+            self.hover_popup = None;
+        }
+        self.popup_cursor_inside = false;
+        self.hover_dwell_suppressed = true;
+        if self.byte_sel.is_active() {
+            self.clear_byte_selection();
+        }
         self.controller.clear_selection();
         self.after_mutation(cx);
     }
@@ -2394,6 +2503,10 @@ impl RcxEditor {
         // Item 13: a full hover clear (viewport leave) also drops the
         // cursor-inside-popup guard so a stale flag can't suppress the next popup.
         self.popup_cursor_inside = false;
+        // A full hover reset (kbd nav / viewport leave) also releases the
+        // Esc-dismiss latch — the hover band is gone, so the next dwell on any row
+        // is a fresh one and should be allowed to open a preview.
+        self.hover_dwell_suppressed = false;
         if changed {
             cx.notify();
         }
@@ -3751,6 +3864,7 @@ impl RcxEditor {
 
     /// Whether row `idx` is selected (any selection-id maps to its node, matching
     /// the line type for footer/array-elem/member rows; §7 `applySelectionOverlay`).
+    /// Delegates the precise per-id match to [`sel_id_matches_row`].
     fn is_row_selected(&self, lm: &LineMeta) -> bool {
         if lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
             return false;
@@ -3758,7 +3872,7 @@ impl RcxEditor {
         self.controller
             .selected_ids()
             .iter()
-            .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
+            .any(|&id| sel_id_matches_row(id, lm))
     }
 
     /// Pixel `(left, width)` of the char span `[start, end)` within `text`,
@@ -4882,6 +4996,194 @@ impl RcxEditor {
         }
     }
 
+    // ── Part D: "Selected bytes (N) ▸" submenu actions ──
+    // Each reads the live byte range from `byte_sel` and routes to the controller's
+    // byte-op handler (the C++ `addByteSubmenu` actions, controller.cpp). Copy ops
+    // put the formatted string on the clipboard; paste/zero-fill mutate (undoable);
+    // Save writes a binary file; Edit hex opens the hex-overwrite editor on the row
+    // containing the selection start; Break extracts the range into a new class.
+
+    /// The selected byte range as `(lo, n)` with `n` the byte count, if active.
+    fn byte_sel_lo_n(&self) -> Option<(u64, i32)> {
+        let (lo, hi) = self.byte_sel.range()?;
+        let n = hi.saturating_sub(lo) as i32;
+        (n > 0).then_some((lo, n))
+    }
+
+    fn action_byte_copy_hex(
+        &mut self,
+        _: &EditorByteCopyHex,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some((lo, n)) = self.byte_sel_lo_n() {
+            if let Some(s) = self.controller.byte_copy_hex(lo, n) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s));
+            }
+            self.drain_status(cx);
+        }
+    }
+
+    fn action_byte_copy_c_array(
+        &mut self,
+        _: &EditorByteCopyCArray,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some((lo, n)) = self.byte_sel_lo_n() {
+            if let Some(s) = self.controller.byte_copy_c_array(lo, n) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s));
+            }
+            self.drain_status(cx);
+        }
+    }
+
+    fn action_byte_copy_python(
+        &mut self,
+        _: &EditorByteCopyPython,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some((lo, n)) = self.byte_sel_lo_n() {
+            if let Some(s) = self.controller.byte_copy_python(lo, n) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s));
+            }
+            self.drain_status(cx);
+        }
+    }
+
+    fn action_byte_edit_hex(
+        &mut self,
+        _: &EditorByteEditHex,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        // The Rust port has no byte-range-narrowed inline edit (the C++
+        // `beginByteEdit`); open the existing hex-overwrite editor on the row that
+        // contains the selection start (the nearest equivalent).
+        let Some((lo, _)) = self.byte_sel_lo_n() else {
+            return;
+        };
+        let line = self
+            .controller
+            .last_result()
+            .meta
+            .iter()
+            .position(|lm| {
+                let count = if lm.line_byte_count > 0 {
+                    lm.line_byte_count
+                } else {
+                    crate::core::size_for_kind(lm.node_kind)
+                };
+                is_hex_preview(lm.node_kind)
+                    && lm.line_kind == LineKind::Field
+                    && lo >= lm.offset_addr
+                    && lo < lm.offset_addr + count.max(0) as u64
+            });
+        if let Some(line) = line {
+            self.begin_inline_edit(line, EditTarget::Value, window, cx);
+        }
+    }
+
+    fn action_byte_zero_fill(
+        &mut self,
+        _: &EditorByteZeroFill,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        if let Some((lo, n)) = self.byte_sel_lo_n() {
+            self.controller.byte_zero_fill(lo, n);
+            self.after_mutation(cx);
+        }
+    }
+
+    fn action_byte_paste_hex(
+        &mut self,
+        _: &EditorBytePasteHex,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let Some((lo, n)) = self.byte_sel_lo_n() else {
+            return;
+        };
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text().map(|t| t.to_string()))
+            .unwrap_or_default();
+        self.controller.byte_paste_hex(lo, n, &text);
+        self.after_mutation(cx);
+    }
+
+    fn action_byte_save_binary(
+        &mut self,
+        _: &EditorByteSaveBinary,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let Some((lo, n)) = self.byte_sel_lo_n() else {
+            return;
+        };
+        // 128 MB sanity cap (the C++ `1 << 27`).
+        if n > (1 << 27) {
+            return;
+        }
+        // Reuse the controller's `write_selected_bytes_to_file` (controller.rs).
+        // The save-file picker is host UI; default the path next to the binary
+        // under a deterministic name (`bytes_<addr>_<n>.bin`) in the working dir.
+        let path = std::path::PathBuf::from(format!("bytes_{:x}_{}.bin", lo, n));
+        match self.controller.write_selected_bytes_to_file(lo, n, &path) {
+            Ok(()) => self.set_status(
+                format!(
+                    "Saved {} byte{} to {}",
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    path.display()
+                ),
+                cx,
+            ),
+            Err(e) => self.set_status(e, cx),
+        }
+    }
+
+    fn action_byte_break_class(
+        &mut self,
+        _: &EditorByteBreakClass,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let Some((lo, hi)) = self.byte_sel.range() else {
+            return;
+        };
+        self.clear_byte_selection();
+        self.controller.extract_byte_selection_to_new_class(lo, hi);
+        self.after_mutation(cx);
+    }
+
+    fn action_clear_selection(
+        &mut self,
+        _: &EditorClearSelection,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        // Clear the byte selection AND the row selection together (the C++ bottom
+        // "Clear selection"). clear_byte_selection mirrors empty rows; then clear any
+        // row selection made without a byte selection.
+        if self.byte_sel.is_active() {
+            self.clear_byte_selection();
+        }
+        self.controller.clear_selection();
+        self.after_mutation(cx);
+    }
+
     // ── Item 17: Copy submenu ──
 
     fn action_copy_offset(
@@ -5441,6 +5743,48 @@ fn hex_kind_for_size(bytes: i32) -> NodeKind {
     }
 }
 
+/// Whether a single encoded selection id `sel_id` selects the row `lm` — the
+/// per-id match behind [`RcxEditor::is_row_selected`], extracted as a free fn so
+/// it's unit-testable without a gpui Window (the C++ `applySelectionOverlay`
+/// per-row loop, editor.cpp:3266). Classify `sel_id` by PRIORITY via `sel_kind`
+/// (the single source of truth) — NOT independent flag-bit tests — then strip to
+/// the bare node id and match the row's TYPE precisely: a footer-sel only paints
+/// footer rows, an array-elem-sel only the row with the matching element index, a
+/// member-sel only the row with the matching sub-line. Without this, selecting one
+/// array element (or one member row) greyed EVERY row of that node.
+fn sel_id_matches_row(sel_id: u64, lm: &LineMeta) -> bool {
+    use crate::core::linemeta::{
+        array_elem_idx_from_sel_id, member_sub_from_sel_id, sel_kind, SelKind,
+    };
+    if crate::controller::strip_sel_pub(sel_id) != lm.node_id {
+        return false;
+    }
+    let sk = sel_kind(sel_id);
+    let is_footer = lm.line_kind == LineKind::Footer;
+    // Footer selection paints footer rows only, and vice-versa.
+    if (sk == SelKind::Footer) != is_footer {
+        return false;
+    }
+    // Array element: match by element index; a non-array-elem sel must not paint an
+    // array-element row.
+    if sk == SelKind::ArrayElem {
+        if !lm.is_array_element || lm.array_element_idx != array_elem_idx_from_sel_id(sel_id) {
+            return false;
+        }
+    } else if lm.is_array_element {
+        return false;
+    }
+    // Member line: match by sub-line; a non-member sel must not paint a member row.
+    if sk == SelKind::Member {
+        if !lm.is_member_line || lm.sub_line != member_sub_from_sel_id(sel_id) {
+            return false;
+        }
+    } else if lm.is_member_line {
+        return false;
+    }
+    true
+}
+
 /// The "alternate" kind for the quick type-cycler (`← cur ↔ alt →`) and the
 /// forward `T`-less cycle (item 16): steps to the NEXT same-byte-size variant,
 /// wrapping. Cycling between equal-footprint primitives (e.g. int32_t → uint32_t →
@@ -5681,6 +6025,16 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_cut_nodes))
             .on_action(cx.listener(Self::action_paste_nodes))
             .on_action(cx.listener(Self::action_copy_address))
+            // Part D: byte-selection submenu actions + the shared "Clear selection".
+            .on_action(cx.listener(Self::action_byte_copy_hex))
+            .on_action(cx.listener(Self::action_byte_copy_c_array))
+            .on_action(cx.listener(Self::action_byte_copy_python))
+            .on_action(cx.listener(Self::action_byte_edit_hex))
+            .on_action(cx.listener(Self::action_byte_zero_fill))
+            .on_action(cx.listener(Self::action_byte_paste_hex))
+            .on_action(cx.listener(Self::action_byte_save_binary))
+            .on_action(cx.listener(Self::action_byte_break_class))
+            .on_action(cx.listener(Self::action_clear_selection))
             .on_mouse_down_out(cx.listener(|this, _e: &MouseDownEvent, window, cx| {
                 // Clicking outside the editor commits an active edit.
                 if this.editing.is_some() {
@@ -6098,6 +6452,51 @@ mod tests {
                 "element row {el} redirects to the parent array header line"
             );
         }
+    }
+
+    #[test]
+    fn array_element_selection_greys_only_its_own_row() {
+        // Part B regression (the C++ `applySelectionOverlay` per-row match): selecting
+        // ONE array element must paint only that element's row, not every row of the
+        // array node. `sel_id_matches_row` (behind `is_row_selected`) classifies the
+        // encoded id by priority and matches the element index precisely.
+        use super::sel_id_matches_row;
+        use crate::core::linemeta::make_array_elem_sel_id;
+        let c = editor_with_primitive_array();
+        let meta = &c.last_result().meta;
+
+        let elem_lines: Vec<usize> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_array_element)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(elem_lines.len(), 4);
+        let node_id = meta[elem_lines[0]].node_id;
+
+        // Select array element index 1.
+        let sel = make_array_elem_sel_id(node_id, 1);
+        let matched: Vec<i32> = elem_lines
+            .iter()
+            .filter(|&&l| sel_id_matches_row(sel, &meta[l]))
+            .map(|&l| meta[l].array_element_idx)
+            .collect();
+        // Exactly the element row whose array_element_idx == 1 matches.
+        assert_eq!(
+            matched,
+            vec![1],
+            "only the element with idx 1 is selected, not all array rows"
+        );
+        // The bare node id (no array-elem bit) would have greyed ALL element rows —
+        // confirm the precise encoding does NOT.
+        let greyed_by_bare = elem_lines
+            .iter()
+            .filter(|&&l| sel_id_matches_row(node_id, &meta[l]))
+            .count();
+        assert_eq!(
+            greyed_by_bare, 0,
+            "a bare node id must not match array-element rows (they carry the elem encoding)"
+        );
     }
 
     #[test]

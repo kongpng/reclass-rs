@@ -32,8 +32,8 @@ pub use kind::{
 };
 pub use linemeta::{
     array_elem_idx_from_sel_id, find_chip, is_synthetic_line, make_array_elem_sel_id,
-    make_member_sel_id, member_sub_from_sel_id, ChipKind, ComposeResult, LayoutInfo, LineChip,
-    LineKind, LineMeta,
+    make_member_sel_id, member_sub_from_sel_id, sel_id_for_line, sel_kind, ChipKind, ComposeResult,
+    LayoutInfo, LineChip, LineKind, LineMeta, SelKind,
 };
 pub use node::{BitfieldMember, Bookmark, Node, K_MAX_ARRAY_LEN};
 pub use tree::{root_class_names, NodeTree, OverlapPair, ValidateReport};

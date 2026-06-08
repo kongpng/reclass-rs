@@ -109,6 +109,19 @@ impl super::RcxEditor {
         if changed_band {
             self.hovered_line = Some(line);
             self.hovered_node_id = node_id;
+            // Moving onto a DIFFERENT node/line releases the Esc-dismiss hover
+            // latch — the preview may dwell again here. While the cursor stays on
+            // the same row the latch holds (below), so Esc "sticks".
+            self.hover_dwell_suppressed = false;
+        }
+        // Esc dismissed the popups; suppress re-opening one until the cursor moves
+        // to a different row (the C++ `m_hoverDwellElapsed` reset). Still track the
+        // hover band so other affordances update.
+        if self.hover_dwell_suppressed {
+            if changed_band {
+                cx.notify();
+            }
+            return;
         }
         // Hover popups are gated by the hover-effects toggle. Item 68: the
         // value-history popup is NOT suppressed while editing — when an edit is

@@ -59,6 +59,57 @@ fn append_node_submenus(
     })
 }
 
+/// Part D: prepend the "Selected bytes (N) ▸" submenu to a node/batch menu when a
+/// byte selection is active (the C++ `addByteSubmenu`, controller.cpp:231). Mirrors
+/// `addByteSubmenu`'s item order: Copy as hex / Copy as C array / Copy as Python
+/// bytes / Edit hex / Zero-fill / Paste hex / Save bytes as binary / Break into new
+/// class, then a separator. No-op when `byte_active` is false. Paste/Zero-fill are
+/// shown unconditionally (the controller's handlers re-check writability and emit a
+/// "read-only" hint), matching the C++ which lists them always.
+fn add_byte_submenu(
+    menu: gpui_component::menu::PopupMenu,
+    byte_active: bool,
+    byte_count: i32,
+    mw: &mut Window,
+    mcx: &mut Context<gpui_component::menu::PopupMenu>,
+) -> gpui_component::menu::PopupMenu {
+    if !byte_active {
+        return menu;
+    }
+    menu.submenu(
+        SharedString::from(format!("Selected bytes ({byte_count})")),
+        mw,
+        mcx,
+        |sub, _w, _cx| {
+            sub.menu_with_icon("Copy as hex", IconName::Copy, Box::new(EditorByteCopyHex))
+                .menu_with_icon(
+                    "Copy as C array",
+                    IconName::Copy,
+                    Box::new(EditorByteCopyCArray),
+                )
+                .menu_with_icon(
+                    "Copy as Python bytes",
+                    IconName::Copy,
+                    Box::new(EditorByteCopyPython),
+                )
+                .menu_with_icon("Edit hex\u{2026}", IconName::Replace, Box::new(EditorByteEditHex))
+                .menu_with_icon("Zero-fill", IconName::Minus, Box::new(EditorByteZeroFill))
+                .menu_with_icon("Paste hex", IconName::Inbox, Box::new(EditorBytePasteHex))
+                .menu_with_icon(
+                    "Save bytes as binary\u{2026}",
+                    IconName::HardDrive,
+                    Box::new(EditorByteSaveBinary),
+                )
+                .menu_with_icon(
+                    "Break into new class",
+                    IconName::Frame,
+                    Box::new(EditorByteBreakClass),
+                )
+        },
+    )
+    .separator()
+}
+
 impl super::RcxEditor {
     // ── Node context menu (reclass `customContextMenuRequested`) ──
 
@@ -118,12 +169,14 @@ impl super::RcxEditor {
 
         // Right-click selects the node (single-select) if it is not already part
         // of the selection — matches the reclass behaviour where the menu acts on
-        // the clicked node.
-        let already_selected = self
-            .controller
-            .selected_ids()
-            .iter()
-            .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id);
+        // the clicked node. Membership uses the SAME encoded id the click path stores
+        // (`sel_id_for_line`): array-element / member / footer rows carry encoding
+        // bits in `sel_ids`, so a raw-node-id test would treat an already-selected
+        // such row as "outside" and reset it — wrongly dropping an active byte
+        // selection (and its submenu) when you right-click the rows it covers
+        // (the C++ `showContextMenu` selection policy, controller.cpp:3925).
+        let clicked_id = crate::core::sel_id_for_line(&lm);
+        let already_selected = self.controller.selected_ids().contains(&clicked_id);
 
         // Item 7/22/46: when MORE THAN ONE node is selected and the right-clicked
         // node is part of that selection, open the BATCH menu (Change to <type> for
@@ -154,6 +207,13 @@ impl super::RcxEditor {
         }
 
         if !already_selected {
+            // Right-clicking a row outside the current selection moves the selection
+            // here and drops any active byte selection (and its submenu) so the two
+            // stay coherent. clear_byte_selection mirrors an empty covered set (→
+            // clears sel_ids), so do it before installing the clicked id.
+            if self.byte_sel.is_active() {
+                self.clear_byte_selection();
+            }
             self.controller
                 .handle_node_click(line as i64, lm.node_id, CtrlMods::NONE);
             let _ = self.controller.take_events();
@@ -326,9 +386,13 @@ impl super::RcxEditor {
     ) {
         let editor_focus = self.focus_handle.clone();
         let show_comment = self.show_comments();
+        // Part D: byte submenu (prepended) + bottom "Clear selection".
+        let byte_active = self.byte_sel.is_active();
+        let byte_count = self.byte_sel.len() as i32;
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
-            menu.min_w(px(220.0))
-                .action_context(editor_focus.clone())
+            let menu = menu.min_w(px(220.0)).action_context(editor_focus.clone());
+            let menu = add_byte_submenu(menu, byte_active, byte_count, mw, mcx);
+            menu
                 // "Change type of N nodes…" → opens the Change Type picker (applies
                 // to every selected node via the batch-aware controller path).
                 .menu_with_icon(
@@ -382,6 +446,14 @@ impl super::RcxEditor {
                 .submenu("Copy", mw, mcx, |sub, _w, _cx| {
                     sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
                 })
+                // Part D: bottom "Clear selection" — clears byte + row selection
+                // together (the batch branch always has a multi-selection).
+                .separator()
+                .menu_with_icon(
+                    "Clear selection",
+                    IconName::Close,
+                    Box::new(EditorClearSelection),
+                )
         });
         self.show_context_menu_at(menu, pos, window, cx);
     }
@@ -628,12 +700,23 @@ impl super::RcxEditor {
         };
         let static_has_any = static_add_child || static_dissolve_union;
 
+        // Part D: the live byte selection drives the "Selected bytes (N) ▸" submenu
+        // prepended at the top, and the bottom "Clear selection" (shown when there's
+        // a byte selection OR a row selection).
+        let byte_active = self.byte_sel.is_active();
+        let byte_count = self.byte_sel.len() as i32;
+        let show_clear = byte_active || !self.controller.selected_ids().is_empty();
+
         let editor_focus = self.focus_handle.clone();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
-            menu.min_w(px(220.0))
+            let menu = menu
+                .min_w(px(220.0))
                 // Dispatch the menu's actions to the editor's focus context (the
                 // `RcxEditor` key context that registers the `Editor*` handlers).
-                .action_context(editor_focus.clone())
+                .action_context(editor_focus.clone());
+            // Prepend the "Selected bytes (N) ▸" submenu (+ separator) when active.
+            let menu = add_byte_submenu(menu, byte_active, byte_count, mw, mcx);
+            menu
                 // Item 16: New Class only for non-container kinds; Ptr to New Class
                 // additionally requires a 4/8-byte node.
                 .when(show_new_class, |menu| {
@@ -913,6 +996,16 @@ impl super::RcxEditor {
                     IconName::SquareTerminal,
                     Box::new(EditorCopyCStruct),
                 )
+                // Part D: bottom "Clear selection" — clears the byte selection AND
+                // the row selection together (the C++ menu tail). Only offered when
+                // there's something to clear.
+                .when(show_clear, |menu| {
+                    menu.separator().menu_with_icon(
+                        "Clear selection",
+                        IconName::Close,
+                        Box::new(EditorClearSelection),
+                    )
+                })
         });
 
         self.show_context_menu_at(menu, pos, window, cx);

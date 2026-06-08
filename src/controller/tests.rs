@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::core::linemeta::{make_array_elem_sel_id, make_member_sel_id};
 use crate::core::{Node, NodeKind, NodeTree, OffsetAdj, ValueHistory};
 use crate::provider::{BufferProvider, MemoryRegion, Provider, RegionType};
 
@@ -4068,4 +4069,85 @@ fn rtti_gate_resolves_vtable_through_controller_accessors() {
     let got = resolve_field_vtable(c.tree(), &sel, c.provider().as_ref())
         .expect("pointer field resolves to its stored vtable word");
     assert_eq!(got, VTABLE);
+}
+
+// ── Part D: byte-selection clipboard formatters (pure, no GPUI) ──
+
+#[test]
+fn byte_format_hex_is_uppercase_space_separated() {
+    use super::format_bytes_hex;
+    // Mirrors the C++ `byteCopyHex` format (hex-row preview): UPPERCASE, single
+    // space between 2-digit pairs, no trailing space.
+    assert_eq!(format_bytes_hex(&[0xDE, 0xAD, 0xBE, 0xEF]), "DE AD BE EF");
+    assert_eq!(format_bytes_hex(&[0x00, 0x0F, 0xA0]), "00 0F A0");
+    assert_eq!(format_bytes_hex(&[0x42]), "42");
+    assert_eq!(format_bytes_hex(&[]), "");
+}
+
+#[test]
+fn byte_format_c_array_wraps_at_16_and_lowercase_prefix() {
+    use super::format_bytes_c_array;
+    // Mirrors the C++ `byteCopyCArray`: `{0xDE, 0xAD, …}`, lowercase `0x` prefix,
+    // UPPERCASE digits, line-wrap (newline replaces the post-comma space) every 16
+    // bytes — the break sits BEFORE byte index 16, 32, ….
+    assert_eq!(
+        format_bytes_c_array(&[0xDE, 0xAD, 0xBE, 0xEF]),
+        "{0xDE, 0xAD, 0xBE, 0xEF}"
+    );
+    assert_eq!(format_bytes_c_array(&[0x01]), "{0x01}");
+    assert_eq!(format_bytes_c_array(&[]), "{}");
+
+    // 17 bytes → a newline before the 17th element (index 16), spaces elsewhere.
+    let data: Vec<u8> = (0..17u8).collect();
+    let out = format_bytes_c_array(&data);
+    assert_eq!(out.matches('\n').count(), 1, "exactly one wrap at 16 bytes");
+    assert!(out.starts_with("{0x00, 0x01,"));
+    assert!(
+        out.contains("0x0F,\n0x10}"),
+        "wrap is a bare newline (no space) before byte 16: {out}"
+    );
+}
+
+#[test]
+fn byte_format_python_is_lowercase_bytes_literal() {
+    use super::format_bytes_python;
+    // Mirrors the C++ `byteCopyPython`: `b'\xde\xad…'`, lowercase hex to match
+    // `repr(bytes(...))`, no separators.
+    assert_eq!(
+        format_bytes_python(&[0xDE, 0xAD, 0xBE, 0xEF]),
+        r"b'\xde\xad\xbe\xef'"
+    );
+    assert_eq!(format_bytes_python(&[0x00, 0x7F]), r"b'\x00\x7f'");
+    assert_eq!(format_bytes_python(&[]), "b''");
+}
+
+#[test]
+fn on_byte_selection_rows_replaces_selection_and_clears() {
+    use std::collections::HashSet;
+    let mut c = make_ctrl();
+    // Seed a stale single-node selection + anchor (as a prior click would).
+    c.handle_node_click(1, 1, crate::controller::Modifiers::NONE);
+    let _ = c.take_events();
+    assert!(c.anchor_line() >= 0);
+
+    // A byte selection covering two rows mirrors its covered sel-ids: the row
+    // selection is REPLACED wholesale and the click anchor is reset (the byte
+    // selection owns the row selection while active — `onByteSelectionRows`).
+    let covered: HashSet<u64> = [10u64, 20u64].into_iter().collect();
+    c.on_byte_selection_rows(covered.clone());
+    assert_eq!(c.selected_ids(), &covered);
+    assert_eq!(c.anchor_line(), -1);
+    // It emits SelectionChanged(2) so the command row / overlays update.
+    assert!(c
+        .take_events()
+        .iter()
+        .any(|e| *e == crate::controller::ControllerEvent::SelectionChanged(2)));
+
+    // An empty covered set clears the row selection (single-stage Esc coupling).
+    c.on_byte_selection_rows(HashSet::new());
+    assert!(c.selected_ids().is_empty());
+    assert!(c
+        .take_events()
+        .iter()
+        .any(|e| *e == crate::controller::ControllerEvent::SelectionChanged(0)));
 }

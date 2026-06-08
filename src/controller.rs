@@ -22,11 +22,11 @@ use serde_json::{Map, Value};
 
 use crate::compose;
 use crate::core::linemeta::{
-    is_synthetic_line, make_array_elem_sel_id, make_member_sel_id, K_ARRAY_ELEM_BIT,
-    K_ARRAY_ELEM_MASK, K_COMMAND_ROW_ID, K_FOOTER_ID_BIT, K_MEMBER_BIT, K_MEMBER_SUB_MASK,
+    is_synthetic_line, sel_id_for_line, K_ARRAY_ELEM_BIT, K_ARRAY_ELEM_MASK, K_COMMAND_ROW_ID,
+    K_FOOTER_ID_BIT, K_MEMBER_BIT, K_MEMBER_SUB_MASK,
 };
 use crate::core::{
-    alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node,
+    alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node, is_hex_preview,
     is_pointer_kind, is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string,
     size_for_kind, BitfieldMember, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree,
     OffsetAdj, ValueHistory, K_COMMON_TYPES,
@@ -1608,6 +1608,484 @@ impl RcxController {
         std::fs::write(path.as_ref(), &data)
             .map_err(|e| format!("Couldn't open {:?} for writing: {}", path.as_ref(), e))?;
         Ok(())
+    }
+
+    /// `extractByteSelectionToNewClass(selLo, selHi)` (`controller.cpp:2272`). Break
+    /// the byte range `[sel_lo, sel_hi)` out into a new root class and embed an
+    /// instance of it at the selection start in the original parent. Refuses (with a
+    /// `StatusHint`) when the selection starts before the base address, crosses a
+    /// parent-struct boundary, crosses a Struct/Array, or partially crosses a typed
+    /// (non-hex) field. Undoable as a single "Extract to New Class" macro.
+    pub fn extract_byte_selection_to_new_class(&mut self, sel_lo: u64, sel_hi: u64) {
+        if sel_hi <= sel_lo {
+            self.emit(ControllerEvent::StatusHint("No bytes selected".to_string()));
+            return;
+        }
+        let base = self.doc.tree.base_address;
+        if sel_lo < base {
+            self.emit(ControllerEvent::StatusHint(
+                "Selection starts before base address".to_string(),
+            ));
+            return;
+        }
+        let rel_lo = (sel_lo - base) as i32;
+        let rel_hi = (sel_hi - base) as i32;
+
+        // Restrict consideration to nodes whose ancestor chain leads to the viewed
+        // root (other root structs/enums numerically overlap but live in different
+        // address spaces — including them falsely refuses with "cross-parent").
+        let view_root = self.view_root_id;
+        let is_in_view = |tree: &NodeTree, node_id: u64| -> bool {
+            if view_root == 0 {
+                return true;
+            }
+            let mut id = node_id;
+            while id != 0 {
+                if id == view_root {
+                    return true;
+                }
+                let idx = tree.index_of_id(id);
+                if idx < 0 {
+                    return false;
+                }
+                id = tree.nodes[idx as usize].parent_id;
+            }
+            false
+        };
+        let node_size = |tree: &NodeTree, n: &Node| -> i32 {
+            if matches!(n.kind, NodeKind::Struct | NodeKind::Array) {
+                tree.struct_span(n.id)
+            } else {
+                n.byte_size()
+            }
+        };
+
+        // Pass 1: determine the single parent struct from the first intersected LEAF
+        // child (containers skipped — their span includes children).
+        let mut parent_id = 0u64;
+        let mut parent_set = false;
+        {
+            let tree = &self.doc.tree;
+            for n in &tree.nodes {
+                if matches!(n.kind, NodeKind::Struct | NodeKind::Array) {
+                    continue;
+                }
+                if !is_in_view(tree, n.id) {
+                    continue;
+                }
+                let sz = node_size(tree, n);
+                if sz <= 0 {
+                    continue;
+                }
+                let row_lo = n.offset;
+                let row_hi = row_lo + sz;
+                if row_hi <= rel_lo || row_lo >= rel_hi {
+                    continue;
+                }
+                if !parent_set {
+                    parent_id = n.parent_id;
+                    parent_set = true;
+                } else if n.parent_id != parent_id {
+                    self.emit(ControllerEvent::StatusHint(
+                        "Selection crosses parent struct boundary".to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
+        if !parent_set {
+            self.emit(ControllerEvent::StatusHint(
+                "No fields in selection".to_string(),
+            ));
+            return;
+        }
+
+        // Pass 2: collect intersected siblings of `parent_id`, validate.
+        let mut intersected: Vec<usize> = Vec::new();
+        {
+            let tree = &self.doc.tree;
+            for ci in tree.children_of(parent_id) {
+                let sib = &tree.nodes[ci];
+                let sz = node_size(tree, sib);
+                if sz <= 0 {
+                    continue;
+                }
+                let row_lo = sib.offset;
+                let row_hi = row_lo + sz;
+                if row_hi <= rel_lo || row_lo >= rel_hi {
+                    continue;
+                }
+                let fully_contained = row_lo >= rel_lo && row_hi <= rel_hi;
+                if matches!(sib.kind, NodeKind::Struct | NodeKind::Array) {
+                    self.emit(ControllerEvent::StatusHint(
+                        "Selection crosses a Struct/Array — refusing extract".to_string(),
+                    ));
+                    return;
+                }
+                if !fully_contained && !is_hex_preview(sib.kind) {
+                    self.emit(ControllerEvent::StatusHint(
+                        "Selection partially crosses a typed field — refusing".to_string(),
+                    ));
+                    return;
+                }
+                intersected.push(ci);
+            }
+        }
+        if intersected.is_empty() {
+            self.emit(ControllerEvent::StatusHint(
+                "No fields in selection".to_string(),
+            ));
+            return;
+        }
+
+        // Sort by offset so aff_lo/aff_hi are well-defined.
+        intersected.sort_by_key(|&i| self.doc.tree.nodes[i].offset);
+        let aff_lo = self.doc.tree.nodes[*intersected.first().unwrap()].offset;
+        let last = &self.doc.tree.nodes[*intersected.last().unwrap()];
+        let aff_hi = last.offset + node_size(&self.doc.tree, last);
+        let left_pad_bytes = rel_lo - aff_lo;
+        let right_pad_bytes = aff_hi - rel_hi;
+        let extract_size = rel_hi - rel_lo;
+        debug_assert!(left_pad_bytes >= 0);
+        debug_assert!(right_pad_bytes >= 0);
+        debug_assert!(extract_size > 0);
+
+        // Snapshot each intersected sibling (full node copy) so we can rebuild typed
+        // fields in the new class after removal.
+        struct Snapshot {
+            node: Node,
+            sz: i32,
+            fully_contained: bool,
+        }
+        let snaps: Vec<Snapshot> = intersected
+            .iter()
+            .map(|&idx| {
+                let node = self.doc.tree.nodes[idx].clone();
+                let sz = node_size(&self.doc.tree, &node);
+                let fully_contained = node.offset >= rel_lo && node.offset + sz <= rel_hi;
+                Snapshot {
+                    node,
+                    sz,
+                    fully_contained,
+                }
+            })
+            .collect();
+
+        // Match the File → New Class naming convention: lowest-numbered
+        // `UnnamedClassN` not already taken (same flat namespace).
+        let type_name = {
+            let existing: HashSet<String> = self
+                .doc
+                .tree
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Struct && !n.struct_type_name.is_empty())
+                .map(|n| n.struct_type_name.clone())
+                .collect();
+            let mut idx = 0;
+            loop {
+                let name = format!("UnnamedClass{idx}");
+                if !existing.contains(&name) {
+                    break name;
+                }
+                idx += 1;
+            }
+        };
+
+        let was_suppressed = self.suppress_refresh;
+        self.suppress_refresh = true;
+        self.begin_macro("Extract to New Class");
+
+        // 1. Create the new root struct.
+        let mut root = Node {
+            kind: NodeKind::Struct,
+            struct_type_name: type_name.clone(),
+            name: "instance".to_string(),
+            class_keyword: "class".to_string(),
+            parent_id: 0,
+            offset: 0,
+            ..Node::default()
+        };
+        root.id = self.doc.tree.reserve_id();
+        let root_id = root.id;
+        self.push_command(Command::Insert {
+            node: root,
+            off_adjs: Vec::new(),
+        });
+
+        // 2. Populate the new class: fully-contained snaps re-inserted at their
+        //    selection-relative offset (preserving kind/name/comment/ref_id); gaps
+        //    filled with greedy hex packing.
+        {
+            struct Placement<'a> {
+                new_off: i32,
+                sz: i32,
+                s: &'a Snapshot,
+            }
+            let mut placements: Vec<Placement> = snaps
+                .iter()
+                .filter(|sn| sn.fully_contained)
+                .map(|sn| Placement {
+                    new_off: sn.node.offset - rel_lo,
+                    sz: sn.sz,
+                    s: sn,
+                })
+                .collect();
+            placements.sort_by_key(|p| p.new_off);
+
+            let mut cursor = 0;
+            for p in &placements {
+                if p.new_off > cursor {
+                    self.pack_greedy_hex(root_id, cursor, p.new_off - cursor);
+                }
+                let mut clone = p.s.node.clone();
+                clone.parent_id = root_id;
+                clone.offset = p.new_off;
+                clone.id = self.doc.tree.reserve_id();
+                self.push_command(Command::Insert {
+                    node: clone,
+                    off_adjs: Vec::new(),
+                });
+                cursor = p.new_off + p.sz;
+            }
+            if cursor < extract_size {
+                self.pack_greedy_hex(root_id, cursor, extract_size - cursor);
+            }
+        }
+
+        // 3. Remove every intersected sibling from the original parent (no offset
+        //    shifts — the equal-size replacements below balance).
+        let intersected_ids: Vec<u64> = intersected
+            .iter()
+            .map(|&idx| self.doc.tree.nodes[idx].id)
+            .collect();
+        for &id in intersected_ids.iter().rev() {
+            let cur_idx = self.doc.tree.index_of_id(id);
+            if cur_idx < 0 {
+                continue;
+            }
+            let copy = self.doc.tree.nodes[cur_idx as usize].clone();
+            self.push_command(Command::Remove {
+                node_id: copy.id,
+                subtree: vec![copy],
+                off_adjs: Vec::new(),
+            });
+        }
+
+        // 4. Insert left pads + embedded struct + right pads at the original offsets.
+        self.pack_greedy_hex(parent_id, aff_lo, left_pad_bytes);
+
+        let mut embed = Node {
+            kind: NodeKind::Struct,
+            parent_id,
+            offset: rel_lo,
+            struct_type_name: type_name.clone(),
+            // Field name mirrors the type name lowercased (C-style "ClassFoo
+            // classfoo;") — reads naturally and saves the user a rename.
+            name: type_name.to_lowercase(),
+            ref_id: root_id,
+            ..Node::default()
+        };
+        embed.id = self.doc.tree.reserve_id();
+        self.push_command(Command::Insert {
+            node: embed,
+            off_adjs: Vec::new(),
+        });
+
+        self.pack_greedy_hex(parent_id, rel_hi, right_pad_bytes);
+
+        self.end_macro();
+        self.suppress_refresh = was_suppressed;
+        if !self.suppress_refresh {
+            self.refresh();
+        }
+
+        self.emit(ControllerEvent::StatusHint(format!(
+            "Extracted {} byte{} into {}",
+            extract_size,
+            if extract_size == 1 { "" } else { "s" },
+            type_name
+        )));
+    }
+
+    /// Greedy hex packer (`controller.cpp:2322` lambda): fill `n_bytes` at
+    /// consecutive offsets under `parent_id` with the largest hex kind that fits
+    /// (Hex64 → Hex8). No-op for `n_bytes <= 0`.
+    fn pack_greedy_hex(&mut self, parent_id: u64, start_offset: i32, n_bytes: i32) {
+        let mut off = start_offset;
+        let mut rem = n_bytes;
+        while rem > 0 {
+            let (k, sz) = if rem >= 8 {
+                (NodeKind::Hex64, 8)
+            } else if rem >= 4 {
+                (NodeKind::Hex32, 4)
+            } else if rem >= 2 {
+                (NodeKind::Hex16, 2)
+            } else {
+                (NodeKind::Hex8, 1)
+            };
+            let mut child = Node {
+                kind: k,
+                name: format!("field_{:04x}", off),
+                parent_id,
+                offset: off,
+                ..Node::default()
+            };
+            child.id = self.doc.tree.reserve_id();
+            self.push_command(Command::Insert {
+                node: child,
+                off_adjs: Vec::new(),
+            });
+            off += sz;
+            rem -= sz;
+        }
+    }
+
+    // ── Byte-selection op handlers (`controller.cpp:52-219`) ──
+    // One implementation shared by the right-click "Selected bytes (N) ▸" submenu
+    // and the Ctrl+C/V/Del shortcuts. Each takes the live byte range `[lo, lo+n)`
+    // (the editor owns the selection) and does provider I/O via the active snapshot
+    // (snapshot wins over the real provider so copied values match what's shown).
+    // The copy variants RETURN the formatted string for the view to put on the
+    // clipboard (the controller has no clipboard handle); paste/zero-fill mutate via
+    // an undoable `WriteBytes`. 65536-byte cap on copy/paste.
+
+    /// Read `[lo, lo+n)` through the active snapshot (else the real provider).
+    /// `None` (with a `StatusHint`) when `n` is out of range or the range is
+    /// unreadable. `readSelectionBytes` (`controller.cpp:52`).
+    pub fn read_selection_bytes(&mut self, lo: u64, n: i32) -> Option<Vec<u8>> {
+        if n <= 0 || n > 65536 {
+            return None;
+        }
+        let prov: &dyn Provider = match &self.snapshot {
+            Some(s) => s.as_ref(),
+            None => &*self.doc.provider,
+        };
+        if !prov.is_readable(lo, n) {
+            self.emit(ControllerEvent::StatusHint(format!(
+                "Couldn't read {} bytes at 0x{:x}",
+                n, lo
+            )));
+            return None;
+        }
+        let data = prov.read_bytes(lo, n);
+        if data.len() < n as usize {
+            self.emit(ControllerEvent::StatusHint(format!(
+                "Couldn't read {} bytes at 0x{:x}",
+                n, lo
+            )));
+            return None;
+        }
+        Some(data)
+    }
+
+    /// `byteCopyHex` (`controller.cpp:69`) — returns the UPPERCASE space-separated
+    /// hex string for the view to copy, plus a status hint. `None` if unreadable.
+    pub fn byte_copy_hex(&mut self, lo: u64, n: i32) -> Option<String> {
+        let data = self.read_selection_bytes(lo, n)?;
+        let out = format_bytes_hex(&data);
+        self.emit(ControllerEvent::StatusHint(format!(
+            "Copied {} byte{} as hex",
+            data.len(),
+            if data.len() == 1 { "" } else { "s" }
+        )));
+        Some(out)
+    }
+
+    /// `byteCopyCArray` (`controller.cpp:97`) — `{0xDE, 0xAD, …}`.
+    pub fn byte_copy_c_array(&mut self, lo: u64, n: i32) -> Option<String> {
+        let data = self.read_selection_bytes(lo, n)?;
+        let out = format_bytes_c_array(&data);
+        self.emit(ControllerEvent::StatusHint(format!(
+            "Copied {} byte{} as C array",
+            data.len(),
+            if data.len() == 1 { "" } else { "s" }
+        )));
+        Some(out)
+    }
+
+    /// `byteCopyPython` (`controller.cpp:120`) — `b'\xde\xad…'`.
+    pub fn byte_copy_python(&mut self, lo: u64, n: i32) -> Option<String> {
+        let data = self.read_selection_bytes(lo, n)?;
+        let out = format_bytes_python(&data);
+        self.emit(ControllerEvent::StatusHint(format!(
+            "Copied {} byte{} as Python bytes",
+            data.len(),
+            if data.len() == 1 { "" } else { "s" }
+        )));
+        Some(out)
+    }
+
+    /// `bytePasteHex` (`controller.cpp:165`) — parse `clipboard_text` via lenient
+    /// hex, clamp to the selection length (truncate longer / zero-pad shorter), and
+    /// write it as an undoable `WriteBytes`. Gated on a writable provider.
+    pub fn byte_paste_hex(&mut self, lo: u64, n: i32, clipboard_text: &str) {
+        if !self.doc.provider.is_writable() || self.read_only_override {
+            self.emit(ControllerEvent::StatusHint("Target is read-only".to_string()));
+            return;
+        }
+        if n <= 0 || n > 65536 {
+            return;
+        }
+        let bytes = match crate::core::clipboard::parse_lenient_hex(clipboard_text) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                self.emit(ControllerEvent::StatusHint(
+                    "Clipboard isn't valid hex".to_string(),
+                ));
+                return;
+            }
+            Err(e) => {
+                self.emit(ControllerEvent::StatusHint(format!("Clipboard: {e}")));
+                return;
+            }
+        };
+        // Clamp to the selection length: truncate longer, zero-pad shorter.
+        let mut write = vec![0u8; n as usize];
+        let copy_n = bytes.len().min(n as usize);
+        write[..copy_n].copy_from_slice(&bytes[..copy_n]);
+        self.write_selected_bytes(lo, n, write);
+        self.emit(ControllerEvent::StatusHint(format!(
+            "Pasted {} byte{} at 0x{:x}",
+            n,
+            if n == 1 { "" } else { "s" },
+            lo
+        )));
+    }
+
+    /// `byteZeroFill` (`controller.cpp:201`) — overwrite `[lo, lo+n)` with zeros as
+    /// an undoable `WriteBytes`. Gated on a writable provider.
+    pub fn byte_zero_fill(&mut self, lo: u64, n: i32) {
+        if !self.doc.provider.is_writable() || self.read_only_override {
+            self.emit(ControllerEvent::StatusHint("Target is read-only".to_string()));
+            return;
+        }
+        if n <= 0 || n > 65536 {
+            return;
+        }
+        self.write_selected_bytes(lo, n, vec![0u8; n as usize]);
+        self.emit(ControllerEvent::StatusHint(format!(
+            "Zero-filled {} byte{} at 0x{:x}",
+            n,
+            if n == 1 { "" } else { "s" },
+            lo
+        )));
+    }
+
+    /// Shared write path for paste/zero-fill: snapshot the old bytes (for undo),
+    /// push an undoable `WriteBytes`. The real provider's read (not the snapshot)
+    /// supplies the `old_bytes` so undo restores the real memory.
+    fn write_selected_bytes(&mut self, lo: u64, n: i32, new_bytes: Vec<u8>) {
+        let old_bytes = if self.doc.provider.is_readable(lo, n) {
+            self.doc.provider.read_bytes(lo, n)
+        } else {
+            vec![0u8; n as usize]
+        };
+        self.push_command(Command::WriteBytes {
+            addr: lo,
+            old_bytes,
+            new_bytes,
+        });
     }
 }
 
@@ -4472,28 +4950,70 @@ fn elide(s: &str, max: i32) -> String {
     out
 }
 
+// ── Byte-selection clipboard formatters (free fns — pure, unit-tested) ──
+// Each mirrors a `byteCopy*` formatter in `controller.cpp` (the hex-row preview
+// format / a C array initializer / a Python bytes literal). Factored out of the
+// controller methods so they're testable without a provider or clipboard.
+
+/// `byteCopyHex` format (`controller.cpp:85`): UPPERCASE, space-separated 2-digit
+/// pairs — matches the hex-row preview.
+pub fn format_bytes_hex(data: &[u8]) -> String {
+    let mut hex = String::with_capacity(data.len() * 3);
+    for (i, b) in data.iter().enumerate() {
+        if i > 0 {
+            hex.push(' ');
+        }
+        hex.push_str(&format!("{:02X}", b));
+    }
+    hex
+}
+
+/// `byteCopyCArray` format (`controller.cpp:103`): `{0xDE, 0xAD, …}` — a direct
+/// C/C++ array initializer, line-wrapped at 16 bytes/row. The `0x` prefix stays
+/// lowercase; the two hex digits are UPPERCASE.
+pub fn format_bytes_c_array(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() * 7);
+    out.push('{');
+    for (i, b) in data.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+            if i % 16 == 0 {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+        }
+        out.push_str(&format!("0x{:02X}", b));
+    }
+    out.push('}');
+    out
+}
+
+/// `byteCopyPython` format (`controller.cpp:120`): a Python bytes literal
+/// `b'\xde\xad…'`, lowercase hex to match `repr(bytes(...))`.
+pub fn format_bytes_python(data: &[u8]) -> String {
+    let mut out = String::with_capacity(4 + data.len() * 4);
+    out.push_str("b'");
+    for b in data {
+        out.push_str(&format!("\\x{:02x}", b));
+    }
+    out.push('\'');
+    out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Selection (`controller.cpp:5094-5184`)
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl RcxController {
     /// `effectiveId(line, nid)` (inner lambda of `handleNodeClick`,
-    /// `controller.cpp:5104`).
+    /// `controller.cpp:5104`). Delegates to `sel_id_for_line` (the single
+    /// source of truth for the line→sel_id rule).
     fn effective_id(&self, line: i64, nid: u64) -> u64 {
         if line < 0 || line as usize >= self.last_result.meta.len() {
             return nid;
         }
-        let lm = &self.last_result.meta[line as usize];
-        if lm.line_kind == LineKind::Footer {
-            return nid | K_FOOTER_ID_BIT;
-        }
-        if lm.is_array_element && lm.array_element_idx >= 0 {
-            return make_array_elem_sel_id(nid, lm.array_element_idx);
-        }
-        if lm.is_member_line && lm.sub_line >= 0 {
-            return make_member_sel_id(nid, lm.sub_line);
-        }
-        nid
+        sel_id_for_line(&self.last_result.meta[line as usize])
     }
 
     /// `handleNodeClick(source, line, nodeId, mods)` (`controller.cpp:5094`).
@@ -4576,6 +5096,18 @@ impl RcxController {
     /// `clearSelection()` (`controller.cpp:5174`).
     pub fn clear_selection(&mut self) {
         self.sel_ids.clear();
+        self.anchor_line = -1;
+        self.update_command_row();
+    }
+
+    /// `onByteSelectionRows(selIds)` (`controller.cpp:5314`). Mirror an editor's
+    /// byte selection into the row selection: replace `sel_ids` wholesale with the
+    /// encoded sel-ids of every hex row the byte selection covers (an empty set
+    /// clears). The byte selection owns the row selection while active. Driven by
+    /// the editor's byte-selection→row sync so the grey `M_SELECTED` rows track the
+    /// byte selection. Emits `SelectionChanged` via `update_command_row`.
+    pub fn on_byte_selection_rows(&mut self, sel_ids: HashSet<u64>) {
+        self.sel_ids = sel_ids;
         self.anchor_line = -1;
         self.update_command_row();
     }

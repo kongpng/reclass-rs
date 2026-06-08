@@ -45,9 +45,11 @@ impl super::RcxEditor {
         let mut lm = lm;
         let mut hit = hit;
 
-        // Plain LMB clears the byte selection (Shift/Ctrl preserve it; §9).
+        // Plain LMB clears the byte selection (Shift/Ctrl preserve it; §9). Clear
+        // the mirrored rows together (coupled selection) before the click below
+        // installs its own node selection.
         if !modifiers.shift && !modifiers.control {
-            self.byte_sel.clear();
+            self.clear_byte_selection();
         }
 
         // Record the drag anchor for row drag-select (item 8). Whether the press
@@ -92,13 +94,15 @@ impl super::RcxEditor {
             return;
         }
 
-        // Hex byte click → byte selection (Shift extends; §9).
+        // Hex byte click → byte selection (Shift extends; §9). Mirror the covered
+        // rows into the controller's row selection.
         if let Some(addr) = self.byte_addr_for_hit(&lm, &text, hit.col) {
             if modifiers.shift {
                 self.byte_sel.shift_extend_to(addr);
             } else {
                 self.byte_sel.arm(addr);
             }
+            self.sync_byte_rows();
             cx.notify();
             return;
         }
@@ -527,6 +531,7 @@ impl super::RcxEditor {
             let col = self.metrics.col_containing_x(rel_x);
             if let Some(addr) = self.byte_addr_for_hit(&lm, &text, col) {
                 self.byte_sel.shift_extend_to(addr);
+                self.sync_byte_rows();
                 cx.notify();
             }
             return;

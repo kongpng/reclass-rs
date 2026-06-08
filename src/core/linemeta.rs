@@ -62,9 +62,19 @@ pub const K_FOOTER_ID_BIT: u64 = 0x8000_0000_0000_0000;
 pub const K_ARRAY_ELEM_BIT: u64 = 0x4000_0000_0000_0000;
 pub const K_ARRAY_ELEM_SHIFT: u64 = 42;
 pub const K_ARRAY_ELEM_MASK: u64 = 0x3FFF_FC00_0000_0000;
-pub const K_MEMBER_BIT: u64 = 0x2000_0000_0000_0000;
+// Member selection encoding (enum/bitfield members) — mirrors the array
+// element pattern, but the flag bit sits one position LOWER (bit 61 vs the
+// array's bit 62), so the value field is 19 bits (42-60), NOT 20. The mask
+// must therefore EXCLUDE bit 61 (= `K_MEMBER_BIT`): a 20-bit mask
+// (`0x3FFF_FC..`, reaching bit 61) would read the flag bit back into the
+// decoded sub-line and inflate every result by 2^19 (524288), so
+// `member_sub_from_sel_id` never matched the real sub-line and member rows
+// were never highlighted. (The strip mask used for node lookup is
+// `K_MEMBER_BIT | K_MEMBER_SUB_MASK` = bits 42-61, unchanged by this
+// narrowing.)
+pub const K_MEMBER_BIT: u64 = 0x2000_0000_0000_0000; // bit 61
 pub const K_MEMBER_SUB_SHIFT: u64 = 42;
-pub const K_MEMBER_SUB_MASK: u64 = 0x3FFF_FC00_0000_0000;
+pub const K_MEMBER_SUB_MASK: u64 = 0x1FFF_FC00_0000_0000; // bits 42-60 (19 bits)
 
 /// `makeArrayElemSelId` (`core.h:945`).
 #[inline]
@@ -80,12 +90,68 @@ pub fn array_elem_idx_from_sel_id(sel_id: u64) -> i32 {
 /// `makeMemberSelId` (`core.h:957`).
 #[inline]
 pub fn make_member_sel_id(node_id: u64, sub_line: i32) -> u64 {
-    node_id | K_MEMBER_BIT | (((sub_line as u64) & 0xFFFFF) << K_MEMBER_SUB_SHIFT)
+    node_id | K_MEMBER_BIT | (((sub_line as u64) & 0x7FFFF) << K_MEMBER_SUB_SHIFT)
 }
 /// `memberSubFromSelId` (`core.h:960`).
 #[inline]
 pub fn member_sub_from_sel_id(sel_id: u64) -> i32 {
     ((sel_id & K_MEMBER_SUB_MASK) >> K_MEMBER_SUB_SHIFT) as i32
+}
+
+/// What kind of selection an encoded `sel_id` represents. The flag bits are
+/// NOT independent: the 20-bit array index field (bits 42-61) reaches bit 61
+/// (= `K_MEMBER_BIT`) for indices >= 2^19, so a high array element id also has
+/// the member bit set. Disambiguate by PRIORITY (footer 63 > array 62 >
+/// member 61) — this is the single source of truth; never test the flag bits
+/// independently (a `sel_id & K_MEMBER_BIT` check would misclassify a
+/// high-index array element as a member). Decode the index/sub-line only after
+/// classifying: `array_elem_idx_from_sel_id` reads the full 20-bit field, so
+/// the array index round-trips correctly even with bit 61 set.
+///
+/// `enum class SelKind` / `selKindOf` (`core.h`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SelKind {
+    Plain,
+    Footer,
+    ArrayElem,
+    Member,
+}
+
+/// `selKindOf(selId)` (`core.h`).
+#[inline]
+pub fn sel_kind(sel_id: u64) -> SelKind {
+    if sel_id & K_FOOTER_ID_BIT != 0 {
+        return SelKind::Footer;
+    }
+    if sel_id & K_ARRAY_ELEM_BIT != 0 {
+        return SelKind::ArrayElem;
+    }
+    if sel_id & K_MEMBER_BIT != 0 {
+        return SelKind::Member;
+    }
+    SelKind::Plain
+}
+
+/// Encoded selection id for a composed line — the single source of truth for
+/// the line→sel_id rule. Footer rows carry the footer bit, array elements the
+/// array-elem encoding, members the member encoding; everything else is the
+/// bare node id. Used by both the controller's click handler
+/// (`handle_node_click`) and the editor's byte-selection→row sync so a byte
+/// selection produces exactly the ids a click would.
+///
+/// `selIdForLine(lm)` (`core.h`).
+#[inline]
+pub fn sel_id_for_line(lm: &LineMeta) -> u64 {
+    if lm.line_kind == LineKind::Footer {
+        return lm.node_id | K_FOOTER_ID_BIT;
+    }
+    if lm.is_array_element && lm.array_element_idx >= 0 {
+        return make_array_elem_sel_id(lm.node_id, lm.array_element_idx);
+    }
+    if lm.is_member_line && lm.sub_line >= 0 {
+        return make_member_sel_id(lm.node_id, lm.sub_line);
+    }
+    lm.node_id
 }
 
 /// `enum class ChipKind : uint8_t` (`core.h:971-980`).
@@ -270,16 +336,64 @@ mod tests {
 
     #[test]
     fn member_sel_id_tags_and_encodes() {
-        // The member mask/shift are IDENTICAL to the array-element ones (42,
-        // 20-bit) — distinguished only by the tag bit — exactly as in the C++
-        // (`core.h:933-961`). Because the 20-bit sub-line field (bits 42..61)
-        // ends at bit 61, which is also `K_MEMBER_BIT`, the extracted value
-        // re-includes the tag bit; this matches the C++ verbatim and is benign
-        // because real sub-line indices are tiny. We assert the tag bit and the
-        // low sub-line bits round-trip.
+        // The member flag bit (61) sits one position BELOW the array bit (62),
+        // so the sub-line field is only 19 bits (42-60) and `K_MEMBER_SUB_MASK`
+        // EXCLUDES bit 61. With the narrowed mask the sub-line round-trips
+        // EXACTLY (the prior 20-bit mask folded the flag bit back in and
+        // inflated every decode by 2^19 = 524288, silently killing member-row
+        // highlight). Assert the tag bit, that the node id strips clean, and an
+        // exact round-trip with no inflation.
         let id = make_member_sel_id(9, 4);
         assert!(id & K_MEMBER_BIT != 0);
         assert_eq!(id & !(K_MEMBER_BIT | K_MEMBER_SUB_MASK), 9);
-        assert_eq!(member_sub_from_sel_id(id) & 0xFFFF, 4);
+        assert_eq!(member_sub_from_sel_id(id), 4);
+        assert_eq!(sel_kind(id), SelKind::Member);
+
+        // Regression: a high array index (>= 2^19) sets bit 61 (= K_MEMBER_BIT),
+        // but `sel_kind` must classify it as ArrayElem (array bit 62 has higher
+        // priority than the member bit), and the full 20-bit array index field
+        // must still round-trip — it must NOT be misread as a member.
+        let arr = make_array_elem_sel_id(11, 0x80000);
+        assert_eq!(sel_kind(arr), SelKind::ArrayElem);
+        assert_eq!(array_elem_idx_from_sel_id(arr), 0x80000);
+    }
+
+    #[test]
+    fn sel_id_for_line_matches_click_encoding() {
+        // The single source of truth for the line→sel_id rule: footer rows carry
+        // the footer bit, array elements the array encoding, members the member
+        // encoding, everything else the bare node id. (Mirrors `selIdForLine`.)
+        let plain = LineMeta {
+            node_id: 5,
+            ..LineMeta::default()
+        };
+        assert_eq!(sel_id_for_line(&plain), 5);
+        assert_eq!(sel_kind(sel_id_for_line(&plain)), SelKind::Plain);
+
+        let footer = LineMeta {
+            node_id: 5,
+            line_kind: LineKind::Footer,
+            ..LineMeta::default()
+        };
+        assert_eq!(sel_id_for_line(&footer), 5 | K_FOOTER_ID_BIT);
+        assert_eq!(sel_kind(sel_id_for_line(&footer)), SelKind::Footer);
+
+        let elem = LineMeta {
+            node_id: 5,
+            is_array_element: true,
+            array_element_idx: 3,
+            ..LineMeta::default()
+        };
+        assert_eq!(sel_id_for_line(&elem), make_array_elem_sel_id(5, 3));
+        assert_eq!(array_elem_idx_from_sel_id(sel_id_for_line(&elem)), 3);
+
+        let member = LineMeta {
+            node_id: 5,
+            is_member_line: true,
+            sub_line: 2,
+            ..LineMeta::default()
+        };
+        assert_eq!(sel_id_for_line(&member), make_member_sel_id(5, 2));
+        assert_eq!(member_sub_from_sel_id(sel_id_for_line(&member)), 2);
     }
 }
