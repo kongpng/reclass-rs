@@ -215,6 +215,32 @@ pub fn is_pointer_kind(k: NodeKind) -> bool {
 pub fn is_container_kind(k: NodeKind) -> bool {
     matches!(k, NodeKind::Struct | NodeKind::Array)
 }
+/// `isCommonKind` (`core.h:164-179`) — the everyday "common" primitive set shown
+/// by default in the type chooser (the rest are reachable via the chooser's
+/// "Show all" toggle, or by typing in its filter which always searches every
+/// type). Chosen from a frequency sweep of the bundled example `.rcx` files:
+/// this set covers ~99% of real nodes while keeping the default list short.
+#[inline]
+pub fn is_common_kind(k: NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::Hex8
+            | NodeKind::Hex16
+            | NodeKind::Hex32
+            | NodeKind::Hex64
+            | NodeKind::Hex128
+            | NodeKind::UInt8
+            | NodeKind::UInt16
+            | NodeKind::UInt32
+            | NodeKind::UInt64
+            | NodeKind::Int32
+            | NodeKind::Int64
+            | NodeKind::Pointer64
+            | NodeKind::Float
+            | NodeKind::Double
+            | NodeKind::Bool
+    )
+}
 #[inline]
 pub fn is_string_kind(k: NodeKind) -> bool {
     matches!(k, NodeKind::UTF8 | NodeKind::UTF16)

@@ -20,8 +20,8 @@
 //! Gated behind the `ui` feature for the view; the model is always built/tested.
 
 use crate::core::kind::{
-    is_container_kind, is_func_ptr, is_hex_node, is_matrix_kind, is_pointer_kind, is_string_kind,
-    is_vector_kind, size_for_kind, NodeKind, K_KIND_META,
+    is_common_kind, is_container_kind, is_func_ptr, is_hex_node, is_matrix_kind, is_pointer_kind,
+    is_string_kind, is_vector_kind, size_for_kind, NodeKind, K_KIND_META,
 };
 use crate::theme::color::Color;
 use crate::theme::model::Theme;
@@ -197,6 +197,17 @@ pub fn kind_group_for(k: NodeKind) -> KindGroup {
     KindGroup::Hex
 }
 
+/// The simple-mode keep predicate (`typeselectorpopup.cpp:1729`/`1770` gate):
+/// in the default (common-only) view, keep composites + user structs and the
+/// common primitives, while dropping the std-lib "Common Types" group entirely
+/// and the long-tail primitives. Applied identically by the grouped and the flat
+/// Name/Size sorts (the cbc3b1a hoist). The Recent section is built BEFORE this
+/// gate, so recent long-tail picks still appear.
+fn keep_common(e: &TypeEntry) -> bool {
+    e.group != KindGroup::Common
+        && (e.entry_kind != EntryKind::Primitive || is_common_kind(e.primitive_kind))
+}
+
 /// `kindGroupColor(group)` (`typeselectorpopup.cpp:69`) — the accent color for a
 /// group, resolved from our [`Theme`]'s semantic colors. Falls back to `text`
 /// when a color is unset (the C++ reads the live palette which is always set).
@@ -252,6 +263,13 @@ pub struct TypeEntry {
     pub size_bytes: i32,
     /// The colored group (auto-assigned from the kind if a primitive).
     pub group: KindGroup,
+    /// Synthetic, selectable "Show all types / Show common only" row appended to
+    /// the bottom of the unfiltered view. Activating it toggles
+    /// [`TypeModel::show_all_types`] and re-filters instead of emitting a type
+    /// selection (`TypeEntry::isExpandToggle`, `typeselectorpopup.h:55`). It is
+    /// navigable/selectable but NEVER counts as a real type pick (excluded from
+    /// the accept path, the status count, and the empty-state guard).
+    pub is_expand_toggle: bool,
 }
 
 impl TypeEntry {
@@ -267,6 +285,7 @@ impl TypeEntry {
             enabled: true,
             size_bytes: size_for_kind(kind),
             group: kind_group_for(kind),
+            is_expand_toggle: false,
         }
     }
 
@@ -283,6 +302,7 @@ impl TypeEntry {
             size_bytes: size,
             // Composites bucket into the container group ("Type" section).
             group: KindGroup::Ctr,
+            is_expand_toggle: false,
         }
     }
 
@@ -298,10 +318,33 @@ impl TypeEntry {
             enabled: false,
             size_bytes: 0,
             group: KindGroup::Common,
+            is_expand_toggle: false,
         }
     }
 
-    /// Whether this row can be selected (not a section, and enabled).
+    /// The synthetic "+ Show all types (N)" / "− Show common types only" toggle
+    /// row (`acceptIndex` flips `m_showAllTypes`, `typeselectorpopup.cpp:1917`).
+    /// Modeled as a Primitive (so it is NOT a Section and stays navigable), but
+    /// flagged `is_expand_toggle` so the accept path intercepts it and every
+    /// type-count / empty-state computation excludes it.
+    fn expand_toggle(label: &str) -> Self {
+        TypeEntry {
+            entry_kind: EntryKind::Primitive,
+            primitive_kind: NodeKind::Struct,
+            struct_id: 0,
+            display_name: label.to_string(),
+            is_relative: false,
+            class_keyword: String::new(),
+            enabled: true,
+            size_bytes: 0,
+            group: KindGroup::Common,
+            is_expand_toggle: true,
+        }
+    }
+
+    /// Whether this row can be selected (not a section, and enabled). The expand
+    /// toggle IS selectable — it is a navigable affordance — even though it does
+    /// not count as a real type pick.
     pub fn selectable(&self) -> bool {
         self.entry_kind != EntryKind::Section && self.enabled
     }
@@ -405,6 +448,13 @@ pub struct TypeModel {
     /// are never filtered out). Filtering happens in the model so hidden rows are
     /// excluded from the ranked/bucketed list rather than hidden at render.
     active_groups: std::collections::BTreeSet<&'static str>,
+    /// When false (default), the UNFILTERED view (both the grouped sections and
+    /// the flat Name/Size sorts) shows only the common primitive set
+    /// ([`is_common_kind`](crate::core::is_common_kind)) + user structs; the
+    /// std-lib "Common Types" group and the long-tail primitives are hidden
+    /// behind a bottom "+ Show all types (N)" toggle row. Typing a filter always
+    /// searches every type regardless (`m_showAllTypes`, `typeselectorpopup.h:158`).
+    show_all_types: bool,
 }
 
 impl TypeModel {
@@ -430,6 +480,8 @@ impl TypeModel {
                 .filter(|g| g.has_chip())
                 .map(|g| g.key())
                 .collect(),
+            // Simple-by-default: open showing only the common set + user structs.
+            show_all_types: false,
         };
         m.apply_filter("");
         m
@@ -622,6 +674,31 @@ impl TypeModel {
         self.apply_filter(&q);
     }
 
+    /// Whether the chooser is currently showing the full catalogue
+    /// (`m_showAllTypes`).
+    pub fn show_all_types(&self) -> bool {
+        self.show_all_types
+    }
+
+    /// Flip between the simple (common-only) and full catalogue views and re-run
+    /// the last filter so the rows re-layout immediately (`acceptIndex` expand
+    /// branch, `typeselectorpopup.cpp:1917`). Activating the bottom toggle row
+    /// calls this instead of emitting a type pick.
+    pub fn toggle_show_all(&mut self) {
+        self.show_all_types = !self.show_all_types;
+        let q = self.last_filter.clone();
+        self.apply_filter(&q);
+    }
+
+    /// Whether the currently-selected row is the synthetic expand/collapse toggle
+    /// (the accept path reads this to intercept it before emitting a selection).
+    pub fn selected_is_expand_toggle(&self) -> bool {
+        self.selected
+            .and_then(|r| self.rows.get(r))
+            .map(|row| row.entry.is_expand_toggle)
+            .unwrap_or(false)
+    }
+
     /// `setModifier(modId, arr)` (`typeselectorpopup.cpp:1106`): set the modifier
     /// (unchecks all, then checks by id). For an array, `count` is the element
     /// count.
@@ -653,19 +730,60 @@ impl TypeModel {
                 SortMode::Group => self.build_bucketed(),
                 SortMode::Name | SortMode::Size => self.build_sorted_flat(),
             }
+            // Inline expand/collapse affordance at the bottom of the UNFILTERED
+            // view — in BOTH the grouped and flat sorts (the cbc3b1a hoist), so
+            // simple mode stays consistent and always reversible regardless of
+            // sort. The filtered (non-empty query) path is never gated and emits
+            // no toggle — filtering always searches the full catalogue.
+            self.push_expand_toggle();
+            // Empty-state placeholder (toggle-aware): a fully-gated simple view
+            // whose only row would be the toggle still shows the placeholder.
+            Self::push_empty_state(&mut self.rows, "No types available");
         } else {
             self.build_filtered(trimmed);
         }
         self.selected = self.first_selectable_row();
     }
 
+    /// Append the synthetic expand/collapse toggle row to the unfiltered view
+    /// (`typeselectorpopup.cpp:1808-1832`). `hidden_count` is every catalogue
+    /// entry (excluding sections) the simple-mode gate would hide: the std-lib
+    /// "Common Types" group plus the long-tail primitives. The row is emitted
+    /// when expanded (offering the way back) OR when something is actually
+    /// hidden. The toggle is NOT a real type pick (accept intercepts it).
+    fn push_expand_toggle(&mut self) {
+        let hidden_count = self
+            .entries
+            .iter()
+            .filter(|e| e.entry_kind != EntryKind::Section)
+            .filter(|e| {
+                e.group == KindGroup::Common
+                    || (e.entry_kind == EntryKind::Primitive && !is_common_kind(e.primitive_kind))
+            })
+            .count();
+        if self.show_all_types || hidden_count > 0 {
+            let label = if self.show_all_types {
+                "\u{2212} Show common types only".to_string()
+            } else {
+                format!("+ Show all types ({hidden_count})")
+            };
+            self.rows.push(TypeRow {
+                entry: TypeEntry::expand_toggle(&label),
+                match_positions: Vec::new(),
+            });
+        }
+    }
+
     /// Build the empty-filter **flat** sorted view for the Name/Size sort modes:
     /// every selectable entry in one list, sorted by the active key + direction,
     /// with no section headers (the C++ `SortName`/`SortSize` branch).
-    /// The single section row shown when a filter yields no rows. A no-op when
-    /// `rows` is non-empty — the guard the three list builders share.
+    /// The single section row shown when a filter (or the gated simple view)
+    /// yields no real rows. A no-op when at least one NON-toggle row exists. The
+    /// expand/collapse toggle is not a real result, so a `rows` vec whose only
+    /// entry is the toggle still counts as empty and gets the placeholder
+    /// (`typeselectorpopup.cpp:1825` `resultCount` excludes `isExpandToggle`).
     fn push_empty_state(rows: &mut Vec<TypeRow>, label: &str) {
-        if rows.is_empty() {
+        if rows.iter().all(|r| r.entry.is_expand_toggle) {
             rows.push(TypeRow {
                 entry: TypeEntry::section(label),
                 match_positions: Vec::new(),
@@ -676,6 +794,13 @@ impl TypeModel {
     fn build_sorted_flat(&mut self) {
         let dir = self.sort_dir;
         let mut entries: Vec<TypeEntry> = self.entries.clone();
+        // Simple mode applies in the flat sorts too (the cbc3b1a fix): else
+        // switching to name/size sort would silently reveal everything with no
+        // way back. Drop the std-lib "Common Types" + long-tail primitives,
+        // exactly as the grouped view does (`typeselectorpopup.cpp:1770`).
+        if !self.show_all_types {
+            entries.retain(keep_common);
+        }
         match self.sort_mode {
             SortMode::Name => {
                 entries.sort_by(|a, b| a.display_name.cmp(&b.display_name));
@@ -692,14 +817,16 @@ impl TypeModel {
         if dir < 0 {
             entries.reverse();
         }
-        let mut rows: Vec<TypeRow> = entries
+        let rows: Vec<TypeRow> = entries
             .into_iter()
             .map(|e| TypeRow {
                 entry: e,
                 match_positions: Vec::new(),
             })
             .collect();
-        Self::push_empty_state(&mut rows, "No types available");
+        // The empty-state placeholder is pushed by `apply_filter` AFTER the
+        // toggle row is (conditionally) appended, so it can see whether any real
+        // row survived the simple-mode gate.
         self.rows = rows;
     }
 
@@ -740,15 +867,29 @@ impl TypeModel {
                 .cmp(&b.display_name.to_lowercase())
         };
         for group in KindGroup::ALL {
+            // Simple (default) mode: hide the std-lib "Common Types" group
+            // entirely and drop the long-tail primitives, keeping only the
+            // common set + user structs (`typeselectorpopup.cpp:1729`). The
+            // "Show all types" toggle row emitted by `apply_filter` flips
+            // `show_all_types`; the filter box still searches everything.
+            if !self.show_all_types && group == KindGroup::Common {
+                continue;
+            }
             // Category-chip gate (`catAllowed` → `buckets`,
             // `typeselectorpopup.cpp:1687`): chip-hidden groups are skipped so
             // their rows never enter the bucketed list.
             let mut group_entries: Vec<TypeEntry> = self
                 .entries
                 .iter()
-                .filter(|e| e.group == group && self.group_allowed(e.group))
+                .filter(|e| {
+                    e.group == group
+                        && self.group_allowed(e.group)
+                        && (self.show_all_types || keep_common(e))
+                })
                 .cloned()
                 .collect();
+            // Skip a group that became empty under the simple-mode gate (no
+            // header) — matches the C++ `if (items.isEmpty()) continue;`.
             if group_entries.is_empty() {
                 continue;
             }
@@ -779,7 +920,9 @@ impl TypeModel {
                 });
             }
         }
-        Self::push_empty_state(&mut rows, "No types available");
+        // The empty-state placeholder is pushed by `apply_filter` AFTER the
+        // toggle row is (conditionally) appended (so a fully-gated simple view
+        // still shows the placeholder beneath the toggle).
         self.rows = rows;
     }
 
@@ -1286,6 +1429,19 @@ mod view {
         /// close. The base kind is the selected row's primitive kind; the modifier
         /// is the active `*`/`**`/`[]` (or `None`).
         fn accept_selected(&mut self, cx: &mut Context<Self>) {
+            // The expand/collapse toggle row flips the simple/all view and
+            // re-renders in place (`acceptIndex` expand branch,
+            // typeselectorpopup.cpp:1917) — it never emits a selection and never
+            // closes the popup. Reset the selection to the first selectable row
+            // since the rows just rebuilt.
+            if self.model.selected_is_expand_toggle() {
+                self.model.toggle_show_all();
+                // toggle_show_all re-filters (selection → first selectable); make
+                // that explicit so the cursor lands on a real row, not the toggle.
+                self.model.move_home();
+                cx.notify();
+                return;
+            }
             let Some(entry) = self.model.selected_entry().cloned() else {
                 return;
             };
@@ -1495,7 +1651,35 @@ mod view {
                 // rows are excluded from `model.rows()`), so the rendered children
                 // map 1:1 onto the model rows — no render-time filter needed.
                 .map(|(row, r)| {
-                    if r.entry.entry_kind == EntryKind::Section {
+                    if r.entry.is_expand_toggle {
+                        // The synthetic "+ Show all types (N)" / "− Show common
+                        // types only" affordance: a single centered muted label,
+                        // no size bar / keyword chip / leading icon. Still
+                        // clickable — a click routes through `accept_row`, which
+                        // intercepts the toggle and flips the view in place.
+                        let is_sel = selected == Some(row);
+                        gpui_component::h_flex()
+                            .id(("type-row", row))
+                            .w_full()
+                            .h(px(26.))
+                            .px(px(tokens::space::MD))
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(tokens::radius::MD))
+                            .text_size(px(tokens::font::UI_XS))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .when(is_sel, |d| d.bg(sel_bg))
+                            .when(!is_sel, |d| d.hover(|s| s.bg(hover_bg)))
+                            .on_mouse_move(cx.listener(move |this, _e, _w, cx| {
+                                this.hover_row(row, cx);
+                            }))
+                            .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                                this.accept_row(row, cx);
+                            }))
+                            .child(r.entry.display_name.clone())
+                            .into_any_element()
+                    } else if r.entry.entry_kind == EntryKind::Section {
                         // A Zed section caption: a colored group dot + uppercase
                         // micro label, muted.
                         let group = r.entry_group_for_label();
@@ -1534,6 +1718,7 @@ mod view {
                         // + RVA) sharing `primitive_kind`; badge only the variant
                         // matching the node's `is_relative` so both don't light up.
                         let is_current = !is_sel
+                            && !r.entry.is_expand_toggle
                             && r.entry.primitive_kind == self.current
                             && r.entry.entry_kind != EntryKind::Composite
                             && (!is_pointer_kind(self.current)
@@ -1946,6 +2131,13 @@ mod view {
             let accent = color::accent(cx);
             let hover_bg = color::hover_overlay(cx);
             let sel_bg = color::selected_bg(cx);
+            let text_disabled = color::text_disabled(cx);
+            // While a text filter is active the result list is fuzzy-rank ordered
+            // and the sort mode is ignored, so grey out the sort buttons to signal
+            // they have no effect (b7baced). The group chips DO still filter the
+            // fuzzy results, so they stay enabled; the layout icons stay enabled
+            // too (the C++ leaves those alone).
+            let filtering = !self.input.read(cx).value().trim().is_empty();
             let active_mode = self.model.sort_mode();
             let dir_arrow = if self.model.sort_dir() >= 0 {
                 " \u{2191}"
@@ -1953,7 +2145,7 @@ mod view {
                 " \u{2193}"
             };
 
-            // A clickable sort-key text button.
+            // A clickable sort-key text button — greyed + inert while filtering.
             let sort_btn = |id: &'static str, label: &'static str, mode: SortMode| -> AnyElement {
                 let is_active = active_mode == mode;
                 let text = if is_active {
@@ -1968,14 +2160,24 @@ mod view {
                     .flex()
                     .items_center()
                     .rounded(px(tokens::radius::SM))
-                    .text_color(if is_active { accent } else { muted })
-                    .cursor_pointer()
-                    .when(is_active, |d| d.bg(sel_bg))
-                    .when(!is_active, |d| d.hover(|s| s.bg(hover_bg).text_color(fg)))
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        this.model.set_sort_mode(mode);
-                        cx.notify();
-                    }))
+                    .text_color(if filtering {
+                        text_disabled
+                    } else if is_active {
+                        accent
+                    } else {
+                        muted
+                    })
+                    .when(is_active && !filtering, |d| d.bg(sel_bg))
+                    // Only wire the interactive bits when NOT filtering — no
+                    // cursor, no hover, no click while the sort is inert.
+                    .when(!filtering, |d| {
+                        d.cursor_pointer()
+                            .when(!is_active, |d| d.hover(|s| s.bg(hover_bg).text_color(fg)))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.model.set_sort_mode(mode);
+                                cx.notify();
+                            }))
+                    })
                     .child(text)
                     .into_any_element()
             };
@@ -2677,6 +2879,10 @@ mod tests {
             if r.entry.entry_kind == EntryKind::Section {
                 break;
             }
+            // The synthetic expand/collapse toggle is not a group member.
+            if r.entry.is_expand_toggle {
+                continue;
+            }
             out.push(r.entry.display_name.clone());
         }
         out
@@ -2694,7 +2900,11 @@ mod tests {
             TypeEntry::primitive(NodeKind::Int16, "Beta"),
             TypeEntry::primitive(NodeKind::UInt16, "gamma"),
         ];
-        let model = TypeModel::new(entries);
+        let mut model = TypeModel::new(entries);
+        // Int16 ("Beta") is outside the common set, so the simple default view
+        // would hide it; reveal the full catalogue — this test exercises the
+        // sort comparator, which is orthogonal to the common-only gate.
+        model.toggle_show_all();
         let names = group_section_names(&model, KindGroup::Int.section_label());
         assert_eq!(
             names,
@@ -2830,6 +3040,173 @@ mod tests {
         assert!(
             names.contains(&"Trophy"),
             "chip-less Ctr group always allowed"
+        );
+    }
+
+    // ── simple (common-only) mode + expand toggle (224443f + cbc3b1a) ──
+
+    /// A catalogue mixing common primitives, a long-tail primitive, a std-lib
+    /// "Common Types" composite, and a user struct. Vec3 is intentionally NOT in
+    /// `is_common_kind` (the long-tail prim); UNICODE_STRING sits in the
+    /// `KindGroup::Common` std-lib group; MyStruct is a user composite (Ctr).
+    fn simple_mode_entries() -> Vec<TypeEntry> {
+        // Sanity: the long-tail prim really is outside the common set, and the
+        // common ones really are inside it (guards against the set drifting).
+        assert!(!crate::core::is_common_kind(NodeKind::Vec3));
+        assert!(crate::core::is_common_kind(NodeKind::Hex64));
+        assert!(crate::core::is_common_kind(NodeKind::UInt32));
+
+        let mut unicode_string = TypeEntry::composite(0, "UNICODE_STRING", "struct", 16);
+        // The std-lib "Common Types" group (as built in editor/popups.rs:233).
+        unicode_string.group = KindGroup::Common;
+        vec![
+            TypeEntry::primitive(NodeKind::Hex64, "hex64"),
+            TypeEntry::primitive(NodeKind::UInt32, "uint32_t"),
+            // Long-tail primitive — NOT in is_common_kind, so hidden by default.
+            TypeEntry::primitive(NodeKind::Vec3, "Vec3"),
+            unicode_string,
+            TypeEntry::composite(100, "MyStruct", "struct", 64),
+        ]
+    }
+
+    /// The display names of the real (non-section, non-toggle) selectable rows.
+    fn real_row_names(model: &TypeModel) -> Vec<String> {
+        model
+            .rows()
+            .iter()
+            .filter(|r| r.entry.entry_kind != EntryKind::Section && !r.entry.is_expand_toggle)
+            .map(|r| r.entry.display_name.clone())
+            .collect()
+    }
+
+    fn has_toggle(model: &TypeModel) -> bool {
+        model.rows().iter().any(|r| r.entry.is_expand_toggle)
+    }
+
+    fn toggle_label(model: &TypeModel) -> Option<String> {
+        model
+            .rows()
+            .iter()
+            .find(|r| r.entry.is_expand_toggle)
+            .map(|r| r.entry.display_name.clone())
+    }
+
+    #[test]
+    fn simple_mode_hides_long_tail_but_filter_finds_all() {
+        // 224443f: default to the common set + user structs; the long-tail
+        // primitive and the std-lib "Common Types" group hide behind a toggle.
+        let mut model = TypeModel::new(simple_mode_entries());
+
+        // Default (simple) view: common prims + user struct present; the
+        // long-tail prim and the Common-group composite are hidden.
+        let names = real_row_names(&model);
+        assert!(names.contains(&"hex64".to_string()));
+        assert!(names.contains(&"uint32_t".to_string()));
+        assert!(names.contains(&"MyStruct".to_string()));
+        assert!(
+            !names.contains(&"Vec3".to_string()),
+            "long-tail primitive hidden in simple mode"
+        );
+        assert!(
+            !names.contains(&"UNICODE_STRING".to_string()),
+            "std-lib Common-group composite hidden in simple mode"
+        );
+
+        // The expand toggle is present and reads "+ Show all types (N)".
+        assert!(has_toggle(&model), "expand toggle row exists in simple mode");
+        let label = toggle_label(&model).unwrap();
+        assert!(
+            label.starts_with("+ Show all types ("),
+            "collapsed label was {label:?}"
+        );
+        // Exactly two entries are hidden (Vec3 + UNICODE_STRING).
+        assert_eq!(label, "+ Show all types (2)");
+
+        // The toggle is NOT counted as a real type by the empty-state / count
+        // machinery: filter_placeholder counts the full catalogue (5 entries),
+        // never the toggle (the toggle is never in `entries`). (FieldType so the
+        // noun reads "types".)
+        model.set_mode(TypePopupMode::FieldType);
+        assert_eq!(
+            model.filter_placeholder(),
+            "Filter 5 types..  (Ctrl+F)",
+            "toggle excluded from the placeholder count"
+        );
+
+        // Expand → the long-tail prim + the Common-group composite appear, and
+        // the toggle flips to the collapse label (Unicode U+2212 minus).
+        model.toggle_show_all();
+        let names = real_row_names(&model);
+        assert!(names.contains(&"Vec3".to_string()), "Vec3 shown when expanded");
+        assert!(
+            names.contains(&"UNICODE_STRING".to_string()),
+            "UNICODE_STRING shown when expanded"
+        );
+        assert_eq!(
+            toggle_label(&model).as_deref(),
+            Some("\u{2212} Show common types only"),
+            "expanded label uses the U+2212 minus"
+        );
+
+        // Collapse again restores simple mode.
+        model.toggle_show_all();
+        assert!(!real_row_names(&model).contains(&"Vec3".to_string()));
+        assert_eq!(
+            toggle_label(&model).as_deref(),
+            Some("+ Show all types (2)")
+        );
+
+        // The FILTER always searches the full catalogue even while collapsed:
+        // typing the long-tail name surfaces it, and the filtered path emits NO
+        // toggle (matches the C++ — filtering is never gated).
+        assert!(!model.show_all_types());
+        model.apply_filter("vec3");
+        let filtered = real_row_names(&model);
+        assert!(
+            filtered.contains(&"Vec3".to_string()),
+            "filter surfaces the long-tail prim despite simple mode"
+        );
+        assert!(
+            !has_toggle(&model),
+            "filtered (non-empty query) path emits no toggle"
+        );
+    }
+
+    #[test]
+    fn flat_sort_also_hides_long_tail() {
+        // cbc3b1a: the common-set gate + toggle row must apply in the flat
+        // Name/Size sorts too, not just the grouped default — else switching
+        // sort would silently reveal everything with no way back.
+        let mut model = TypeModel::new(simple_mode_entries());
+        model.set_sort_mode(SortMode::Name); // flat sort, empty filter
+
+        let names = real_row_names(&model);
+        assert!(names.contains(&"hex64".to_string()));
+        assert!(names.contains(&"MyStruct".to_string()));
+        assert!(
+            !names.contains(&"Vec3".to_string()),
+            "long-tail still hidden under the flat Name sort"
+        );
+        assert!(
+            !names.contains(&"UNICODE_STRING".to_string()),
+            "Common-group composite still hidden under the flat Name sort"
+        );
+        // The toggle row is still appended in the flat sort.
+        assert!(has_toggle(&model), "toggle row appended in the flat sort");
+        assert_eq!(toggle_label(&model).as_deref(), Some("+ Show all types (2)"));
+
+        // Same for the Size sort.
+        model.set_sort_mode(SortMode::Size);
+        let names = real_row_names(&model);
+        assert!(!names.contains(&"Vec3".to_string()));
+        assert!(has_toggle(&model));
+
+        // Expanding under a flat sort reveals the long-tail and flips the label.
+        model.toggle_show_all();
+        assert!(real_row_names(&model).contains(&"Vec3".to_string()));
+        assert_eq!(
+            toggle_label(&model).as_deref(),
+            Some("\u{2212} Show common types only")
         );
     }
 }
