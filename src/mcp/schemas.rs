@@ -7,7 +7,7 @@
 //! array order is preserved by serde; within each descriptor the keys are
 //! sorted by serde's default `Value` map (matches Qt's sorted-key output).
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::wire::ok_reply;
 
@@ -107,26 +107,72 @@ fn tool_tree_apply() -> Value {
 }
 
 fn tool_source_switch() -> Value {
+    let mut properties = Map::new();
+    properties.insert(
+        "tabIndex".into(),
+        json!({"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}),
+    );
+    properties.insert("sourceIndex".into(), json!({"type": "integer"}));
+    properties.insert("filePath".into(), json!({"type": "string"}));
+    properties.insert("allViews".into(), json!({"type": "boolean"}));
+
+    properties.insert(
+        "provider".into(),
+        json!({"type": "string", "description": "Use 'processmemory' for local PID attach, 'remoteprocessmemory' for payload-backed attach, 'kernelmemory' for rcxdrv-backed process/physical memory, 'windbgmemory' for DbgEng, or 'memflow'/'memflowprocessmemory' for connector-backed attach."}),
+    );
+    properties.insert(
+        "pid".into(),
+        json!({"type": "integer", "description": "Process ID to attach to for live memory reading."}),
+    );
+    properties.insert(
+        "processName".into(),
+        json!({"type": "string", "description": "Display name for the process. Required for remoteprocessmemory; optional with local processmemory."}),
+    );
+    properties.insert(
+        "target".into(),
+        json!({"type": "string", "description": "Provider-specific target. kernelmemory accepts 'km:<pid>:<name>' or 'phys:<hex_base>'; windbgmemory accepts 'tcp:...', 'npipe:...', 'pid:<id>', or 'dump:<path>'."}),
+    );
+    properties.insert(
+        "physicalBase".into(),
+        json!({"type": ["integer", "string"], "description": "Physical base address for provider:'kernelmemory' physical-memory attach; accepts decimal or 0x-prefixed hex."}),
+    );
+
+    #[cfg(feature = "memflow-provider")]
+    {
+        properties.insert(
+            "connector".into(),
+            json!({"type": "string", "description": "memflow connector plugin name, e.g. qemu, kvm, pcileech, winio."}),
+        );
+        properties.insert(
+            "connectorArgs".into(),
+            json!({"type": "string", "description": "Raw memflow connector args without the connector name, e.g. 'win10' or 'win10:memmap=map'."}),
+        );
+        properties.insert(
+            "os".into(),
+            json!({"type": "string", "description": "memflow OS plugin name. Defaults to win32."}),
+        );
+        properties.insert(
+            "osArgs".into(),
+            json!({"type": "string", "description": "Raw memflow OS args without the OS name. For win32 extra args without a target, include the leading colon, e.g. ':dtb=0x1234'."}),
+        );
+        properties.insert(
+            "writable".into(),
+            json!({"type": "boolean", "description": "Allow writes through memflow. Defaults false."}),
+        );
+        properties.insert(
+            "pluginDirs".into(),
+            json!({"type": "array", "items": {"type": "string"}, "description": "Additional memflow plugin directories to scan for third-party connectors/OS layers."}),
+        );
+    }
+
+    let description = "Switch active data source (provider). Use sourceIndex for saved sources, filePath to load a binary file, provider:'processmemory' with pid, provider:'remoteprocessmemory' with pid/processName, provider:'kernelmemory' with pid/target/physicalBase, provider:'windbgmemory' with target, or provider:'memflow' with connector/os settings.";
+
     json!({
         "name": "source.switch",
-        "description": "Switch active data source (provider). Use sourceIndex for saved sources, filePath to load a binary file, or provider:'memflow'/'processmemory' with connector/os settings to attach to a live process.",
+        "description": description,
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."},
-                "sourceIndex": {"type": "integer"},
-                "filePath": {"type": "string"},
-                "provider": {"type": "string", "description": "Use 'memflow' or 'processmemory' for live process memory."},
-                "connector": {"type": "string", "description": "memflow connector plugin name, e.g. qemu, kvm, pcileech, winio."},
-                "connectorArgs": {"type": "string", "description": "Raw memflow connector args without the connector name, e.g. 'win10' or 'win10:memmap=map'."},
-                "os": {"type": "string", "description": "memflow OS plugin name. Defaults to win32."},
-                "osArgs": {"type": "string", "description": "Raw memflow OS args without the OS name. For win32 extra args without a target, include the leading colon, e.g. ':dtb=0x1234'."},
-                "pid": {"type": "integer", "description": "Process ID to attach to for live memory reading."},
-                "processName": {"type": "string", "description": "Display name for the process (optional with pid)."},
-                "writable": {"type": "boolean", "description": "Allow writes through memflow. Defaults false."},
-                "pluginDirs": {"type": "array", "items": {"type": "string"}, "description": "Additional memflow plugin directories to scan for third-party connectors/OS layers."},
-                "allViews": {"type": "boolean"}
-            }
+            "properties": properties
         }
     })
 }
@@ -757,6 +803,42 @@ mod tests {
             assert!(d.get("name").and_then(|v| v.as_str()).is_some());
             assert!(d.get("description").and_then(|v| v.as_str()).is_some());
             assert_eq!(d["inputSchema"]["type"], "object");
+        }
+    }
+
+    #[test]
+    fn source_switch_schema_tracks_memflow_feature() {
+        let d = tool_source_switch();
+        let props = d["inputSchema"]["properties"].as_object().unwrap();
+        assert!(props.contains_key("sourceIndex"));
+        assert!(props.contains_key("filePath"));
+        assert!(props.contains_key("allViews"));
+        assert!(props.contains_key("provider"));
+        assert!(props.contains_key("pid"));
+        assert!(props.contains_key("processName"));
+        assert!(props.contains_key("target"));
+        assert!(props.contains_key("physicalBase"));
+
+        #[cfg(feature = "memflow-provider")]
+        {
+            assert!(props.contains_key("connector"));
+            assert!(props.contains_key("os"));
+            assert!(props.contains_key("pluginDirs"));
+            assert!(d["description"]
+                .as_str()
+                .unwrap()
+                .contains("provider:'memflow'"));
+        }
+
+        #[cfg(not(feature = "memflow-provider"))]
+        {
+            assert!(!props.contains_key("connector"));
+            assert!(!props.contains_key("os"));
+            assert!(!props.contains_key("pluginDirs"));
+            assert!(d["description"]
+                .as_str()
+                .unwrap()
+                .contains("provider:'processmemory'"));
         }
     }
 

@@ -1,0 +1,9 @@
+[package]
+name = "rcx-rpc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }

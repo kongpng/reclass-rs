@@ -421,6 +421,7 @@ impl super::MainWindow {
     /// a live process target (see `crate::provider::memflow`), so report what was
     /// resolvable and how many modules were seen. With no modules (a File source
     /// enumerates none) this guides the user to attach a live source.
+    #[cfg(feature = "symbols")]
     pub(super) fn download_all_module_symbols(
         &mut self,
         window: &mut Window,
@@ -475,6 +476,19 @@ impl super::MainWindow {
                  Network PDB fetch needs a live process target.",
                 modules.len()
             ),
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(not(feature = "symbols"))]
+    pub(super) fn download_all_module_symbols(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify(
+            "Download All symbols requires the symbols feature.",
             window,
             cx,
         );

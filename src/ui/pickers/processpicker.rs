@@ -6,20 +6,16 @@
 //! filterable by name-or-PID, default-sorted highest-PID-first, with double-click
 //! / Attach to accept.
 //!
-//! This legacy picker does not enumerate live OS processes; live process attach is
-//! handled first-party by the memflow attach dialog (`documents.rs`
-//! `open_process_source`). So this surface is backed by the **provider registry's
-//! available sources** (the benign built-ins that *are* implemented) plus
-//! **clearly-labeled, non-attaching stub rows** for the legacy native
-//! process/kernel/remote sources, kept for menu parity with the C++.
+//! This picker now enumerates live OS processes through the selected provider's
+//! `enumerateProcesses()` equivalent and returns the provider id plus PID/name.
 //!
 //! Split (gpui-free model + a thin view):
-//! - [`SourceAvailability`] — whether a row is an attachable built-in or a labeled
-//!   stub.
+//! - [`SourceAvailability`] — whether a row is attachable or a labeled disabled
+//!   provider row.
 //! - [`ProcessRow`] — one table row (PID, name, path/detail, availability, 32-bit
 //!   flag), with the C++ `(32-bit)` display-name suffix.
-//! - [`ProcessPickerModel`] — builds the row list from a [`ProviderRegistry`] +
-//!   the standard stub set, the name-or-PID filter (`filterProcesses`), and the
+//! - [`ProcessPickerModel`] — builds the row list from a [`ProviderRegistry`] or
+//!   provider process list, the name-or-PID filter (`filterProcesses`), and the
 //!   default highest-PID-first sort. Pure + unit-tested headlessly.
 //! - [`ProcessPicker`] / [`ProcessPickEvent`] — the gpui view: a filter input
 //!   above a [`DataTable`](gpui_component::table::DataTable), raising
@@ -27,17 +23,15 @@
 //!
 //! Gated behind the `ui` feature.
 
+use crate::plugin::contract::ProcessInfo;
 use crate::provider::ProviderRegistry;
 
-/// Whether a picker row is an attachable source or a labeled, non-attaching stub.
+/// Whether a picker row is an attachable source or a labeled disabled row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SourceAvailability {
-    /// A benign, implemented built-in source (file/buffer/snapshot/null) — the
-    /// row can be selected/attached.
+    /// An implemented source row — the row can be selected/attached.
     Available,
-    /// A legacy native source (process/kernel/remote/WinDbg) that this picker does
-    /// not attach — present for fidelity, shown disabled with a "(stub)" tag.
-    /// (Live process attach is provided by the memflow attach dialog.)
+    /// A source row shown for context but not attachable from this picker.
     Stub,
 }
 
@@ -53,9 +47,8 @@ impl SourceAvailability {
 
 /// One process-picker row — the C++ `ProcessInfo` generalized to a *source* row.
 ///
-/// For real built-ins the `pid` is a synthetic 0 (they are not processes) and the
-/// `path`/detail describes the source; for the live-source stubs the fields carry
-/// representative placeholder text so the column layout matches the original.
+/// For registry rows the `pid` is a synthetic 0 (they are not processes) and the
+/// `path`/detail describes the source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessRow {
     /// PID column (`Qt::EditRole` int). 0 for non-process sources.
@@ -100,59 +93,16 @@ impl ProcessRow {
     }
 }
 
-/// The standard legacy native-source stub rows (kept for fidelity with the C++
-/// picker, clearly labeled and non-attachable). Live process attach itself is the
-/// memflow path, not this picker.
-fn stub_rows() -> Vec<ProcessRow> {
-    [
-        (
-            "process",
-            "Process Memory",
-            "Attach to a running process (live)",
-        ),
-        (
-            "kernel",
-            "Kernel Memory",
-            "Kernel-mode physical memory (live)",
-        ),
-        (
-            "remote",
-            "Remote Target",
-            "Remote agent over a socket (live)",
-        ),
-        (
-            "windbg",
-            "WinDbg Session",
-            "WinDbg kernel/user session (live)",
-        ),
-    ]
-    .into_iter()
-    .map(|(id, name, detail)| ProcessRow {
-        pid: 0,
-        name: name.to_string(),
-        path: detail.to_string(),
-        is_32bit: false,
-        availability: SourceAvailability::Stub,
-        identifier: id.to_string(),
-    })
-    .collect()
-}
-
 /// The process-picker model — the row list + the filter, built from the provider
-/// registry's available sources plus the standard stub set.
+/// registry's available sources or a provider's process enumeration.
 #[derive(Clone, Debug, Default)]
 pub struct ProcessPickerModel {
     rows: Vec<ProcessRow>,
 }
 
 impl ProcessPickerModel {
-    /// Build the model from the registry's registered providers (turned into
-    /// attachable rows) plus the live-source stub rows, sorted the C++ way
-    /// (highest PID first, then attachable-before-stub, then name).
-    ///
-    /// The C++ enumerated OS processes; here the available rows are the benign
-    /// built-in providers the registry knows about (file/buffer/snapshot/null),
-    /// which is the in-scope analogue of "things you can attach to".
+    /// Build a fallback model from the registry's registered providers. The real
+    /// process attach path uses [`from_processes`](Self::from_processes).
     pub fn from_registry(registry: &ProviderRegistry) -> ProcessPickerModel {
         let mut rows: Vec<ProcessRow> = registry
             .enabled_providers()
@@ -165,7 +115,23 @@ impl ProcessPickerModel {
                 identifier: p.identifier.clone(),
             })
             .collect();
-        rows.extend(stub_rows());
+        Self::sort_default(&mut rows);
+        ProcessPickerModel { rows }
+    }
+
+    /// Build a real C++-style process list for one provider id.
+    pub fn from_processes(processes: Vec<ProcessInfo>, identifier: &str) -> ProcessPickerModel {
+        let mut rows: Vec<ProcessRow> = processes
+            .into_iter()
+            .map(|p| ProcessRow {
+                pid: p.pid,
+                name: p.name,
+                path: p.path,
+                is_32bit: p.is_32bit,
+                availability: SourceAvailability::Available,
+                identifier: identifier.to_string(),
+            })
+            .collect();
         Self::sort_default(&mut rows);
         ProcessPickerModel { rows }
     }
@@ -262,6 +228,8 @@ impl ProcessRow {
 // ── gpui view ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ui")]
+pub(crate) use view::ProcessDelegate as ProcessTableDelegate;
+#[cfg(feature = "ui")]
 pub use view::{ProcessPickEvent, ProcessPicker};
 
 #[cfg(feature = "ui")]
@@ -308,8 +276,8 @@ mod view {
 
     /// The [`TableDelegate`] backing the picker table — PID / Process Name / Path
     /// (the C++ `.ui` column set). Stub rows are dimmed (non-attachable).
-    struct ProcessDelegate {
-        rows: Vec<ProcessRow>,
+    pub(crate) struct ProcessDelegate {
+        pub(crate) rows: Vec<ProcessRow>,
         /// The Path column width, sized at construction to fill the table box.
         /// gpui-component's table has no "stretch last section", so we compute the
         /// fill width ourselves from the live card width (the C++
@@ -321,11 +289,19 @@ mod view {
     }
 
     impl ProcessDelegate {
-        fn new(path_width: Pixels) -> Self {
+        pub(crate) fn new(path_width: Pixels) -> Self {
             ProcessDelegate {
                 rows: Vec::new(),
                 path_width,
             }
+        }
+
+        pub(crate) fn set_rows(&mut self, rows: Vec<ProcessRow>) {
+            self.rows = rows;
+        }
+
+        pub(crate) fn rows(&self) -> &[ProcessRow] {
+            &self.rows
         }
     }
 
@@ -787,9 +763,7 @@ mod view {
 
             let body = modal::body(cx)
                 .child(modal::help_text(
-                    "Select a data source to attach. The native sources here are \
-                     non-attaching stubs; live process attach is on the \
-                     File ▸ Data Source ▸ Process Memory menu.",
+                    "Select a live process for the chosen data source.",
                     cx,
                 ))
                 .child(Input::new(&self.filter).w_full())
@@ -867,8 +841,8 @@ mod tests {
         preferred_row_index, preferred_row_index_for, ProcessPickerModel, ProcessRow,
         SourceAvailability,
     };
+    use crate::plugin::contract::ProcessInfo;
     use crate::provider::ProviderRegistry;
-
     fn available(pid: u32, name: &str) -> ProcessRow {
         ProcessRow {
             pid,
@@ -881,24 +855,42 @@ mod tests {
     }
 
     #[test]
-    fn from_registry_includes_builtins_and_stubs() {
-        let mut reg = ProviderRegistry::new();
-        reg.register_builtin("Buffer", "buffer");
-        reg.register_builtin("File", "file");
-        let m = ProcessPickerModel::from_registry(&reg);
+    fn from_registry_includes_registered_builtins_only() {
+        let mgr = crate::plugin::PluginManager::with_builtins();
+        let m = ProcessPickerModel::from_registry(mgr.registry());
 
-        // The two registered built-ins are attachable rows.
+        // The registered built-ins are attachable rows.
         let buffer = m.rows().iter().find(|r| r.identifier == "buffer").unwrap();
         assert!(buffer.is_attachable());
         assert_eq!(buffer.name, "Buffer");
 
-        // The standard live-source stubs are present and NOT attachable.
-        let process = m.rows().iter().find(|r| r.identifier == "process").unwrap();
-        assert_eq!(process.availability, SourceAvailability::Stub);
-        assert!(!process.is_attachable());
-        assert!(m.rows().iter().any(|r| r.identifier == "kernel"));
-        assert!(m.rows().iter().any(|r| r.identifier == "remote"));
-        assert!(m.rows().iter().any(|r| r.identifier == "windbg"));
+        #[cfg(feature = "process-provider")]
+        assert!(m.rows().iter().any(|r| {
+            r.identifier == "processmemory" && r.availability == SourceAvailability::Available
+        }));
+        #[cfg(not(feature = "process-provider"))]
+        assert!(!m.rows().iter().any(|r| r.identifier == "processmemory"));
+
+        assert!(!m
+            .rows()
+            .iter()
+            .any(|r| r.availability == SourceAvailability::Stub));
+    }
+
+    #[test]
+    fn from_processes_builds_real_pid_rows_for_provider() {
+        let m = ProcessPickerModel::from_processes(
+            vec![ProcessInfo {
+                pid: 42,
+                name: "target.exe".to_string(),
+                path: "C:/target.exe".to_string(),
+                is_32bit: true,
+            }],
+            "processmemory",
+        );
+        assert_eq!(m.rows()[0].pid, 42);
+        assert_eq!(m.rows()[0].identifier, "processmemory");
+        assert_eq!(m.rows()[0].display_name(), "target.exe (32-bit)");
     }
 
     #[test]
@@ -910,9 +902,9 @@ mod tests {
 
         let stub = ProcessRow {
             availability: SourceAvailability::Stub,
-            ..available(0, "Process Memory")
+            ..available(0, "Kernel Memory")
         };
-        assert_eq!(stub.display_name(), "Process Memory (stub)");
+        assert_eq!(stub.display_name(), "Kernel Memory (stub)");
     }
 
     #[test]
@@ -993,8 +985,8 @@ mod tests {
     }
 
     #[test]
-    fn preferred_none_when_only_stubs() {
-        // Empty registry → only stub rows → no attachable preferred.
+    fn preferred_none_when_no_rows() {
+        // Empty registry means no fake rows and no attachable preferred.
         let reg = ProviderRegistry::new();
         let m = ProcessPickerModel::from_registry(&reg);
         assert!(m.preferred().is_none());

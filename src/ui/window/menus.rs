@@ -204,17 +204,26 @@ impl super::MainWindow {
             // ── File: data source (the active-source picker; data_options.png) ──
             // The C++ `m_sourceMenu` triggers route to controller->selectSource /
             // clearSources. File attaches a binary; Process attaches a live target
-            // through memflow; the remaining legacy native sources (remote /
-            // WinDbg / ReClass.NET) are not yet ported.
+            // through the first-party provider set; platform-specific providers
+            // surface their own attach errors when unavailable on this OS.
             "source.clear" => self.clear_active_source(window, cx),
             "source.file" => self.prompt_data_file(window, cx),
             "source.process" => self.open_process_source(window, cx),
-            // The C++ Data Source set is File + the registered providers only — no
-            // Kernel Memory row (kernelmemory is a Browse-Page-Tables provider id,
-            // never a Data Source entry; see commandpalette.rs `menu_tree_with`).
-            "source.remote" | "source.windbg" | "source.rcnet" => {
-                self.report_unavailable_source(cmd.as_str(), window, cx)
-            }
+            #[cfg(feature = "memflow-provider")]
+            "source.memflow" => self.open_memflow_attach_dialog(window, cx),
+            #[cfg(feature = "remote-process-provider")]
+            "source.remote" => self.open_provider_process_picker("remoteprocessmemory", window, cx),
+            #[cfg(not(feature = "remote-process-provider"))]
+            "source.remote" => self.report_unavailable_source(cmd.as_str(), window, cx),
+            #[cfg(all(windows, feature = "kernel-provider"))]
+            "source.kernel" => self.open_provider_process_picker("kernelmemory", window, cx),
+            #[cfg(not(all(windows, feature = "kernel-provider")))]
+            "source.kernel" => self.report_unavailable_source(cmd.as_str(), window, cx),
+            #[cfg(all(windows, feature = "windbg-provider"))]
+            "source.windbg" => self.open_windbg_attach_dialog(window, cx),
+            #[cfg(not(all(windows, feature = "windbg-provider")))]
+            "source.windbg" => self.report_unavailable_source(cmd.as_str(), window, cx),
+            "source.rcnet" => self.report_unavailable_source(cmd.as_str(), window, cx),
 
             // ── Edit (Undo / Redo / Add Bookmark… / Quick Bookmark Here) ──
             "edit.undo" => self.active_editor_undo(false, cx),
@@ -306,8 +315,8 @@ impl super::MainWindow {
             // A plugin-contributed command (design §6 Phase 2): route it through the
             // session-owned manager + a scoped live host. Checked AFTER the built-in
             // ids so a plugin can't shadow a host command, and BEFORE the catch-all
-            // so it doesn't fall to the log-noop. In the default build no plugin
-            // contributes a command, so this never matches.
+            // so it doesn't fall to the log-noop. With no contributed plugin command
+            // loaded, this never matches.
             other if self.plugin_manager.is_plugin_command(other) => {
                 self.dispatch_plugin_command(other, window, cx);
             }
@@ -395,7 +404,7 @@ impl super::MainWindow {
     pub(super) fn switch_saved_source_by_command(
         &mut self,
         cmd: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(idx) = cmd
@@ -407,10 +416,24 @@ impl super::MainWindow {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             return;
         };
-        editor.update(cx, |ed, cx| {
-            ed.controller_mut().switch_to_saved_source(idx);
-            ed.apply_document(cx);
-        });
+        let mut attach_error = None;
+        {
+            let plugin_manager = &self.plugin_manager;
+            editor.update(cx, |ed, cx| {
+                let result = ed
+                    .controller_mut()
+                    .switch_to_saved_source_with_provider_factory(idx, |identifier, target| {
+                        plugin_manager.create_provider(identifier, target)
+                    });
+                if let Err(err) = result {
+                    attach_error = Some(err);
+                }
+                ed.apply_document(cx);
+            });
+        }
+        if let Some(err) = attach_error {
+            self.notify(format!("Saved source attach failed: {err}"), window, cx);
+        }
         // Re-derive the tab source icon + re-feed the docks from the new source.
         let source = Self::source_for_controller(editor.read(cx).controller());
         if let Some(active_id) = self.active_doc_id(cx) {
@@ -521,9 +544,9 @@ impl super::MainWindow {
         };
         relabel_command(&mut tree, "tools.mcp", mcp_label);
         // Inject any enabled plugin-contributed menu commands into the &Plugins
-        // submenu (design §6 Phase 2). With no contributing plugin loaded (the
-        // default build) `ui_contributions()` is empty, so the tree is byte-identical
-        // to before — the &Plugins submenu keeps only [Manage Plugins…].
+        // submenu (design §6 Phase 2). With no contributing plugin loaded,
+        // `ui_contributions()` is empty, so the tree is byte-identical to before —
+        // the &Plugins submenu keeps only [Manage Plugins…].
         let plugin_commands = self.plugin_manager.ui_contributions();
         inject_plugin_menu_items(&mut tree, &plugin_commands);
         self.menubar.update(cx, |mb, cx| mb.set_menus(tree, cx));

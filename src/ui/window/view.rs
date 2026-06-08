@@ -137,6 +137,7 @@ impl super::MainWindow {
     /// Load an already-built document into the active editor tab and sync the
     /// tab title + source (shared by import; mirrors the tail of
     /// [`open_project`](Self::open_project)).
+    #[cfg(feature = "imports")]
     pub(super) fn load_doc_into_active(
         &mut self,
         doc: crate::controller::RcxDocument,

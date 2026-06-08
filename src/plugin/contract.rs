@@ -9,7 +9,7 @@
 //! [`Provider`](crate::provider::Provider) trait for the memory-reading surface.
 //! No `abi_stable` here — the design (§2 "NO abi_stable in Phase 1") defers the
 //! stable-ABI wrapping (`RBox`/`RVec`/`RString`, `#[sabi_trait]`) to Phase 3,
-//! behind the `plugins` cargo feature, so default builds carry no extra deps.
+//! behind the `plugins` cargo feature, so lean builds can omit those deps.
 //!
 //! C++ anchors: `iplugin.h` (`IPlugin`/`IProviderPlugin`), `pluginmanager.cpp`
 //! (load + auto-register), captured in `_design/plugin_system_cpp_reference.md`.

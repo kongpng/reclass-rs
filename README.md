@@ -31,7 +31,7 @@ it in. Both feature sets build green on Linux.
 | Rust module | C++ source | Role |
 |---|---|---|
 | `core/` (`kind`, `node`, `tree`, `value_history`, `linemeta`, `command`, `commontypes`, `clipboard`, `typeinfer`) | `core.h`, `commontypes.h`, `typeinfer.h`, `clipboard.h` | Node tree, `NodeKind`/type system, `.rcx` serde, value-history heatmap, line/render metadata, undo/redo command model, predefined struct templates, clipboard codec. **Genuinely ported.** |
-| `provider/` (`mod`, `buffer`, `file`, `snapshot`, `null`, `registry`, `native`) | `providers/*`, `providerregistry.h`, `iplugin.h` | The `Provider` trait + built-in **file / buffer / snapshot / null** sources + + **live process via `memflow`** (runtime-discovered connector/OS plugins) + registry. **Real**, including live process; only the legacy native-plugin seam in `native` (kernel / remote / WinDbg / ReClass.NET) is a documented stub. |
+| `provider/` (`mod`, `buffer`, `file`, `process`, `remote`, `kernel`, `windbg`, `memflow`, `snapshot`, `null`, `registry`, `native`) | `providers/*`, `providerregistry.h`, `iplugin.h` | The `Provider` trait + built-in **file / buffer / snapshot / null** sources, plus first-party **process / remote payload / kernel driver / WinDbg / memflow** providers when their feature/platform gates are available. `native` is the legacy external plugin-loader seam. |
 | `compose.rs` | `compose.cpp` | Tree + Provider → rendered rows (text + `LineMeta`, column geometry). |
 | `format.rs` | `format.cpp` | Value formatting, hex/ASCII previews, value read/parse/validate. |
 | `addr.rs` | `addressparser.*` | Address-expression evaluator (`<mod>+0x10`, deref chains, symbols). |
@@ -46,7 +46,7 @@ it in. Both feature sets build green on Linux.
 | `ui/` (`mod`, `editor`) | `editor.*`, `widgets/*`, dialogs, popups, docks, `mainwindow.h`, `startpage.h`, `titlebar.*` | GPUI views: standard chrome via gpui-component + the bespoke raw-gpui editor `Element`. [feature: `ui`, default] |
 | `main.rs` | `main.cpp` | The `reclass` app binary: window, CLI, lifecycle, wiring. |
 | `bin/reclass-mcp-bridge.rs` | `tools/rcx-mcp-stdio.cpp` | stdio ↔ local-socket bridge binary. |
-| `memflow` / — | `plugins/*` | **Live process** is first-party via `provider::memflow`. The legacy kernel / remote / WinDbg / ReClass.NET sources remain documented stubs behind `provider::native`. |
+| `rcx-rpc`, `rcx-payload` | `plugins/rcx_payload/*` | Shared RPC protocol and the Rust payload DLL used by Remote Process Memory. |
 
 ## Binaries
 
@@ -59,7 +59,7 @@ it in. Both feature sets build green on Linux.
 ## Features
 
 ```
-default = ["ui", "imports", "disasm", "symbols", "mcp"]
+default = ["ui", "imports", "disasm", "symbols", "mcp", "memflow-provider", "plugins"]
 ```
 
 | Feature | Pulls | Gates |
@@ -69,16 +69,19 @@ default = ["ui", "imports", "disasm", "symbols", "mcp"]
 | `disasm` | `iced-x86` | x86/x64 disassembly + hex dump |
 | `symbols` | `cpp_demangle`, `msvc-demangler`, `reqwest`, `directories`, `regex` | RTTI/demangle/symbol-server |
 | `mcp` | `interprocess` | JSON-RPC MCP server |
-| `memflow-provider` (compat) | nothing | no-op alias; the memflow live provider is always compiled |
+| `memflow-provider` | `memflow` | live process memory via runtime-discovered memflow connector/OS plugins |
+| `plugins` | `abi_stable`, `libloading`, `reclass-plugin-abi`, Windows-only `windows` | stable-ABI native plugin loader + ReClass.NET compat routing |
 | `scanner-parallel` (off) | `rayon` | parallel scanner |
-| `native-plugins` (off) | `libloading` | legacy native-plugin loader seam for un-ported C++ sources (stubs only) |
+| `native-providers` | platform APIs | enables the first-party process / remote / kernel / WinDbg provider family, with OS-specific implementations selected by `cfg` |
+| `native-plugins` (off) | `libloading` | legacy external native-plugin loader seam |
 
-The memflow live process provider is always compiled. Connector and OS support
-is still runtime/plugin based: qemu, kvm, pcileech, winio, and win32 are loaded
-from memflow plugin directories when available.
+The memflow live process provider is default-on but still feature-gated.
+Connector and OS support is runtime/plugin based: qemu, kvm, pcileech, winio,
+and win32 are loaded from memflow plugin directories when available.
 
 `--no-default-features` yields a **headless engine** build (no gpui) for fast
-logic-only testing; core providers, including memflow, remain available.
+logic-only testing; add `--features memflow-provider,plugins` to include those
+provider/plugin surfaces in a lean build.
 
 ## Building
 
@@ -190,10 +193,8 @@ outputs from the original C++ tests live under `_oracle/`.
 
 Independently verified on Linux (Fedora, GCC 16) on 2026-05-31 — **PASS**.
 
-Single package confirmed: `cargo metadata --no-deps --format-version 1` reports
-exactly one package `reclass` (targets `lib:reclass`, `bin:reclass`,
-`bin:reclass-mcp-bridge`); `workspace_members` is just `reclass@0.1.0`. There is
-no `crates/` directory and no `[workspace]` table. The `src/` module layout
+Workspace package set: `reclass` plus support crates `rcx-rpc` and
+`rcx-payload` for the Rust Remote Process Memory payload. The `src/` module layout
 matches `_design/ARCHITECTURE.md` §2, and `src/core/` holds real ported types
 (e.g. `NodeKind`'s 31 variants in exact `core.h` order and the full `Node`
 struct), not stubs.

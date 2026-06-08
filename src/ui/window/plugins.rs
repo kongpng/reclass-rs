@@ -2,7 +2,7 @@
 //! declarative-UI host, command/panel/dialog dispatch, and the plugin-manager
 //! dialog. Extracted from window.rs as an `impl super::MainWindow` cluster (the
 //! gpui side of the session-owned `plugin_manager`). With no contributing plugin
-//! loaded (the default build) every path here is a no-op over an empty list.
+//! loaded, every path here is a no-op over an empty list.
 
 // `use super::*` inherits the parent window module's full import set (gpui, the
 // crate types, the plugin-manager dialog types) — a child module can see its
@@ -39,7 +39,7 @@ impl super::MainWindow {
     // menu items, (2) builds a scoped `LivePluginHost` per call sequence, and (3)
     // drains the host's collected toasts / open-dialog / re-render requests into
     // `notify` / `open_plugin_dialog` / `rerender_plugin_panel`. With NO contributing
-    // plugin loaded (the default build) every loop here is a no-op over an empty
+    // plugin loaded, every loop here is a no-op over an empty
     // list — nothing is mounted, injected, or routed (HARD PARITY).
 
     /// Mount each enabled plugin-contributed `Panel` into the existing dock area
@@ -316,14 +316,11 @@ impl super::MainWindow {
         }
     }
 
-    /// Plugins ▸ Manage Plugins… — open the read-only [`PluginManagerDialog`] (the
-    /// C++ `showPluginsDialog`; main.cpp:8821). The C++ lists each loaded
-    /// `IPlugin` (name, version, description, type, author) with Load/Unload
-    /// buttons backed by native `dlopen`. This platform has no native plugin
-    /// loader, so the dialog lists the **built-in provider plugins** the port ships
-    /// — the in-scope analogue of "loaded provider plugins" — read-only, with a
-    /// note that runtime DLL/SO loading is out of scope. This replaces the bare
-    /// notify with the actual (read-only) manager surface.
+    /// Plugins ▸ Manage Plugins… — open the [`PluginManagerDialog`] (the C++
+    /// `showPluginsDialog`; main.cpp:8821). The C++ lists each loaded `IPlugin`
+    /// (name, version, description, type, author) with Load/Unload buttons backed
+    /// by native `dlopen`; this port lists the in-tree providers in every build and
+    /// enables runtime plugin loading only when the `plugins` feature is compiled.
     pub(super) fn open_plugins_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Render the dialog from the SESSION-OWNED manager's live plugin set (design
         // §6 Phase 6 / §7.A [fix]) — not a throwaway `with_builtins()`. An
@@ -337,8 +334,8 @@ impl super::MainWindow {
         });
         // Surface the session manager's retained native-load failures (design §7.A
         // [fix]) so ABI/load errors are visible with detail in the dialog instead of
-        // only logged at startup. Feature-gated: the default build has no loader, so
-        // there are no errors to push (and `set_load_errors` doesn't exist there).
+        // only logged at startup. Feature-gated: builds without `plugins` have no
+        // loader, so there are no errors to push (and `set_load_errors` doesn't exist).
         #[cfg(feature = "plugins")]
         {
             let errs = self.plugin_manager.load_errors().to_vec();

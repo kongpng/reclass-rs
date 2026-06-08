@@ -1,9 +1,10 @@
 //! Provider registry — lists data sources for the Source picker.
 //!
 //! Port of `src/providerregistry.h`. Providers register here so they appear in
-//! the Source menu. The C++ supports plugin-based and built-in providers; only
-//! the built-in (benign) factories are in scope. The Qt menu-population helper
-//! (`populateSourceMenu`) belongs to the UI layer and is omitted here.
+//! the Source menu. The C++ supports plugin-based and built-in providers; this
+//! registry stores descriptors while provider creation lives on the plugin
+//! contribution. The Qt menu-population helper (`populateSourceMenu`) belongs to
+//! the UI layer and is omitted here.
 
 /// `struct SavedSourceDisplay` (`providerregistry.h:13-16`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -14,7 +15,7 @@ pub struct SavedSourceDisplay {
 
 /// `ProviderRegistry::ProviderInfo` (`providerregistry.h:29-44`), trimmed to the
 /// in-scope fields (the Qt `IProviderPlugin*` / `BuiltinFactory` callbacks are
-/// modeled as a simple identifier + display name; native plugins are stubs).
+/// modeled as a simple identifier + display name).
 ///
 /// The actual create/can_handle factory lives on the plugin's
 /// [`ProviderSpec`](crate::plugin::provider_spec::ProviderSpec); the registry is

@@ -2,7 +2,8 @@
 //! (`optionsdialog.{h,cpp}`, widgets-dialogs.md §5).
 //!
 //! Port of `OptionsDialog`: a fixed 700×450 dialog with a left nav tree
-//! (Environment → General / AI Features / Generator) + a search box that filters
+//! (Environment → General / AI Features / Generator; AI is shown only with the
+//! `mcp` feature) + a search box that filters
 //! the tree, and a right page stack reading/writing an [`OptionsResult`]. Per the
 //! cookbook (ARCHITECTURE §5) it maps onto a gpui-component `Dialog` + `Tree` +
 //! conditional page render + a `TextInput` filter.
@@ -10,8 +11,8 @@
 //! Split (gpui-free model + thin view, like the prior stages):
 //! - [`OptionsResult`] — the C++ `struct OptionsResult` round-tripped by the
 //!   dialog (`themeIndex`/`fontName`/…); the controls read/write it.
-//! - [`OptionsPage`] — the three pages (General/AI/Generator) + their nav labels,
-//!   keywords (for search), and the controls each hosts.
+//! - [`OptionsPage`] — the feature-visible pages + their nav labels, keywords
+//!   (for search), and the controls each hosts.
 //! - [`filter_visible`] / [`filter_visible_with_themes`] — the recursive tree
 //!   search filter (`filterTree`), unit-tested against the C++ rule (name OR
 //!   page-keywords OR any child); the themes-aware variant also matches the
@@ -151,12 +152,22 @@ pub enum OptionsPage {
 }
 
 impl OptionsPage {
-    /// The pages in nav order.
+    /// The full page set in nav order.
     pub const ALL: [OptionsPage; 3] = [
         OptionsPage::General,
         OptionsPage::AiFeatures,
         OptionsPage::Generator,
     ];
+
+    /// The pages visible in this build. The AI/MCP page is only useful when the
+    /// `mcp` feature is compiled in; lean UI builds should not advertise it.
+    pub fn visible() -> Vec<OptionsPage> {
+        let mut pages = vec![OptionsPage::General];
+        #[cfg(feature = "mcp")]
+        pages.push(OptionsPage::AiFeatures);
+        pages.push(OptionsPage::Generator);
+        pages
+    }
 
     /// The page index (`m_itemPageIndex` value).
     pub fn index(self) -> usize {
@@ -248,12 +259,12 @@ pub fn filter_visible(query: &str) -> Vec<OptionsPage> {
 /// `m_pageKeywords[generalItem]`. `themes` is the dialog's available theme list.
 pub fn filter_visible_with_themes(query: &str, themes: &[String]) -> Vec<OptionsPage> {
     let q = query.trim().to_lowercase();
+    let pages = OptionsPage::visible();
     if q.is_empty() {
-        return OptionsPage::ALL.to_vec();
+        return pages;
     }
-    OptionsPage::ALL
-        .iter()
-        .copied()
+    pages
+        .into_iter()
         .filter(|p| page_matches_themes(*p, &q, themes))
         .collect()
 }
@@ -310,9 +321,11 @@ pub use view::{OptionsDialog, OptionsEvent};
 
 #[cfg(feature = "ui")]
 mod view {
+    #[cfg(feature = "mcp")]
+    use super::MCP_DESC;
     use super::{
         filter_visible_with_themes, font_choice_index, parse_refresh_ms, step_visible_page,
-        OptionsPage, OptionsResult, FONT_CHOICES, MCP_DESC, REFRESH_DESC,
+        OptionsPage, OptionsResult, FONT_CHOICES, REFRESH_DESC,
     };
     use crate::ui::design::{color, section_label, tokens, zed_list_row};
     use crate::ui::dialogs::modal;
@@ -430,7 +443,7 @@ mod view {
         ) -> Entity<Self> {
             cx.new(|cx| {
                 let mut this = OptionsDialog::new(current, themes, window, cx);
-                this.page = page;
+                this.page = Self::visible_page_or_default(page);
                 this
             })
         }
@@ -447,8 +460,16 @@ mod view {
 
         /// Select a page (the C++ `selectPage` / `currentItemChanged`).
         pub fn select_page(&mut self, page: OptionsPage, cx: &mut Context<Self>) {
-            self.page = page;
+            self.page = Self::visible_page_or_default(page);
             cx.notify();
+        }
+
+        fn visible_page_or_default(page: OptionsPage) -> OptionsPage {
+            if OptionsPage::visible().contains(&page) {
+                page
+            } else {
+                OptionsPage::General
+            }
         }
 
         fn confirm(&mut self, cx: &mut Context<Self>) {
@@ -655,7 +676,10 @@ mod view {
         fn render_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
             match self.page {
                 OptionsPage::General => self.render_general(cx).into_any_element(),
+                #[cfg(feature = "mcp")]
                 OptionsPage::AiFeatures => self.render_ai(cx).into_any_element(),
+                #[cfg(not(feature = "mcp"))]
+                OptionsPage::AiFeatures => self.render_general(cx).into_any_element(),
                 OptionsPage::Generator => self.render_generator(cx).into_any_element(),
             }
         }
@@ -804,6 +828,7 @@ mod view {
                 })
         }
 
+        #[cfg(feature = "mcp")]
         fn render_ai(&self, cx: &mut Context<Self>) -> impl IntoElement {
             use gpui_component::checkbox::Checkbox;
             gpui_component::v_flex()
@@ -1029,22 +1054,34 @@ mod tests {
         assert_eq!(OptionsPage::General.nav_label(), "General");
         assert_eq!(OptionsPage::AiFeatures.nav_label(), "AI Features");
         assert_eq!(OptionsPage::Generator.nav_label(), "Generator");
+        #[cfg(feature = "mcp")]
+        assert_eq!(OptionsPage::visible(), OptionsPage::ALL.to_vec());
+        #[cfg(not(feature = "mcp"))]
+        assert_eq!(
+            OptionsPage::visible(),
+            vec![OptionsPage::General, OptionsPage::Generator]
+        );
     }
 
     #[test]
     fn empty_query_shows_all_pages() {
-        assert_eq!(filter_visible("").len(), 3);
-        assert_eq!(filter_visible("   ").len(), 3);
+        assert_eq!(filter_visible(""), OptionsPage::visible());
+        assert_eq!(filter_visible("   "), OptionsPage::visible());
     }
 
     #[test]
     fn mcp_search_hides_general_shows_ai() {
         // "MCP" search hides General, shows AI Features (test_options_dialog.cpp:201).
         let visible = filter_visible("MCP");
-        assert!(visible.contains(&OptionsPage::AiFeatures));
-        assert!(!visible.contains(&OptionsPage::General));
+        #[cfg(feature = "mcp")]
+        {
+            assert!(visible.contains(&OptionsPage::AiFeatures));
+            assert!(!visible.contains(&OptionsPage::General));
+        }
+        #[cfg(not(feature = "mcp"))]
+        assert!(visible.is_empty());
         // Clearing un-hides.
-        assert_eq!(filter_visible("").len(), 3);
+        assert_eq!(filter_visible(""), OptionsPage::visible());
     }
 
     #[test]
@@ -1088,7 +1125,10 @@ mod tests {
         // QLabel text) hits both pages, faithfully (optionsdialog.cpp:154).
         let visible = filter_visible("editor");
         assert!(visible.contains(&OptionsPage::General));
+        #[cfg(feature = "mcp")]
         assert!(visible.contains(&OptionsPage::AiFeatures));
+        #[cfg(not(feature = "mcp"))]
+        assert!(!visible.contains(&OptionsPage::AiFeatures));
     }
 
     #[test]
@@ -1107,9 +1147,15 @@ mod tests {
         // The MCP description QLabel (MCP_DESC) is an AI-page keyword, so its
         // distinctive phrasing surfaces AI Features only (optionsdialog.cpp:152-154).
         let visible = filter_visible("bridge");
+        #[cfg(feature = "mcp")]
         assert_eq!(visible, vec![OptionsPage::AiFeatures]);
+        #[cfg(not(feature = "mcp"))]
+        assert!(visible.is_empty());
         let visible = filter_visible("external AI");
+        #[cfg(feature = "mcp")]
         assert_eq!(visible, vec![OptionsPage::AiFeatures]);
+        #[cfg(not(feature = "mcp"))]
+        assert!(visible.is_empty());
     }
 
     #[test]

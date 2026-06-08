@@ -3,7 +3,7 @@
 //! Port of `StartPageWidget`. The C++ is a fully custom-painted frameless dialog
 //! shown ~90%×85% over the window: a "Reclass" title, an **Open recent** file
 //! list bucketed by modified date, a column of **action cards** (New Class /
-//! Open project / Import from Source / Import ReClass XML / Import PDB), a
+//! Open project, plus import cards when the `imports` feature is enabled), a
 //! "Tutorial →" link, a search filter, and ESC / outside-click dismiss. The
 //! cookbook (ARCHITECTURE §5) maps it onto plain `div`/flex + buttons; the
 //! bucketing + card data are pure and unit-tested headlessly.
@@ -12,7 +12,7 @@
 //! - [`RecentEntry`] / [`Bucket`] / [`bucket_for`] / [`build_groups`] — the
 //!   gpui-free data model (recent files → date-bucketed groups + the search
 //!   filter), mirroring `loadEntries` / `buildGroups` (`startpage.h:217-261`).
-//! - [`StartCard`] — the five action cards (`drawCards`), as data.
+//! - [`StartCard`] — the action cards (`drawCards`), as data.
 //! - [`StartPageEvent`] / [`StartPage`] — the gpui view raising the same signals
 //!   the C++ emitted (`openProject` / `newClass` / `dismissed` / `importSource`
 //!   / `importXml` / `importPdb` / `fileSelected`).
@@ -28,8 +28,9 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
 
-/// The five start-page action cards (`drawCards`, `startpage.h`) — the order is
-/// load-bearing for parity (card index → action; `hitTest` cards 0..4).
+/// The start-page action cards (`drawCards`, `startpage.h`) — the order is
+/// load-bearing for parity (card index → action; `hitTest` cards 0..4 in full
+/// builds). Import cards are displayed only when the `imports` feature is enabled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StartCard {
     /// Card 0 — create a new class (`newClass`).
@@ -53,6 +54,19 @@ impl StartCard {
         StartCard::ImportXml,
         StartCard::ImportPdb,
     ];
+
+    /// The cards rendered in this build. Lean UI builds without `imports` still
+    /// show project creation/opening, but do not advertise unavailable import flows.
+    pub fn visible() -> Vec<StartCard> {
+        #[cfg(feature = "imports")]
+        {
+            StartCard::ALL.to_vec()
+        }
+        #[cfg(not(feature = "imports"))]
+        {
+            vec![StartCard::NewClass, StartCard::OpenProject]
+        }
+    }
 
     /// The card title (the bold line; `drawCards`).
     pub fn title(self) -> &'static str {
@@ -530,9 +544,9 @@ impl EventEmitter<StartPageEvent> for StartPage {}
 impl Render for StartPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let recent = self.render_recent(cx);
-        let cards: Vec<_> = StartCard::ALL
-            .iter()
-            .map(|c| self.render_card(*c, cx).into_any_element())
+        let cards: Vec<_> = StartCard::visible()
+            .into_iter()
+            .map(|c| self.render_card(c, cx).into_any_element())
             .collect();
 
         // The welcome surface: a full-window content-bg backdrop, with a single
@@ -664,6 +678,13 @@ mod tests {
         assert_eq!(StartCard::ALL[2], StartCard::ImportSource);
         assert_eq!(StartCard::ALL[3], StartCard::ImportXml);
         assert_eq!(StartCard::ALL[4], StartCard::ImportPdb);
+        let visible = StartCard::visible();
+        assert_eq!(visible[0], StartCard::NewClass);
+        assert_eq!(visible[1], StartCard::OpenProject);
+        #[cfg(feature = "imports")]
+        assert_eq!(visible, StartCard::ALL.to_vec());
+        #[cfg(not(feature = "imports"))]
+        assert_eq!(visible, vec![StartCard::NewClass, StartCard::OpenProject]);
         assert_eq!(StartCard::NewClass.title(), "New Class");
         assert!(!StartCard::OpenProject.description().is_empty());
     }

@@ -52,8 +52,7 @@ impl DocId {
 /// The real byte access goes through [`crate::provider::Provider`]; this enum
 /// only records *which kind* of source is active, for the tab source-icon +
 /// liveness chrome. Mirrors the built-in providers (file / buffer / snapshot /
-/// null) plus the live `Process` source, which is read through the memflow
-/// provider.
+/// null) plus live `Process` sources.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SourceKind {
     /// No source attached yet (the `:/vsicons/plug.svg` "No source" fallback).
@@ -65,7 +64,7 @@ pub enum SourceKind {
     Buffer,
     /// A captured snapshot.
     Snapshot,
-    /// A live OS process, read through the memflow provider.
+    /// A live OS process or remote process provider.
     Process,
 }
 

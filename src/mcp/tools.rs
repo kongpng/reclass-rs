@@ -48,6 +48,7 @@ fn arg_bool(args: &Map<String, Value>, k: &str) -> bool {
     arg(args, k).and_then(Value::as_bool).unwrap_or(false)
 }
 
+#[cfg(feature = "memflow-provider")]
 fn arg_string_list(args: &Map<String, Value>, k: &str) -> Vec<String> {
     match arg(args, k) {
         Some(Value::Array(items)) => items
@@ -826,7 +827,7 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
 
     let provider = arg_str(args, "provider").to_lowercase();
     let memflow_requested = provider == "memflow"
-        || provider == "processmemory"
+        || provider == "memflowprocessmemory"
         || args.contains_key("connector")
         || args.contains_key("connectorArgs")
         || args.contains_key("os")
@@ -834,7 +835,53 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
         || args.contains_key("pluginDirs")
         || args.contains_key("writable");
     if memflow_requested {
+        #[cfg(feature = "memflow-provider")]
         return tool_source_switch_memflow(idx, args, host);
+        #[cfg(not(feature = "memflow-provider"))]
+        return make_text_result(
+            "memflow live-process provider is not enabled in this build",
+            true,
+        );
+    }
+
+    if provider == "processmemory" || (provider.is_empty() && args.contains_key("pid")) {
+        #[cfg(feature = "process-provider")]
+        return tool_source_switch_process(idx, args, host);
+        #[cfg(not(feature = "process-provider"))]
+        return make_text_result(
+            "local Process Memory provider is not enabled in this build",
+            true,
+        );
+    }
+
+    if provider == "remoteprocessmemory" {
+        #[cfg(feature = "remote-process-provider")]
+        return tool_source_switch_remote(idx, args, host);
+        #[cfg(not(feature = "remote-process-provider"))]
+        return make_text_result(
+            "Remote Process Memory provider is not enabled in this build",
+            true,
+        );
+    }
+
+    if provider == "kernelmemory" {
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        return tool_source_switch_kernel(idx, args, host);
+        #[cfg(not(all(windows, feature = "kernel-provider")))]
+        return make_text_result(
+            "Kernel Memory provider is available only on Windows builds with kernel-provider",
+            true,
+        );
+    }
+
+    if provider == "windbgmemory" {
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        return tool_source_switch_windbg(idx, args, host);
+        #[cfg(not(all(windows, feature = "windbg-provider")))]
+        return make_text_result(
+            "WinDbg Memory provider is available only on Windows builds with windbg-provider",
+            true,
+        );
     }
 
     if args.contains_key("sourceIndex") {
@@ -867,7 +914,7 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
 
     if args.contains_key("pid") {
         return make_text_result(
-            "Live process attach requires provider:\"memflow\" plus connector/os configuration",
+            "Live process attach requires provider:\"processmemory\", \"remoteprocessmemory\", \"kernelmemory\", \"windbgmemory\", or \"memflow\"",
             true,
         );
     }
@@ -881,7 +928,7 @@ pub fn tool_source_switch(args: &Map<String, Value>, host: &mut dyn McpHost) -> 
     }
 
     make_text_result(
-        "Provide sourceIndex, filePath, or provider:\"memflow\"",
+        "Provide sourceIndex, filePath, provider:\"processmemory\", provider:\"kernelmemory\", provider:\"windbgmemory\", or provider:\"memflow\"",
         true,
     )
 }
@@ -920,6 +967,7 @@ pub fn tool_source_modules(args: &Map<String, Value>, host: &mut dyn McpHost) ->
     }
 }
 
+#[cfg(feature = "memflow-provider")]
 fn tool_source_switch_memflow(
     idx: usize,
     args: &Map<String, Value>,
@@ -963,9 +1011,154 @@ fn tool_source_switch_memflow(
     let name = provider.name();
     let provider = Arc::new(provider);
     host.with_tab(idx, &mut |tab: &mut TabState| {
-        tab.attach_provider(provider.clone(), target.clone());
+        tab.attach_provider_with_identifier(
+            provider.clone(),
+            "memflowprocessmemory",
+            target.clone(),
+        );
     });
     make_text_result(&format!("Attached memflow process: {name}"), false)
+}
+
+#[cfg(feature = "process-provider")]
+fn tool_source_switch_process(
+    idx: usize,
+    args: &Map<String, Value>,
+    host: &mut dyn McpHost,
+) -> Value {
+    use crate::provider::LocalProcessProvider;
+
+    let raw = parse_integer(arg(args, "pid"), -1);
+    if raw <= 0 || raw > u32::MAX as i64 {
+        return make_text_result("pid must be a positive u32", true);
+    }
+    let pid = raw as u32;
+    let process_name = arg_str(args, "processName");
+    let target = if process_name.is_empty() {
+        pid.to_string()
+    } else {
+        format!("{pid}:{process_name}")
+    };
+    let provider = match LocalProcessProvider::attach(&target) {
+        Ok(provider) => provider,
+        Err(err) => return make_text_result(&format!("process attach failed: {err}"), true),
+    };
+    let name = provider.name();
+    let provider = Arc::new(provider);
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        tab.attach_provider_with_identifier(provider.clone(), "processmemory", target.clone());
+    });
+    make_text_result(&format!("Attached process: {name}"), false)
+}
+
+#[cfg(feature = "remote-process-provider")]
+fn tool_source_switch_remote(
+    idx: usize,
+    args: &Map<String, Value>,
+    host: &mut dyn McpHost,
+) -> Value {
+    use crate::provider::RemoteProcessProvider;
+
+    let raw = parse_integer(arg(args, "pid"), -1);
+    if raw <= 0 || raw > u32::MAX as i64 {
+        return make_text_result("pid must be a positive u32", true);
+    }
+    let pid = raw as u32;
+    let process_name = arg_str(args, "processName");
+    if process_name.is_empty() {
+        return make_text_result("remoteprocessmemory requires processName", true);
+    }
+    let target = format!("rpm:{pid}:{process_name}");
+    let provider = match RemoteProcessProvider::attach(&target) {
+        Ok(provider) => provider,
+        Err(err) => return make_text_result(&format!("remote attach failed: {err}"), true),
+    };
+    let name = provider.name();
+    let provider = Arc::new(provider);
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        tab.attach_provider_with_identifier(
+            provider.clone(),
+            "remoteprocessmemory",
+            target.clone(),
+        );
+    });
+    make_text_result(&format!("Attached remote process: {name}"), false)
+}
+
+#[cfg(all(windows, feature = "kernel-provider"))]
+fn tool_source_switch_kernel(
+    idx: usize,
+    args: &Map<String, Value>,
+    host: &mut dyn McpHost,
+) -> Value {
+    use crate::provider::KernelMemoryProvider;
+
+    let target = if args.contains_key("target") {
+        arg_str(args, "target")
+    } else if args.contains_key("physicalBase") {
+        let base = parse_integer(arg(args, "physicalBase"), -1);
+        if base < 0 {
+            return make_text_result("physicalBase must be a non-negative integer", true);
+        }
+        format!("phys:{base:X}")
+    } else {
+        let raw = parse_integer(arg(args, "pid"), -1);
+        if raw <= 0 || raw > u32::MAX as i64 {
+            return make_text_result("kernelmemory requires pid, target, or physicalBase", true);
+        }
+        let pid = raw as u32;
+        let process_name = arg_str(args, "processName");
+        if process_name.is_empty() {
+            format!("km:{pid}:PID {pid}")
+        } else {
+            format!("km:{pid}:{process_name}")
+        }
+    };
+    if target.trim().is_empty() {
+        return make_text_result("kernelmemory target cannot be empty", true);
+    }
+    let provider = match KernelMemoryProvider::attach(&target) {
+        Ok(provider) => provider,
+        Err(err) => return make_text_result(&format!("kernel attach failed: {err}"), true),
+    };
+    let name = provider.name();
+    let provider = Arc::new(provider);
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        tab.attach_provider_with_identifier(provider.clone(), "kernelmemory", target.clone());
+    });
+    make_text_result(&format!("Attached kernel source: {name}"), false)
+}
+
+#[cfg(all(windows, feature = "windbg-provider"))]
+fn tool_source_switch_windbg(
+    idx: usize,
+    args: &Map<String, Value>,
+    host: &mut dyn McpHost,
+) -> Value {
+    use crate::provider::WinDbgMemoryProvider;
+
+    let target = if args.contains_key("target") {
+        arg_str(args, "target")
+    } else {
+        let raw = parse_integer(arg(args, "pid"), -1);
+        if raw <= 0 || raw > u32::MAX as i64 {
+            return make_text_result("windbgmemory requires target or pid", true);
+        }
+        format!("pid:{raw}")
+    };
+    if target.trim().is_empty() {
+        return make_text_result("windbgmemory target cannot be empty", true);
+    }
+    let provider = match WinDbgMemoryProvider::attach(&target) {
+        Ok(provider) => provider,
+        Err(err) => return make_text_result(&format!("WinDbg attach failed: {err}"), true),
+    };
+    let name = provider.name();
+    let provider = Arc::new(provider);
+    host.with_tab(idx, &mut |tab: &mut TabState| {
+        tab.attach_provider_with_identifier(provider.clone(), "windbgmemory", target.clone());
+    });
+    make_text_result(&format!("Attached WinDbg source: {name}"), false)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -3505,19 +3698,25 @@ mod tests {
     fn source_switch_file_and_pid_stub() {
         let mut h = TestHost::new();
         h.project_new();
-        // bare pid → explicit memflow config required
+        // bare pid routes to the local process provider when compiled in; in
+        // feature sets without it, the tool reports the explicit provider choices.
         let r = tool_source_switch(&map(json!({"pid": 1234})), &mut h);
+        #[cfg(feature = "process-provider")]
         assert_eq!(r["isError"], json!(true));
-        assert!(r["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("provider:\"memflow\""));
+        #[cfg(not(feature = "process-provider"))]
+        {
+            assert_eq!(r["isError"], json!(true));
+            assert!(r["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("provider:\"processmemory\""));
+        }
         // no args → error
         let r = tool_source_switch(&map(json!({})), &mut h);
         assert_eq!(r["isError"], json!(true));
         assert_eq!(
             r["content"][0]["text"],
-            "Provide sourceIndex, filePath, or provider:\"memflow\""
+            "Provide sourceIndex, filePath, provider:\"processmemory\", provider:\"kernelmemory\", provider:\"windbgmemory\", or provider:\"memflow\""
         );
     }
 

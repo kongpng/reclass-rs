@@ -242,13 +242,22 @@ impl super::MainWindow {
         .detach();
     }
 
-    /// File ▸ Data Source ▸ Process Memory — attach through the memflow-backed
-    /// live provider.
+    /// File ▸ Data Source ▸ Process Memory — attach through the local OS provider.
     pub(super) fn open_process_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "process-provider")]
+        self.open_provider_process_picker("processmemory", window, cx);
+        #[cfg(all(not(feature = "process-provider"), feature = "memflow-provider"))]
         self.open_memflow_attach_dialog(window, cx);
+        #[cfg(all(not(feature = "process-provider"), not(feature = "memflow-provider")))]
+        self.open_process_picker(window, cx);
     }
 
-    fn open_memflow_attach_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    #[cfg(feature = "memflow-provider")]
+    pub(super) fn open_memflow_attach_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
         else {
             return;
@@ -269,7 +278,7 @@ impl super::MainWindow {
                     };
                     let provider = match this
                         .plugin_manager
-                        .create_provider("processmemory", &target)
+                        .create_provider("memflowprocessmemory", &target)
                     {
                         Ok(provider) => provider,
                         Err(err) => {
@@ -280,7 +289,12 @@ impl super::MainWindow {
                     let display = provider.name();
                     editor.update(cx, |ed, cx| {
                         ed.controller_mut()
-                            .attach_provider_with_target(provider, true, target);
+                            .attach_provider_with_identifier_and_target(
+                                provider,
+                                "memflowprocessmemory",
+                                true,
+                                target,
+                            );
                         ed.apply_document(cx);
                     });
                     let source = crate::ui::state::DataSource::new(
@@ -301,22 +315,45 @@ impl super::MainWindow {
 
     /// File ▸ Data Source ▸ Process Memory — open the legacy process picker (the
     /// C++ `ProcessPicker` reached from `selectSource("process")`). Live process
-    /// attach is handled first-party by the sibling memflow path
-    /// (`open_process_source` → `open_memflow_attach_dialog`); this older picker
-    /// is a non-attaching fallback that surfaces registry rows and records the
-    /// selection as the document's logical source.
+    /// attach is handled first-party by the sibling memflow path when
+    /// `memflow-provider` is enabled; this older picker is a non-attaching fallback
+    /// that surfaces registry rows and records the selection as the document's
+    /// logical source.
     #[allow(dead_code)]
     pub(super) fn open_process_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_provider_process_picker("processmemory", window, cx);
+    }
+
+    pub(super) fn open_provider_process_picker(
+        &mut self,
+        provider_identifier: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use crate::ui::pickers::processpicker::{
             ProcessPickEvent, ProcessPicker, ProcessPickerModel,
         };
-        // Build the picker's available-source rows from the SESSION-OWNED plugin
-        // manager's registry (the in-tree File/Buffer/Snapshot/Null providers
-        // registered through the contract) — the single source the rest of the app
-        // reads, so an enable/disable in Manage-Plugins is reflected here within the
-        // session (design §6 Phase 1 / §7.A [fix] / §H). Byte-identical output to the
-        // old throwaway `with_builtins()` when no plugin has been toggled.
-        let model = ProcessPickerModel::from_registry(self.plugin_manager.registry());
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
+            return;
+        };
+        let Some(spec) = self.plugin_manager.provider_spec(provider_identifier) else {
+            self.notify(
+                format!("No provider registered as {provider_identifier}."),
+                window,
+                cx,
+            );
+            return;
+        };
+        let Some(processes) = spec.enumerate_processes() else {
+            self.notify(
+                format!("{provider_identifier} does not provide a process list."),
+                window,
+                cx,
+            );
+            return;
+        };
+        let model = ProcessPickerModel::from_processes(processes, provider_identifier);
         // Remember which process the user last attached to (the C++
         // `lastAttachedProcess` QSettings key; processpicker.cpp:386-403). The
         // picker READS this to pre-select the matching row by name in
@@ -332,24 +369,35 @@ impl super::MainWindow {
         self.goto_sub = Some(cx.subscribe_in(
             &picker,
             window,
-            |this, _p, ev: &ProcessPickEvent, window, cx| match ev {
-                ProcessPickEvent::Attach { name, pid, .. } => {
+            move |this, _p, ev: &ProcessPickEvent, window, cx| match ev {
+                ProcessPickEvent::Attach {
+                    identifier,
+                    name,
+                    pid,
+                    ..
+                } => {
                     window.close_dialog(cx);
-                    // Remember this process for next time (the C++ persists
-                    // `lastAttachedProcess` on a successful attach; read back by
-                    // `selectPreferredProcess`). Persisted via the disk store.
-                    this.settings
-                        .borrow_mut()
-                        .set(settings_keys::LAST_ATTACHED_PROCESS, name);
-                    // This legacy picker does not attach (live attach is the
-                    // memflow path); record the pick as the document's logical
-                    // source so the tab reflects it.
-                    let source = crate::ui::state::DataSource::new(
-                        crate::ui::state::SourceKind::Process,
-                        format!("{name} (pid {pid})"),
-                    );
-                    this.set_active_source(source, window, cx);
-                    this.notify(format!("Selected process {name} (pid {pid})"), window, cx);
+                    let target = match identifier.as_str() {
+                        "remoteprocessmemory" => format!("rpm:{pid}:{name}"),
+                        "kernelmemory" => format!("km:{pid}:{name}"),
+                        _ => format!("{pid}:{name}"),
+                    };
+                    #[cfg(feature = "remote-process-provider")]
+                    if identifier == "remoteprocessmemory" {
+                        window.close_dialog(cx);
+                        this.open_remote_connect_choice(
+                            editor.clone(),
+                            identifier.to_string(),
+                            target,
+                            *pid,
+                            name.to_string(),
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    window.close_dialog(cx);
+                    this.attach_provider_target(&editor, identifier.as_str(), target, window, cx);
                 }
                 ProcessPickEvent::Cancel => window.close_dialog(cx),
             },
@@ -357,12 +405,135 @@ impl super::MainWindow {
         self.present_modal(&picker, 720., 80., None, window, cx);
     }
 
-    /// File ▸ Data Source ▸ {Remote / WinDbg / ReClass.NET} — these legacy native
-    /// sources are not yet ported (the live *process* source is first-party via
-    /// memflow). The C++ shows a blocking warning when a source can't attach;
-    /// mirror that with the themed modal message box (not a transient toast). (No
-    /// Kernel Memory case: the C++ Data Source menu has no such row — see
-    /// `report_unavailable_source`'s callers / `menu_tree_with`.)
+    fn attach_provider_target(
+        &mut self,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
+        identifier: &str,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = match self.plugin_manager.create_provider(identifier, &target) {
+            Ok(provider) => provider,
+            Err(err) => {
+                self.notify(format!("Attach failed: {err}"), window, cx);
+                return;
+            }
+        };
+        let display = provider.name();
+        editor.update(cx, |ed, cx| {
+            ed.controller_mut()
+                .attach_provider_with_identifier_and_target(provider, identifier, true, target);
+            ed.apply_document(cx);
+        });
+        self.settings
+            .borrow_mut()
+            .set(settings_keys::LAST_ATTACHED_PROCESS, display.as_str());
+        let source = crate::ui::state::DataSource::new(
+            crate::ui::state::SourceKind::Process,
+            display.clone(),
+        );
+        self.set_active_source(source, window, cx);
+        self.notify(format!("Attached {display}"), window, cx);
+    }
+
+    #[cfg(feature = "remote-process-provider")]
+    fn open_remote_connect_choice(
+        &mut self,
+        editor: Entity<crate::ui::editor::RcxEditor>,
+        identifier: String,
+        target: String,
+        pid: u32,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = cx.new(|cx| RemoteConnectDialog::new(name.clone(), pid, cx));
+        let focus = dialog.read(cx).focus_handle(cx);
+        self.goto_sub = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            move |this, _d, choice: &RemoteConnectChoice, window, cx| match choice {
+                RemoteConnectChoice::Cancel => window.close_dialog(cx),
+                RemoteConnectChoice::AlreadyInjected => {
+                    window.close_dialog(cx);
+                    this.attach_provider_target(&editor, &identifier, target.clone(), window, cx);
+                }
+                RemoteConnectChoice::InjectPayload => {
+                    window.close_dialog(cx);
+                    if let Err(err) = crate::provider::RemoteProcessProvider::inject_payload(pid) {
+                        this.notify(format!("Injection failed: {err}"), window, cx);
+                        return;
+                    }
+                    this.attach_provider_target(&editor, &identifier, target.clone(), window, cx);
+                }
+            },
+        ));
+        self.present_modal(&dialog, 460., 100., Some(&focus), window, cx);
+    }
+
+    /// File ▸ Data Source ▸ WinDbg Memory — collect the C++ plugin target string
+    /// and attach through the provider registry (`tcp:...`, `npipe:...`,
+    /// `pid:<id>`, or `dump:<path>`).
+    #[cfg(all(windows, feature = "windbg-provider"))]
+    pub(super) fn open_windbg_attach_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
+            return;
+        };
+        let this = cx.entity().downgrade();
+        self.open_text_prompt(
+            "WinDbg Memory",
+            "Target",
+            "tcp:Port=5055,Server=localhost",
+            window,
+            cx,
+            move |target, window, app| {
+                let target = target.trim().to_string();
+                if target.is_empty() {
+                    return;
+                }
+                let _ = this.update(app, |me, cx| {
+                    let provider = match me.plugin_manager.create_provider("windbgmemory", &target)
+                    {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            me.notify(format!("WinDbg attach failed: {err}"), window, cx);
+                            return;
+                        }
+                    };
+                    let display = provider.name();
+                    editor.update(cx, |ed, cx| {
+                        ed.controller_mut()
+                            .attach_provider_with_identifier_and_target(
+                                provider,
+                                "windbgmemory",
+                                true,
+                                target,
+                            );
+                        ed.apply_document(cx);
+                    });
+                    let source = crate::ui::state::DataSource::new(
+                        crate::ui::state::SourceKind::Process,
+                        display.clone(),
+                    );
+                    me.set_active_source(source, window, cx);
+                    me.settings
+                        .borrow_mut()
+                        .set(settings_keys::LAST_ATTACHED_PROCESS, display.as_str());
+                    me.notify(format!("Attached {display}"), window, cx);
+                });
+            },
+        );
+    }
+
+    /// File ▸ Data Source ▸ unavailable provider — surface a modal warning when a
+    /// platform-specific provider was compiled out or the ReClass.NET compat layer
+    /// is unavailable on this platform.
     pub(super) fn report_unavailable_source(
         &mut self,
         cmd: &str,
@@ -371,6 +542,7 @@ impl super::MainWindow {
     ) {
         let label = match cmd {
             "source.remote" => "Remote Process Memory",
+            "source.kernel" => "Kernel Memory",
             "source.windbg" => "WinDbg Memory",
             "source.rcnet" => "ReClass.NET Compat",
             _ => "This data source",
@@ -378,8 +550,8 @@ impl super::MainWindow {
         let spec = crate::ui::dialogs::messagebox::warn(
             "Source Unavailable",
             &format!(
-                "{label} is not available in this port. Open a project with a saved \
-                 source, or attach a binary File instead."
+                "{label} is not available in this build or on this operating system. \
+                 Open a project with a saved source, or attach another data source."
             ),
         );
         crate::ui::dialogs::messagebox::open_message(spec, window, cx);

@@ -4,12 +4,12 @@
 //! Port of `SourceChooserPopup`: a popover of two-line cards (saved sources +
 //! provider actions + section headers + a clear action) with a fuzzy filter over
 //! a composed searchable string, liveness/stale tracking, and an accept rule that
-//! ignores the already-active source. The file / buffer / snapshot / null and the
-//! memflow live-process providers are real; only the legacy native sources
-//! (kernel / remote / WinDbg / ReClass.NET) remain stubs. The popup UI references
-//! provider identifiers only. Per the cookbook (ARCHITECTURE §5) it maps onto a `Popover`
-//! + a `List` with a custom `render_item`. This ports the pure model + filter
-//! (unit-tested) + a popover view.
+//! ignores the already-active source. The file / buffer / snapshot / null providers
+//! are always real; the feature/platform-enabled live providers register through
+//! the same provider list.
+//! The popup UI references provider identifiers only. Per the cookbook
+//! (ARCHITECTURE §5) it maps onto a `Popover` + a `List` with a custom
+//! `render_item`. This ports the pure model + filter (unit-tested) + a popover view.
 //!
 //! Filter uses the recursive [`source_score`](crate::ui::fuzzy::source_score) (the
 //! C++ source chooser's own scorer); the searchable string is
@@ -384,6 +384,7 @@ pub fn kind_label_for(identifier: &str) -> &'static str {
         "null" => "Null",
         "kernelmemory" => "Kernel",
         "processmemory" => "Process",
+        "memflowprocessmemory" => "Memflow",
         "remoteprocessmemory" => "Remote",
         "windbgmemory" => "WinDbg",
         "reclass.netcompatlayer" | "rcnetcompat" => "Compat",
@@ -412,57 +413,14 @@ pub fn provider_entries_from_registry(
 }
 
 /// The default source families the picker shows when no live registry is threaded
-/// through (the visible memory-source plugin list, PIC4). Built by seeding a
-/// registry with the canonical descriptors and rendering it through the shared
-/// [`provider_entries_from_registry`] path, so the menu and the inline popup share
-/// one code path even before the host wires its real `PluginManager` registry in
-/// (design §7.A [fix]). The legacy native source families (kernel / remote /
-/// WinDbg / ReClass.NET) remain stubs in this port — live process is first-party
-/// via memflow — but they are still listed (with their dll hint) for parity with
-/// the C++ menu.
+/// through. It is derived from registered built-ins only; platform-specific
+/// providers appear only when they are actually registered.
 pub fn provider_entries() -> Vec<SourceEntry> {
+    let builtins = crate::plugin::PluginManager::with_builtins();
     let mut reg = crate::provider::ProviderRegistry::new();
-    // "File" has no plugin dll hint in the screenshot.
-    reg.register_builtin("File", "file");
-    let mk = |reg: &mut crate::provider::ProviderRegistry, name: &str, id: &str, dll: &str| {
-        reg.register_provider(crate::provider::ProviderInfo {
-            name: name.to_string(),
-            identifier: id.to_string(),
-            is_builtin: false,
-            dll_file_name: dll.to_string(),
-            enabled: true,
-        });
-    };
-    mk(
-        &mut reg,
-        "Kernel Memory",
-        "kernelmemory",
-        "libKernelMemoryPlugin.dll",
-    );
-    mk(
-        &mut reg,
-        "Process Memory",
-        "processmemory",
-        "libProcessMemoryPlugin.dll",
-    );
-    mk(
-        &mut reg,
-        "ReClass.NET Compat Layer",
-        "rcnetcompat",
-        "libRcNetCompatPlugin.dll",
-    );
-    mk(
-        &mut reg,
-        "Remote Process Memory",
-        "remoteprocessmemory",
-        "libRemoteProcessMemoryPlugin.dll",
-    );
-    mk(
-        &mut reg,
-        "WinDbg Memory",
-        "windbgmemory",
-        "libWinDbgMemoryPlugin.dll",
-    );
+    for info in builtins.registry().providers().iter().cloned() {
+        reg.register_provider(info);
+    }
     provider_entries_from_registry(&reg)
 }
 
@@ -1070,6 +1028,26 @@ mod tests {
         provider_entries_from_registry, SourceEntryKind,
     };
 
+    fn builtin_provider_names() -> Vec<&'static str> {
+        let mut names = vec!["File"];
+        #[cfg(feature = "process-provider")]
+        names.push("Process Memory");
+        #[cfg(feature = "remote-process-provider")]
+        names.push("Remote Process Memory");
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        names.push("Kernel Memory");
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        names.push("WinDbg Memory");
+        #[cfg(feature = "memflow-provider")]
+        names.push("Memflow Process Memory");
+        names.extend(["Buffer", "Snapshot", "Null"]);
+        names
+    }
+
+    fn provider_entries_pic4_names() -> Vec<&'static str> {
+        builtin_provider_names()
+    }
+
     #[test]
     fn footer_status_echoes_query_on_no_matches() {
         // Empty filtered result echoes the typed query, matching the C++ footer
@@ -1095,7 +1073,7 @@ mod tests {
         let mgr = crate::plugin::PluginManager::with_builtins();
         let entries = provider_entries_from_registry(mgr.registry());
         let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
-        assert_eq!(names, vec!["File", "Buffer", "Snapshot", "Null"]);
+        assert_eq!(names, builtin_provider_names());
         // All are provider actions with a kind label and the derived identifier.
         assert!(entries
             .iter()
@@ -1111,13 +1089,16 @@ mod tests {
         mgr.registry_mut().set_enabled("buffer", false);
         let entries = provider_entries_from_registry(mgr.registry());
         let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
-        assert_eq!(names, vec!["File", "Snapshot", "Null"]);
+        let mut expected = builtin_provider_names();
+        expected.retain(|name| *name != "Buffer");
+        assert_eq!(names, expected);
     }
 
     #[test]
     fn kind_label_for_is_centralized_and_consistent() {
         // The single label table both surfaces share (design §7.A [fix]).
         assert_eq!(kind_label_for("processmemory"), "Process");
+        assert_eq!(kind_label_for("memflowprocessmemory"), "Memflow");
         assert_eq!(kind_label_for("reclass.netcompatlayer"), "Compat");
         assert_eq!(kind_label_for("kernelmemory"), "Kernel");
         assert_eq!(kind_label_for("unknownthing"), "Source");
@@ -1127,25 +1108,42 @@ mod tests {
     fn provider_entries_match_pic4_list() {
         let ps = provider_entries();
         let names: Vec<&str> = ps.iter().map(|e| e.display_name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "File",
-                "Kernel Memory",
-                "Process Memory",
-                "ReClass.NET Compat Layer",
-                "Remote Process Memory",
-                "WinDbg Memory",
-            ]
-        );
-        // The plugins carry their dll filename hint; "File" does not.
-        let kernel = ps
-            .iter()
-            .find(|e| e.display_name == "Kernel Memory")
-            .unwrap();
-        assert_eq!(kernel.dll_file_name, "libKernelMemoryPlugin.dll");
+        assert_eq!(names, provider_entries_pic4_names());
+        // First-party built-ins do not carry a legacy DLL filename hint.
         let file = ps.iter().find(|e| e.display_name == "File").unwrap();
         assert!(file.dll_file_name.is_empty());
+        #[cfg(feature = "process-provider")]
+        {
+            let process = ps
+                .iter()
+                .find(|e| e.display_name == "Process Memory")
+                .unwrap();
+            assert!(process.dll_file_name.is_empty());
+        }
+        #[cfg(feature = "memflow-provider")]
+        {
+            let process = ps
+                .iter()
+                .find(|e| e.display_name == "Memflow Process Memory")
+                .unwrap();
+            assert!(process.dll_file_name.is_empty());
+        }
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        {
+            let process = ps
+                .iter()
+                .find(|e| e.display_name == "Kernel Memory")
+                .unwrap();
+            assert!(process.dll_file_name.is_empty());
+        }
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        {
+            let process = ps
+                .iter()
+                .find(|e| e.display_name == "WinDbg Memory")
+                .unwrap();
+            assert!(process.dll_file_name.is_empty());
+        }
         // All providers are provider actions.
         assert!(ps
             .iter()

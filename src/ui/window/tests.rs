@@ -20,6 +20,29 @@ fn temp_settings_path() -> std::path::PathBuf {
     p
 }
 
+fn builtin_ids() -> Vec<&'static str> {
+    let mut ids = vec!["file"];
+    #[cfg(feature = "process-provider")]
+    ids.push("processmemory");
+    #[cfg(feature = "remote-process-provider")]
+    ids.push("remoteprocessmemory");
+    #[cfg(all(windows, feature = "kernel-provider"))]
+    ids.push("kernelmemory");
+    #[cfg(all(windows, feature = "windbg-provider"))]
+    ids.push("windbgmemory");
+    #[cfg(feature = "memflow-provider")]
+    ids.push("memflowprocessmemory");
+    ids.extend(["buffer", "snapshot", "null"]);
+    ids
+}
+
+fn builtin_enabled_without_null() -> Vec<&'static str> {
+    builtin_ids()
+        .into_iter()
+        .filter(|id| *id != "null")
+        .collect()
+}
+
 #[test]
 fn disk_settings_round_trips_scalars_lists_and_bools_across_reopen() {
     let path = temp_settings_path();
@@ -287,7 +310,7 @@ fn session_manager_at(path: &std::path::Path) -> PluginManager {
 
 #[test]
 fn session_manager_parity_with_empty_settings() {
-    // PARITY: a fresh config dir → the registry is exactly the four
+    // PARITY: a fresh config dir → the registry is exactly the
     // Auto-enabled built-ins, identical order, all enabled — byte-identical to
     // the old throwaway `with_builtins()` the live sites used.
     let path = temp_settings_path();
@@ -298,13 +321,16 @@ fn session_manager_parity_with_empty_settings() {
         .iter()
         .map(|p| p.identifier.as_str())
         .collect();
-    assert_eq!(ids, ["file", "buffer", "snapshot", "null"]);
+    assert_eq!(ids, builtin_ids());
     assert!(mgr
         .registry()
         .providers()
         .iter()
         .all(|p| p.is_builtin && p.enabled));
-    assert_eq!(mgr.registry().enabled_providers().count(), 4);
+    assert_eq!(
+        mgr.registry().enabled_providers().count(),
+        builtin_ids().len()
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -327,7 +353,7 @@ fn disk_backed_enable_disable_reflected_in_view_registry_and_persisted() {
             .enabled_providers()
             .map(|p| p.identifier.as_str())
             .collect();
-        assert_eq!(enabled, ["file", "buffer", "snapshot"]);
+        assert_eq!(enabled, builtin_enabled_without_null());
     }
     // The flag landed in settings.json under the namespaced key.
     let s = DiskSettings::open_at(path.clone());
@@ -337,7 +363,10 @@ fn disk_backed_enable_disable_reflected_in_view_registry_and_persisted() {
     // disabled built-in (the persistence round-trip end-to-end).
     let mgr2 = session_manager_at(&path);
     assert!(!mgr2.registry().find("null").unwrap().enabled);
-    assert_eq!(mgr2.registry().enabled_providers().count(), 3);
+    assert_eq!(
+        mgr2.registry().enabled_providers().count(),
+        builtin_ids().len() - 1
+    );
 
     // Re-enabling persists too, so a third session sees it back on.
     {
@@ -346,7 +375,10 @@ fn disk_backed_enable_disable_reflected_in_view_registry_and_persisted() {
     }
     let mgr4 = session_manager_at(&path);
     assert!(mgr4.registry().find("null").unwrap().enabled);
-    assert_eq!(mgr4.registry().enabled_providers().count(), 4);
+    assert_eq!(
+        mgr4.registry().enabled_providers().count(),
+        builtin_ids().len()
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -470,14 +502,14 @@ fn safe_unload_through_host_removes_row_and_keeps_builtins() {
     assert!(!after.iter().any(|i| i.identifier == id));
     assert!(mgr.registry().find(&id).is_none());
     // …and every built-in is still listed + still registered (parity).
-    for builtin in ["file", "buffer", "snapshot", "null"] {
+    for builtin in builtin_ids() {
         assert!(
             after.iter().any(|i| i.identifier == builtin),
             "built-in {builtin} survives the unload"
         );
         assert!(mgr.registry().find(builtin).is_some());
     }
-    assert_eq!(mgr.registry().providers().len(), 4);
+    assert_eq!(mgr.registry().providers().len(), builtin_ids().len());
     let _ = std::fs::remove_file(&path);
 }
 
@@ -773,7 +805,10 @@ fn relabel_command_flips_the_mcp_label() {
         }
         None
     }
+    #[cfg(feature = "mcp")]
     assert_eq!(find(&tree, "tools.mcp"), Some("Stop MCP Server"));
+    #[cfg(not(feature = "mcp"))]
+    assert_eq!(find(&tree, "tools.mcp"), None);
 }
 
 #[test]

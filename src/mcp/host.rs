@@ -193,9 +193,7 @@ impl TabState {
         self.undo.can_redo()
     }
 
-    /// `RcxDocument::loadData(path)` — load a binary file as a buffer provider
-    /// (the in-scope file source). Live process attach is handled in the tool
-    /// layer via the memflow `source.switch` path.
+    /// `RcxDocument::loadData(path)` — load a binary file as a buffer provider.
     pub fn load_data(&mut self, path: &str) {
         self.data.provider = Arc::new(BufferProvider::from_file(path));
         self.data.sources.push(SavedSource {
@@ -213,10 +211,20 @@ impl TabState {
         provider: Arc<dyn Provider + Send + Sync>,
         provider_target: String,
     ) {
+        let identifier = provider.kind();
+        self.attach_provider_with_identifier(provider, identifier, provider_target);
+    }
+
+    pub fn attach_provider_with_identifier(
+        &mut self,
+        provider: Arc<dyn Provider + Send + Sync>,
+        provider_identifier: impl Into<String>,
+        provider_target: String,
+    ) {
         let base = provider.base();
         let pointer_size = provider.pointer_size();
         let display_name = provider.name();
-        let kind = provider.kind();
+        let kind = provider_identifier.into();
         self.data.provider = provider;
         self.data.tree.pointer_size = pointer_size;
         if (self.data.tree.base_address == 0 || self.data.tree.base_address == 0x0040_0000)

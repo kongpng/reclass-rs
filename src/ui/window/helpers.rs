@@ -50,7 +50,20 @@ impl super::MainWindow {
                         entry.file_path.clone()
                     };
                     return DataSource::new(SourceKind::File, path);
-                } else if entry.kind == "Process" || entry.kind == "processmemory" {
+                } else if matches!(
+                    entry.kind.as_str(),
+                    "Process"
+                        | "LocalProcess"
+                        | "RemoteProcess"
+                        | "KernelProcess"
+                        | "Physical"
+                        | "WinDbg"
+                        | "processmemory"
+                        | "remoteprocessmemory"
+                        | "kernelmemory"
+                        | "windbgmemory"
+                        | "memflowprocessmemory"
+                ) {
                     return DataSource::new(SourceKind::Process, entry.display_name.clone());
                 } else if entry.kind == "Buffer" {
                     return DataSource::new(SourceKind::Buffer, entry.display_name.clone());

@@ -226,6 +226,7 @@ pub fn is_string_kind(k: NodeKind) -> bool {
 /// unless `kind` is itself one — string (UTF8/UTF16) and vector (Vec2/3/4) kinds.
 /// A dynamic/0-byte kind, or a kind with no same-size peers, returns just `[kind]`.
 /// Single source of the filter shared by the editor cycler and the status bar.
+#[cfg(feature = "ui")]
 pub(crate) fn same_size_variants(kind: NodeKind) -> Vec<NodeKind> {
     let size = size_for_kind(kind);
     if size <= 0 {

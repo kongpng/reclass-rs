@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::plugin::contract::ProcessInfo;
 use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
 
 use memflow::cglue::CTup3;
@@ -108,13 +109,20 @@ pub struct MemflowInventoryInfo {
     pub warnings: Vec<String>,
 }
 
-/// Process row returned by memflow process enumeration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MemflowProcessInfo {
-    pub pid: u32,
-    pub name: String,
-    pub path: String,
-    pub is_32bit: bool,
+pub fn default_plugin_dir() -> Option<String> {
+    let path = if cfg!(unix) {
+        directories::BaseDirs::new()?
+            .home_dir()
+            .join(".local")
+            .join("lib")
+            .join("memflow")
+    } else {
+        directories::UserDirs::new()?
+            .document_dir()?
+            .join("memflow")
+    };
+    let _ = std::fs::create_dir_all(&path);
+    Some(path.display().to_string())
 }
 
 pub fn inventory_info(extra_dirs: &[String]) -> MemflowInventoryInfo {
@@ -195,13 +203,13 @@ fn process_info_by_config(
 
 pub fn enumerate_processes(
     cfg: &MemflowAttachConfig,
-) -> std::result::Result<Vec<MemflowProcessInfo>, String> {
+) -> std::result::Result<Vec<ProcessInfo>, String> {
     let mut os = build_os(cfg)?;
-    let mut rows: Vec<MemflowProcessInfo> = os
+    let mut rows: Vec<ProcessInfo> = os
         .process_info_list()
         .map_err(|err| format!("enumerate memflow processes: {err}"))?
         .into_iter()
-        .map(|info| MemflowProcessInfo {
+        .map(|info| ProcessInfo {
             pid: info.pid,
             name: info.name.as_ref().to_string(),
             path: info.path.as_ref().to_string(),

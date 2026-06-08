@@ -30,6 +30,7 @@ impl super::MainWindow {
     ///
     /// The C++ `showRttiBrowser` always walks with `ptrSize = 8` (the `walkRtti`
     /// default arg); mirror that with `max(tree.pointer_size, 8)`.
+    #[cfg(feature = "symbols")]
     pub(super) fn open_rtti_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::rtti::browser::{
             resolve_field_vtable, resolve_rtti, RttiBrowserDialog, RttiBrowserEvent,
@@ -85,6 +86,11 @@ impl super::MainWindow {
             },
         ));
         self.present_modal(&dlg, 720., 80., Some(&focus), window, cx);
+    }
+
+    #[cfg(not(feature = "symbols"))]
+    pub(super) fn open_rtti_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.notify("RTTI Browser requires the symbols feature.", window, cx);
     }
 
     /// Tools ▸ Performance Profiler (Ctrl+Shift+F) — open the live

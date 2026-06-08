@@ -6,24 +6,41 @@
 //!
 //! **In scope (implemented):** [`BufferProvider`] (in-memory + file via
 //! `from_file`), [`FileProvider`] (mmap'd binary file), [`NullProvider`],
-//! [`SnapshotProvider`], and [`memflow`] for live process sources through
-//! memflow's dynamic connector/OS plugins. The legacy process / kernel / remote
-//! / WinDbg native-plugin seam remains documented in [`native`] as stubs.
+//! [`SnapshotProvider`], first-party live providers behind `native-providers`,
+//! and the connector-backed memflow provider.
 
 mod buffer;
 mod file;
+#[cfg(feature = "kernel-provider")]
+mod kernel;
+#[cfg(feature = "memflow-provider")]
 pub mod memflow;
 pub mod native;
 mod null;
+#[cfg(feature = "process-provider")]
+mod process;
 mod registry;
+#[cfg(feature = "remote-process-provider")]
+mod remote;
 mod snapshot;
+#[cfg(feature = "windbg-provider")]
+mod windbg;
 
 pub use buffer::BufferProvider;
 pub use file::FileProvider;
+#[cfg(feature = "kernel-provider")]
+pub use kernel::{KernelMemoryProvider, KernelTarget};
+#[cfg(feature = "memflow-provider")]
 pub use memflow::{MemflowAttachConfig, MemflowProvider};
 pub use null::NullProvider;
+#[cfg(feature = "process-provider")]
+pub use process::{LocalProcessProvider, ProcessTarget};
 pub use registry::{ProviderInfo, ProviderRegistry, SavedSourceDisplay};
+#[cfg(feature = "remote-process-provider")]
+pub use remote::{RemoteProcessProvider, RemoteProcessTarget};
 pub use snapshot::{PageMap, SnapshotProvider, K_PAGE_SIZE};
+#[cfg(feature = "windbg-provider")]
+pub use windbg::WinDbgMemoryProvider;
 
 /// `enum class RegionType : uint8_t` (`provider.h:13-17`).
 #[repr(u8)]
@@ -64,8 +81,8 @@ impl Default for MemoryRegion {
     }
 }
 
-/// `struct VtopResult` (`provider.h:31-37`) — virtual→physical translation
-/// (kernel providers only; out of scope but the shape is part of the trait).
+/// `struct VtopResult` (`provider.h:31-37`) — virtual→physical translation for
+/// providers that expose kernel paging metadata.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct VtopResult {
     pub physical: u64,
@@ -163,7 +180,7 @@ pub trait Provider {
         Vec::new()
     }
 
-    // --- Kernel paging (override in kernel providers; out of scope) ---
+    // --- Kernel paging (override in kernel providers) ---
     fn has_kernel_paging(&self) -> bool {
         false
     }

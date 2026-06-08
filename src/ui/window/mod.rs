@@ -42,8 +42,8 @@ use crate::ui::dialogs::plugin_manager::{
 };
 
 use crate::ui::dialogs::window_dialogs::{
-    ConfirmChoice, RcxConfirmDialog, RcxUnsavedDialog, TextPromptDialog, TextPromptEvent,
-    TypeAliasesDialog, TypeAliasesEvent,
+    ConfirmChoice, RcxConfirmDialog, RcxUnsavedDialog, RemoteConnectChoice, RemoteConnectDialog,
+    TextPromptDialog, TextPromptEvent, TypeAliasesDialog, TypeAliasesEvent,
 };
 
 use crate::theme::{SettingsStore, ThemeManager};
@@ -431,7 +431,7 @@ impl MainWindow {
         );
         // Developer affordance for the F3 declarative-UI host (design §6 Phase 2):
         // gate the in-tree demo plugin behind `RECLASS_DEMO_PLUGIN`. UNSET (the
-        // default shipping build) leaves the manager at EXACTLY the four built-in
+        // default shipping build) leaves the manager at EXACTLY the built-in
         // providers — no plugin contributes UI, so the Plugins menu, docks, and
         // modals are byte-for-byte identical to before (the HARD PARITY guarantee).
         // SET (=anything) adds the demo, which contributes the two menu commands, a
@@ -448,7 +448,7 @@ impl MainWindow {
         // add_plugin). Failures are retained in load_errors() for the dialog (§7.A
         // [fix]). default_plugin_dirs() filters to EXISTING dirs, so an absent/empty
         // plugins dir = no attempts, load_errors empty, registry unchanged — byte
-        // parity. The default build (no `plugins`) does NOT compile this: no scan.
+        // parity. Builds without `plugins` do NOT compile this: no scan.
         #[cfg(feature = "plugins")]
         {
             let failures = plugin_manager.load_native_plugins_from_default_dirs();
@@ -770,7 +770,7 @@ impl MainWindow {
             // The editor starts unsplit (single pane); `view.split` appends panes.
             split_panes: Vec::new(),
             // Plugin panels are mounted just below (after the window is built so the
-            // mount can subscribe to `self`). Empty in the default build.
+            // mount can subscribe to `self`). Empty until a plugin contributes UI.
             plugin_panels: Vec::new(),
             plugin_panel_subs: Vec::new(),
         };
@@ -815,8 +815,8 @@ impl MainWindow {
         // Seed the docks for the initial (empty) document.
         win.refresh_docks_for_active(cx);
         // Mount any enabled plugin-contributed dock panels (design §6 Phase 2). A
-        // no-op in the default build (the four providers contribute no `Panel`), so
-        // the dock layout is byte-identical; with a contributing plugin (the demo,
+        // no-op when only provider plugins are loaded, so the dock layout is
+        // byte-identical; with a contributing plugin (the demo,
         // gated above) it adds a tab into the existing right dock, which stays
         // CLOSED until summoned — no behavior change on launch.
         win.mount_plugin_panels(window, cx);
@@ -1066,9 +1066,11 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_add_bookmark))
             .on_action(cx.listener(Self::on_quick_bookmark))
             .on_action(cx.listener(Self::on_shortcuts))
-            // Tools accelerators (RTTI Browser / Performance Profiler) — advertised
-            // in the menu but previously unbound.
-            .on_action(cx.listener(Self::on_rtti))
+            // Tools accelerators: RTTI exists only with `symbols`; Profiler is
+            // always present in UI builds.
+            .when(cfg!(feature = "symbols"), |el| {
+                el.on_action(cx.listener(Self::on_rtti))
+            })
             .on_action(cx.listener(Self::on_profiler))
             // Alt+letter menu-bar mnemonics → toggle the matching top-level menu.
             .on_action(
@@ -1448,16 +1450,19 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // Both shortcuts were dead labels until now. Each routes to its MENU CONTRACT
     // command via the action handler, so keyboard + menu + palette stay in
     // lockstep. The Ctrl (Win/Linux) and Cmd (mac) forms are both bound. ──
-    bindings.push(KeyBinding::new(
-        "ctrl-shift-r",
-        RttiAction,
-        Some("RcxWindow"),
-    ));
-    bindings.push(KeyBinding::new(
-        "cmd-shift-r",
-        RttiAction,
-        Some("RcxWindow"),
-    ));
+    #[cfg(feature = "symbols")]
+    {
+        bindings.push(KeyBinding::new(
+            "ctrl-shift-r",
+            RttiAction,
+            Some("RcxWindow"),
+        ));
+        bindings.push(KeyBinding::new(
+            "cmd-shift-r",
+            RttiAction,
+            Some("RcxWindow"),
+        ));
+    }
     bindings.push(KeyBinding::new(
         "ctrl-shift-f",
         ProfilerAction,

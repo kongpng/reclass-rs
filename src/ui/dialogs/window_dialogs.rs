@@ -253,6 +253,115 @@ impl Render for RcxConfirmDialog {
     }
 }
 
+/// The Remote Process Memory connect choice (`Inject Payload` /
+/// `Already Injected` / `Cancel`) shown after selecting a process.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RemoteConnectChoice {
+    InjectPayload,
+    AlreadyInjected,
+    Cancel,
+}
+
+pub(crate) struct RemoteConnectDialog {
+    process_name: String,
+    pid: u32,
+    focus_handle: FocusHandle,
+}
+
+impl RemoteConnectDialog {
+    pub(crate) fn new(process_name: String, pid: u32, cx: &mut Context<Self>) -> Self {
+        Self {
+            process_name,
+            pid,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn choose(&mut self, choice: RemoteConnectChoice, cx: &mut Context<Self>) {
+        cx.emit(choice);
+    }
+}
+
+impl Focusable for RemoteConnectDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<RemoteConnectChoice> for RemoteConnectDialog {}
+
+impl Render for RemoteConnectDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::ui::dialogs::modal;
+        use gpui_component::button::{Button, ButtonVariants as _};
+
+        let card_w = modal::clamp_width(460., window);
+        let body = modal::body(cx)
+            .child(
+                div()
+                    .text_size(px(crate::ui::design::tokens::font::UI_MD))
+                    .text_color(crate::ui::design::color::text(cx))
+                    .child(format!(
+                        "Connect to {} (PID {})",
+                        self.process_name, self.pid
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(crate::ui::design::tokens::font::UI_SM))
+                    .text_color(crate::ui::design::color::text_muted(cx))
+                    .child("Choose how to connect to the target:"),
+            );
+
+        let footer =
+            modal::footer(cx)
+                .child(
+                    Button::new("remote-connect-cancel")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.choose(RemoteConnectChoice::Cancel, cx)
+                        })),
+                )
+                .child(
+                    Button::new("remote-connect-existing")
+                        .label("Already Injected")
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.choose(RemoteConnectChoice::AlreadyInjected, cx)
+                        })),
+                )
+                .child(
+                    Button::new("remote-connect-inject")
+                        .primary()
+                        .label("Inject Payload")
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.choose(RemoteConnectChoice::InjectPayload, cx)
+                        })),
+                );
+
+        modal::card(cx)
+            .id("rcx-remote-connect-dialog")
+            .track_focus(&self.focus_handle)
+            .key_context("RcxRemoteConnect")
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "enter" => {
+                        this.choose(RemoteConnectChoice::InjectPayload, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        this.choose(RemoteConnectChoice::Cancel, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .w(card_w)
+            .child(modal::header("Remote Process Memory", cx))
+            .child(body)
+            .child(footer)
+    }
+}
+
 /// The outcome of the [`TextPromptDialog`] (the C++ `QInputDialog` accept/reject).
 #[derive(Clone, Debug)]
 pub(crate) enum TextPromptEvent {

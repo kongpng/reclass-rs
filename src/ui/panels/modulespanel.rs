@@ -213,16 +213,17 @@ mod view {
     use gpui::*;
     use gpui_component::dock::{Panel, PanelEvent};
 
-    use super::{
-        build_module_rows, build_symbol_rows, pdb_type_kind, ModuleRow, ModulesTab, SymbolRow,
-        TypeRow,
-    };
+    use super::{build_module_rows, ModuleRow, ModulesTab, SymbolRow, TypeRow};
+    #[cfg(feature = "symbols")]
+    use super::{build_symbol_rows, pdb_type_kind};
     use crate::provider::Provider;
+    #[cfg(feature = "symbols")]
     use crate::rtti::SymbolStore;
     use crate::ui::design::{color, icon, tokens};
 
     /// The max symbol rows the Symbols tab lists (a full ntdll PDB has tens of
     /// thousands; cap so the non-virtualized list stays responsive).
+    #[cfg(feature = "symbols")]
     const SYMBOL_ROW_CAP: usize = 2000;
 
     /// An intent the modules panel raises for the window to resolve onto the
@@ -292,71 +293,93 @@ mod view {
         /// Each row carries a symbol-loaded indicator computed from the global
         /// [`SymbolStore`] (the C++ "✓ N syms" badge).
         fn rows(&self) -> Vec<ModuleRow> {
-            let mut rows = match &self.provider {
+            let rows = match &self.provider {
                 Some(p) => build_module_rows(&p.enumerate_modules()),
                 None => Vec::new(),
             };
-            if let Ok(store) = SymbolStore::global().lock() {
-                for r in &mut rows {
-                    if let Some(set) = store.module_data(&r.name) {
-                        r.symbol_count = set.name_to_rva.len();
+            #[cfg(feature = "symbols")]
+            {
+                let mut rows = rows;
+                if let Ok(store) = SymbolStore::global().lock() {
+                    for r in &mut rows {
+                        if let Some(set) = store.module_data(&r.name) {
+                            r.symbol_count = set.name_to_rva.len();
+                        }
                     }
                 }
+                rows
             }
-            rows
+            #[cfg(not(feature = "symbols"))]
+            {
+                rows
+            }
         }
 
         /// The resolved-symbol rows for the Symbols tab — every `(name, rva)` of
         /// every loaded module in the global [`SymbolStore`] (the C++ Symbols
         /// tab). Empty until a module's PDB is loaded.
         fn symbol_rows(&self) -> Vec<SymbolRow> {
-            let store = match SymbolStore::global().lock() {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let sets: Vec<(String, Vec<(String, u32)>)> = store
-                .loaded_modules()
-                .into_iter()
-                .filter_map(|m| {
-                    store.module_data(&m).map(|set| {
-                        let syms: Vec<(String, u32)> = set
-                            .name_to_rva
-                            .iter()
-                            .map(|(n, rva)| (n.clone(), *rva))
-                            .collect();
-                        (m, syms)
+            #[cfg(not(feature = "symbols"))]
+            {
+                return Vec::new();
+            }
+            #[cfg(feature = "symbols")]
+            {
+                let store = match SymbolStore::global().lock() {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                let sets: Vec<(String, Vec<(String, u32)>)> = store
+                    .loaded_modules()
+                    .into_iter()
+                    .filter_map(|m| {
+                        store.module_data(&m).map(|set| {
+                            let syms: Vec<(String, u32)> = set
+                                .name_to_rva
+                                .iter()
+                                .map(|(n, rva)| (n.clone(), *rva))
+                                .collect();
+                            (m, syms)
+                        })
                     })
-                })
-                .collect();
-            build_symbol_rows(&sets, SYMBOL_ROW_CAP)
+                    .collect();
+                build_symbol_rows(&sets, SYMBOL_ROW_CAP)
+            }
         }
 
         /// The imported-PDB-type rows for the Types tab — every TPI type of every
         /// loaded module in the global [`SymbolStore`] (the C++ Types tab).
         fn type_rows(&self) -> Vec<TypeRow> {
-            let store = match SymbolStore::global().lock() {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let mut rows: Vec<TypeRow> = Vec::new();
-            for m in store.loaded_modules() {
-                if let Some(set) = store.module_data(&m) {
-                    for t in &set.types {
-                        rows.push(TypeRow {
-                            module: m.clone(),
-                            name: t.name.clone(),
-                            kind: pdb_type_kind(t.is_enum, t.is_union),
-                            size_text: if t.size == 0 {
-                                String::new()
-                            } else {
-                                format!("0x{:X}", t.size)
-                            },
-                        });
+            #[cfg(not(feature = "symbols"))]
+            {
+                return Vec::new();
+            }
+            #[cfg(feature = "symbols")]
+            {
+                let store = match SymbolStore::global().lock() {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                let mut rows: Vec<TypeRow> = Vec::new();
+                for m in store.loaded_modules() {
+                    if let Some(set) = store.module_data(&m) {
+                        for t in &set.types {
+                            rows.push(TypeRow {
+                                module: m.clone(),
+                                name: t.name.clone(),
+                                kind: pdb_type_kind(t.is_enum, t.is_union),
+                                size_text: if t.size == 0 {
+                                    String::new()
+                                } else {
+                                    format!("0x{:X}", t.size)
+                                },
+                            });
+                        }
                     }
                 }
+                rows.sort_by(|a, b| a.module.cmp(&b.module).then(a.name.cmp(&b.name)));
+                rows
             }
-            rows.sort_by(|a, b| a.module.cmp(&b.module).then(a.name.cmp(&b.name)));
-            rows
         }
     }
 

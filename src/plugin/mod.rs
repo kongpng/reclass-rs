@@ -7,7 +7,7 @@
 //! **light**: std + `serde_json` (already core) + the existing
 //! [`Provider`](crate::provider::Provider) trait — *no heavy deps*. The
 //! stable-ABI machinery (`abi_stable`/`libloading`) is **Phase 3** and gates
-//! behind a future `plugins` cargo feature, so default builds are unaffected.
+//! behind the `plugins` cargo feature, so lean builds are unaffected.
 //!
 //! ## Map to the design + the C++ reference
 //!
@@ -40,8 +40,9 @@
 //! ## Phase 1 scope
 //!
 //! - Plain Rust types throughout (no `abi_stable` — design §2/§3 defer it).
-//! - The built-ins (File/Buffer/Snapshot/Null) flow through the same contract a
-//!   native plugin will, registering into the existing
+//! - The built-ins (File/Buffer/Snapshot/Null, plus Process Memory with
+//!   `memflow-provider`) flow through the same contract a native plugin will,
+//!   registering into the existing
 //!   [`ProviderRegistry`](crate::provider::ProviderRegistry) — design §7.A [fix]
 //!   gives both source-picker surfaces one shared list and one identifier helper.
 //! - Observable behavior is unchanged: the controller still attaches a buffered
@@ -57,8 +58,6 @@ pub mod provider_spec;
 pub mod view;
 
 // ── Phase 3: the native stable-ABI dynamic loader (design §6 Phase 3) ──
-// Gated behind the `plugins` feature so default builds pull no `abi_stable`/
-// `libloading`/SDK deps (the feature is wired in Cargo.toml; design §2/§6).
 #[cfg(feature = "plugins")]
 pub mod discovery;
 #[cfg(feature = "plugins")]
@@ -67,7 +66,6 @@ pub mod loader;
 // ── Phase 4: the ReClass.NET native compat subsystem (design §6 Phase 4) ──
 // A CORE host subsystem (not a wrapped plugin) that bridges ReClass.NET's native
 // CoreFunctions ABI into our `Provider`; the folder scan sniffs + routes here.
-// Same `plugins` feature gate (it reuses `libloading`); default builds unaffected.
 #[cfg(feature = "plugins")]
 pub mod reclassnet;
 
@@ -88,25 +86,41 @@ pub use manifest::{
 pub use provider_spec::{ProviderSpec, SharedProvider};
 pub use view::{TreeNode, UiEvent, ViewTree};
 
+/// Native dynamic-library extension for the current compilation target.
+///
+/// Use the standard target constants instead of hand-written `cfg!(target_os)`
+/// branches so tests and plugin discovery use the same platform naming rules as
+/// Rust itself (`dll` / `so` / `dylib`).
+#[cfg(feature = "plugins")]
+pub(crate) fn platform_lib_extension() -> &'static str {
+    std::env::consts::DLL_EXTENSION
+}
+
+/// Native dynamic-library filename prefix for the current target (`lib` on Unix,
+/// empty on Windows).
+#[cfg(all(test, feature = "plugins"))]
+pub(crate) fn platform_lib_prefix() -> &'static str {
+    std::env::consts::DLL_PREFIX
+}
+
+/// Native dynamic-library filename for a Cargo crate name or raw stem.
+#[cfg(all(test, feature = "plugins"))]
+pub(crate) fn platform_lib_filename(stem: &str) -> String {
+    format!(
+        "{}{}.{}",
+        platform_lib_prefix(),
+        stem.replace('-', "_"),
+        platform_lib_extension()
+    )
+}
+
 /// Locate a built example-plugin cdylib under the cargo target dir(s). Returns
 /// `None` if it hasn't been built (so a load test skips rather than fails in
 /// an environment where the example wasn't compiled). Shared by the loader /
 /// manager / discovery test modules.
-#[cfg(test)]
+#[cfg(all(test, feature = "plugins"))]
 pub(crate) fn example_plugin_path(crate_name: &str) -> Option<std::path::PathBuf> {
-    let ext = if cfg!(target_os = "windows") {
-        "dll"
-    } else if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    };
-    let lib_prefix = if cfg!(target_os = "windows") {
-        ""
-    } else {
-        "lib"
-    };
-    let file = format!("{lib_prefix}{}.{ext}", crate_name.replace('-', "_"));
+    let file = platform_lib_filename(crate_name);
 
     // CARGO_MANIFEST_DIR is the repo root (the `reclass` package).
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -121,6 +135,14 @@ pub(crate) fn example_plugin_path(crate_name: &str) -> Option<std::path::PathBuf
 mod tests {
     use super::*;
 
+    fn builtin_provider_count() -> usize {
+        4 + usize::from(cfg!(feature = "process-provider"))
+            + usize::from(cfg!(feature = "remote-process-provider"))
+            + usize::from(cfg!(all(windows, feature = "kernel-provider")))
+            + usize::from(cfg!(all(windows, feature = "windbg-provider")))
+            + usize::from(cfg!(feature = "memflow-provider"))
+    }
+
     /// The end-to-end Phase-1 vertical slice: build the manager with built-ins,
     /// confirm the registry the source picker reads is populated through the
     /// contract, and that an identifier round-trips to a real provider.
@@ -130,8 +152,18 @@ mod tests {
 
         // The registry the source surfaces consume is the real one.
         let reg = mgr.registry();
-        assert_eq!(reg.enabled_providers().count(), 4);
+        assert_eq!(reg.enabled_providers().count(), builtin_provider_count());
         assert!(reg.find("file").is_some());
+        #[cfg(feature = "process-provider")]
+        assert!(reg.find("processmemory").is_some());
+        #[cfg(feature = "remote-process-provider")]
+        assert!(reg.find("remoteprocessmemory").is_some());
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        assert!(reg.find("kernelmemory").is_some());
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        assert!(reg.find("windbgmemory").is_some());
+        #[cfg(feature = "memflow-provider")]
+        assert!(reg.find("memflowprocessmemory").is_some());
 
         // The centralized identifier helper agrees with the manifest path.
         assert_eq!(derive_identifier("File"), "file");
@@ -144,7 +176,7 @@ mod tests {
     /// The Phase-2 slice: the in-tree demo plugin contributes exactly one
     /// `Command`-pair, one `Panel`, and one `Dialog`, and its views enumerate
     /// for the declarative renderer (design §6 Phase 2 deliverable). Adding it
-    /// does NOT change the four-provider Phase-1 registry (parity).
+    /// does NOT change the Phase-1 registry (parity).
     #[test]
     fn phase2_demo_plugin_contributes_command_panel_dialog() {
         let demo = DemoPlugin::new();
@@ -170,10 +202,13 @@ mod tests {
         let views = Contribution::view_ids(&contribs);
         assert_eq!(views, [demo::PANEL_ID, demo::DIALOG_ID]);
 
-        // Parity: with_builtins is still the four-provider set; the demo plugin
+        // Parity: with_builtins is still the built-in provider set; the demo plugin
         // is additive and contributes no provider.
         let mgr = PluginManager::with_builtins_and_demo();
-        assert_eq!(mgr.registry().enabled_providers().count(), 4);
+        assert_eq!(
+            mgr.registry().enabled_providers().count(),
+            builtin_provider_count()
+        );
         assert!(mgr.find_plugin("file").is_some());
     }
 }

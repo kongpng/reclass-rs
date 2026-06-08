@@ -4610,11 +4610,26 @@ impl RcxController {
 
     /// `switchToSavedSource(idx)` (`controller.cpp:6210`).
     pub fn switch_to_saved_source(&mut self, idx: i32) {
+        let _ = self.switch_to_saved_source_with_provider_factory(idx, |identifier, _target| {
+            Err(format!(
+                "provider source '{identifier}' cannot be reattached without a provider factory"
+            ))
+        });
+    }
+
+    /// `switchToSavedSource(idx)` with provider recreation support. The UI passes
+    /// the session [`PluginManager`](crate::plugin::PluginManager) factory here so
+    /// saved live sources can be reattached by `(provider id, target)`.
+    pub fn switch_to_saved_source_with_provider_factory(
+        &mut self,
+        idx: i32,
+        mut create_provider: impl FnMut(&str, &str) -> Result<Arc<dyn Provider + Send + Sync>, String>,
+    ) -> Result<(), String> {
         if idx < 0 || idx as usize >= self.saved_sources.len() {
-            return;
+            return Ok(());
         }
         if idx == self.active_source_idx {
-            return;
+            return Ok(());
         }
         // Save current source's base into its slot.
         if self.active_source_idx >= 0
@@ -4641,11 +4656,19 @@ impl RcxController {
                 self.doc.tree.base_address_formula = entry.base_address_formula.clone();
                 self.refresh();
             }
+        } else if !entry.provider_target.is_empty() {
+            let provider = create_provider(&entry.kind, &entry.provider_target)?;
+            self.undo.clear();
+            self.doc.provider = provider;
+            self.doc.data_path = None;
+            self.doc.tree.pointer_size = self.doc.provider.pointer_size();
+            self.doc.tree.base_address = entry.base_address;
+            self.doc.tree.base_address_formula = entry.base_address_formula.clone();
+            self.reset_snapshot();
+            self.refresh();
         }
-        // Non-File kinds (buffer / snapshot / live memflow process) are not
-        // re-materialized by a saved-source switch — their original attach would
-        // have to be re-invoked.
         self.on_document_changed();
+        Ok(())
     }
 
     /// Attach a binary data file as the active source, mirroring C++
@@ -4699,11 +4722,30 @@ impl RcxController {
         register_as_saved: bool,
         provider_target: String,
     ) {
+        let provider_identifier = provider.kind();
+        self.attach_provider_with_identifier_and_target(
+            provider,
+            provider_identifier,
+            register_as_saved,
+            provider_target,
+        );
+    }
+
+    /// Same attach bookkeeping, but records the provider registry identifier in
+    /// the saved-source entry. C++ saves the provider id (`processmemory`,
+    /// `remoteprocessmemory`, …), not the display kind (`Process` / `Remote`).
+    pub fn attach_provider_with_identifier_and_target(
+        &mut self,
+        provider: Arc<dyn Provider + Send + Sync>,
+        provider_identifier: impl Into<String>,
+        register_as_saved: bool,
+        provider_target: String,
+    ) {
         self.undo.clear();
         let new_base = provider.base();
         let pointer_size = provider.pointer_size();
         let name = provider.name();
-        let kind = provider.kind();
+        let kind = provider_identifier.into();
         self.doc.provider = provider;
         self.doc.data_path = None;
         self.doc.tree.pointer_size = pointer_size;

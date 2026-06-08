@@ -330,16 +330,31 @@ impl super::RcxEditor {
         if bytes.is_empty() {
             return None;
         }
-        let (title, mut body) = if is_fp {
-            (
-                "Disassembly".to_string(),
-                crate::disasm::disassemble(&bytes, ptr_val, if is64 { 64 } else { 32 }, MAX_READ),
-            )
-        } else {
-            (
-                "Hex Dump".to_string(),
-                crate::disasm::hex_dump(&bytes, ptr_val, MAX_READ),
-            )
+        let (title, mut body): (String, String) = {
+            #[cfg(not(feature = "disasm"))]
+            {
+                let _ = is_fp;
+                (String::new(), String::new())
+            }
+            #[cfg(feature = "disasm")]
+            {
+                if is_fp {
+                    (
+                        "Disassembly".to_string(),
+                        crate::disasm::disassemble(
+                            &bytes,
+                            ptr_val,
+                            if is64 { 64 } else { 32 },
+                            MAX_READ,
+                        ),
+                    )
+                } else {
+                    (
+                        "Hex Dump".to_string(),
+                        crate::disasm::hex_dump(&bytes, ptr_val, MAX_READ),
+                    )
+                }
+            }
         };
         // Cap at 6 lines so the popup stays compact (the C++ kMaxLines).
         const MAX_LINES: usize = 6;

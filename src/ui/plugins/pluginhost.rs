@@ -64,17 +64,20 @@ pub const SETTING_PREFIX: &str = "plugin.setting.";
 /// carries **no** provider-identifier string, so the live detach maps the
 /// identifier through the built-in id→kind correspondence. The built-in
 /// identifiers are the derived names of the in-tree providers (`derive_identifier`
-/// of "File"/"Buffer"/"Snapshot"). `null` attaches nothing (the placeholder
-/// provider), so it has no kind. A third-party native provider whose identifier
-/// is none of these maps to `None` — the live detach then closes nothing, which
-/// is correct today because live plugin-provider *attach* is intended-deferred
-/// (providers are stubs), so no document is ever pointed at one. The mechanism is
-/// real and testable against [`DocumentArea`] directly.
+/// of "File"/"Buffer"/"Snapshot"/the live process-family providers). `null`
+/// attaches nothing (the placeholder provider), so it has no kind. A third-party
+/// provider whose identifier is none of these maps to `None`; built-ins map to
+/// the same source kind the tab chrome uses.
 pub fn source_kind_for_provider(identifier: &str) -> Option<SourceKind> {
     match identifier {
         "file" => Some(SourceKind::File),
         "buffer" => Some(SourceKind::Buffer),
         "snapshot" => Some(SourceKind::Snapshot),
+        "processmemory"
+        | "remoteprocessmemory"
+        | "kernelmemory"
+        | "windbgmemory"
+        | "memflowprocessmemory" => Some(SourceKind::Process),
         _ => None,
     }
 }
@@ -278,9 +281,8 @@ mod tests {
     #[test]
     fn source_kind_maps_builtin_identifiers() {
         // The built-in provider identifiers map to their source kinds; null maps
-        // to nothing (it attaches no real source), and an unknown native plugin
-        // identifier maps to None (the live detach then closes nothing — correct
-        // while plugin-provider attach is intended-deferred).
+        // to nothing (it attaches no real source), and an unknown plugin
+        // identifier maps to None.
         assert_eq!(source_kind_for_provider("file"), Some(SourceKind::File));
         assert_eq!(source_kind_for_provider("buffer"), Some(SourceKind::Buffer));
         assert_eq!(
@@ -288,7 +290,22 @@ mod tests {
             Some(SourceKind::Snapshot)
         );
         assert_eq!(source_kind_for_provider("null"), None);
-        assert_eq!(source_kind_for_provider("remoteprocessmemory"), None);
+        assert_eq!(
+            source_kind_for_provider("remoteprocessmemory"),
+            Some(SourceKind::Process)
+        );
+        assert_eq!(
+            source_kind_for_provider("kernelmemory"),
+            Some(SourceKind::Process)
+        );
+        assert_eq!(
+            source_kind_for_provider("windbgmemory"),
+            Some(SourceKind::Process)
+        );
+        assert_eq!(
+            source_kind_for_provider("memflowprocessmemory"),
+            Some(SourceKind::Process)
+        );
         assert_eq!(source_kind_for_provider(""), None);
     }
 

@@ -1,9 +1,11 @@
-//! The in-tree built-in provider plugins (design §6 Phase 1: "Reimplement
-//! File/Buffer/Snapshot/Null as in-tree plugins").
+//! The in-tree built-in provider plugins: File, Process Memory, Remote Process
+//! Memory, Buffer, Snapshot, Null, plus memflow as a separate connector-backed
+//! provider when `memflow-provider` is enabled.
 //!
 //! Each is a tiny [`Plugin`] whose only contribution is a
-//! [`Contribution::Provider`] wrapping the existing benign provider
-//! ([`FileProvider`]/[`BufferProvider`]/[`SnapshotProvider`]/[`NullProvider`]).
+//! [`Contribution::Provider`] wrapping an in-tree provider
+//! ([`FileProvider`]/[`BufferProvider`]/[`SnapshotProvider`]/[`NullProvider`],
+//! first-party live providers, plus [`MemflowProvider`](crate::provider::MemflowProvider)).
 //! This is the **bootstrap loader** of design §2 ("In-tree is the bootstrap — zero
 //! ABI risk, proves the contract"): the built-ins flow through the same contract a
 //! native plugin will, so [`PluginManager`](crate::plugin::manager::PluginManager)
@@ -16,13 +18,22 @@
 
 use std::sync::Arc;
 
+#[cfg(all(windows, feature = "kernel-provider"))]
+use crate::plugin::contract::{CommandResult, CommandSlot};
 use crate::plugin::contract::{Contribution, Plugin};
 use crate::plugin::manifest::{Permission, PluginManifest};
 use crate::plugin::provider_spec::{ProviderSpec, SharedProvider};
-use crate::provider::{
-    BufferProvider, FileProvider, MemflowAttachConfig, MemflowProvider, NullProvider,
-    SnapshotProvider,
-};
+#[cfg(all(windows, feature = "kernel-provider"))]
+use crate::provider::KernelMemoryProvider;
+#[cfg(feature = "process-provider")]
+use crate::provider::LocalProcessProvider;
+#[cfg(feature = "remote-process-provider")]
+use crate::provider::RemoteProcessProvider;
+#[cfg(all(windows, feature = "windbg-provider"))]
+use crate::provider::WinDbgMemoryProvider;
+use crate::provider::{BufferProvider, FileProvider, NullProvider, SnapshotProvider};
+#[cfg(feature = "memflow-provider")]
+use crate::provider::{MemflowAttachConfig, MemflowProvider};
 
 /// The "File" source (cpp_reference §3 — the only built-in the C++ surfaced).
 /// `can_handle` accepts any non-empty path; `create_provider` mmaps it via
@@ -163,17 +174,196 @@ impl Plugin for NullPlugin {
     }
 }
 
-/// The memflow-backed "Process Memory" source. The target is a JSON-encoded
+/// The local OS "Process Memory" source.
+#[cfg(feature = "process-provider")]
+pub struct ProcessMemoryPlugin {
+    manifest: PluginManifest,
+}
+
+#[cfg(feature = "process-provider")]
+impl Default for ProcessMemoryPlugin {
+    fn default() -> Self {
+        ProcessMemoryPlugin {
+            manifest: PluginManifest::builtin(
+                "Process Memory",
+                "Reads and writes a local live process through the current OS APIs.",
+                vec![
+                    Permission::ReadMemory,
+                    Permission::WriteMemory,
+                    Permission::AddProvider,
+                ],
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "process-provider")]
+impl Plugin for ProcessMemoryPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn contributions(&self) -> Vec<Contribution> {
+        vec![Contribution::Provider(
+            ProviderSpec::new(LocalProcessProvider::can_handle, |target| {
+                Ok(Arc::new(LocalProcessProvider::attach(target)?) as SharedProvider)
+            })
+            .with_enumerate(|| Some(LocalProcessProvider::enumerate_processes())),
+        )]
+    }
+}
+
+/// The remote payload-backed "Remote Process Memory" source.
+#[cfg(feature = "remote-process-provider")]
+pub struct RemoteProcessMemoryPlugin {
+    manifest: PluginManifest,
+}
+
+#[cfg(feature = "remote-process-provider")]
+impl Default for RemoteProcessMemoryPlugin {
+    fn default() -> Self {
+        let _ = rcx_payload::artifact_dependency_marker as fn();
+        RemoteProcessMemoryPlugin {
+            manifest: PluginManifest::builtin(
+                "Remote Process Memory",
+                "Reads and writes a live process through an injected rcx_payload.",
+                vec![
+                    Permission::ReadMemory,
+                    Permission::WriteMemory,
+                    Permission::AddProvider,
+                ],
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "remote-process-provider")]
+impl Plugin for RemoteProcessMemoryPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn contributions(&self) -> Vec<Contribution> {
+        let spec = ProviderSpec::new(RemoteProcessProvider::can_handle, |target| {
+            Ok(Arc::new(RemoteProcessProvider::attach(target)?) as SharedProvider)
+        });
+        #[cfg(feature = "process-provider")]
+        let spec = spec.with_enumerate(|| Some(LocalProcessProvider::enumerate_processes()));
+        vec![Contribution::Provider(spec)]
+    }
+}
+
+/// The Windows rcxdrv.sys-backed "Kernel Memory" source.
+#[cfg(all(windows, feature = "kernel-provider"))]
+pub struct KernelMemoryPlugin {
+    manifest: PluginManifest,
+}
+
+#[cfg(all(windows, feature = "kernel-provider"))]
+impl Default for KernelMemoryPlugin {
+    fn default() -> Self {
+        KernelMemoryPlugin {
+            manifest: PluginManifest::builtin(
+                "Kernel Memory",
+                "Reads and writes process or physical memory through rcxdrv.sys.",
+                vec![
+                    Permission::ReadMemory,
+                    Permission::WriteMemory,
+                    Permission::AddProvider,
+                ],
+            ),
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "kernel-provider"))]
+impl Plugin for KernelMemoryPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn contributions(&self) -> Vec<Contribution> {
+        vec![
+            Contribution::Provider(
+                ProviderSpec::new(KernelMemoryProvider::can_handle, |target| {
+                    Ok(Arc::new(KernelMemoryProvider::attach(target)?) as SharedProvider)
+                })
+                .with_enumerate(|| Some(KernelMemoryProvider::enumerate_processes())),
+            ),
+            Contribution::Command {
+                id: "kernel.unload_driver".to_string(),
+                title: "Unload Kernel Driver".to_string(),
+                slot: CommandSlot::SourceMenu,
+            },
+        ]
+    }
+
+    fn handle_command(
+        &mut self,
+        id: &str,
+        _args: serde_json::Value,
+        _host: &mut dyn crate::plugin::host::PluginHost,
+    ) -> CommandResult {
+        if id != "kernel.unload_driver" {
+            return CommandResult::default();
+        }
+        match KernelMemoryProvider::unload_driver_service() {
+            Ok(()) => CommandResult::toast("Kernel driver unloaded"),
+            Err(err) => CommandResult::toast(err),
+        }
+    }
+}
+
+/// The Windows DbgEng-backed "WinDbg Memory" source.
+#[cfg(all(windows, feature = "windbg-provider"))]
+pub struct WinDbgMemoryPlugin {
+    manifest: PluginManifest,
+}
+
+#[cfg(all(windows, feature = "windbg-provider"))]
+impl Default for WinDbgMemoryPlugin {
+    fn default() -> Self {
+        WinDbgMemoryPlugin {
+            manifest: PluginManifest::builtin(
+                "WinDbg Memory",
+                "Reads memory through DbgEng from a debug server, live process, or dump file.",
+                vec![
+                    Permission::ReadMemory,
+                    Permission::WriteMemory,
+                    Permission::AddProvider,
+                ],
+            ),
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "windbg-provider"))]
+impl Plugin for WinDbgMemoryPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn contributions(&self) -> Vec<Contribution> {
+        vec![Contribution::Provider(ProviderSpec::new(
+            WinDbgMemoryProvider::can_handle,
+            |target| Ok(Arc::new(WinDbgMemoryProvider::attach(target)?) as SharedProvider),
+        ))]
+    }
+}
+
+/// The memflow-backed "Memflow Process Memory" source. The target is a JSON-encoded
 /// [`MemflowAttachConfig`] so the UI and MCP can share one provider factory.
+#[cfg(feature = "memflow-provider")]
 pub struct MemflowProcessPlugin {
     manifest: PluginManifest,
 }
 
+#[cfg(feature = "memflow-provider")]
 impl Default for MemflowProcessPlugin {
     fn default() -> Self {
         MemflowProcessPlugin {
             manifest: PluginManifest::builtin(
-                "Process Memory",
+                "Memflow Process Memory",
                 "Reads a live process through memflow connector and OS plugins.",
                 vec![Permission::AddProvider],
             ),
@@ -181,6 +371,7 @@ impl Default for MemflowProcessPlugin {
     }
 }
 
+#[cfg(feature = "memflow-provider")]
 impl Plugin for MemflowProcessPlugin {
     fn manifest(&self) -> &PluginManifest {
         &self.manifest
@@ -199,16 +390,24 @@ impl Plugin for MemflowProcessPlugin {
 }
 
 /// The in-tree built-in plugins, in the C++ registration order the Manage
-/// Plugins dialog lists. `Process Memory` is inserted after `File`, matching the
-/// data-source menu's user-facing order.
+/// Plugins dialog lists.
 pub fn builtin_plugins() -> Vec<Box<dyn Plugin>> {
-    vec![
-        Box::new(FilePlugin::default()),
-        Box::new(MemflowProcessPlugin::default()),
-        Box::new(BufferPlugin::default()),
-        Box::new(SnapshotPlugin::default()),
-        Box::new(NullPlugin::default()),
-    ]
+    let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
+    plugins.push(Box::new(FilePlugin::default()));
+    #[cfg(feature = "process-provider")]
+    plugins.push(Box::new(ProcessMemoryPlugin::default()));
+    #[cfg(feature = "remote-process-provider")]
+    plugins.push(Box::new(RemoteProcessMemoryPlugin::default()));
+    #[cfg(all(windows, feature = "kernel-provider"))]
+    plugins.push(Box::new(KernelMemoryPlugin::default()));
+    #[cfg(all(windows, feature = "windbg-provider"))]
+    plugins.push(Box::new(WinDbgMemoryPlugin::default()));
+    #[cfg(feature = "memflow-provider")]
+    plugins.push(Box::new(MemflowProcessPlugin::default()));
+    plugins.push(Box::new(BufferPlugin::default()));
+    plugins.push(Box::new(SnapshotPlugin::default()));
+    plugins.push(Box::new(NullPlugin::default()));
+    plugins
 }
 
 #[cfg(test)]
@@ -217,16 +416,29 @@ mod tests {
     use crate::plugin::contract::Contribution;
 
     fn provider_spec(p: &dyn Plugin) -> ProviderSpec {
-        let mut contribs = p.contributions();
-        assert_eq!(
-            contribs.len(),
-            1,
-            "built-ins contribute exactly one provider"
-        );
-        match contribs.remove(0) {
-            Contribution::Provider(spec) => spec,
-            _ => panic!("expected a Provider contribution"),
-        }
+        p.contributions()
+            .into_iter()
+            .find_map(|c| match c {
+                Contribution::Provider(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("built-in contributes a provider")
+    }
+
+    fn builtin_ids() -> Vec<&'static str> {
+        let mut ids = vec!["file"];
+        #[cfg(feature = "process-provider")]
+        ids.push("processmemory");
+        #[cfg(feature = "remote-process-provider")]
+        ids.push("remoteprocessmemory");
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        ids.push("kernelmemory");
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        ids.push("windbgmemory");
+        #[cfg(feature = "memflow-provider")]
+        ids.push("memflowprocessmemory");
+        ids.extend(["buffer", "snapshot", "null"]);
+        ids
     }
 
     #[test]
@@ -238,9 +450,30 @@ mod tests {
             "snapshot"
         );
         assert_eq!(NullPlugin::default().manifest().identifier(), "null");
+        #[cfg(feature = "process-provider")]
+        assert_eq!(
+            ProcessMemoryPlugin::default().manifest().identifier(),
+            "processmemory"
+        );
+        #[cfg(feature = "remote-process-provider")]
+        assert_eq!(
+            RemoteProcessMemoryPlugin::default().manifest().identifier(),
+            "remoteprocessmemory"
+        );
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        assert_eq!(
+            KernelMemoryPlugin::default().manifest().identifier(),
+            "kernelmemory"
+        );
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        assert_eq!(
+            WinDbgMemoryPlugin::default().manifest().identifier(),
+            "windbgmemory"
+        );
+        #[cfg(feature = "memflow-provider")]
         assert_eq!(
             MemflowProcessPlugin::default().manifest().identifier(),
-            "processmemory"
+            "memflowprocessmemory"
         );
     }
 
@@ -250,7 +483,7 @@ mod tests {
             .iter()
             .map(|p| p.manifest().identifier())
             .collect();
-        assert_eq!(ids, ["file", "processmemory", "buffer", "snapshot", "null"]);
+        assert_eq!(ids, builtin_ids());
     }
 
     #[test]

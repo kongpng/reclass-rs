@@ -275,23 +275,19 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
             .map(|(i, e)| N::item(&recent_menu_label(i, &e.label), "", &e.command))
             .collect()
     };
-    // Data Source children — the File source, then the registered built-in
-    // providers, then any saved sources (active one rendered checked via the
-    // host's checked-set), then Clear All (the C++ `populateSourceMenu` layout;
-    // main.cpp:8802 → `ProviderRegistry::populateSourceMenu`,
-    // providerregistry.cpp:63). The C++ provider set is exactly File + the
-    // registered providers (processmemory / remoteprocessmemory / windbgmemory /
-    // reclass.netcompatlayer — see `s_providerIcons`, providerregistry.cpp:66).
-    // There is NO "Kernel Memory" data-source row: `kernelmemory` is only a
-    // provider-tab id reached from the right-click Browse-Page-Tables path
-    // (controller.cpp:4029/4066), never emitted into the Data Source menu.
-    let mut source_children = vec![
-        N::item("File", "", "source.file"),
-        N::item("Process Memory", "", "source.process"),
-        N::item("Remote Process Memory", "", "source.remote"),
-        N::item("WinDbg Memory", "", "source.windbg"),
-        N::item("ReClass.NET Compat", "", "source.rcnet"),
-    ];
+    // Data Source children — File, feature-backed built-in providers, then saved
+    // sources and Clear All.
+    let mut source_children = vec![N::item("File", "", "source.file")];
+    #[cfg(feature = "process-provider")]
+    source_children.push(N::item("Process Memory", "", "source.process"));
+    #[cfg(feature = "remote-process-provider")]
+    source_children.push(N::item("Remote Process Memory", "", "source.remote"));
+    #[cfg(all(windows, feature = "kernel-provider"))]
+    source_children.push(N::item("Kernel Memory", "", "source.kernel"));
+    #[cfg(all(windows, feature = "windbg-provider"))]
+    source_children.push(N::item("WinDbg Memory", "", "source.windbg"));
+    #[cfg(feature = "memflow-provider")]
+    source_children.push(N::item("Memflow Process Memory", "", "source.memflow"));
     if !sources.is_empty() {
         source_children.push(N::Separator);
         for s in sources {
@@ -305,50 +301,66 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
         source_children.push(N::Separator);
         source_children.push(N::item("Clear All", "", "source.clear"));
     }
+    let export_children = vec![
+        N::item("C++ Header…", "", "file.export.cpp"),
+        N::item("Rust Structs…", "", "file.export.rust"),
+        N::item("#define Offsets…", "", "file.export.defines"),
+        N::item("C# Structs…", "", "file.export.csharp"),
+        N::item("Python ctypes…", "", "file.export.python"),
+        #[cfg(feature = "imports")]
+        N::item("ReClass XML…", "", "file.export.xml"),
+    ];
+
+    let mut file_children = vec![
+        N::item("New Class", "Ctrl+N", "file.new_class"),
+        N::item("New Struct", "Ctrl+T", "file.new_struct"),
+        N::item("New Enum", "Ctrl+E", "file.new_enum"),
+        N::item("Open…", "Ctrl+O", "file.open"),
+        // Dynamic — the host rebuilds the tree with the live recent list
+        // (or a disabled "(empty)" row) via `MenuBar::set_menus`.
+        N::submenu("Recent Files", recent_children),
+        N::Separator,
+        N::item("Save", "Ctrl+S", "file.save"),
+        // Save As is QKeySequence::SaveAs (Ctrl+Shift+S on Win/Linux).
+        N::item("Save As…", "Ctrl+Shift+S", "file.save_as"),
+        N::Separator,
+    ];
+    #[cfg(feature = "imports")]
+    file_children.push(N::submenu(
+        "Import",
+        vec![
+            N::item("From Source…", "", "file.import.source"),
+            N::item("ReClass XML…", "", "file.import.xml"),
+            N::item("PDB…", "", "file.import.pdb"),
+        ],
+    ));
+    file_children.extend([
+        N::submenu("Export", export_children),
+        N::submenu("Examples", example_menu_items()),
+        N::Separator,
+        N::item("Close Project", "Ctrl+W", "file.close"),
+        N::Separator,
+        N::submenu("Data Source", source_children),
+        N::Separator,
+        N::item("Exit", "", "file.exit"),
+    ]);
+
+    let mut tools_children = Vec::new();
+    #[cfg(feature = "symbols")]
+    tools_children.push(N::item("RTTI Browser", "Ctrl+Shift+R", "tools.rtti"));
+    tools_children.extend([
+        N::item("Type Aliases…", "", "tools.type_aliases"),
+        N::item("Performance Profiler…", "Ctrl+Shift+F", "tools.profiler"),
+    ]);
+    #[cfg(feature = "mcp")]
+    {
+        tools_children.push(N::Separator);
+        tools_children.push(N::item("Start MCP Server", "", "tools.mcp"));
+    }
+    tools_children.extend([N::Separator, N::item("Options…", "", "tools.options")]);
+
     vec![
-        N::submenu(
-            "&File",
-            vec![
-                N::item("New Class", "Ctrl+N", "file.new_class"),
-                N::item("New Struct", "Ctrl+T", "file.new_struct"),
-                N::item("New Enum", "Ctrl+E", "file.new_enum"),
-                N::item("Open…", "Ctrl+O", "file.open"),
-                // Dynamic — the host rebuilds the tree with the live recent list
-                // (or a disabled "(empty)" row) via `MenuBar::set_menus`.
-                N::submenu("Recent Files", recent_children),
-                N::Separator,
-                N::item("Save", "Ctrl+S", "file.save"),
-                // Save As is QKeySequence::SaveAs (Ctrl+Shift+S on Win/Linux).
-                N::item("Save As…", "Ctrl+Shift+S", "file.save_as"),
-                N::Separator,
-                N::submenu(
-                    "Import",
-                    vec![
-                        N::item("From Source…", "", "file.import.source"),
-                        N::item("ReClass XML…", "", "file.import.xml"),
-                        N::item("PDB…", "", "file.import.pdb"),
-                    ],
-                ),
-                N::submenu(
-                    "Export",
-                    vec![
-                        N::item("C++ Header…", "", "file.export.cpp"),
-                        N::item("Rust Structs…", "", "file.export.rust"),
-                        N::item("#define Offsets…", "", "file.export.defines"),
-                        N::item("C# Structs…", "", "file.export.csharp"),
-                        N::item("Python ctypes…", "", "file.export.python"),
-                        N::item("ReClass XML…", "", "file.export.xml"),
-                    ],
-                ),
-                N::submenu("Examples", example_menu_items()),
-                N::Separator,
-                N::item("Close Project", "Ctrl+W", "file.close"),
-                N::Separator,
-                N::submenu("Data Source", source_children),
-                N::Separator,
-                N::item("Exit", "", "file.exit"),
-            ],
-        ),
+        N::submenu("&File", file_children),
         N::submenu(
             "&Edit",
             vec![
@@ -414,23 +426,9 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
                 N::item("Presentation Mode", "", "view.presentation"),
             ],
         ),
-        // C++ Tools menu (main.cpp:1522-1572): RTTI Browser (Ctrl+Shift+R),
-        // Type Aliases…, Performance Profiler… (Ctrl+Shift+F), —— , Start/Stop
-        // MCP Server, —— , Options…. The previous tree invented a "Validate
-        // Project… Ctrl+Shift+V" item with no C++ counterpart (removed). The MCP
-        // label is dynamic (Start vs Stop); the live label is pushed by the host.
-        N::submenu(
-            "&Tools",
-            vec![
-                N::item("RTTI Browser", "Ctrl+Shift+R", "tools.rtti"),
-                N::item("Type Aliases…", "", "tools.type_aliases"),
-                N::item("Performance Profiler…", "Ctrl+Shift+F", "tools.profiler"),
-                N::Separator,
-                N::item("Start MCP Server", "", "tools.mcp"),
-                N::Separator,
-                N::item("Options…", "", "tools.options"),
-            ],
-        ),
+        // C++ Tools menu (main.cpp:1522-1572), filtered by cargo features: RTTI
+        // Browser needs `symbols`; Start/Stop MCP Server needs `mcp`.
+        N::submenu("&Tools", tools_children),
         N::submenu(
             "&Plugins",
             vec![N::item("Manage Plugins…", "", "plugins.manage")],
@@ -1072,14 +1070,24 @@ mod tests {
                 .find(|e| e.command == cmd)
                 .map(|e| e.path.clone())
         };
+        #[cfg(feature = "imports")]
         assert_eq!(
             path_of("file.import.source").as_deref(),
             Some("File > Import > From Source…")
         );
+        #[cfg(not(feature = "imports"))]
+        assert_eq!(path_of("file.import.source"), None);
         assert_eq!(
             path_of("file.export.cpp").as_deref(),
             Some("File > Export > C++ Header…")
         );
+        #[cfg(feature = "imports")]
+        assert_eq!(
+            path_of("file.export.xml").as_deref(),
+            Some("File > Export > ReClass XML…")
+        );
+        #[cfg(not(feature = "imports"))]
+        assert_eq!(path_of("file.export.xml"), None);
         assert_eq!(
             path_of("source.file").as_deref(),
             Some("File > Data Source > File")
@@ -1160,11 +1168,16 @@ mod tests {
         // are no longer dead). This pins the advertised label ⇄ command contract
         // the bindings route through.
         let entries = flatten_menu_bar(&default_menu_tree());
-        let rtti = entries
-            .iter()
-            .find(|e| e.command == "tools.rtti")
-            .expect("RTTI Browser entry present");
-        assert_eq!(rtti.shortcut, "Ctrl+Shift+R");
+        #[cfg(feature = "symbols")]
+        {
+            let rtti = entries
+                .iter()
+                .find(|e| e.command == "tools.rtti")
+                .expect("RTTI Browser entry present");
+            assert_eq!(rtti.shortcut, "Ctrl+Shift+R");
+        }
+        #[cfg(not(feature = "symbols"))]
+        assert!(!entries.iter().any(|e| e.command == "tools.rtti"));
         let profiler = entries
             .iter()
             .find(|e| e.command == "tools.profiler")
@@ -1176,21 +1189,23 @@ mod tests {
     fn data_source_menu_matches_cpp_provider_set() {
         // The C++ `ProviderRegistry::populateSourceMenu` (providerregistry.cpp:63)
         // emits File + the registered providers, then (ONLY when saved sources
-        // exist) the saved rows + a separator + Clear All — the registered
-        // provider set being exactly processmemory / remoteprocessmemory /
-        // windbgmemory / reclass.netcompatlayer (`s_providerIcons`). There is NO
-        // "Kernel Memory" data-source row: `kernelmemory` is only a provider-tab id
-        // used by the right-click Browse-Page-Tables path, never a Data-Source entry.
+        // exist) the saved rows + a separator + Clear All. This port includes the
+        // first-party provider registry entries enabled for the current build.
         let entries = flatten_menu_bar(&default_menu_tree());
         let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
-        // File + the four registered providers are present.
-        for c in [
-            "source.file",
-            "source.process",
-            "source.remote",
-            "source.windbg",
-            "source.rcnet",
-        ] {
+        // File + feature-backed built-in providers for this feature set are present.
+        let mut expected = vec!["source.file"];
+        #[cfg(feature = "process-provider")]
+        expected.push("source.process");
+        #[cfg(feature = "remote-process-provider")]
+        expected.push("source.remote");
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        expected.push("source.kernel");
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        expected.push("source.windbg");
+        #[cfg(feature = "memflow-provider")]
+        expected.push("source.memflow");
+        for c in expected {
             assert!(cmds.contains(&c), "Data Source menu missing {c}");
         }
         // UPDATED (item 7): this assertion previously demanded `source.clear` even
@@ -1202,15 +1217,6 @@ mod tests {
         assert!(
             !cmds.contains(&"source.clear"),
             "Clear All must NOT appear when there are no saved sources"
-        );
-        // The invented Kernel Memory row (no C++ counterpart) is gone.
-        assert!(
-            !cmds.contains(&"source.kernel"),
-            "source.kernel should be removed — kernelmemory is never a Data Source row"
-        );
-        assert!(
-            !entries.iter().any(|e| e.path.ends_with("Kernel Memory")),
-            "no 'Kernel Memory' Data Source label should remain"
         );
     }
 
@@ -1268,6 +1274,14 @@ mod tests {
         find(tree).expect("Data Source submenu present").to_vec()
     }
 
+    fn fixed_data_source_count() -> usize {
+        1 + usize::from(cfg!(feature = "process-provider"))
+            + usize::from(cfg!(feature = "remote-process-provider"))
+            + usize::from(cfg!(all(windows, feature = "kernel-provider")))
+            + usize::from(cfg!(all(windows, feature = "windbg-provider")))
+            + usize::from(cfg!(feature = "memflow-provider"))
+    }
+
     #[test]
     fn data_source_menu_omits_separator_and_clear_all_when_no_saved_sources() {
         // Item 7: the C++ `populateSourceMenu` adds the trailing separator +
@@ -1276,9 +1290,12 @@ mod tests {
         // the registered providers — no stray separator, no "Clear All".
         use super::{menu_tree_with, MenuNode};
         let children = data_source_children(&menu_tree_with(&[], &[]));
-        // The five fixed provider rows only (File + 4 providers); no separator,
-        // no Clear All.
-        assert_eq!(children.len(), 5, "expected only the 5 fixed provider rows");
+        // The fixed provider rows only; no separator, no Clear All.
+        assert_eq!(
+            children.len(),
+            fixed_data_source_count(),
+            "expected only the fixed provider rows for this feature set"
+        );
         assert!(
             !children.iter().any(|n| matches!(n, MenuNode::Separator)),
             "no trailing separator with zero saved sources"
@@ -1293,8 +1310,8 @@ mod tests {
 
     #[test]
     fn data_source_menu_keeps_separator_and_clear_all_with_saved_sources() {
-        // Item 7 (the other branch): WITH a saved source the layout is
-        // File + 4 providers, separator, the saved row(s), separator, Clear All.
+        // Item 7 (the other branch): WITH a saved source the layout is fixed
+        // providers, separator, the saved row(s), separator, Clear All.
         use super::{menu_tree_with, MenuNode, SourceMenuEntry};
         let sources = vec![SourceMenuEntry {
             label: "File 'game.bin'".into(),
@@ -1302,8 +1319,8 @@ mod tests {
             active: true,
         }];
         let children = data_source_children(&menu_tree_with(&[], &sources));
-        // 5 providers + sep + 1 saved + sep + Clear All = 9.
-        assert_eq!(children.len(), 9);
+        let fixed = fixed_data_source_count();
+        assert_eq!(children.len(), fixed + 4);
         assert!(
             children
                 .iter()
@@ -1311,9 +1328,9 @@ mod tests {
             "'Clear All' present once a saved source exists"
         );
         // The last two rows are the trailing separator then Clear All.
-        assert!(matches!(children[7], MenuNode::Separator));
+        assert!(matches!(children[fixed + 2], MenuNode::Separator));
         assert!(
-            matches!(&children[8], MenuNode::Item { command, .. } if command == "source.clear")
+            matches!(&children[fixed + 3], MenuNode::Item { command, .. } if command == "source.clear")
         );
     }
 

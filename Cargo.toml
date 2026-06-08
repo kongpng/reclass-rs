@@ -8,11 +8,8 @@
 # exists below, but ONLY to build the separately-distributed plugin SDK
 # (`crates/reclass-plugin-abi` + `crates/reclass-plugin`) and the example native
 # plugins (`examples/plugins/*`) that design §6 Phase 3 requires as standalone
-# cdylibs (they cannot live in the app's `src/` without pulling `abi_stable` into
-# the app's library graph). The APP is still ONE package (`reclass`); none of the
-# workspace members are dependencies of the default app build. The stable-ABI deps
-# (`abi_stable`/`libloading`/the SDK) are all gated behind the `plugins` feature,
-# so default app builds are byte-for-byte unaffected.
+# cdylibs. The APP is still ONE package (`reclass`); host-side dynamic loading is
+# feature-gated, while platform-specific pieces inside it are target-cfg gated.
 #
 # Portable headless logic builds with `--no-default-features`; the GPUI UI is
 # isolated behind the default `ui` feature (the only thing that pulls gpui).
@@ -23,6 +20,8 @@ resolver = "2"
 members = [
     "crates/reclass-plugin-abi",
     "crates/reclass-plugin",
+    "crates/rcx-rpc",
+    "crates/rcx-payload",
     "examples/plugins/example-provider",
     "examples/plugins/example-ui",
     # Phase 4: a test ReClass.NET native plugin (raw extern-C CoreFunctions).
@@ -58,7 +57,16 @@ path = "src/lib.rs"
 # Features (ARCHITECTURE.md §8). Off `ui` ⇒ headless engine build (logic-only).
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
-default = ["ui", "imports", "disasm", "symbols", "mcp"]
+default = [
+    "ui",
+    "imports",
+    "disasm",
+    "symbols",
+    "mcp",
+    "native-providers",
+    "memflow-provider",
+    "plugins",
+]
 
 # The whole GPUI UI surface. The ONLY feature that pulls gpui/gpui-component.
 # `gpui-component-assets` is part of it: it bundles the SVG icon assets that back
@@ -79,32 +87,35 @@ symbols = ["dep:cpp_demangle", "dep:msvc-demangler", "dep:regex", "dep:reqwest"]
 # JSON-RPC 2.0 MCP server over a local socket.
 mcp = ["dep:interprocess"]
 
-# Compatibility alias: the memflow provider is always compiled now. Keep this so
-# older `--features memflow-provider` commands do not fail, but do not use a
-# Cargo feature to hide core live-memory behavior.
-memflow-provider = []
+# Live-process provider through memflow's runtime connector/OS plugin inventory.
+memflow-provider = ["dep:memflow"]
 
-# Legacy native-plugin loader seam (libloading) for the un-ported C++ ReClass
-# `plugins/*` sources (kernel / remote / WinDbg / ReClass.NET). Off by default:
-# stubs only, so the package builds on Linux without them. Live process/memory is
-# NOT here — it is provided unconditionally by the core `memflow` dependency.
+# C++ provider parity set. Individual providers stay feature-addressable for
+# lean builds; platform-specific implementations are target-cfg gated inside the
+# modules.
+native-providers = [
+    "process-provider",
+    "kernel-provider",
+    "remote-process-provider",
+    "windbg-provider",
+]
+process-provider = ["dep:procfs", "dep:nix", "dep:windows-sys"]
+kernel-provider = ["dep:windows-sys"]
+remote-process-provider = [
+    "dep:rcx-rpc",
+    "dep:rcx-payload",
+    "dep:procfs",
+    "dep:nix",
+    "dep:libc",
+    "dep:windows-sys",
+]
+windbg-provider = ["dep:windows", "dep:windows-sys"]
+
+# Legacy native-provider loader seam.
 native-plugins = ["dep:libloading"]
 
-# Phase-3 stable-ABI native plugin boundary (design §2/§6 Phase 3). Pulls the
-# HOST-side loader deps: `abi_stable` (the stable ABI + load-time version/layout
-# check), `libloading` (open the `.so`/`.dll`/`.dylib`), and the shared contract
-# crate `reclass-plugin-abi` (the single definition of the FFI types host and
-# plugin agree on). OFF by default → default app builds pull NONE of these and are
-# byte-for-byte unaffected. `native-plugins` is a SEPARATE, untouched feature (the
-# legacy native-plugin loader seam); the two do not overlap.
-#
-# Phase 5 also lists `dep:windows` here for the Windows-only ReClass.NET managed
-# CLR host. The `windows` dep is target-gated below
-# ([target.'cfg(windows)'.dependencies]) AND optional, so on non-Windows it is
-# simply absent — the feature stays satisfiable and the Linux default build pulls
-# nothing new (the whole `windows` crate is `#![cfg(windows)]`, so even if resolved
-# it compiles to nothing off-Windows). Default app builds remain byte-for-byte
-# unaffected (the `plugins` feature is itself off by default).
+# Stable-ABI native plugin loader + ReClass.NET native/managed compatibility
+# routing. The managed CLR host is additionally target-gated to Windows below.
 plugins = ["dep:abi_stable", "dep:libloading", "dep:reclass-plugin-abi", "dep:windows"]
 
 # Optional parallel scanner (rayon). Off by default: the scanner falls back to
@@ -119,8 +130,8 @@ scanner-parallel = ["dep:rayon"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Plugin `plugin.toml` manifest parsing (design §5, §6 Phase 6). Pure-Rust and
-# already a transitive dep (the version pinned in Cargo.lock), so promoting it to
-# a direct ALWAYS-ON edge leaves the light default build effectively unaffected;
+# already a transitive dep (the version pinned in Cargo.lock), so keeping it as
+# a direct always-on host-bookkeeping edge leaves lean builds effectively unaffected;
 # it is NOT gated behind the `plugins` feature because manifest parsing is host
 # bookkeeping that has no `abi_stable`/`libloading` ties.
 toml = "0.8"
@@ -146,10 +157,12 @@ directories = "6"
 
 # Live-process provider. This links only memflow core; connectors/OS layers such
 # as qemu, kvm, pcileech, winio, and win32 are discovered at runtime from memflow
-# plugin directories.
-memflow = "0.2.4"
+# plugin directories. Default-on via `memflow-provider`, removable in lean builds.
+memflow = { version = "0.2.4", optional = true }
+rcx-rpc = { path = "crates/rcx-rpc", optional = true }
+rcx-payload = { path = "crates/rcx-payload", optional = true }
 
-# ── feature-gated (optional) ──
+# ── feature-gated product-mode dependencies ──
 # disasm — pure Rust x86/x64 decoder+formatter (replaces fadec).
 iced-x86 = { version = "1", optional = true }
 # scanner — optional parallel value/pattern search (QtConcurrent → rayon).
@@ -165,31 +178,56 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 interprocess = { version = "2", optional = true }
 libloading = { version = "0.9", optional = true }
 
-# ── plugins (Phase 3 stable-ABI native loader) — host side only, off by default ──
+# ── plugins (Phase 3 stable-ABI native loader) — host side ──
 # The stable ABI + load-time version/layout check (design §7.B [+]).
 abi_stable = { version = "0.11", optional = true }
 # The shared FFI contract crate (the single definition host + plugin agree on).
 reclass-plugin-abi = { path = "crates/reclass-plugin-abi", optional = true }
 
-# ── plugins (Phase 5 ReClass.NET managed CLR host) — Windows-only, off by default ──
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux local-process provider: procfs handles stat/exe metadata, while nix
+# exposes process_vm_readv/writev for the C++ fast path before /proc/pid/mem
+# fallback.
+procfs = { version = "0.18", optional = true, default-features = false }
+nix = { version = "0.31", optional = true, default-features = false, features = ["process", "ptrace", "signal", "uio"] }
+libc = { version = "0.2", optional = true }
+
+# ── plugins (Phase 5 ReClass.NET managed CLR host) — Windows-only ──
 # The official `windows` crate CLR-hosting COM bindings host the .NET Framework 4.x
 # CLR for the managed ReClass.NET compat path (design §4 managed path, §6 Phase 5,
-# §8 decision). Target-gated to Windows AND optional AND pulled ONLY by `plugins`,
-# so the Linux default build (and even `--features plugins` on Linux) pulls nothing
-# from this; the whole crate is `#![cfg(windows)]` regardless. The three features
-# carry exactly the API the CLR host uses (verified against windows 0.62):
+# §8 decision). Target-gated to Windows and pulled only by `plugins`, so Linux
+# builds do not compile this edge. The three features carry exactly the API the
+# CLR host uses (verified against windows 0.62):
 #   Win32_System_ClrHosting → CLRCreateInstance, CLSID_CLRMetaHost, ICLRMetaHost,
 #                             ICLRRuntimeInfo, ICLRRuntimeHost (Start/
 #                             ExecuteInDefaultAppDomain)
 #   Win32_System_Com        → COM scaffolding the ClrHosting types build on
 #   Win32_Foundation        → HRESULT / BOOL / handle primitives
-# 0.62 is already resolved transitively in Cargo.lock, so this only promotes it to a
-# direct Windows-only edge (minimal lockfile delta).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", optional = true, features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_ClrHosting",
+    "Win32_System_Diagnostics_Debug_Extensions",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+] }
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # ── UI (gpui) — unpinned git, SAME source form as gpui-component (§7). ──

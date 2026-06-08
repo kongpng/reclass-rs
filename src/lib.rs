@@ -11,14 +11,15 @@
 //!
 //! - `--no-default-features` → the headless engine (no gpui), for fast
 //!   logic-only testing.
-//! - `default = ["ui", "imports", "disasm", "symbols", "mcp"]` gates the
-//!   heavy optional modules + their external deps.
+//! - `default = ["ui", "imports", "disasm", "symbols", "mcp",
+//!   "memflow-provider", "plugins"]` gates the optional modules/providers + their
+//!   external deps.
 //!
 //! All data access goes through the [`provider::Provider`] trait. File / buffer
-//! / snapshot / null sources plus the memflow-backed live process provider are
-//! always compiled; UI and MCP entry points follow their module features.
-//! Legacy native OS process / kernel / remote / WinDbg sources remain documented
-//! stubs in [`provider::native`].
+//! / snapshot / null sources are always compiled; local process, remote payload,
+//! kernel-driver, WinDbg, and memflow-backed live providers are feature/platform
+//! gated and register through the same provider registry. UI and MCP entry points
+//! follow their module features.
 
 // gpui's element/builder types are deeply nested generics; some `#[test]` macro
 // expansions in the UI modules brush against the default 128 type-recursion

@@ -27,6 +27,7 @@
 //! Gated behind the `ui` feature (the dialogs render via gpui-component).
 
 pub mod gotoaddress;
+#[cfg(feature = "memflow-provider")]
 pub mod memflow_attach;
 pub mod messagebox;
 pub mod optionsdialog;
@@ -38,7 +39,7 @@ pub mod window_dialogs;
 // roof (the "open a dialog" entry point the window wires to).
 #[cfg(feature = "ui")]
 pub use crate::ui::dialogs::gotoaddress::{GotoAddressDialog, GotoEvent};
-#[cfg(feature = "ui")]
+#[cfg(all(feature = "ui", feature = "memflow-provider"))]
 pub use crate::ui::dialogs::memflow_attach::{MemflowAttachDialog, MemflowAttachEvent};
 #[cfg(feature = "ui")]
 pub use crate::ui::dialogs::optionsdialog::{

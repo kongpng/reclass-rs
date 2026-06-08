@@ -46,13 +46,7 @@ use crate::plugin::reclassnet::{load_reclassnet_managed, load_reclassnet_native,
 /// The shared-library extension for the current platform (the C++ platform filter,
 /// cpp_reference §2).
 pub fn platform_lib_extension() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "dll"
-    } else if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    }
+    crate::plugin::platform_lib_extension()
 }
 
 /// Whether `path` is a loadable native plugin candidate: the right extension and
@@ -259,9 +253,9 @@ fn parse_clr_directory_present(bytes: &[u8]) -> bool {
 }
 
 /// Load a single candidate by sniffing + routing it (design §4). Returns the
-/// loaded plugin, or a [`LoadError`] describing why it was not loaded (a managed
-/// assembly is a Phase-5 [`LoadError::Unrecognized`] skip with an explanatory
-/// note). The C++ `LoadPlugin`, generalized to multiple loaders (reference §8).
+/// loaded plugin, or a [`LoadError`] describing why it was not loaded. A managed
+/// assembly is a Phase-5 [`LoadError::RcNetManaged`] skip with an explanatory
+/// note. The C++ `LoadPlugin`, generalized to multiple loaders (reference §8).
 pub fn load_one(path: &Path) -> Result<Box<dyn Plugin>, LoadError> {
     match sniff(path) {
         RcNetClass::OurFormat => load_native_plugin(path),
@@ -467,13 +461,7 @@ mod tests {
     /// `example_plugin_path`). Returns `None` if it hasn't been built, so the e2e
     /// test **skips** rather than fails where the example wasn't compiled.
     fn fake_native_path() -> Option<PathBuf> {
-        let ext = platform_lib_extension();
-        let lib_prefix = if cfg!(target_os = "windows") {
-            ""
-        } else {
-            "lib"
-        };
-        let file = format!("{lib_prefix}reclassnet_fake_native.{ext}");
+        let file = crate::plugin::platform_lib_filename("reclassnet-fake-native");
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         [
             root.join("target/debug").join(&file),

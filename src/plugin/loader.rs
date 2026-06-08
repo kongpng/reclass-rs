@@ -10,8 +10,8 @@
 //! Phase 3 deliverable).
 //!
 //! Gated behind the `plugins` cargo feature: this module only exists when the
-//! stable-ABI deps (`abi_stable` + `reclass-plugin-abi`) are pulled, so default
-//! app builds are unaffected (design §2/§6).
+//! stable-ABI deps (`abi_stable` + `reclass-plugin-abi`) are pulled, so lean
+//! builds can omit the runtime loader (design §2/§6).
 
 use std::path::Path;
 use std::sync::Arc;

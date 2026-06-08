@@ -99,6 +99,15 @@ impl EditorPalette {
     /// Snapshot the palette from the active gpui-component theme.
     pub fn from_theme(cx: &gpui::App) -> Self {
         let t = cx.theme();
+        // Light themes (e.g. the XP-Luna "Light" theme — background lightness
+        // > 0.78) get pure-white editor paper instead of a darkened tint, matching
+        // the C++ `applyTheme` rule (`lightnessF() > 0.78 ? #FFFFFF : darker(115)`)
+        // so the body stays crisp instead of a dirty khaki that fights the chrome.
+        let paper = if t.background.l > 0.78 {
+            rgb_u8(0xff, 0xff, 0xff)
+        } else {
+            darker(t.background, 0.06)
+        };
         EditorPalette {
             text: t.foreground,
             // Item 21: primitive type tokens (uint8_t/hex64/…) render BLUE (the C++
@@ -155,8 +164,8 @@ impl EditorPalette {
             // darker editor paper (the editor paper is `background.darker`).
             hover_bg: with_alpha(t.foreground, 0.05),
             caret: t.caret,
-            paper: darker(t.background, 0.06),
-            gutter_bg: darker(t.background, 0.06),
+            paper,
+            gutter_bg: paper,
             gutter_fg: with_alpha(t.muted_foreground, 0.70),
             // Item 31: footer pills are a flat translucent box (`indCmdPill`), no
             // border, dim pill fill. The 1px border + MD rounding are dropped at

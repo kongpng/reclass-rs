@@ -55,8 +55,8 @@ mod tests {
 
     #[test]
     fn stub_set_excludes_phantoms() {
-        // 25 -> 20 after dropping the 5 phantom advertisements.
-        assert_eq!(STUB_TOOLS.len(), 20);
+        // Keep this pinned so adding/removing advertised stub handlers is explicit.
+        assert_eq!(STUB_TOOLS.len(), 19);
         for phantom in [
             "analysis.find_overlaps",
             "analysis.tree_summary",

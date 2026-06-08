@@ -328,7 +328,7 @@ impl PluginManager {
         mgr
     }
 
-    /// Build a manager with `persistence` installed **first**, then the four
+    /// Build a manager with `persistence` installed **first**, then the built-in
     /// built-ins added — so any **stored** enabled flag for a built-in is restored
     /// at add time (design §7.A [fix] "restore stored enabled flags on startup").
     ///
@@ -353,7 +353,7 @@ impl PluginManager {
     /// deliverable that contributes a `Command`, a `Panel`, and a `Dialog` for
     /// the declarative-UI host to render (design §6 Phase 2). Kept separate so
     /// [`with_builtins`](PluginManager::with_builtins) stays exactly the
-    /// four-provider Phase-1 set (the parity tests rely on that).
+    /// current feature-set's built-in provider set (the parity tests rely on that).
     pub fn with_builtins_and_demo() -> Self {
         let mut mgr = PluginManager::with_builtins();
         mgr.add_plugin(crate::plugin::demo::DemoPlugin::boxed());
@@ -876,8 +876,31 @@ mod tests {
     #[cfg(feature = "plugins")]
     use crate::plugin::example_plugin_path;
 
+    fn builtin_ids() -> Vec<&'static str> {
+        let mut ids = vec!["file"];
+        #[cfg(feature = "process-provider")]
+        ids.push("processmemory");
+        #[cfg(feature = "remote-process-provider")]
+        ids.push("remoteprocessmemory");
+        #[cfg(all(windows, feature = "kernel-provider"))]
+        ids.push("kernelmemory");
+        #[cfg(all(windows, feature = "windbg-provider"))]
+        ids.push("windbgmemory");
+        #[cfg(feature = "memflow-provider")]
+        ids.push("memflowprocessmemory");
+        ids.extend(["buffer", "snapshot", "null"]);
+        ids
+    }
+
+    fn builtin_enabled_without_null() -> Vec<&'static str> {
+        builtin_ids()
+            .into_iter()
+            .filter(|id| *id != "null")
+            .collect()
+    }
+
     #[test]
-    fn with_builtins_registers_four_providers_in_order() {
+    fn with_builtins_registers_providers_in_order() {
         let mgr = PluginManager::with_builtins();
         let ids: Vec<&str> = mgr
             .registry()
@@ -886,7 +909,7 @@ mod tests {
             .map(|p| p.identifier.as_str())
             .collect();
         // Registration order = built-in listing order (cpp_reference §2/§3).
-        assert_eq!(ids, ["file", "buffer", "snapshot", "null"]);
+        assert_eq!(ids, builtin_ids());
         // All marked built-in + enabled.
         assert!(mgr
             .registry()
@@ -939,7 +962,7 @@ mod tests {
             .enabled_providers()
             .map(|p| p.identifier.as_str())
             .collect();
-        assert_eq!(enabled, ["file", "buffer", "snapshot"]);
+        assert_eq!(enabled, builtin_enabled_without_null());
     }
 
     // ── Phase-6 management + permissions ──
@@ -1044,7 +1067,7 @@ mod tests {
     #[test]
     fn with_persistence_and_builtins_is_parity_when_store_empty() {
         // With NO stored flags, the persistence-installed constructor yields the
-        // exact four-provider Auto-enabled set with_builtins() gives (parity).
+        // exact feature-set Auto-enabled provider list with_builtins() gives (parity).
         let store = shared_mem_store();
         let mgr = PluginManager::with_persistence_and_builtins(Box::new(
             DiskPluginPersistence::new(store.clone()),
@@ -1055,7 +1078,7 @@ mod tests {
             .iter()
             .map(|p| p.identifier.as_str())
             .collect();
-        assert_eq!(ids, ["file", "buffer", "snapshot", "null"]);
+        assert_eq!(ids, builtin_ids());
         assert!(mgr
             .registry()
             .providers()
@@ -1074,13 +1097,13 @@ mod tests {
             DiskPluginPersistence::new(store.clone()),
         ));
         assert!(!mgr.registry().find("null").unwrap().enabled);
-        // The other three are still enabled (only the stored one flipped).
+        // The other built-ins are still enabled (only the stored one flipped).
         let enabled: Vec<&str> = mgr
             .registry()
             .enabled_providers()
             .map(|p| p.identifier.as_str())
             .collect();
-        assert_eq!(enabled, ["file", "buffer", "snapshot"]);
+        assert_eq!(enabled, builtin_enabled_without_null());
     }
 
     /// A bare provider plugin built from an arbitrary manifest, for exercising
@@ -1189,12 +1212,12 @@ mod tests {
     #[test]
     fn plugins_view_models_every_plugin() {
         let mut mgr = PluginManager::with_builtins_and_demo();
-        // One more native manual plugin on top of the four built-ins + demo.
+        // One more native manual plugin on top of the built-ins + demo.
         mgr.add_plugin(provider_plugin("Remote Reader", LoadType::Manual));
 
         let rows = mgr.plugins_view();
-        // Four built-ins + the demo (UI-only) + the native = 6 rows.
-        assert_eq!(rows.len(), 6);
+        // Built-ins + the demo (UI-only) + the native = all rows.
+        assert_eq!(rows.len(), builtin_ids().len() + 2);
 
         // The built-ins are flagged builtin + enabled + labelled "builtin".
         let file = rows.iter().find(|r| r.identifier == "file").unwrap();
@@ -1271,7 +1294,7 @@ mod tests {
         assert!(mgr.find_plugin_any(&id).is_none());
         // The surviving built-ins are still resolvable through the rebuilt index.
         assert!(mgr.find_plugin("file").is_some());
-        assert_eq!(mgr.registry().providers().len(), 4);
+        assert_eq!(mgr.registry().providers().len(), builtin_ids().len());
 
         // Unloading an unknown id is a no-op false (host not re-asked).
         assert!(!mgr.safe_unload("nope", &mut host));
@@ -1428,7 +1451,7 @@ mod tests {
     }
 
     /// PARITY: scanning an absent directory makes no load attempt, retains no
-    /// errors, and leaves the registry at exactly the four built-ins — so the
+    /// errors, and leaves the registry at exactly the built-ins — so the
     /// startup hook over an empty/missing `plugins/` dir is byte-for-byte the
     /// pre-F4 state (`default_plugin_dirs` filters to existing dirs, so this is the
     /// realistic default-environment case).
@@ -1446,7 +1469,10 @@ mod tests {
 
         assert!(failures.is_empty());
         assert!(mgr.load_errors().is_empty());
-        assert_eq!(mgr.registry().enabled_providers().count(), 4);
+        assert_eq!(
+            mgr.registry().enabled_providers().count(),
+            builtin_ids().len()
+        );
     }
 
     // ── Phase-2 routing ──
@@ -1456,23 +1482,29 @@ mod tests {
 
     #[test]
     fn with_builtins_unchanged_with_demo_added_separately() {
-        // Parity: with_builtins is still exactly the four-provider set.
+        // Parity: with_builtins is still exactly the built-in provider set.
         let plain = PluginManager::with_builtins();
-        assert_eq!(plain.registry().enabled_providers().count(), 4);
+        assert_eq!(
+            plain.registry().enabled_providers().count(),
+            builtin_ids().len()
+        );
         assert!(plain.find_plugin("plugindemo").is_none());
 
         // The demo constructor adds the demo plugin (one more plugin, but it
-        // contributes no provider, so the registry is still the four built-ins).
+        // contributes no provider, so the registry is still the built-ins).
         let demo_mgr = PluginManager::with_builtins_and_demo();
-        assert_eq!(demo_mgr.registry().enabled_providers().count(), 4);
-        assert_eq!(demo_mgr.plugins().len(), 5);
+        assert_eq!(
+            demo_mgr.registry().enabled_providers().count(),
+            builtin_ids().len()
+        );
+        assert_eq!(demo_mgr.plugins().len(), builtin_ids().len() + 1);
     }
 
     // ── Phase-2 live UI-contribution enumeration (the F3 host seam) ──
 
     #[test]
     fn ui_contributions_empty_without_demo() {
-        // PARITY: the default shipping manager (four providers, no UI plugin)
+        // PARITY: the default shipping manager (built-in providers, no UI plugin)
         // exposes ZERO UI contributions — so the live host injects nothing and the
         // UI is byte-identical.
         let mgr = PluginManager::with_builtins();

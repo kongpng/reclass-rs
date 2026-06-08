@@ -3971,6 +3971,14 @@ impl RcxEditor {
                     .pr(px(self.metrics.cell_width))
                     .bg(palette.gutter_bg)
                     .text_color(palette.gutter_fg)
+                    // C++ re-runs applyHoverCursor for the full Scintilla viewport,
+                    // including margin 0. Moving from the value column into the
+                    // offset gutter must therefore clear any value/disasm/preview
+                    // hover card; route gutter hover through the same dispatcher at
+                    // text-column 0 so the value-span gate fails naturally.
+                    .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
+                        this.dispatch_row_hover(idx, 0.0, e.position, window, cx);
+                    }))
                     // Double-click the offset margin → flip relative/absolute
                     // offsets (item 25; the C++ `MouseButtonDblClick` over margin 0).
                     .on_mouse_down(

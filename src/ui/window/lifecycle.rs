@@ -189,7 +189,9 @@ impl super::MainWindow {
 
     /// Float `dialog` as a centered modal card of `width` × `margin_top` (the shared
     /// tail every modal opener repeated): `window.open_dialog` with no close button,
-    /// optionally focus `focus`, then re-render. Collapses 12 copy-pasted tails.
+    /// optionally focus `focus`, then re-render. The GPUI dialog host applies its
+    /// own content inset, so reserve both horizontal gutters here; otherwise the
+    /// child card consumes the left inset and clips through the right one.
     pub(super) fn present_modal<D: Render>(
         &self,
         dialog: &Entity<D>,
@@ -200,8 +202,9 @@ impl super::MainWindow {
         cx: &mut Context<Self>,
     ) {
         let card = dialog.clone();
+        let host_width = width + 2.0 * crate::ui::dialogs::modal::PAD;
         window.open_dialog(cx, move |d, _window, _cx| {
-            d.w(px(width))
+            d.w(px(host_width))
                 .margin_top(px(margin_top))
                 .close_button(false)
                 .child(card.clone())

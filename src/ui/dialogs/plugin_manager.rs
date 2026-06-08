@@ -42,8 +42,8 @@ pub(crate) struct PluginInfo {
 /// the dialog renders the live plugin set — built-in, native, or auto-detected
 /// ReClass.NET — not a second hand-kept table). The C++ `"<name> Provider"`
 /// display text is preserved for the built-in providers. Native DLL/SO loading
-/// stays out of the default build (the dialog notes it).
-/// The four-built-in row list mapped to [`PluginInfo`] — the parity baseline (the
+/// stays out of builds compiled without the `plugins` feature (the dialog notes it).
+/// The built-in row list mapped to [`PluginInfo`] — the parity baseline (the
 /// live opener reads the session-owned manager instead, but tests assert the shipped
 /// built-in set's display fields through this). `#[cfg(test)]` because the only
 /// non-test caller now reads the owned manager.
@@ -106,25 +106,22 @@ pub(crate) enum PluginManagerEvent {
     },
     /// Load a native plugin from a user-chosen path (the C++ load-from-path;
     /// design §6 Phase 3/6). Only present + handled behind the `plugins` feature —
-    /// the default build ships no runtime loader, so this variant doesn't exist
-    /// there (and the dialog shows no "Load plugin…" button).
+    /// no-`plugins` builds ship no runtime loader, so this variant doesn't exist
+    /// there (and the dialog shows no "Load plugin..." button).
     #[cfg(feature = "plugins")]
     Load,
 }
 
-/// The read-only Plugins manager view (the C++ `showPluginsDialog`; main.cpp:8821).
-/// Lists the built-in provider plugins with the same fields the C++ shows
-/// (name·version·type·author·description) and a single Close button. The C++
-/// Load/Unload buttons drove native `dlopen`/`dlclose`, which has no analogue on
-/// this platform, so they are replaced by a one-line "loading runtime plugins is
-/// not supported in this build" note (the honest boundary).
+/// The Plugins manager view (the C++ `showPluginsDialog`; main.cpp:8821). It lists
+/// provider/plugin rows with the same fields the C++ shows
+/// (name·version·type·author·description). Runtime plugin loading is available
+/// only in `plugins` builds; no-`plugins` builds show a clear build-mode note instead.
 pub(crate) struct PluginManagerDialog {
     plugins: Vec<PluginInfo>,
-    /// Retained native-load failures, `(path, detail)` (design §7.A [fix]). Always
-    /// present so `new()` stays uniform across builds; populated only under the
-    /// `plugins` feature (the default build has no runtime loader, so it stays
-    /// empty and the render emits nothing — parity). The opener pushes the session
-    /// manager's `load_errors()` in via [`set_load_errors`](Self::set_load_errors).
+    /// Retained native-load failures, `(path, detail)` (design §7.A [fix]). This
+    /// state exists only with the runtime plugin loader; no-`plugins` builds have no
+    /// native-loader errors to surface.
+    #[cfg(feature = "plugins")]
     load_errors: Vec<(std::path::PathBuf, String)>,
     focus_handle: FocusHandle,
 }
@@ -133,6 +130,7 @@ impl PluginManagerDialog {
     pub(crate) fn new(plugins: Vec<PluginInfo>, cx: &mut Context<Self>) -> Self {
         PluginManagerDialog {
             plugins,
+            #[cfg(feature = "plugins")]
             load_errors: Vec::new(),
             focus_handle: cx.focus_handle(),
         }
@@ -140,7 +138,7 @@ impl PluginManagerDialog {
 
     /// Install the session manager's retained native-load failures so the dialog
     /// can surface them with detail (design §7.A [fix] — C++ logs then drops the
-    /// detail). Feature-gated: the default build has no loader, so neither the
+    /// detail). Feature-gated: builds without `plugins` have no loader, so neither the
     /// caller nor this setter exists there and `load_errors` stays empty.
     #[cfg(feature = "plugins")]
     pub(crate) fn set_load_errors(
@@ -176,7 +174,7 @@ impl PluginManagerDialog {
     }
 
     /// Emit the intent to load a native plugin from a path (the C++ load-from-path;
-    /// design §6 Phase 3/6). Feature-gated — the default build has no loader, so
+    /// design §6 Phase 3/6). Feature-gated — builds without `plugins` have no loader, so
     /// neither the button nor this method exists there.
     #[cfg(feature = "plugins")]
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -330,7 +328,7 @@ impl Render for PluginManagerDialog {
         // The footer note. With the `plugins` feature the runtime loader is
         // present (so the wording invites Load plugin…); without it, the honest
         // boundary note stays verbatim (the C++ load-from-path has no analogue in
-        // the default build).
+        // a no-`plugins` build).
         #[cfg(feature = "plugins")]
         let note_text = "Enable/Disable is applied to the session and persisted \
              across launches. Use “Load plugin…” to load a native plugin (.so/.dll) \
@@ -346,7 +344,7 @@ impl Render for PluginManagerDialog {
 
         // Native-load failure section (design §7.A [fix] — surface ABI/load errors
         // with detail rather than only logging them, the way the C++ generic "check
-        // the console" box did NOT). Gated on the `plugins` feature so the default
+        // the console" box did NOT). Gated on the `plugins` feature so a no-`plugins`
         // build (no loader, no errors) emits nothing — byte parity. Rendered ABOVE
         // the footer note, inside the same scroll area.
         #[cfg(feature = "plugins")]
@@ -394,7 +392,7 @@ impl Render for PluginManagerDialog {
 
         let footer = modal::footer(cx);
         // "Load plugin…" — the C++ load-from-path, only behind the `plugins`
-        // feature (the default build has no runtime loader). Placed BEFORE Close.
+        // feature (builds without it have no runtime loader). Placed BEFORE Close.
         #[cfg(feature = "plugins")]
         let footer = footer.child(
             Button::new("plugins-load")

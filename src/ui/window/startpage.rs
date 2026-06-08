@@ -35,7 +35,7 @@ impl super::MainWindow {
     /// tab, so the equivalent guard is "the active document has no top-level struct
     /// yet". Seeds the same New Class the File ▸ New Class command does, retitles
     /// the tab, and resyncs the view options / workspace / docks.
-    fn preload_new_class_if_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn preload_new_class_if_empty(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
             return;
         };

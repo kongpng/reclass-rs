@@ -261,6 +261,10 @@ pub const THEME_FIELDS: &[ThemeFieldMeta] = &[
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Theme {
     pub name: String,
+    /// Optional editor-font family hint carried by the theme JSON (upstream
+    /// `Theme::font`). Recorded for round-trip fidelity but NOT force-applied —
+    /// the editor font family stays the user's View ▸ Font choice.
+    pub font: String,
     // ── Chrome ──
     pub background: Option<Color>,
     pub background_alt: Option<Color>,
@@ -388,6 +392,11 @@ impl Theme {
     pub fn to_json(&self) -> Value {
         let mut o = Map::new();
         o.insert("name".to_string(), Value::String(self.name.clone()));
+        // `font` only-when-non-empty (Qt `if (!font.isEmpty()) o["font"] = font;`),
+        // kept outside THEME_FIELDS so the field-count invariant holds.
+        if !self.font.is_empty() {
+            o.insert("font".to_string(), Value::String(self.font.clone()));
+        }
         for f in THEME_FIELDS {
             o.insert(
                 f.key.to_string(),
@@ -410,6 +419,15 @@ impl Theme {
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("Untitled")
+            .to_string();
+
+        // font: absent / non-string → "" (Qt `o["font"].toString()`). Carried for
+        // round-trip fidelity; not force-applied to the editor (the port's
+        // FONT_CHOICES intentionally excludes upstream's IBM Plex Mono lock).
+        t.font = o
+            .get("font")
+            .and_then(Value::as_str)
+            .unwrap_or("")
             .to_string();
 
         // Each present key parses; non-string → "" → parse None; unparseable → None.
