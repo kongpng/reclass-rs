@@ -1599,16 +1599,19 @@ impl RcxEditor {
         if hist.unique_count() <= 1 {
             return;
         }
-        let now = Self::now_millis();
-        let mut entries: Vec<(String, String)> = Vec::new();
+        // Capture (value, raw epoch-msec) newest→oldest; the render derives the
+        // age label, delta column and recency tiers (bf49a64). Carry the uncapped
+        // total so the ring-overflow footer can fire.
+        let mut entries: Vec<(String, i64)> = Vec::new();
         hist.for_each_with_time(|v, t| {
             if entries.len() < crate::core::value_history::K_CAPACITY {
-                entries.push((v.to_string(), Self::relative_age(now, t)));
+                entries.push((v.to_string(), t));
             }
         });
         if entries.len() <= 1 {
             return;
         }
+        let total_count = i64::from(hist.count);
         // Anchor near the edited row: float at the row's top-left in surface space
         // (the deferred anchor offsets by (+12,+16) for the cursor cards; here we
         // anchor to the field row, the C++ field-anchored popup). Use the measured
@@ -1620,6 +1623,7 @@ impl RcxEditor {
             pos,
             kind: HoverPopupKind::ValueHistory {
                 entries,
+                total_count,
                 node_idx: lm.node_idx,
                 sub_line: lm.sub_line,
                 resolved_addr: lm.offset_addr,
@@ -6978,7 +6982,8 @@ mod tests {
     fn hover_kind_eq_distinguishes_content_and_variant() {
         use super::hover_popup::{hover_kind_eq, HoverPopupKind};
         let mk = |vals: &[&str], set_buttons: bool| HoverPopupKind::ValueHistory {
-            entries: vals.iter().map(|v| (v.to_string(), "now".into())).collect(),
+            entries: vals.iter().map(|v| (v.to_string(), 1000i64)).collect(),
+            total_count: vals.len() as i64,
             node_idx: 0,
             sub_line: 0,
             resolved_addr: 0,
@@ -6986,10 +6991,12 @@ mod tests {
         };
         let a = mk(&["1", "2"], false);
         let a2 = mk(&["1", "2"], false);
-        // Same VALUES but different age labels must still compare equal (the age
-        // labels tick; only the value column drives popup identity, item 68).
+        // Same VALUES but different raw timestamps must still compare equal (the
+        // elapsed-time labels tick; only the value column drives popup identity,
+        // item 68; `hover_kind_eq` ignores the msec field).
         let a3 = HoverPopupKind::ValueHistory {
-            entries: vec![("1".into(), "5s ago".into()), ("2".into(), "9s ago".into())],
+            entries: vec![("1".into(), 5000i64), ("2".into(), 9000i64)],
+            total_count: 2,
             node_idx: 0,
             sub_line: 0,
             resolved_addr: 0,
@@ -7006,17 +7013,6 @@ mod tests {
         assert!(!hover_kind_eq(&a, &b), "different values differ");
         assert!(!hover_kind_eq(&a, &with_buttons), "Set-button mode differs");
         assert!(!hover_kind_eq(&a, &t), "different variants differ");
-    }
-
-    #[test]
-    fn relative_age_buckets_match_cpp() {
-        use super::RcxEditor;
-        let now = 10_000_000i64;
-        assert_eq!(RcxEditor::relative_age(now, 0), "", "untracked → empty");
-        assert_eq!(RcxEditor::relative_age(now, now - 500), "now");
-        assert_eq!(RcxEditor::relative_age(now, now - 12_000), "12s ago");
-        assert_eq!(RcxEditor::relative_age(now, now - 180_000), "3m ago");
-        assert_eq!(RcxEditor::relative_age(now, now - 7_200_000), "2h ago");
     }
 
     // ── Item 4: Vec/Mat value-component narrowing (the column→component map) ──

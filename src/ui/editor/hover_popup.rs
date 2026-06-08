@@ -14,13 +14,19 @@ use gpui::*;
 #[derive(Clone, Debug)]
 pub(super) enum HoverPopupKind {
     /// A changed-value history list (newest → oldest), the heat graph analogue.
-    /// Each entry carries the value text + a relative-age label ('now'/'12s ago'/
-    /// '3m ago'/'1h ago'). `node_idx`/`sub_line`/`resolved_addr` + `set_buttons`
+    /// Each entry carries the value text + the RAW epoch-msec it was recorded at
+    /// (0 = untracked); the render derives the relative-age label, the signed
+    /// delta column and the recency tiers from the timestamp (upstream bf49a64's
+    /// `buildValueHistoryBody` polish). `total_count` is the uncapped number of
+    /// values ever recorded for this node (`ValueHistory::count`) — the visible
+    /// list is capped at the ring window, so a larger total drives the
+    /// ring-overflow footer. `node_idx`/`sub_line`/`resolved_addr` + `set_buttons`
     /// drive the edit-time 'Set' buttons (item 68): when `set_buttons` is true the
     /// popup is shown during an active edit and each row gets a Set button that
     /// writes the value back into the node.
     ValueHistory {
-        entries: Vec<(String, String)>,
+        entries: Vec<(String, i64)>,
+        total_count: i64,
         node_idx: i32,
         sub_line: i32,
         resolved_addr: u64,
@@ -56,9 +62,10 @@ pub(super) fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
                 ..
             },
         ) => {
-            // Compare only the VALUE column (ignore the relative-age labels, which
-            // tick) + the Set-button mode — the C++ `vals == m_values` test. This
-            // avoids constant popup re-creation as the '12s ago' labels advance.
+            // Compare only the VALUE column (ignore the raw msec timestamps, which
+            // are constant per entry but irrelevant to identity) + the Set-button
+            // mode — the C++ `vals == m_values` test. This avoids constant popup
+            // re-creation as the elapsed-time labels advance each frame.
             sa == sb
                 && la.len() == lb.len()
                 && la.iter().zip(lb.iter()).all(|((va, _), (vb, _))| va == vb)
@@ -75,6 +82,209 @@ pub(super) fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
         ) => ta == tb && ba == bb,
         _ => false,
     }
+}
+
+// ── Value-history popup pure helpers (bf49a64 `buildValueHistoryBody`) ──
+//
+// These are GPUI-free so they can be unit-tested headlessly. The render arm
+// (`render_hover_popup`) composes them into the GPUI rows.
+
+/// Format an elapsed duration as a compact single token — "12s" / "5m" / "3h" /
+/// "2d" / "1w" — tiered by magnitude, with NO "ago" suffix (the C++
+/// `formatElapsed` lambda). Used for the right-aligned time column and the
+/// header "since …" / "~…/Δ" tokens. Sub-second deltas read "now".
+pub(super) fn fmt_elapsed_compact(delta_ms: i64) -> String {
+    let d = delta_ms.max(0);
+    if d < 1000 {
+        "now".to_string()
+    } else if d < 60_000 {
+        format!("{}s", d / 1000)
+    } else if d < 3_600_000 {
+        format!("{}m", d / 60_000)
+    } else if d < 86_400_000 {
+        format!("{}h", d / 3_600_000)
+    } else if d < 604_800_000 {
+        format!("{}d", d / 86_400_000)
+    } else {
+        format!("{}w", d / 604_800_000)
+    }
+}
+
+/// Compact a magnitude with K/M/G suffixes for the delta column (the C++
+/// `compactNumber` lambda) so a large step doesn't spill into the time column.
+/// `n` is treated as a magnitude (sign is applied by the caller). Below 10 000
+/// the full number is printed; at/above the thresholds it switches to a
+/// 3-significant-digit K/M/G form (e.g. `1234 → "1.23K"`, `2_000_000 → "2M"`).
+pub(super) fn compact_number(n: i64) -> String {
+    let v = n.unsigned_abs();
+    if v >= 1_000_000_000 {
+        trim_sig3(v as f64 / 1_000_000_000.0, 'G')
+    } else if v >= 1_000_000 {
+        trim_sig3(v as f64 / 1_000_000.0, 'M')
+    } else if v >= 10_000 {
+        trim_sig3(v as f64 / 1_000.0, 'K')
+    } else {
+        v.to_string()
+    }
+}
+
+/// Render `value` to ~3 significant digits (Qt's `'g', 3`), strip any trailing
+/// `.0`/zeros, and append `suffix`. Keeps the delta column narrow ("1.23K",
+/// "2M", "1.5G") without trailing-zero noise.
+fn trim_sig3(value: f64, suffix: char) -> String {
+    // 3 significant figures: choose decimals so total sig digits ≈ 3.
+    let s = if value >= 100.0 {
+        format!("{:.0}", value)
+    } else if value >= 10.0 {
+        format!("{:.1}", value)
+    } else {
+        format!("{:.2}", value)
+    };
+    // Trim trailing zeros / dot so "2.00" → "2", "1.20" → "1.2".
+    let trimmed = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    };
+    format!("{trimmed}{suffix}")
+}
+
+/// Parse a DISPLAYED value string as a signed integer when it looks numeric and
+/// small enough that a delta would be meaningful (the C++ `tryParseAsInt`).
+/// Accepts decimal (optionally signed) and `0x`/`0X` hex. Returns `None` for
+/// non-numeric values (pointers/strings/floats) so their delta is skipped.
+/// Pointer-sized hex (>= 9 hex digits = up to a full 64-bit address) is rejected
+/// — deltas between heap addresses are noise. Decimal magnitudes that overflow
+/// `i64` also yield `None`.
+pub(super) fn try_parse_int(value_str: &str) -> Option<i64> {
+    let t = value_str.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (hex_body, is_hex) = if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+    {
+        (rest, true)
+    } else {
+        (t, false)
+    };
+    if is_hex {
+        if hex_body.is_empty() || hex_body.len() >= 9 {
+            return None; // skip pointer-ish (and empty "0x")
+        }
+        return u64::from_str_radix(hex_body, 16).ok().map(|u| u as i64);
+    }
+    // Signed decimal.
+    t.parse::<i64>().ok()
+}
+
+/// A per-entry recency tier (0 = newest/hottest … 3 = oldest/coldest) derived
+/// from the entry's age, mirroring the C++ `timeTierColor` bands. The render
+/// maps the tier to a color/emphasis so the newest value reads brightest:
+///   0: < 1s   (just changed — accent)
+///   1: < 1m   (strong / full text)
+///   2: < 1h   (muted)
+///   3: ≥ 1h   (deepest dim)
+pub(super) fn recency_tier(delta_ms: i64) -> u8 {
+    let d = delta_ms.max(0);
+    if d < 1000 {
+        0
+    } else if d < 60_000 {
+        1
+    } else if d < 3_600_000 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Build the value-history summary header (the C++ body-header line), e.g.
+/// `"5 entries · 3 unique · ↑ rising · since 12m · ~30s/Δ · stale"`. Computed
+/// entirely from the captured `(value, msec)` list (newest-first) plus `now_ms`:
+///   - `N entr{y|ies}` — the visible (capped) entry count.
+///   - `· M unique` — distinct values in the window, only when fewer than N.
+///   - `· ↑ rising` / `· ↓ falling` — when every consecutive numeric delta
+///     shares a sign (monotonic). Omitted for non-numeric or mixed sequences.
+///   - `· since X` — age of the oldest timestamped entry.
+///   - `· ~Y/Δ` — average inter-change interval (total span ÷ gaps), only when
+///     ≥ 3 entries and the span is ≥ 2 s.
+///   - `· stale` — when the newest entry is itself older than 5 min.
+/// Tolerant: any token whose data doesn't apply is silently omitted.
+pub(super) fn history_header(entries: &[(String, i64)], now_ms: i64) -> String {
+    let unique = entries.len();
+    let mut out = format!("{unique} entr{}", if unique == 1 { "y" } else { "ies" });
+
+    // Distinct value count in the visible window.
+    let distinct = {
+        let mut seen: Vec<&str> = Vec::with_capacity(unique);
+        for (v, _) in entries {
+            if !seen.iter().any(|s| *s == v.as_str()) {
+                seen.push(v.as_str());
+            }
+        }
+        seen.len()
+    };
+    if distinct < unique {
+        out.push_str(&format!(" · {distinct} unique"));
+    }
+
+    // Monotonic-direction hint over consecutive numeric deltas (newest-first:
+    // entries[k] is newer than entries[k+1]).
+    {
+        let mut pos = 0i32;
+        let mut neg = 0i32;
+        let mut all_numeric = true;
+        for k in 0..entries.len().saturating_sub(1) {
+            match (try_parse_int(&entries[k].0), try_parse_int(&entries[k + 1].0)) {
+                (Some(a), Some(b)) => {
+                    let d = a - b;
+                    if d > 0 {
+                        pos += 1;
+                    } else if d < 0 {
+                        neg += 1;
+                    }
+                }
+                _ => {
+                    all_numeric = false;
+                    break;
+                }
+            }
+        }
+        if all_numeric {
+            if pos > 0 && neg == 0 {
+                out.push_str(" · ↑ rising");
+            } else if neg > 0 && pos == 0 {
+                out.push_str(" · ↓ falling");
+            }
+        }
+    }
+
+    // Oldest timestamped entry → "since X".
+    let oldest_ms = entries.iter().rev().map(|(_, t)| *t).find(|t| *t > 0);
+    if let Some(oldest) = oldest_ms {
+        out.push_str(&format!(" · since {}", fmt_elapsed_compact(now_ms - oldest)));
+    }
+
+    // Average change interval: span ÷ gaps, when there are ≥ 3 entries and the
+    // span is at least 2 s.
+    let newest_ms = entries.first().map(|(_, t)| *t).filter(|t| *t > 0);
+    if let (Some(newest), Some(oldest)) = (newest_ms, oldest_ms) {
+        if entries.len() >= 3 {
+            let span = newest - oldest;
+            let gaps = (entries.len() - 1) as i64;
+            if span >= 2000 && gaps > 0 {
+                out.push_str(&format!(" · ~{}/Δ", fmt_elapsed_compact(span / gaps)));
+            }
+        }
+    }
+
+    // Stale-newest hint: most recent entry is itself > 5 min old.
+    if let Some(newest) = newest_ms {
+        if now_ms - newest > 5 * 60 * 1000 {
+            out.push_str(" · stale");
+        }
+    }
+
+    out
 }
 
 impl super::RcxEditor {
@@ -258,12 +468,15 @@ impl super::RcxEditor {
         if lm.heat_level > 0 {
             if let Some(hist) = self.controller.value_history().get(&lm.node_id) {
                 if hist.unique_count() > 1 {
-                    // Capture (value, relative-age) pairs newest→oldest.
-                    let now = Self::now_millis();
-                    let mut entries: Vec<(String, String)> = Vec::new();
+                    // Capture (value, raw epoch-msec) pairs newest→oldest. The
+                    // render derives the relative-age label, signed delta and
+                    // recency tiers from the raw timestamp (bf49a64). Also carry
+                    // the UNCAPPED total (`count`) so the render can surface the
+                    // ring-overflow footer when older values were evicted.
+                    let mut entries: Vec<(String, i64)> = Vec::new();
                     hist.for_each_with_time(|v, t| {
                         if entries.len() < crate::core::value_history::K_CAPACITY {
-                            entries.push((v.to_string(), Self::relative_age(now, t)));
+                            entries.push((v.to_string(), t));
                         }
                     });
                     if entries.len() > 1 {
@@ -273,6 +486,7 @@ impl super::RcxEditor {
                             pos,
                             kind: HoverPopupKind::ValueHistory {
                                 entries,
+                                total_count: i64::from(hist.count),
                                 node_idx: lm.node_idx,
                                 sub_line: lm.sub_line,
                                 resolved_addr: lm.offset_addr,
@@ -286,33 +500,15 @@ impl super::RcxEditor {
         None
     }
 
-    /// Current wall-clock time in milliseconds since the Unix epoch (for the
-    /// value-history relative-age labels). Falls back to 0 if the clock is before
-    /// the epoch (which would make every age read 'now').
+    /// Current wall-clock time in milliseconds since the Unix epoch (the value-
+    /// history clock — feeds the compact time column + the header age tokens, the
+    /// C++ `QDateTime::currentMSecsSinceEpoch()` recomputed per popup rebuild).
+    /// Falls back to 0 if the clock is before the epoch.
     pub(super) fn now_millis() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
-    }
-
-    /// Format a value-history timestamp as a relative age ('now' / 'Ns ago' /
-    /// 'Nm ago' / 'Nh ago') — the C++ `ValueHistoryPopup::populate` time string
-    /// (editor.cpp:252). A non-positive timestamp (untracked) yields an empty label.
-    pub(super) fn relative_age(now: i64, then: i64) -> String {
-        if then <= 0 {
-            return String::new();
-        }
-        let elapsed = (now - then).max(0);
-        if elapsed < 1000 {
-            "now".to_string()
-        } else if elapsed < 60_000 {
-            format!("{}s ago", elapsed / 1000)
-        } else if elapsed < 3_600_000 {
-            format!("{}m ago", elapsed / 60_000)
-        } else {
-            format!("{}h ago", elapsed / 3_600_000)
-        }
     }
 
     /// Build the disasm/hex-dump popup for a function/void pointer node by reading
@@ -468,6 +664,7 @@ impl super::RcxEditor {
         let card = match &state.kind {
             HoverPopupKind::ValueHistory {
                 entries,
+                total_count,
                 node_idx,
                 sub_line,
                 resolved_addr,
@@ -477,84 +674,240 @@ impl super::RcxEditor {
                 let sub_line = *sub_line;
                 let resolved_addr = *resolved_addr;
                 let set_buttons = *set_buttons;
-                let rows: Vec<AnyElement> = entries
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (v, age))| {
-                        let mut row = div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(design::tokens::space::SM))
-                            .text_size(px(self.editor_font_size()))
-                            .font_family(self.editor_font_family())
-                            // Newest sample reads in the bright value hue; older
-                            // samples fade to the dim text (the heat-history graph).
-                            .child(
-                                div()
-                                    .flex_grow()
-                                    .text_color(if i == 0 { palette.text } else { palette.dim })
-                                    .child(SharedString::from(v.clone())),
-                            );
-                        // Relative-age label (item 68): 'now' / 'Ns ago' / ….
-                        if !age.is_empty() {
-                            row = row.child(
-                                div()
-                                    .text_size(px(design::tokens::font::UI_XS))
-                                    .text_color(palette.dim)
-                                    .child(SharedString::from(age.clone())),
-                            );
+                let total_count = *total_count;
+                // Recompute "now" fresh each frame so the time column stays live
+                // (the C++ recomputes `now` in the builder). `hover_kind_eq` ignores
+                // the raw msec, so this does NOT churn the popup identity.
+                let now = Self::now_millis();
+                let font_size = self.editor_font_size();
+                let font_family = self.editor_font_family();
+                let unique_shown = entries.len();
+
+                // Fixed monospace column widths (≈0.62 ch advance) so values stay
+                // vertically aligned as the elapsed counters tick — the C++ locks
+                // these with QFontMetrics. Index = 2 ch, delta = "+1.23K" (~6 ch),
+                // time = "999w" (~4 ch).
+                let ch = font_size * 0.62;
+                let idx_w = px(ch * 2.0);
+                let delta_w = px(ch * 6.0 + 2.0);
+                let time_w = px(ch * 4.0 + 2.0);
+
+                // Recency-tier → color: newest/just (0) = accent, recent (1) =
+                // full text, minutes (2) = dim, hours+ (3) = deeper-faded dim.
+                let tier_color = |tier: u8| -> Hsla {
+                    match tier {
+                        0 => palette.accent,
+                        1 => palette.text,
+                        2 => palette.dim,
+                        _ => with_alpha(palette.dim, 0.7),
+                    }
+                };
+
+                let newest_value = entries.first().map(|(v, _)| v.clone()).unwrap_or_default();
+
+                let mut rows: Vec<AnyElement> = Vec::with_capacity(unique_shown + 2);
+                for (i, (v, msec)) in entries.iter().enumerate() {
+                    let msec = *msec;
+                    let age_ms = if msec > 0 { (now - msec).max(0) } else { 0 };
+                    let tier = recency_tier(age_ms);
+
+                    // Index column — "▸" accent caret on the newest row; older rows
+                    // numbered from 1, colored by their own recency tier so the
+                    // index + time columns form a matching pair of recency cues.
+                    let idx_text = if i == 0 {
+                        "▸".to_string()
+                    } else {
+                        (i + 1).to_string()
+                    };
+                    let idx_color = if i == 0 { palette.accent } else { tier_color(tier) };
+
+                    // Value — bright on the newest, fading on older rows via the
+                    // recency tier. Rows that REPEAT the newest value fade an extra
+                    // notch (the data point is already shown on row 0).
+                    let mut val_color = if i == 0 { palette.text } else { tier_color(tier) };
+                    if i > 0 && *v == newest_value {
+                        val_color = with_alpha(val_color, 0.6);
+                    }
+
+                    // Signed delta from the next-older numeric value. Skipped for
+                    // non-numeric (pointers/strings) or a zero step. Positive →
+                    // number hue, negative → warm (heat-hot) so direction reads
+                    // without parsing the sign; magnitude compacted (K/M/G).
+                    let mut delta_text = String::new();
+                    let mut delta_color = palette.dim;
+                    if let Some(cur) = try_parse_int(v) {
+                        if let Some((older, _)) = entries.get(i + 1) {
+                            if let Some(prev) = try_parse_int(older) {
+                                let diff = cur - prev;
+                                if diff != 0 {
+                                    let mag = compact_number(diff);
+                                    delta_text = if diff > 0 {
+                                        format!("+{mag}")
+                                    } else {
+                                        // U+2212 MINUS SIGN reads cleaner than '-'.
+                                        format!("\u{2212}{mag}")
+                                    };
+                                    delta_color = if diff > 0 {
+                                        palette.number
+                                    } else {
+                                        palette.heat_hot
+                                    };
+                                }
+                            }
                         }
-                        // Edit-time 'Set' button (item 68): writes this value back
-                        // into the node via the controller's `set_node_value`.
-                        if set_buttons && node_idx >= 0 {
-                            let val = v.clone();
-                            row = row.child(
-                                div()
-                                    .id(("vh-set", i))
-                                    .px(px(4.0))
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_size(px(design::tokens::font::UI_XS))
-                                    .text_color(palette.dim)
-                                    .hover(|s| s.text_color(palette.text).bg(palette.hover_bg))
-                                    .child("Set")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
-                                            cx.stop_propagation();
-                                            this.set_value_from_history(
-                                                node_idx as usize,
-                                                sub_line,
-                                                &val,
-                                                resolved_addr,
-                                                cx,
-                                            );
-                                        }),
-                                    ),
-                            );
-                        }
-                        row.into_any_element()
-                    })
-                    .collect();
-                div()
+                    }
+
+                    let mut row = div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(design::tokens::space::SM))
+                        .text_size(px(font_size))
+                        .font_family(font_family.clone())
+                        // Index column.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(idx_w)
+                                .text_right()
+                                .text_color(idx_color)
+                                .child(SharedString::from(idx_text)),
+                        )
+                        // Value column — grows, truncates so a long value can't
+                        // blow the card width; the time/delta columns stay pinned.
+                        .child(
+                            div()
+                                .flex_grow()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_color(val_color)
+                                .child(SharedString::from(v.clone())),
+                        )
+                        // Delta column (fixed width; empty placeholder keeps the
+                        // value column from shifting when there's no numeric step).
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(delta_w)
+                                .text_right()
+                                .text_size(px(design::tokens::font::UI_XS))
+                                .text_color(delta_color)
+                                .child(SharedString::from(delta_text)),
+                        )
+                        // Time column — compact, right-aligned, recency-tinted.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(time_w)
+                                .text_right()
+                                .text_size(px(design::tokens::font::UI_XS))
+                                .text_color(tier_color(tier))
+                                .child(SharedString::from(if msec > 0 {
+                                    fmt_elapsed_compact(age_ms)
+                                } else {
+                                    String::new()
+                                })),
+                        );
+
+                    // Edit-time 'Set' button (item 68): writes this value back into
+                    // the node via the controller's `set_node_value`.
+                    if set_buttons && node_idx >= 0 {
+                        let val = v.clone();
+                        row = row.child(
+                            div()
+                                .id(("vh-set", i))
+                                .flex_none()
+                                .px(px(4.0))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(design::tokens::font::UI_XS))
+                                .text_color(palette.dim)
+                                .hover(|s| s.text_color(palette.text).bg(palette.hover_bg))
+                                .child("Set")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
+                                        cx.stop_propagation();
+                                        this.set_value_from_history(
+                                            node_idx as usize,
+                                            sub_line,
+                                            &val,
+                                            resolved_addr,
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                        );
+                    }
+                    rows.push(row.into_any_element());
+
+                    // Thin newest-vs-rest separator, drawn once after row 0 so the
+                    // eye locks onto "current vs previous" at a glance.
+                    if i == 0 && unique_shown > 1 {
+                        rows.push(
+                            div()
+                                .h(px(1.0))
+                                .my(px(2.0))
+                                .bg(with_alpha(palette.border, 0.5))
+                                .into_any_element(),
+                        );
+                    }
+                }
+
+                // Ring-overflow footer — ValueHistory caps at K_CAPACITY entries;
+                // when the uncapped total exceeds the visible window, earlier values
+                // were evicted. Surface the drop count so the popup doesn't read as
+                // a complete log when it's a sliding window.
+                let discarded = total_count - unique_shown as i64;
+                let footer: Option<AnyElement> = if discarded > 0 {
+                    Some(
+                        div()
+                            .pt(px(design::tokens::space::XS))
+                            .text_size(px(design::tokens::font::UI_XS))
+                            .text_color(palette.dim)
+                            .italic()
+                            .child(SharedString::from(format!(
+                                "+ {discarded} earlier value{} discarded",
+                                if discarded == 1 { "" } else { "s" }
+                            )))
+                            .into_any_element(),
+                    )
+                } else {
+                    None
+                };
+
+                let mut card = div()
                     .flex()
                     .flex_col()
                     .gap(px(design::tokens::space::XS))
                     .child(
-                        // Item 19: the "Previous Values" title carries an HLine
-                        // separator beneath it (the C++ popup divider, editor.cpp:222)
-                        // — a thin bottom border in the popup border hue.
+                        // Summary header (the C++ body header) replacing the bare
+                        // "Previous Values" title — entry/unique counts, monotonic
+                        // direction, age, avg interval, stale hint. Carries the
+                        // HLine divider beneath it (the popup divider).
                         div()
                             .text_size(px(design::tokens::font::UI_XS))
                             .text_color(palette.dim)
                             .pb(px(design::tokens::space::XS))
                             .border_b_1()
                             .border_color(palette.border)
-                            // The C++ title is "Previous Values" (editor.cpp:222).
-                            .child("Previous Values"),
+                            .child(SharedString::from(history_header(entries, now))),
                     )
-                    .children(rows)
+                    // Height-capped scroll body: a tall history scrolls instead of
+                    // crushing each row (the C++ QScrollArea wrapper). ~14 rows tall.
+                    .child(
+                        div()
+                            .id("rcx-vh-scroll")
+                            .flex()
+                            .flex_col()
+                            .max_h(px(font_size * 14.0 + 56.0))
+                            .overflow_y_scroll()
+                            .children(rows),
+                    );
+                if let Some(footer) = footer {
+                    card = card.child(footer);
+                }
+                card
             }
             HoverPopupKind::TitleBody { title, body } => {
                 let body_rows: Vec<AnyElement> = body
@@ -608,5 +961,126 @@ impl super::RcxEditor {
             .with_priority(2)
             .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compact_number, fmt_elapsed_compact, history_header, recency_tier, try_parse_int,
+    };
+
+    const S: i64 = 1000;
+    const M: i64 = 60 * S;
+    const H: i64 = 60 * M;
+    const D: i64 = 24 * H;
+    const W: i64 = 7 * D;
+
+    #[test]
+    fn fmt_elapsed_compact_tiers() {
+        assert_eq!(fmt_elapsed_compact(0), "now");
+        assert_eq!(fmt_elapsed_compact(-5), "now"); // clamped
+        assert_eq!(fmt_elapsed_compact(999), "now");
+        assert_eq!(fmt_elapsed_compact(12 * S), "12s");
+        assert_eq!(fmt_elapsed_compact(59 * S), "59s");
+        assert_eq!(fmt_elapsed_compact(5 * M), "5m");
+        assert_eq!(fmt_elapsed_compact(3 * H), "3h");
+        assert_eq!(fmt_elapsed_compact(2 * D), "2d");
+        assert_eq!(fmt_elapsed_compact(1 * W), "1w");
+        assert_eq!(fmt_elapsed_compact(3 * W), "3w");
+    }
+
+    #[test]
+    fn compact_number_kmg() {
+        // Below 10_000 → full number.
+        assert_eq!(compact_number(0), "0");
+        assert_eq!(compact_number(42), "42");
+        assert_eq!(compact_number(9999), "9999");
+        assert_eq!(compact_number(-9999), "9999"); // magnitude only
+                                                    // K tier.
+        assert_eq!(compact_number(10_000), "10K");
+        assert_eq!(compact_number(1_234_000), "1.23M");
+        // M tier.
+        assert_eq!(compact_number(2_000_000), "2M");
+        assert_eq!(compact_number(-2_000_000), "2M");
+        // G tier.
+        assert_eq!(compact_number(1_500_000_000), "1.5G");
+    }
+
+    #[test]
+    fn try_parse_int_hex_dec_signed_and_none() {
+        // Decimal, signed.
+        assert_eq!(try_parse_int("42"), Some(42));
+        assert_eq!(try_parse_int("-7"), Some(-7));
+        assert_eq!(try_parse_int("  100 "), Some(100));
+        // Hex (case-insensitive prefix).
+        assert_eq!(try_parse_int("0x10"), Some(16));
+        assert_eq!(try_parse_int("0X1f"), Some(31));
+        // Pointer-ish hex (>= 9 digits) rejected.
+        assert_eq!(try_parse_int("0x100000000"), None);
+        assert_eq!(try_parse_int("0x"), None);
+        // Non-numeric → None.
+        assert_eq!(try_parse_int(""), None);
+        assert_eq!(try_parse_int("hello"), None);
+        assert_eq!(try_parse_int("3.14"), None); // float
+        assert_eq!(try_parse_int("0xZZ"), None);
+    }
+
+    #[test]
+    fn recency_tier_bands() {
+        assert_eq!(recency_tier(0), 0);
+        assert_eq!(recency_tier(500), 0);
+        assert_eq!(recency_tier(5 * S), 1);
+        assert_eq!(recency_tier(5 * M), 2);
+        assert_eq!(recency_tier(5 * H), 3);
+    }
+
+    #[test]
+    fn history_header_counts_and_direction() {
+        // now-relative timestamps, newest-first. A rising counter: 30, 20, 10.
+        let now = 10_000_000i64;
+        let entries = vec![
+            ("30".to_string(), now - 10 * S),
+            ("20".to_string(), now - 40 * S),
+            ("10".to_string(), now - 70 * S),
+        ];
+        let h = history_header(&entries, now);
+        // Visible entry count.
+        assert!(h.contains("3 entries"), "header = {h:?}");
+        // Monotonic rising direction (newest 30 > older 20 > 10).
+        assert!(h.contains("↑ rising"), "header = {h:?}");
+        // Oldest-age token.
+        assert!(h.contains("since "), "header = {h:?}");
+    }
+
+    #[test]
+    fn history_header_unique_and_mixed_no_direction() {
+        let now = 10_000_000i64;
+        // A bouncing value A→B→A: 3 entries, 2 unique, mixed direction (non-numeric
+        // here so no direction token at all).
+        let entries = vec![
+            ("ptrA".to_string(), now - 1 * S),
+            ("ptrB".to_string(), now - 2 * S),
+            ("ptrA".to_string(), now - 3 * S),
+        ];
+        let h = history_header(&entries, now);
+        assert!(h.contains("3 entries"), "header = {h:?}");
+        assert!(h.contains("2 unique"), "header = {h:?}");
+        assert!(
+            !h.contains("rising") && !h.contains("falling"),
+            "non-numeric → no direction hint: {h:?}"
+        );
+    }
+
+    #[test]
+    fn history_header_stale_when_newest_old() {
+        let now = 10_000_000i64;
+        // Newest entry is 10 min old → stale.
+        let entries = vec![
+            ("1".to_string(), now - 10 * M),
+            ("2".to_string(), now - 20 * M),
+        ];
+        let h = history_header(&entries, now);
+        assert!(h.contains("stale"), "header = {h:?}");
     }
 }
