@@ -83,7 +83,7 @@ impl super::RcxEditor {
             return;
         };
         // Item 6 / B4: the command-row header gets the no-node menu (Insert 4 / 8
-        // bytes, Append bytes, Add Static Field, Fold / Copy / Tracking). "Convert
+        // bytes, Append bytes, Fold / Copy / Tracking). "Convert
         // to Struct" / "Convert to Class" is NOT decided here — it is bound to a
         // dedicated shaped-position hitbox over the `struct`/`class` KEYWORD
         // (`rcx-keyword-hover`), which opens the convert menu directly. Routing it
@@ -216,7 +216,7 @@ impl super::RcxEditor {
     /// The enum HEADER context menu (the C++ enum-header branch, controller.cpp:3362):
     /// Add Member / Rename / Delete, then the shared Fold/Copy/Tracking submenus.
     /// Deliberately OMITS the struct ops (type-cycler, Change Type, Insert, Convert,
-    /// Static, Big endian, Duplicate, Copy-as-C-Struct) that would corrupt an enum.
+    /// Structure, Big endian, Duplicate, Copy-as-C-Struct) that would corrupt an enum.
     fn open_enum_header_context_menu(
         &mut self,
         _target: ContextTarget,
@@ -388,7 +388,7 @@ impl super::RcxEditor {
 
     /// Item 11/17: the no-node (empty area) context menu (the C++ `!hasNode`
     /// branch, controller.cpp:3882). Insert ▸ (Insert 4 / Insert 8 / Append bytes…),
-    /// then "Add Static Field" when the view root is a Struct/Array, then the
+    /// then the
     /// always-appended Fold / Copy / Tracking submenus the C++ adds after the
     /// hasNode/!hasNode split (controller.cpp:3913-3974). The empty-area Copy has no
     /// Address/Offset group (no node) — only Copy Line / Copy All as Text.
@@ -399,18 +399,6 @@ impl super::RcxEditor {
         cx: &mut Context<Self>,
     ) {
         let editor_focus = self.focus_handle.clone();
-        // "Add Static Field" appears only when the view root is a Struct/Array.
-        let root_is_container = {
-            let root_id = self.controller.view_root_id();
-            let tree = self.controller.tree();
-            let idx = tree.index_of_id(root_id);
-            root_id != 0
-                && idx >= 0
-                && matches!(
-                    tree.nodes[idx as usize].kind,
-                    NodeKind::Struct | NodeKind::Array
-                )
-        };
         let track_values = self.controller.track_values();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
             menu.min_w(px(200.0))
@@ -424,14 +412,6 @@ impl super::RcxEditor {
                             IconName::Plus,
                             Box::new(EditorAppendBytes),
                         )
-                })
-                // Add Static Field to the current view root (Struct/Array only).
-                .when(root_is_container, |menu| {
-                    menu.menu_with_icon(
-                        "Add Static Field",
-                        IconName::Plus,
-                        Box::new(EditorRootAddStaticField),
-                    )
                 })
                 .separator()
                 // Fold ▸ — Collapse All / Expand All (whole tree).
@@ -478,7 +458,7 @@ impl super::RcxEditor {
     /// accelerators share one code path. Item layout mirrors the C++ menu
     /// (reclass_right_click_on_address.png): New Class · Ptr to New Class · the
     /// `← cur ↔ alt →` quick type-cycler · Rename · Change Type · Insert ▸ ·
-    /// Convert ▸ · Big endian · Static ▸ · Duplicate · Delete · Fold ▸ · Copy ▸ ·
+    /// Convert ▸ · Big endian · Structure ▸ · Duplicate · Delete · Fold ▸ · Copy ▸ ·
     /// Tracking ▸ · Copy as C Struct, with leading SVG icons + accelerator hints.
     fn open_context_menu(
         &mut self,
@@ -622,30 +602,15 @@ impl super::RcxEditor {
         // check). Read once here so the menu closure can capture it by value.
         let track_values = self.controller.track_values();
 
-        // ── Item 8: Static-submenu gates (the C++ `Static` submenu,
+        // ── Item 8: Structure-submenu gates (the C++ `Structure` submenu,
         // controller.cpp:3782) ──
-        //   * Add Child (Hex64) + Add Static Field: container (Struct/Array) heads.
-        //   * Add Static Field (sibling): a non-container child of a Struct/Array.
-        //   * Edit Expression: the node is a static field.
+        //   * Add Child (Hex64): container (Struct/Array) heads.
         //   * Dissolve Union: the node is a union, or its parent is a union.
-        let (
-            static_add_child,
-            static_add_field_self,
-            static_add_field_sibling,
-            static_edit_expr,
-            static_dissolve_union,
-        ) = {
+        let (static_add_child, static_dissolve_union) = {
             let tree = self.controller.tree();
             match tree.nodes.get(target.node_idx) {
                 Some(n) => {
                     let is_container_node = matches!(n.kind, NodeKind::Struct | NodeKind::Array);
-                    let parent_is_container = n.parent_id != 0
-                        && tree
-                            .nodes
-                            .get(tree.index_of_id(n.parent_id).max(0) as usize)
-                            .map(|p| matches!(p.kind, NodeKind::Struct | NodeKind::Array))
-                            .unwrap_or(false);
-                    let add_field_sibling = !is_container_node && parent_is_container;
                     let dissolve = if n.kind == NodeKind::Struct && n.is_union() {
                         true
                     } else if n.parent_id != 0 {
@@ -656,22 +621,12 @@ impl super::RcxEditor {
                     } else {
                         false
                     };
-                    (
-                        is_container_node,
-                        is_container_node,
-                        add_field_sibling,
-                        n.is_static,
-                        dissolve,
-                    )
+                    (is_container_node, dissolve)
                 }
-                None => (false, false, false, false, false),
+                None => (false, false),
             }
         };
-        let static_has_any = static_add_child
-            || static_add_field_self
-            || static_add_field_sibling
-            || static_edit_expr
-            || static_dissolve_union;
+        let static_has_any = static_add_child || static_dissolve_union;
 
         let editor_focus = self.focus_handle.clone();
         let menu = gpui_component::menu::PopupMenu::build(window, cx, move |menu, mw, mcx| {
@@ -873,33 +828,19 @@ impl super::RcxEditor {
                         Box::new(EditorEditBytesAscii),
                     )
                 })
-                // Item 8: the Static submenu — real entries wired to the controller
-                // static-field / StaticExpr / dissolve-union mutators (the C++
-                // `Static` submenu, controller.cpp:3782). Shown only when at least
-                // one entry applies; a placeholder otherwise.
-                .submenu("Static", mw, mcx, move |mut sub, _w, _cx| {
+                // Item 8: the Structure submenu — real entries wired to the
+                // controller's add-child / dissolve-union mutators (the C++
+                // `Structure` submenu, controller.cpp:3782). Shown only when at
+                // least one entry applies; a placeholder otherwise.
+                .submenu("Structure", mw, mcx, move |mut sub, _w, _cx| {
                     if !static_has_any {
-                        return sub.label("(no static address)");
+                        return sub.label("(none)");
                     }
                     if static_add_child {
                         sub = sub.menu_with_icon(
                             "Add Child",
                             IconName::Plus,
                             Box::new(EditorStaticAddChild),
-                        );
-                    }
-                    if static_add_field_self || static_add_field_sibling {
-                        sub = sub.menu_with_icon(
-                            "Add Static Field",
-                            IconName::Plus,
-                            Box::new(EditorStaticAddField),
-                        );
-                    }
-                    if static_edit_expr {
-                        sub = sub.menu_with_icon(
-                            "Edit Expression",
-                            IconName::SquareTerminal,
-                            Box::new(EditorStaticEditExpr),
                         );
                     }
                     if static_dissolve_union {

@@ -107,18 +107,6 @@ pub enum Command {
         old_members: Vec<(String, i64)>,
         new_members: Vec<(String, i64)>,
     },
-    /// `cmd::ChangeOffsetExpr` (`core.h`).
-    ChangeOffsetExpr {
-        node_id: u64,
-        old_expr: String,
-        new_expr: String,
-    },
-    /// `cmd::ToggleStatic` (`core.h`).
-    ToggleStatic {
-        node_id: u64,
-        old_val: bool,
-        new_val: bool,
-    },
     /// `cmd::ToggleRelative` (`core.h`) — declared but unhandled in C++.
     ToggleRelative {
         node_id: u64,

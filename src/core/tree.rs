@@ -405,9 +405,6 @@ impl NodeTree {
             let mut ranges: Vec<(usize, i64, i64)> = Vec::with_capacity(kids.len());
             for &ci in kids {
                 let n = &self.nodes[ci];
-                if n.is_static {
-                    continue;
-                }
                 let sz = if matches!(n.kind, NodeKind::Struct | NodeKind::Array) {
                     self.struct_span(n.id)
                 } else {
@@ -622,9 +619,6 @@ impl NodeTree {
         let kids = self.children_of(struct_id);
         for &ci in &kids {
             let c = &self.nodes[ci];
-            if c.is_static {
-                continue;
-            }
             let sz = if matches!(c.kind, NodeKind::Struct | NodeKind::Array) {
                 self.struct_span_inner(c.id, visited, depth + 1)
             } else {

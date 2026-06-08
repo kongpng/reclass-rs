@@ -1501,9 +1501,6 @@ impl super::RcxEditor {
             EditTarget::ArrayElementCount | EditTarget::ArrayCount => {
                 self.commit_array_count(idx, commit.text.trim(), cx);
             }
-            EditTarget::StaticExpr => {
-                self.commit_static_expr(idx, commit.text.trim(), cx);
-            }
             _ => {}
         }
         self.after_mutation(cx);
@@ -1623,33 +1620,6 @@ impl super::RcxEditor {
                 new_element_kind: elem_kind,
                 old_array_len,
                 new_array_len: old_array_len,
-            });
-    }
-
-    /// Write a committed static-expression edit (item 15) via `ChangeOffsetExpr`.
-    fn commit_static_expr(&mut self, idx: usize, text: &str, _cx: &mut Context<Self>) {
-        let tree = self.controller.tree();
-        if idx >= tree.nodes.len() {
-            return;
-        }
-        let n = &tree.nodes[idx];
-        // Item 7: only a STATIC node gets an offsetExpr written (the C++
-        // `EditTarget::StaticExpr` guard `if (node.isStatic && text != ...)`,
-        // controller.cpp:1405). A non-static node must NOT acquire an offsetExpr
-        // (which would quietly make it relative on the next compose).
-        if !n.is_static {
-            return;
-        }
-        let node_id = n.id;
-        let old_expr = n.offset_expr.clone();
-        if old_expr == text {
-            return;
-        }
-        self.controller
-            .push_command(crate::core::Command::ChangeOffsetExpr {
-                node_id,
-                old_expr,
-                new_expr: text.to_string(),
             });
     }
 

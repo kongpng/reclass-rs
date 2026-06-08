@@ -107,10 +107,6 @@ pub fn target_at_col(
     }
 
     // ── Generic type / name / value / comment columns. ──
-    // NOTE: a static `return <expr>` row is a LineKind::Field and C++ hitTestTarget
-    // never probes staticExprSpanFor — a click on it resolves to the Type span
-    // (opening the Type picker), exactly like any field. StaticExpr editing stays
-    // reachable via the right-click "Edit Expression" menu + the edit-begin path.
     // Header redirect: array header Type → ArrayElementType (handled above);
     // plain header Type opens the picker, Name editable.
     if span_contains(
@@ -654,7 +650,6 @@ mod tests {
             ArrayIndex,
             ArrayCount,
             ArrayElementCount,
-            StaticExpr,
         ] {
             assert!(!is_picker_target(t), "{t:?} must NOT be a picker token");
         }

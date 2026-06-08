@@ -606,119 +606,6 @@ fn inline_edit_type_unknown_struct_name_is_noop() {
     assert_eq!(c.tree().nodes[ni as usize].struct_type_name, "");
 }
 
-// ── Static-field arms ──
-
-fn push_static_field(c: &mut RcxController, name: &str, expr: &str) -> u64 {
-    let root_id = c.tree().nodes[0].id;
-    let mut sf = Node {
-        kind: NodeKind::Hex64,
-        name: name.into(),
-        parent_id: root_id,
-        offset: 0,
-        is_static: true,
-        offset_expr: expr.into(),
-        ..Node::default()
-    };
-    sf.id = c.tree_mut().reserve_id();
-    let id = sf.id;
-    c.push_command(Command::Insert {
-        node: sf,
-        off_adjs: Vec::new(),
-    });
-    id
-}
-
-#[test]
-fn add_static_field() {
-    let mut c = make_ctrl();
-    let root_id = c.tree().nodes[0].id;
-    let orig = c.tree().nodes.len();
-    push_static_field(&mut c, "static_field", "base");
-    assert_eq!(c.tree().nodes.len(), orig + 1);
-    let h = c.tree().nodes.last().unwrap();
-    assert!(h.is_static);
-    assert_eq!(h.offset_expr, "base");
-    assert_eq!(h.name, "static_field");
-    assert_eq!(h.parent_id, root_id);
-}
-
-#[test]
-fn add_static_field_undo() {
-    let mut c = make_ctrl();
-    let orig = c.tree().nodes.len();
-    push_static_field(&mut c, "static_field", "base");
-    assert_eq!(c.tree().nodes.len(), orig + 1);
-    c.undo();
-    assert_eq!(c.tree().nodes.len(), orig);
-    c.redo();
-    assert_eq!(c.tree().nodes.len(), orig + 1);
-    assert!(c.tree().nodes.last().unwrap().is_static);
-}
-
-#[test]
-fn change_static_field_expression() {
-    let mut c = make_ctrl();
-    let sf_id = push_static_field(&mut c, "static_field", "base");
-    c.push_command(Command::ChangeOffsetExpr {
-        node_id: sf_id,
-        old_expr: "base".into(),
-        new_expr: "base + 0x10".into(),
-    });
-    let idx = c.tree().index_of_id(sf_id) as usize;
-    assert_eq!(c.tree().nodes[idx].offset_expr, "base + 0x10");
-    c.undo();
-    let idx = c.tree().index_of_id(sf_id) as usize;
-    assert_eq!(c.tree().nodes[idx].offset_expr, "base");
-}
-
-#[test]
-fn delete_static_field_preserves_struct_size() {
-    let mut c = make_ctrl();
-    let root_id = c.tree().nodes[0].id;
-    let span_before = c.tree().struct_span(root_id);
-    push_static_field(&mut c, "static_field", "base");
-    assert_eq!(c.tree().struct_span(root_id), span_before);
-    let sf_id = c.tree().nodes.last().unwrap().id;
-    // cmd::Remove{sfId} — empty subtree (redo recomputes; only undo consults it).
-    c.push_command(Command::Remove {
-        node_id: sf_id,
-        subtree: Vec::new(),
-        off_adjs: Vec::new(),
-    });
-    assert_eq!(c.tree().struct_span(root_id), span_before);
-}
-
-#[test]
-fn static_field_rename_preserves_expression() {
-    let mut c = make_ctrl();
-    let sf_id = push_static_field(&mut c, "my_static", "base + field_u32");
-    c.push_command(Command::Rename {
-        node_id: sf_id,
-        old_name: "my_static".into(),
-        new_name: "renamed_static".into(),
-    });
-    let idx = c.tree().index_of_id(sf_id) as usize;
-    assert_eq!(c.tree().nodes[idx].name, "renamed_static");
-    assert_eq!(c.tree().nodes[idx].offset_expr, "base + field_u32");
-    assert!(c.tree().nodes[idx].is_static);
-}
-
-#[test]
-fn static_field_type_change_preserves_flags() {
-    let mut c = make_ctrl();
-    let sf_id = push_static_field(&mut c, "static_field", "base");
-    c.push_command(Command::ChangeKind {
-        node_id: sf_id,
-        old_kind: NodeKind::Hex64,
-        new_kind: NodeKind::UInt32,
-        off_adjs: Vec::new(),
-    });
-    let idx = c.tree().index_of_id(sf_id) as usize;
-    assert_eq!(c.tree().nodes[idx].kind, NodeKind::UInt32);
-    assert!(c.tree().nodes[idx].is_static);
-    assert_eq!(c.tree().nodes[idx].offset_expr, "base");
-}
-
 #[test]
 fn clear_value_history_resets_heat() {
     let mut doc = RcxDocument::new();
@@ -1550,31 +1437,6 @@ fn nullptr_pointer_display() {
     assert_eq!(crate::format::fmt_pointer32(0), "nullptr");
     assert!(crate::format::fmt_pointer64(0x400000).starts_with("0x"));
     assert!(crate::format::fmt_pointer32(0x1000).starts_with("0x"));
-}
-
-#[test]
-fn static_field_excluded_from_span() {
-    let mut c = make_ctrl();
-    let root_id = c.tree().nodes[0].id;
-    let mut sf = Node {
-        kind: NodeKind::Hex64,
-        name: "static_test".into(),
-        parent_id: root_id,
-        offset: 9999,
-        is_static: true,
-        ..Node::default()
-    };
-    sf.id = c.tree_mut().reserve_id();
-    let sf_id = sf.id;
-    c.push_command(Command::Insert {
-        node: sf,
-        off_adjs: Vec::new(),
-    });
-    let sf_idx = c.tree().index_of_id(sf_id);
-    assert!(sf_idx >= 0);
-    assert!(c.tree().nodes[sf_idx as usize].is_static);
-    let span = c.tree().struct_span(root_id);
-    assert!(span < 9999);
 }
 
 #[test]
@@ -3043,7 +2905,7 @@ fn materialize_ref_children_noop_without_ref() {
 
 // ───────────────────────────────────────────────────────────────────────────
 // New-feature ports: type popup, find/create struct, dissolve union, bitfield
-// interaction, enum/bitfield members, static field, address resolution.
+// interaction, enum/bitfield members, address resolution.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// A two-root document: a `Player` root struct and a sibling leaf field on a
@@ -3624,27 +3486,6 @@ fn bitfield_member_add_rename_delete_are_noops() {
         .bitfield_members
         .clone();
     assert_eq!(after, before);
-}
-
-#[test]
-fn insert_static_field_defaults() {
-    let mut c = make_ctrl();
-    let root_id = c.tree().nodes[0].id;
-    let before = c.tree().children_of(root_id).len();
-    c.insert_static_field(root_id);
-    let kids = c.tree().children_of(root_id);
-    assert_eq!(kids.len(), before + 1);
-    let sf = kids
-        .iter()
-        .map(|&i| c.tree().nodes[i].clone())
-        .find(|n| n.is_static)
-        .unwrap();
-    assert_eq!(sf.kind, NodeKind::Hex64);
-    assert_eq!(sf.offset_expr, "base");
-    assert_eq!(sf.name, "static_field");
-    // Undoable.
-    c.undo();
-    assert_eq!(c.tree().children_of(root_id).len(), before);
 }
 
 #[test]

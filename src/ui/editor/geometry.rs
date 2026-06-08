@@ -650,9 +650,6 @@ pub fn debug_line(
         lm.effective_type_w,
         lm.effective_name_w,
     );
-    if lm.is_static_line {
-        meta.push_str(" static");
-    }
     if lm.is_continuation {
         meta.push_str(" cont");
     }
@@ -871,7 +868,6 @@ pub fn resolved_span_for(
         ArrayIndex => compose::array_index_span_for(lm, text),
         ArrayCount => compose::array_count_span_for(lm, text),
         PointerTarget => compose::pointer_target_span_for(lm, text),
-        StaticExpr => compose::static_expr_span_for(text),
         TypeSelector => compose::command_row_chevron_span(text),
     }
 }
@@ -960,32 +956,6 @@ fn header_type_span(lm: &LineMeta, text: &str, type_w: i32) -> ColumnSpan {
     // Anonymous structs use bare keywords — not clickable.
     if matches!(type_col.as_str(), "struct" | "union" | "class") {
         return ColumnSpan::default();
-    }
-
-    // Static field headers: "static hex64 target {" — skip the "static " prefix,
-    // then return the FIRST whitespace-delimited token (the type name).
-    if lm.is_static_line {
-        let mut cursor = ind;
-        while cursor < type_end && chars[cursor as usize] == ' ' {
-            cursor += 1;
-        }
-        // Peek the 7 chars "static " at the cursor.
-        let peek: String = chars
-            .iter()
-            .skip(cursor as usize)
-            .take(7)
-            .collect::<String>();
-        if peek == "static " {
-            cursor += 7;
-        }
-        return match first_token_in(&chars, cursor, type_end) {
-            Some((start, end)) => ColumnSpan {
-                start,
-                end,
-                valid: true,
-            },
-            None => ColumnSpan::default(),
-        };
     }
 
     // Named struct: the entire type column is the type name; find its bounds
@@ -1914,22 +1884,6 @@ mod tests {
             .collect();
         // Trimmed to the actual type-name bounds (no padding, no following columns).
         assert_eq!(slice, "_MMPTE");
-    }
-
-    #[test]
-    fn header_type_span_skips_static_prefix() {
-        // A static-field header "static hex64 target {" — the type span is the type
-        // token AFTER the "static " prefix (item 91).
-        let mut lm = header_line(0);
-        lm.is_static_line = true;
-        let type_w = 20;
-        let text = compose_header_text(0, "static hex64", type_w, "target {");
-        let s = header_type_span(&lm, &text, type_w);
-        assert!(s.valid);
-        let slice: String = text.chars().collect::<Vec<_>>()[s.start as usize..s.end as usize]
-            .iter()
-            .collect();
-        assert_eq!(slice, "hex64");
     }
 
     #[test]

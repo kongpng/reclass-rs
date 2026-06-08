@@ -218,17 +218,10 @@ actions!(
         // Item 7/18/48: group the multi-selection into a Union (controller
         // `group_into_union`).
         EditorGroupIntoUnion,
-        // Item 8: the Static submenu actions — add a Hex64 child / a static field,
-        // edit the static expression, or dissolve a union member.
+        // Item 8: the Structure submenu actions — add a Hex64 child, or
+        // dissolve a union member.
         EditorStaticAddChild,
-        EditorStaticAddField,
-        EditorStaticEditExpr,
         EditorStaticDissolveUnion,
-        // Item 11: the no-node (empty-area) menu's "Add Static Field" — adds a
-        // static field to the current VIEW ROOT struct/array (the C++ `!hasNode`
-        // branch's `insertStaticField(rootId)`, controller.cpp:3904). Distinct from
-        // `EditorStaticAddField`, which targets the right-clicked node.
-        EditorRootAddStaticField,
         // Item 11: type-inference quick-convert (the C++ `Convert to <type>` /
         // `Split into <type>xN`). The suggested kind(s) are stashed in
         // `pending_hint_convert` when the menu opens (a parameterless gpui action
@@ -5072,7 +5065,7 @@ impl RcxEditor {
         }
     }
 
-    // ── Item 8: Static submenu actions ──
+    // ── Item 8: Structure submenu actions ──
 
     /// "Add Child" — insert a Hex64 child at the container head's offset 0 (the C++
     /// `insertNode(nodeId, 0, Hex64, "newField")`).
@@ -5087,75 +5080,6 @@ impl RcxEditor {
             self.controller
                 .insert_node(t.node_id, 0, NodeKind::Hex64, "newField");
             self.apply_document(cx);
-        }
-    }
-
-    /// "Add Static Field" — add a static field to the target container (or, for a
-    /// non-container child of a struct/array, to its parent), the C++
-    /// `insertStaticField`.
-    fn action_static_add_field(
-        &mut self,
-        _: &EditorStaticAddField,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_context_menu(cx);
-        if let Some(t) = self.action_target() {
-            let parent = {
-                let tree = self.controller.tree();
-                match tree.nodes.get(t.node_idx) {
-                    Some(n) if matches!(n.kind, NodeKind::Struct | NodeKind::Array) => n.id,
-                    Some(n) => n.parent_id,
-                    None => 0,
-                }
-            };
-            if parent != 0 {
-                self.controller.insert_static_field(parent);
-                self.apply_document(cx);
-            }
-        }
-    }
-
-    /// Item 11: "Add Static Field" from the no-node (empty-area) menu — add a
-    /// static field to the current VIEW ROOT, when it is a Struct/Array (the C++
-    /// `!hasNode` branch, controller.cpp:3904).
-    fn action_root_add_static_field(
-        &mut self,
-        _: &EditorRootAddStaticField,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_context_menu(cx);
-        let root_id = self.controller.view_root_id();
-        if root_id == 0 {
-            return;
-        }
-        let is_container = {
-            let tree = self.controller.tree();
-            let idx = tree.index_of_id(root_id);
-            idx >= 0
-                && matches!(
-                    tree.nodes[idx as usize].kind,
-                    NodeKind::Struct | NodeKind::Array
-                )
-        };
-        if is_container {
-            self.controller.insert_static_field(root_id);
-            self.apply_document(cx);
-        }
-    }
-
-    /// "Edit Expression" — open the inline StaticExpr edit on the static field's
-    /// row (the C++ `beginInlineEdit(StaticExpr, line)`).
-    fn action_static_edit_expr(
-        &mut self,
-        _: &EditorStaticEditExpr,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_context_menu(cx);
-        if let Some(t) = self.action_target() {
-            self.begin_inline_edit(t.line, EditTarget::StaticExpr, window, cx);
         }
     }
 
@@ -5702,10 +5626,7 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_group_into_union))
             // Item 8: Static submenu actions.
             .on_action(cx.listener(Self::action_static_add_child))
-            .on_action(cx.listener(Self::action_static_add_field))
-            .on_action(cx.listener(Self::action_static_edit_expr))
             .on_action(cx.listener(Self::action_static_dissolve_union))
-            .on_action(cx.listener(Self::action_root_add_static_field))
             .on_action(cx.listener(Self::action_hint_convert))
             .on_action(cx.listener(Self::action_hint_split))
             .on_action(cx.listener(Self::action_toggle_big_endian))

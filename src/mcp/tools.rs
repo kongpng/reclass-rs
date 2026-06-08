@@ -539,32 +539,6 @@ pub fn tool_tree_apply(args: &Map<String, Value>, host: &mut dyn McpHost) -> Val
                         );
                     }
                 }
-                "change_offset_expr" => {
-                    if let Some((tidx, node_id)) = lookup(tab, op_obj, "nodeId", &placeholders) {
-                        let old = tab.data.tree.nodes[tidx].offset_expr.clone();
-                        tab.push_command(Command::ChangeOffsetExpr {
-                            node_id,
-                            old_expr: old,
-                            new_expr: arg_str(op_obj, "offsetExpr"),
-                        });
-                        applied += 1;
-                    } else {
-                        skip(&mut skipped, i, "change_offset_expr", op_obj, &placeholders);
-                    }
-                }
-                "toggle_static" => {
-                    if let Some((tidx, node_id)) = lookup(tab, op_obj, "nodeId", &placeholders) {
-                        let old = tab.data.tree.nodes[tidx].is_static;
-                        tab.push_command(Command::ToggleStatic {
-                            node_id,
-                            old_val: old,
-                            new_val: arg_bool(op_obj, "isStatic"),
-                        });
-                        applied += 1;
-                    } else {
-                        skip(&mut skipped, i, "toggle_static", op_obj, &placeholders);
-                    }
-                }
                 "toggle_relative" => {
                     if let Some((tidx, node_id)) = lookup(tab, op_obj, "nodeId", &placeholders) {
                         let old = tab.data.tree.nodes[tidx].is_relative;
@@ -696,8 +670,6 @@ fn apply_insert(
     n.element_kind = kind_from_string(&arg_str_default(op, "elementKind", "UInt8"));
     n.array_len = (parse_integer(arg(op, "arrayLen"), 1) as i32).clamp(1, K_MAX_ARRAY_LEN);
     n.ptr_depth = (parse_integer(arg(op, "ptrDepth"), 0) as i32).clamp(0, 2);
-    n.is_static = arg_bool(op, "isStatic");
-    n.offset_expr = arg_str(op, "offsetExpr");
     n.is_relative = arg_bool(op, "isRelative");
 
     if op.contains_key("enumMembers") {

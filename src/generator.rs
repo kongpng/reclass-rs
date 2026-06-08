@@ -346,21 +346,14 @@ impl<'a> GenContext<'a> {
     }
 
     /// `GenContext::prepareChildren(structId)` (`generator.cpp:87-97`).
-    /// Returns `(regular sorted by offset, static fields)`.
-    fn prepare_children(&self, struct_id: u64) -> (Vec<usize>, Vec<usize>) {
-        let mut children: Vec<usize> = Vec::new();
-        let mut static_idxs: Vec<usize> = Vec::new();
-        if let Some(kids) = self.child_map.get(&struct_id) {
-            for &ci in kids {
-                if self.tree.nodes[ci].is_static {
-                    static_idxs.push(ci);
-                } else {
-                    children.push(ci);
-                }
-            }
-        }
+    /// Returns the children sorted by offset.
+    fn prepare_children(&self, struct_id: u64) -> Vec<usize> {
+        let mut children: Vec<usize> = match self.child_map.get(&struct_id) {
+            Some(kids) => kids.clone(),
+            None => Vec::new(),
+        };
         children.sort_by_key(|&i| self.tree.nodes[i].offset);
-        (children, static_idxs)
+        children
     }
 
     /// `GenContext::uniquePadName()` (`generator.cpp:99-101`).
@@ -407,31 +400,6 @@ impl<'a> GenContext<'a> {
             }
         }
         None
-    }
-
-    /// Emit the `// static: TYPE name @ off` trailer for each static field — the
-    /// shared C / Rust / C# loop, differing only in the per-language fallback.
-    fn emit_static_comments(
-        &mut self,
-        ind: &str,
-        static_idxs: &[usize],
-        fallback: fn(NodeKind) -> &'static str,
-    ) {
-        for &si in static_idxs {
-            let sf = self.tree.nodes[si].clone();
-            let sf_type = if sf.struct_type_name.is_empty() {
-                self.aliased(sf.kind, fallback)
-            } else {
-                sf.struct_type_name.clone()
-            };
-            self.output.push_str(&format!(
-                "{}// static: {} {} @ {}\n",
-                ind,
-                sf_type,
-                sanitize_ident(&sf.name),
-                sf.offset_expr
-            ));
-        }
     }
 
     /// `GenContext::structName(const Node&)` (`generator.cpp:114-118`).
@@ -579,7 +547,7 @@ fn emit_struct_body(
     let struct_size = ctx.tree.struct_span(struct_id);
     let ind = indent(depth);
 
-    let (children, static_idxs) = ctx.prepare_children(struct_id);
+    let children = ctx.prepare_children(struct_id);
 
     let mut cursor = 0i32;
     let mut i = 0usize;
@@ -729,8 +697,6 @@ fn emit_struct_body(
         emit_pad_run_c(ctx, &ind, base_offset, cursor, struct_size - cursor);
     }
 
-    // Static field comments.
-    ctx.emit_static_comments(&ind, &static_idxs, c_type_name);
 }
 
 /// The `emitPadRun` lambda inside `emitStructBody` (`generator.cpp:237-243`).
@@ -941,7 +907,7 @@ fn emit_rust_struct_body(
     let struct_size = ctx.tree.struct_span(struct_id);
     let ind = indent(depth);
 
-    let (children, static_idxs) = ctx.prepare_children(struct_id);
+    let children = ctx.prepare_children(struct_id);
 
     let mut cursor = 0i32;
     let mut i = 0usize;
@@ -1060,7 +1026,6 @@ fn emit_rust_struct_body(
         emit_pad_run_rust(ctx, &ind, base_offset, cursor, struct_size - cursor);
     }
 
-    ctx.emit_static_comments(&ind, &static_idxs, rust_type_name);
 }
 
 /// Join `name:bits` for the bitfield comment (`generator.cpp:660-662`).
@@ -1192,9 +1157,6 @@ fn emit_defines_for_struct(ctx: &mut GenContext, struct_id: u64, prefix: &str, b
 
     for ci in children {
         let child = ctx.tree.nodes[ci].clone();
-        if child.is_static {
-            continue;
-        }
         if is_hex_node(child.kind) {
             continue;
         }
@@ -1241,7 +1203,7 @@ fn emit_csharp_struct_body(
     }
 
     let ind = indent(depth);
-    let (children, static_idxs) = ctx.prepare_children(struct_id);
+    let children = ctx.prepare_children(struct_id);
 
     // C# uses [FieldOffset(N)] — no manual padding.
     for ci in children {
@@ -1356,7 +1318,6 @@ fn emit_csharp_struct_body(
         }
     }
 
-    ctx.emit_static_comments(&ind, &static_idxs, cs_type_name);
 }
 
 /// `emitCSharpStruct(GenContext&, uint64_t)` (`generator.cpp:1035-1085`).
@@ -1459,7 +1420,7 @@ fn emit_python_struct_body(ctx: &mut GenContext, struct_id: u64, is_union: bool,
     let struct_size = ctx.tree.struct_span(struct_id);
     let ind = "        "; // 2 levels for inside _fields_
 
-    let (children, _static_idxs) = ctx.prepare_children(struct_id);
+    let children = ctx.prepare_children(struct_id);
 
     let mut cursor = 0i32;
     let mut i = 0usize;
@@ -1683,18 +1644,6 @@ fn emit_python_struct(ctx: &mut GenContext, struct_id: u64) {
 
     ctx.output.push_str("    ]\n");
 
-    // Static field comments.
-    let static_idxs = ctx.prepare_children(struct_id).1;
-    for si in static_idxs {
-        let sf = &ctx.tree.nodes[si];
-        let line = format!(
-            "    # static: {} {} @ {}\n",
-            py_type_name(sf.kind),
-            sanitize_ident(&sf.name),
-            sf.offset_expr
-        );
-        ctx.output.push_str(&line);
-    }
     ctx.output.push('\n');
 
     ctx.visiting.remove(&struct_id);

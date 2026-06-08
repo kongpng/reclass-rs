@@ -387,24 +387,6 @@ fn apply_command(tab: &mut TabData, cmd: &Command, is_undo: bool) {
                 new_members.clone()
             }
         }),
-        Command::ChangeOffsetExpr {
-            node_id,
-            old_expr,
-            new_expr,
-        } => set_field(tree, *node_id, |n| {
-            n.offset_expr = if is_undo {
-                old_expr.clone()
-            } else {
-                new_expr.clone()
-            }
-        }),
-        Command::ToggleStatic {
-            node_id,
-            old_val,
-            new_val,
-        } => set_field(tree, *node_id, |n| {
-            n.is_static = if is_undo { *old_val } else { *new_val }
-        }),
         // ToggleRelative is declared but UNHANDLED in the C++ applyCommand
         // (latent no-op) — preserve that.
         Command::ToggleRelative { .. } => {}

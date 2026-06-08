@@ -1278,28 +1278,6 @@ impl RcxController {
                     };
                 }
             }
-            Command::ChangeOffsetExpr {
-                node_id,
-                old_expr,
-                new_expr,
-            } => {
-                if let Some(n) = self.node_mut(*node_id) {
-                    n.offset_expr = if is_undo {
-                        old_expr.clone()
-                    } else {
-                        new_expr.clone()
-                    };
-                }
-            }
-            Command::ToggleStatic {
-                node_id,
-                old_val,
-                new_val,
-            } => {
-                if let Some(n) = self.node_mut(*node_id) {
-                    n.is_static = if is_undo { *old_val } else { *new_val };
-                }
-            }
             // FIXME-parity: `cmd::ToggleRelative` has NO arm in C++
             // `applyCommand` (`controller.cpp:2890-3049`) — the flag never
             // toggles via this command. Preserved as a no-op for fidelity.
@@ -2929,11 +2907,11 @@ impl RcxController {
                     self.suppress_refresh = true;
                     self.begin_macro("Adjust sibling offsets");
                     for si in siblings {
-                        let (sib_id, sib_off, sib_static) = {
+                        let (sib_id, sib_off) = {
                             let s = &self.doc.tree.nodes[si];
-                            (s.id, s.offset, s.is_static)
+                            (s.id, s.offset)
                         };
-                        if sib_id == node_id || sib_static {
+                        if sib_id == node_id {
                             continue;
                         }
                         if sib_off >= old_end {
@@ -3386,26 +3364,6 @@ impl RcxController {
         true
     }
 
-    /// `insertStaticField(parentId)` (`controller.cpp:2909`).
-    ///
-    /// Add a static/global field (`isStatic`, `offsetExpr = "base"`, Hex64) as a
-    /// child of `parent_id`, undoable.
-    pub fn insert_static_field(&mut self, parent_id: u64) {
-        let mut sf = Node {
-            kind: NodeKind::Hex64,
-            name: "static_field".to_string(),
-            parent_id,
-            offset: 0,
-            is_static: true,
-            offset_expr: "base".to_string(),
-            ..Node::default()
-        };
-        sf.id = self.doc.tree.reserve_id();
-        self.push_command(Command::Insert {
-            node: sf,
-            off_adjs: Vec::new(),
-        });
-    }
 
     /// Add a member to an enum (`Add Member`, `controller.cpp:3364` / `3315`):
     /// append `("NewMember", lastVal+1)`. `at == None` appends; `at == Some(i)`

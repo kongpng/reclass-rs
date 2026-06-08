@@ -3,8 +3,7 @@
 //! Faithful port of `src/core.h:200-382`. JSON (`to_json`/`from_json`) is
 //! hand-mapped over `serde_json::Value` to reproduce the C++ byte-for-byte:
 //! 64-bit ids/refId/parentId/enum-values are **decimal strings**, `collapsed`
-//! always loads `true`, optional fields omitted when default, `isStatic`
-//! falls back to the legacy `isHelper` key.
+//! always loads `true`, optional fields omitted when default.
 
 use serde_json::{json, Map, Value};
 
@@ -37,10 +36,6 @@ pub struct Node {
     /// parent node id; `0` = root.
     pub parent_id: u64,
     pub offset: i32,
-    /// static field — excluded from struct layout/span.
-    pub is_static: bool,
-    /// C/C++ expression → absolute address (static fields only).
-    pub offset_expr: String,
     /// Pointer: target = base + value (RVA) vs absolute.
     pub is_relative: bool,
     /// Array element count.
@@ -77,8 +72,6 @@ impl Default for Node {
             class_keyword: String::new(),
             parent_id: 0,
             offset: 0,
-            is_static: false,
-            offset_expr: String::new(),
             is_relative: false,
             array_len: 1,
             str_len: 64,
@@ -156,12 +149,6 @@ impl Node {
         }
         o.insert("parentId".into(), json!(self.parent_id.to_string()));
         o.insert("offset".into(), json!(self.offset));
-        if self.is_static {
-            o.insert("isStatic".into(), json!(true));
-        }
-        if !self.offset_expr.is_empty() {
-            o.insert("offsetExpr".into(), json!(self.offset_expr));
-        }
         if self.is_relative {
             o.insert("isRelative".into(), json!(true));
         }
@@ -218,11 +205,6 @@ impl Node {
             class_keyword: get("classKeyword").as_str().unwrap_or("").to_string(),
             parent_id: str_to_u64(&get("parentId"), "0"),
             offset: get("offset").as_i64().unwrap_or(0) as i32,
-            // backward-compat with the legacy `isHelper` key.
-            is_static: get("isStatic")
-                .as_bool()
-                .unwrap_or_else(|| get("isHelper").as_bool().unwrap_or(false)),
-            offset_expr: get("offsetExpr").as_str().unwrap_or("").to_string(),
             is_relative: get("isRelative").as_bool().unwrap_or(false),
             array_len: qbound(
                 1,
@@ -771,8 +753,6 @@ mod tests {
             class_keyword: "union".into(),
             parent_id: 7,
             offset: 0x7FFF_FFFF,
-            is_static: true,
-            offset_expr: "<a.exe>+0x10".into(),
             is_relative: true,
             array_len: 3,
             str_len: 64,
@@ -796,12 +776,6 @@ mod tests {
         expect.collapsed = true;
         expect.view_index = 0;
         assert_eq!(back, expect);
-    }
-
-    #[test]
-    fn is_helper_legacy_key() {
-        let v = json!({ "id": "1", "kind": "Hex8", "isHelper": true });
-        assert!(Node::from_json(&v).is_static);
     }
 
     // ── Evidence records ──

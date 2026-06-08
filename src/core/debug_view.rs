@@ -152,9 +152,6 @@ pub fn generate_debug_text(result: &ComposeResult) -> String {
             nw = lm.effective_name_w,
         );
         // Flags, appended in the exact C++ order.
-        if lm.is_static_line {
-            meta.push_str(" static");
-        }
         if lm.is_continuation {
             meta.push_str(" cont");
         }
@@ -459,17 +456,16 @@ mod tests {
     }
 
     #[test]
-    fn flag_ordering_static_cont_member_arrelem_foldplus_hint_and_cmtstart() {
+    fn flag_ordering_cont_member_arrelem_foldplus_hint_and_cmtstart() {
         // All flags on at once, plus a Comment chip (drives cmtStart) and a
         // TypeHint chip (drives hint@N). Asserts the EXACT C++ append order:
-        // static, cont, member, arrElem, fold+, hint@N — with cmtStart inline.
+        // cont, member, arrElem, fold+, hint@N — with cmtStart inline.
         let lm = LineMeta {
             line_kind: LineKind::Continuation,
             node_kind: NodeKind::UInt32,
             depth: 3,
             effective_type_w: 20,
             effective_name_w: 30,
-            is_static_line: true,
             is_continuation: true,
             is_member_line: true,
             is_array_element: true,
@@ -496,7 +492,7 @@ mod tests {
         assert_eq!(
             got,
             "|x  ## L=0 Cont nKind=UInt32 depth=3 cmtStart=40 tW=20 nW=30 \
-             static cont member arrElem fold+ hint@12"
+             cont member arrElem fold+ hint@12"
         );
     }
 

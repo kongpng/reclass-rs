@@ -1768,18 +1768,7 @@ fn compose_parent(
             return;
         }
 
-        let all_children: Vec<i32> = state.child_indices(node.id).to_vec();
-
-        // Split regular vs static.
-        let mut regular: Vec<i32> = Vec::new();
-        let mut static_idxs: Vec<i32> = Vec::new();
-        for &ci in &all_children {
-            if tree.nodes[ci as usize].is_static {
-                static_idxs.push(ci);
-            } else {
-                regular.push(ci);
-            }
-        }
+        let regular: Vec<i32> = state.child_indices(node.id).to_vec();
 
         let child_depth = depth + 1;
 
@@ -1990,7 +1979,7 @@ fn compose_parent(
             let child_id = child.id;
             let child_byte_size = child.byte_size();
 
-            let has_more = (ri < n_reg - 1) || (!static_idxs.is_empty() && !node.collapsed);
+            let has_more = ri < n_reg - 1;
             state.set_tree_sibling(child_depth, has_more);
             let (elem_idx_arg, container_addr_arg) = if children_are_array_elements {
                 let e = element_idx;
@@ -2028,19 +2017,6 @@ fn compose_parent(
             }
         }
 
-        // ── Static fields ──
-        if !static_idxs.is_empty() && (!node.collapsed || is_root_header) {
-            compose_static_fields(
-                state,
-                tree,
-                prov,
-                &node,
-                abs_addr,
-                child_depth,
-                &regular,
-                &static_idxs,
-            );
-        }
     }
 
     // Footer line.
@@ -2069,315 +2045,6 @@ fn compose_parent(
     }
 
     state.visiting.remove(&node.id);
-}
-
-/// Static-field rendering block (`compose.cpp:970-1210`). Split out for clarity.
-#[allow(clippy::too_many_arguments)]
-fn compose_static_fields(
-    state: &mut ComposeState,
-    tree: &NodeTree,
-    prov: &dyn Provider,
-    _parent: &Node,
-    abs_addr: u64,
-    child_depth: i32,
-    regular: &[i32],
-    static_idxs: &[i32],
-) {
-    use crate::addr::{AddressParser, AddressParserCallbacks};
-
-    // Build the resolver mirroring compose.cpp's makeResolver.
-    let make_callbacks = |parent_abs_addr: u64| -> AddressParserCallbacks<'_> {
-        let ps = tree.pointer_size;
-        AddressParserCallbacks {
-            resolve_identifier: Some(Box::new(move |name: &str| -> (u64, bool) {
-                if name == "base" {
-                    return (parent_abs_addr, true);
-                }
-                for &ci in regular {
-                    let sib = &tree.nodes[ci as usize];
-                    if sib.name == name {
-                        let sz = sib.byte_size();
-                        let sib_addr = parent_abs_addr.wrapping_add(sib.offset as u64);
-                        if sz > 0 && prov.is_valid() && prov.is_readable(sib_addr, sz) {
-                            let v = match sz {
-                                1 => prov.read_u8(sib_addr) as u64,
-                                2 => prov.read_u16(sib_addr) as u64,
-                                4 => prov.read_u32(sib_addr) as u64,
-                                _ => prov.read_u64(sib_addr),
-                            };
-                            return (v, true);
-                        }
-                        return (0, false);
-                    }
-                }
-                (0, false)
-            })),
-            read_pointer: Some(Box::new(move |addr: u64| -> (u64, bool) {
-                if prov.is_valid() && prov.is_readable(addr, ps) {
-                    let v = if ps >= 8 {
-                        prov.read_u64(addr)
-                    } else {
-                        prov.read_u32(addr) as u64
-                    };
-                    (v, true)
-                } else {
-                    (0, false)
-                }
-            })),
-            resolve_module: Some(Box::new(move |name: &str| -> (u64, bool) {
-                let base = prov.symbol_to_address(name);
-                (base, base != 0)
-            })),
-            ..Default::default()
-        }
-    };
-
-    let cbs = make_callbacks(abs_addr);
-
-    let n_static = static_idxs.len();
-    for sii in 0..n_static {
-        let si = static_idxs[sii];
-        state.set_tree_sibling(child_depth, sii < n_static - 1);
-        let sf = tree.nodes[si as usize].clone();
-
-        // Evaluate expression → absolute address.
-        let mut static_addr = 0u64;
-        let mut expr_ok = false;
-        if !sf.offset_expr.is_empty() {
-            let result = AddressParser::evaluate(&sf.offset_expr, tree.pointer_size, Some(&cbs));
-            expr_ok = result.ok;
-            if result.ok {
-                static_addr = result.value;
-            }
-        }
-
-        // Resolve type name.
-        let type_name = if sf.kind == NodeKind::Struct {
-            render::struct_type_name(&sf)
-        } else if sf.kind == NodeKind::Pointer64 || sf.kind == NodeKind::Pointer32 {
-            render::pointer_type_name_kind(resolve_pointer_target(tree, sf.ref_id))
-        } else {
-            render::type_name_raw(sf.kind)
-        };
-
-        let is_collapsed = sf.collapsed;
-
-        // Header line.
-        let mut header_line = U16Str::from_str(&render::indent(child_depth));
-        if is_collapsed {
-            let expr_part = if !sf.offset_expr.is_empty() {
-                if expr_ok {
-                    format!("return {} }} \u{2192} 0x{:X}", sf.offset_expr, static_addr)
-                } else {
-                    format!("return {} }}  (error)", sf.offset_expr)
-                }
-            } else {
-                "}".to_string()
-            };
-            header_line.push_str(&format!(
-                "static {} {} {{ {}",
-                type_name, sf.name, expr_part
-            ));
-        } else {
-            header_line.push_str(&format!("static {} {} {{", type_name, sf.name));
-        }
-
-        let offset_text = format!(
-            "~{}",
-            zero_pad_hex_upper(static_addr, (state.offset_hex_digits - 1) as usize)
-        );
-        let mut lm = LineMeta {
-            node_idx: si,
-            node_id: sf.id,
-            depth: child_depth,
-            line_kind: LineKind::Header,
-            node_kind: sf.kind,
-            fold_head: true,
-            fold_collapsed: is_collapsed,
-            is_static_line: true,
-            fold_level: compute_fold_level(child_depth, true),
-            marker_mask: 1u32 << M_STRUCT_BG,
-            offset_text,
-            offset_addr: static_addr,
-            ptr_base: state.current_ptr_base,
-            effective_type_w: u16_len(&type_name) + 7,
-            effective_name_w: u16_len(&sf.name),
-            ..Default::default()
-        };
-        state.emit_line(&header_line, &mut lm);
-
-        // Body + children (only when expanded).
-        if !is_collapsed {
-            let mut has_struct_kids =
-                expr_ok && (sf.kind == NodeKind::Struct || sf.kind == NodeKind::Array);
-            let static_kids: Vec<i32> = if has_struct_kids {
-                state.child_indices(sf.id).to_vec()
-            } else {
-                Vec::new()
-            };
-            has_struct_kids = has_struct_kids && !static_kids.is_empty();
-
-            // Body line.
-            {
-                state.set_tree_sibling(child_depth + 1, has_struct_kids);
-                let mut body_line = U16Str::from_str(&render::indent(child_depth + 1));
-                if !sf.offset_expr.is_empty() {
-                    if expr_ok {
-                        body_line.push_str(&format!("return {}", sf.offset_expr));
-                    } else {
-                        body_line.push_str(&format!("return {}  (error)", sf.offset_expr));
-                    }
-                } else {
-                    body_line.push_str("return 0");
-                }
-                if expr_ok && !sf.offset_expr.is_empty() {
-                    body_line.push_str(&format!("  \u{2192} 0x{static_addr:X}"));
-                }
-
-                let mut blm = LineMeta {
-                    node_idx: si,
-                    node_id: sf.id,
-                    depth: child_depth + 1,
-                    line_kind: LineKind::Field,
-                    node_kind: sf.kind,
-                    is_static_line: true,
-                    fold_level: compute_fold_level(child_depth + 1, false),
-                    marker_mask: 0,
-                    offset_text: " ".repeat(state.offset_hex_digits as usize),
-                    offset_addr: static_addr,
-                    ptr_base: state.current_ptr_base,
-                    ..Default::default()
-                };
-                state.emit_line(&body_line, &mut blm);
-            }
-
-            // Struct/array children at evaluated address.
-            if has_struct_kids {
-                let n_kids = static_kids.len();
-                for ski in 0..n_kids {
-                    state.set_tree_sibling(child_depth + 1, ski < n_kids - 1);
-                    compose_node(
-                        state,
-                        tree,
-                        prov,
-                        static_kids[ski],
-                        child_depth + 1,
-                        static_addr,
-                        sf.id,
-                        false,
-                        sf.id,
-                        -1,
-                        0,
-                    );
-                }
-            }
-
-            // Static pointer: read pointer value, expand ref struct.
-            if expr_ok
-                && sf.ref_id != 0
-                && (sf.kind == NodeKind::Pointer64 || sf.kind == NodeKind::Pointer32)
-            {
-                let psz = sf.byte_size();
-                let mut ptr_val = 0u64;
-                if prov.is_valid() && psz > 0 && prov.is_readable(static_addr, psz) {
-                    ptr_val = if sf.kind == NodeKind::Pointer32 {
-                        prov.read_u32(static_addr) as u64
-                    } else {
-                        prov.read_u64(static_addr)
-                    };
-                    if ptr_val == u64::MAX
-                        || (sf.kind == NodeKind::Pointer32 && ptr_val == 0xFFFF_FFFF)
-                    {
-                        ptr_val = 0;
-                    }
-                }
-                if sf.is_relative && ptr_val != 0 {
-                    ptr_val = ptr_val.wrapping_add(abs_addr);
-                }
-                if ptr_val != 0 {
-                    let mut p_base = ptr_val;
-                    let ptr_readable = prov.is_readable(p_base, 1);
-                    if !ptr_readable {
-                        p_base = 0;
-                    }
-                    let null_prov = NullProvider;
-                    let child_prov: &dyn Provider = if ptr_readable { prov } else { &null_prov };
-
-                    let ref_idx = tree.index_of_id(sf.ref_id);
-                    if ref_idx >= 0 {
-                        let ref_node = &tree.nodes[ref_idx as usize];
-                        if ref_node.kind == NodeKind::Struct || ref_node.kind == NodeKind::Array {
-                            let ref_id = ref_node.id;
-                            let saved = state.current_ptr_base;
-                            let saved_under = state.current_under_ptr;
-                            state.current_ptr_base = p_base;
-                            state.current_under_ptr = true;
-                            compose_parent(
-                                state,
-                                tree,
-                                child_prov,
-                                ref_idx,
-                                child_depth,
-                                p_base,
-                                ref_id,
-                                true,
-                                0,
-                                -1,
-                                0,
-                            );
-                            state.current_ptr_base = saved;
-                            state.current_under_ptr = saved_under;
-                        }
-                    }
-                }
-            }
-
-            // Footer line "};".
-            {
-                let (offset_text, offset_addr) =
-                    if expr_ok && (sf.kind == NodeKind::Struct || sf.kind == NodeKind::Array) {
-                        let s_span = tree.struct_span(sf.id);
-                        (
-                            render::fmt_offset_margin(
-                                static_addr.wrapping_add(s_span as u64),
-                                false,
-                                state.offset_hex_digits,
-                            ),
-                            static_addr.wrapping_add(s_span as u64),
-                        )
-                    } else {
-                        (" ".repeat(state.offset_hex_digits as usize), static_addr)
-                    };
-                let mut flm = LineMeta {
-                    node_idx: si,
-                    node_id: sf.id,
-                    depth: child_depth,
-                    line_kind: LineKind::Footer,
-                    node_kind: sf.kind,
-                    is_static_line: true,
-                    fold_level: compute_fold_level(child_depth, false),
-                    marker_mask: 0,
-                    offset_text,
-                    offset_addr,
-                    ptr_base: state.current_ptr_base,
-                    ..Default::default()
-                };
-                let mut t = U16Str::from_str(&render::indent(child_depth));
-                t.push_str("};");
-                state.emit_line(&t, &mut flm);
-            }
-        }
-    }
-}
-
-/// `QString::number(v,16).toUpper().rightJustified(digits,'0')`.
-fn zero_pad_hex_upper(v: u64, digits: usize) -> String {
-    let s = format!("{v:X}");
-    if s.len() >= digits {
-        s
-    } else {
-        format!("{}{}", "0".repeat(digits - s.len()), s)
-    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2692,7 +2359,6 @@ pub enum EditTarget {
     RootClassType,
     RootClassName,
     TypeSelector,
-    StaticExpr,
     Comment,
 }
 
@@ -2897,37 +2563,6 @@ pub fn member_value_span_for(lm: &LineMeta, line_text: &str) -> ColumnSpan {
     ColumnSpan {
         start: val_start,
         end: val_end,
-        valid: true,
-    }
-}
-
-/// `staticExprSpanFor` (`core.h:1246-1261`).
-pub fn static_expr_span_for(line_text: &str) -> ColumnSpan {
-    let u = units(line_text);
-    let ret = index_of_str(&u, &units("return "), 0);
-    if ret < 0 {
-        return ColumnSpan::default();
-    }
-    let expr_start = ret + 7;
-    let mut expr_end = u.len() as i32;
-    let arrow = index_of_unit(&u, 0x2192, expr_start);
-    if arrow > expr_start {
-        expr_end = arrow;
-    }
-    let err = index_of_str(&u, &units("(error)"), expr_start);
-    if err > expr_start && err < expr_end {
-        expr_end = err;
-    }
-    let brace = index_of_str(&u, &units(" }"), expr_start);
-    if brace > expr_start && brace < expr_end {
-        expr_end = brace;
-    }
-    while expr_end > expr_start && u[(expr_end - 1) as usize] == SP {
-        expr_end -= 1;
-    }
-    ColumnSpan {
-        start: expr_start,
-        end: expr_end,
         valid: true,
     }
 }
@@ -3297,11 +2932,6 @@ mod render {
     /// The C++ `kind` arg is unused; pass `Pointer64` to match the facade.
     pub fn pointer_type_name(target_name: String) -> String {
         crate::format::pointer_type_name(NodeKind::Pointer64, &target_name)
-    }
-
-    /// Alias matching the static-field call site (`compose.cpp:1041`).
-    pub fn pointer_type_name_kind(target_name: String) -> String {
-        pointer_type_name(target_name)
     }
 
     /// `fmtStructHeader(...)` (`format.cpp:248-259`).
