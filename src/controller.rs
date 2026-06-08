@@ -658,6 +658,11 @@ pub struct RcxController {
     changed_offsets: HashSet<i64>,
     value_history: HashMap<u64, ValueHistory>,
     last_value_addr: HashMap<u64, u64>,
+    // nodeId -> raw bytes of the last sampled value. Change-detection keys on
+    // this (not the formatted display string) so a no-op reformat of identical
+    // bytes — Hex64 "0x0" -> Pointer64 "nullptr", endianness/RVA toggle — doesn't
+    // register as a value change and spuriously light the heatmap.
+    last_value_bytes: HashMap<u64, Vec<u8>>,
     track_values: bool,
     value_track_cooldown: i32,
     refresh_gen: u64,
@@ -736,6 +741,7 @@ impl RcxController {
             changed_offsets: HashSet::new(),
             value_history: HashMap::new(),
             last_value_addr: HashMap::new(),
+            last_value_bytes: HashMap::new(),
             track_values: true,
             value_track_cooldown: 0,
             refresh_gen: 0,
@@ -1057,6 +1063,7 @@ impl RcxController {
         if !on {
             self.value_history.clear();
             self.last_value_addr.clear();
+            self.last_value_bytes.clear();
             for lm in &mut self.last_result.meta {
                 lm.heat_level = 0;
             }
@@ -1069,6 +1076,7 @@ impl RcxController {
         self.changed_offsets.clear();
         self.value_history.clear();
         self.last_value_addr.clear();
+        self.last_value_bytes.clear();
         self.prev_pages.clear();
         self.value_track_cooldown = 5;
         for lm in &mut self.last_result.meta {
@@ -1371,6 +1379,7 @@ impl RcxController {
     fn clear_node_history(&mut self, id: u64) {
         self.value_history.remove(&id);
         self.last_value_addr.remove(&id);
+        self.last_value_bytes.remove(&id);
     }
 
     /// `clearHistoryForAdjs(adjs)` (`controller.cpp:2847`).
@@ -4307,8 +4316,10 @@ impl RcxController {
             let addr = offset_addr;
             let sz = node.byte_size();
 
-            // Read the value through the chosen provider.
-            let val = {
+            // Read the value through the chosen provider. Capture the raw bytes
+            // and the deref-target pointer here too, inside the same borrow
+            // scope, so we can mutate `self` afterward without a borrow clash.
+            let (val, raw_bytes, ptr_u64) = {
                 let prov: &dyn Provider = if use_snapshot {
                     self.snapshot.as_ref().unwrap().as_ref()
                 } else {
@@ -4317,7 +4328,23 @@ impl RcxController {
                 if sz <= 0 || !prov.is_readable(addr, sz) {
                     continue;
                 }
-                format::read_value(&node, prov, addr, sub_line)
+                let val = format::read_value(&node, prov, addr, sub_line);
+                let raw_bytes = prov.read_bytes(addr, sz);
+                // deref guard — mirrors read_value's Pointer64 deref condition
+                // EXACTLY (keep ref_id == 0): only a non-null Pointer64 with
+                // ptr_depth>0 + a valid primitive target dereferences its
+                // target, so its meaningful value lives at *ptr. Those keep
+                // string-based detection; everything else uses the byte path.
+                let ptr_u64 = if node.kind == NodeKind::Pointer64
+                    && node.ptr_depth > 0
+                    && node.ref_id == 0
+                    && is_valid_primitive_ptr_target(node.element_kind)
+                {
+                    prov.read_u64(addr)
+                } else {
+                    0
+                };
+                (val, raw_bytes, ptr_u64)
             };
             if val.is_empty() {
                 continue;
@@ -4325,11 +4352,31 @@ impl RcxController {
             if let Some(&prev_addr) = self.last_value_addr.get(&node_id) {
                 if prev_addr != addr {
                     self.value_history.remove(&node_id);
+                    self.last_value_bytes.remove(&node_id);
                 }
             }
             self.last_value_addr.insert(node_id, addr);
+
+            let should_record = if ptr_u64 != 0 {
+                // A deref-target pointer: let record()'s internal string dedup
+                // decide so a target-memory change still registers.
+                true
+            } else {
+                let changed = self
+                    .last_value_bytes
+                    .get(&node_id)
+                    .map_or(true, |b| b != &raw_bytes);
+                if changed {
+                    self.last_value_bytes.insert(node_id, raw_bytes);
+                }
+                changed
+            };
+            // ALWAYS create the entry (heat_level needs it, even when not
+            // recording — mirrors C++ fetching m_valueHistory[id]).
             let vh = self.value_history.entry(node_id).or_default();
-            vh.record(&val);
+            if should_record {
+                vh.record(&val);
+            }
             let heat = vh.heat_level();
             self.last_result.meta[i].heat_level = heat;
         }

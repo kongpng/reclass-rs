@@ -1204,6 +1204,14 @@ fn compose_leaf(
             };
             ptr_type_override = format!("{base}{stars}");
         }
+        // Mirror the typed-pointer header path (compose_node): a relative
+        // (RVA) pointer must surface " rva" in its type so the user can
+        // tell an untyped RVA pointer apart from a plain void*. Without
+        // this, picking "Pointer32 (RVA)" before wiring a struct target
+        // (ref_id still 0 -> rendered here as a leaf) showed just "void*".
+        if node.is_relative {
+            ptr_type_override.push_str(" rva");
+        }
     }
 
     let raw_type = if ptr_type_override.is_empty() {

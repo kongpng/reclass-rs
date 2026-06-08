@@ -636,27 +636,95 @@ fn clear_value_history_resets_heat() {
         .any(|lm| lm.node_id == target_id && lm.heat_level > 0);
     assert!(found_hot, "pre-clear LineMeta should show heat > 0");
 
-    // Clear value history menu action: remove id + subtree from history.
-    c.value_history_mut().remove(&target_id);
-    let sub: Vec<u64> = c
-        .tree()
-        .subtree_indices(target_id)
-        .into_iter()
-        .map(|ci| c.tree().nodes[ci].id)
-        .collect();
-    for id in sub {
-        c.value_history_mut().remove(&id);
-    }
+    // Clear value history exactly as the "Clear All History" action does —
+    // reset_change_tracking() wipes the per-node history AND the raw-byte
+    // change-detection cache together, then refresh() re-composes. (The earlier
+    // version reached straight into the private history map, which left the byte
+    // cache stale — a state no real code path produces now.)
+    c.reset_change_tracking();
     c.refresh();
 
+    // Immediately after clear, heatLevel must be 0 for this node.
     for lm in &c.last_result().meta {
         if lm.node_id == target_id {
             assert_eq!(lm.heat_level, 0);
         }
     }
+
+    // reset_change_tracking arms a short cooldown (~5) that suppresses
+    // re-recording for a few ticks. Pump past it; the buffer is static, so
+    // exactly ONE baseline value re-records — the raw-byte guard suppresses
+    // re-recording the unchanged bytes on every subsequent tick. End state:
+    // unique_count 1, heat 0 (calm, not spuriously hot).
+    for _ in 0..8 {
+        c.refresh();
+    }
     assert!(c.value_history().contains_key(&target_id));
     assert_eq!(c.value_history()[&target_id].heat_level(), 0);
     assert_eq!(c.value_history()[&target_id].unique_count(), 1);
+}
+
+// Regression: a type change that only REFORMATS identical bytes must not
+// register as a value change. Hex64 "0x0" -> Pointer64 "nullptr" is the user's
+// exact complaint — the previous-values popup fired and the heatmap lit up even
+// though no memory moved. Change-detection now keys on the raw bytes, so this
+// stays calm.
+#[test]
+fn type_reformat_does_not_bump_heat() {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+
+    let root = Node {
+        kind: NodeKind::Struct,
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    };
+    let ri = doc.tree.add_node(root);
+    let root_id = doc.tree.nodes[ri].id;
+
+    let fi = doc.tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "field".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let field_id = doc.tree.nodes[fi].id;
+
+    // 16 zeroed bytes — the Hex64 field reads value 0 ("0x0").
+    doc.provider = Arc::new(BaseAwareProvider {
+        data: vec![0u8; 16],
+        base: 0,
+    });
+
+    let mut c = RcxController::new(doc);
+    c.set_track_values(true);
+
+    // Establish the baseline "0x0" record.
+    for _ in 0..3 {
+        c.refresh();
+    }
+    assert!(c.value_history().contains_key(&field_id));
+    assert_eq!(c.value_history()[&field_id].unique_count(), 1);
+    assert_eq!(c.value_history()[&field_id].heat_level(), 0);
+
+    // Reformat the SAME zero bytes: Hex64 -> Pointer64. The displayed value
+    // flips from "0x0" to "nullptr"; the bytes do not change.
+    let idx = c.tree().index_of_id(field_id) as usize;
+    c.change_node_kind(idx, NodeKind::Pointer64);
+    for _ in 0..4 {
+        c.refresh();
+    }
+
+    // No new history entry, no heat — the reformat is invisible to
+    // change-detection. (Before the byte-guard fix this recorded a 2nd value ->
+    // cold heat -> the previous-values popup fired spuriously.)
+    assert!(c.value_history().contains_key(&field_id));
+    assert_eq!(c.value_history()[&field_id].unique_count(), 1);
+    assert_eq!(c.value_history()[&field_id].heat_level(), 0);
 }
 
 #[test]

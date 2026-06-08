@@ -2982,3 +2982,53 @@ fn live_compose_float_double_routes_through_format() {
         "normal double unchanged: {dnorm:?}"
     );
 }
+
+/// Regression: an untyped RVA pointer (is_relative, ref_id == 0) is rendered by
+/// compose_leaf, not the expansion path in compose_node. compose_leaf must
+/// surface the " rva" suffix in the type column so the user can tell it apart
+/// from a plain void* — picking "Pointer64 (RVA)" from the type chooser before
+/// wiring a struct target keeps ref_id == 0, and the field used to show "void*".
+#[test]
+fn leaf_rva_pointer_shows_rva_suffix() {
+    let prov = BufferProvider::new(vec![0u8; 0x40], "");
+
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Owner".into(),
+        name: "owner".into(),
+        parent_id: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+
+    tree.add_node(Node {
+        kind: NodeKind::Pointer64,
+        name: "rvaField".into(),
+        parent_id: root_id,
+        offset: 0x10,
+        ref_id: 0,         // untyped -> rendered as a leaf
+        is_relative: true, // RVA flag set, no struct target yet
+        ..Node::default()
+    });
+
+    let r = compose_default(&tree, &prov);
+
+    let mut found = false;
+    for line in lines(&r) {
+        if !line.contains("rvaField") {
+            continue;
+        }
+        found = true;
+        assert!(
+            line.contains("void* rva"),
+            "untyped RVA pointer must show 'void* rva' in its type column; \
+             got:\n  {line}"
+        );
+        break;
+    }
+    assert!(found, "rvaField line not found in compose output");
+}

@@ -410,6 +410,7 @@ impl super::RcxController {
         self.changed_offsets.clear();
         self.value_history.clear();
         self.last_value_addr.clear();
+        self.last_value_bytes.clear();
         self.page_stability.clear();
         self.idle_ticks = 0;
         self.tick_count = 0;
