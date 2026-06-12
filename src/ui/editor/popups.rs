@@ -321,7 +321,13 @@ impl super::RcxEditor {
                 let preset = modifier_preset_for(mode, n.kind, n.ptr_depth, n.ref_id, n.array_len);
                 (sz, ps, n.ref_id, preset, n.is_relative)
             } else {
-                (crate::core::size_for_kind(target.kind), ps, 0u64, None, false)
+                (
+                    crate::core::size_for_kind(target.kind),
+                    ps,
+                    0u64,
+                    None,
+                    false,
+                )
             }
         };
         let recent = self.recent_type_names.clone();

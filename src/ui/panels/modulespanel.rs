@@ -212,6 +212,7 @@ mod view {
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
     use gpui_component::dock::{Panel, PanelEvent};
+    use gpui_component::tooltip::Tooltip;
 
     use super::{build_module_rows, ModuleRow, ModulesTab, SymbolRow, TypeRow};
     #[cfg(feature = "symbols")]
@@ -231,9 +232,9 @@ mod view {
     /// does not own the document base or the PDB loader, so it emits requests.
     #[derive(Clone, Debug)]
     pub enum ModuleAction {
-        /// Double-click a module row: set the active document's base address to
-        /// the module base + kick off its PDB symbol load (the C++ module-row
-        /// activation). Carries the module base + name.
+        /// Double-click a module row: open/reuse a module-root class at the
+        /// module base and kick off its PDB symbol load. Carries the module base
+        /// + name.
         Activate { base: u64, name: String },
         /// "Download All" header action: load/download PDB symbols for every
         /// module of the active source (the C++ `download_all`).
@@ -550,6 +551,8 @@ mod view {
         let act_view = view.clone();
         let base = row.base;
         let name = row.name.clone();
+        let tooltip =
+            format!("Double-click to open this module at base 0x{base:X} with absolute addresses");
         gpui_component::h_flex()
             .id(("rcx-module-row", ix))
             .w_full()
@@ -560,14 +563,17 @@ mod view {
             .rounded(px(tokens::radius::MD))
             .hover(|s| s.bg(color::hover_overlay(cx)))
             .on_click(move |e: &gpui::ClickEvent, _w, cx| {
-                // Double-click activates: set base + load PDB (the C++ row
-                // activation). A single click is a no-op selection.
+                // Double-click activates: open the module-root class + load PDB.
+                // A single click is a no-op selection.
                 if e.click_count() >= 2 {
                     let name = name.clone();
                     act_view.update(cx, |_this, cx| {
                         cx.emit(ModuleAction::Activate { base, name });
                     });
                 }
+            })
+            .tooltip(move |window, cx| {
+                Tooltip::new(SharedString::from(tooltip.clone())).build(window, cx)
             })
             .child(
                 icon::source()

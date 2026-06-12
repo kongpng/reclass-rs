@@ -417,6 +417,7 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
                 // on Ctrl+Shift+M and reserves Ctrl+Shift+S for Save As; the label
                 // matches the actual binding.
                 N::item("Memory Scanner", "Ctrl+Shift+M", "view.scanner"),
+                N::item("Target", "", "view.target"),
                 N::item("Modules", "Ctrl+Shift+Y", "view.modules"),
                 N::item("Bookmarks", "Ctrl+Shift+B", "view.bookmarks"),
                 N::Separator,

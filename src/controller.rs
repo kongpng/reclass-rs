@@ -270,6 +270,40 @@ pub fn parse_type_spec(text: &str) -> TypeSpec {
     spec
 }
 
+/// Convert a module filename/path into a stable top-level class name.
+///
+/// The exact module name is still kept on the root comment; this value is the
+/// C-like type name used by the class header and workspace tree.
+pub fn module_root_type_name(module_name: &str) -> String {
+    let tail = module_name
+        .trim()
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("module");
+    let mut out = String::with_capacity(tail.len() + "Module_".len());
+    out.push_str("Module_");
+    for c in tail.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out == "Module_" {
+        out.push_str("module");
+    }
+    out
+}
+
+fn module_root_comment(module_name: &str) -> String {
+    let module_label = module_name.trim();
+    if module_label.is_empty() {
+        "module".to_string()
+    } else {
+        format!("module: {module_label}")
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RcxDocument (`controller.h:27`)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1144,11 +1178,37 @@ impl RcxController {
                     self.revert_off_adjs(off_adjs);
                     let idx = self.doc.tree.index_of_id(node.id);
                     if idx >= 0 {
+                        self.clear_node_history(node.id);
                         self.doc.tree.nodes.remove(idx as usize);
                         self.doc.tree.invalidate_id_cache();
                     }
                 } else {
                     self.doc.tree.add_node(node.clone());
+                    self.apply_off_adjs_new(off_adjs);
+                }
+                self.clear_history_for_adjs(off_adjs);
+            }
+            Command::InsertMany { nodes, off_adjs } => {
+                if is_undo {
+                    self.revert_off_adjs(off_adjs);
+                    let mut indices: Vec<usize> = nodes
+                        .iter()
+                        .filter_map(|node| {
+                            let idx = self.doc.tree.index_of_id(node.id);
+                            (idx >= 0).then_some(idx as usize)
+                        })
+                        .collect();
+                    indices.sort_unstable_by(|a, b| b.cmp(a));
+                    for idx in indices {
+                        let id = self.doc.tree.nodes[idx].id;
+                        self.clear_node_history(id);
+                        self.doc.tree.nodes.remove(idx);
+                    }
+                    self.doc.tree.invalidate_id_cache();
+                } else {
+                    for node in nodes {
+                        self.doc.tree.add_node(node.clone());
+                    }
                     self.apply_off_adjs_new(off_adjs);
                 }
                 self.clear_history_for_adjs(off_adjs);
@@ -2021,7 +2081,9 @@ impl RcxController {
     /// write it as an undoable `WriteBytes`. Gated on a writable provider.
     pub fn byte_paste_hex(&mut self, lo: u64, n: i32, clipboard_text: &str) {
         if !self.doc.provider.is_writable() || self.read_only_override {
-            self.emit(ControllerEvent::StatusHint("Target is read-only".to_string()));
+            self.emit(ControllerEvent::StatusHint(
+                "Target is read-only".to_string(),
+            ));
             return;
         }
         if n <= 0 || n > 65536 {
@@ -2057,7 +2119,9 @@ impl RcxController {
     /// an undoable `WriteBytes`. Gated on a writable provider.
     pub fn byte_zero_fill(&mut self, lo: u64, n: i32) {
         if !self.doc.provider.is_writable() || self.read_only_override {
-            self.emit(ControllerEvent::StatusHint("Target is read-only".to_string()));
+            self.emit(ControllerEvent::StatusHint(
+                "Target is read-only".to_string(),
+            ));
             return;
         }
         if n <= 0 || n > 65536 {
@@ -2378,6 +2442,57 @@ impl RcxController {
             node: n,
             off_adjs: Vec::new(),
         });
+    }
+
+    /// Append `bytes` worth of `Hex64` fields to `struct_id` in one undoable
+    /// mutation. This is the controller-side bulk form of the footer `+10h`,
+    /// `+100h`, and `+1000h` actions; it preserves the old offsets while avoiding
+    /// one `refresh()` per generated node.
+    pub fn append_hex_fields_to_struct(&mut self, struct_id: u64, bytes: i32) -> Vec<u64> {
+        if struct_id == 0 {
+            return Vec::new();
+        }
+        let count = (bytes + 7) / 8;
+        if count <= 0 {
+            return Vec::new();
+        }
+        if self.doc.tree.index_of_id(struct_id) < 0 {
+            return Vec::new();
+        }
+
+        let tail = self
+            .doc
+            .tree
+            .children_of(struct_id)
+            .iter()
+            .map(|&ci| {
+                let child = &self.doc.tree.nodes[ci];
+                child.offset + self.node_size(child)
+            })
+            .max()
+            .unwrap_or(0);
+
+        let mut nodes = Vec::with_capacity(count as usize);
+        let mut ids = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let offset = tail + i * 8;
+            let mut node = Node {
+                kind: NodeKind::Hex64,
+                name: String::new(),
+                parent_id: struct_id,
+                offset,
+                ..Node::default()
+            };
+            node.id = self.doc.tree.reserve_id();
+            ids.push(node.id);
+            nodes.push(node);
+        }
+
+        self.push_command(Command::InsertMany {
+            nodes,
+            off_adjs: Vec::new(),
+        });
+        ids
     }
 
     /// `insertNodeAbove(beforeIdx, kind, name)` (`controller.cpp:2488`).
@@ -3647,6 +3762,114 @@ impl RcxController {
         (root_id, type_name)
     }
 
+    /// Open a module-base view as its own top-level class. If that module class
+    /// already exists, reuse it; otherwise create a 64-byte starter class and set
+    /// it as the active view root. The base change follows navigation semantics:
+    /// it relocates the view without adding a separate undo entry.
+    pub fn open_module_root_class(&mut self, module_name: &str, base: u64) -> (u64, String, bool) {
+        let base_type_name = module_root_type_name(module_name);
+        let module_comment = module_root_comment(module_name);
+        let existing = self
+            .doc
+            .tree
+            .nodes
+            .iter()
+            .find(|n| {
+                n.parent_id == 0
+                    && n.kind == NodeKind::Struct
+                    && n.comment == module_comment
+                    && n.struct_type_name.starts_with(&base_type_name)
+            })
+            .map(|n| n.id);
+
+        let (root_id, type_name, created) = match existing {
+            Some(id) => {
+                let idx = self.doc.tree.index_of_id(id);
+                let type_name = if idx >= 0 {
+                    self.doc.tree.nodes[idx as usize].struct_type_name.clone()
+                } else {
+                    base_type_name
+                };
+                (id, type_name, false)
+            }
+            None => {
+                let existing_names: std::collections::HashSet<String> = self
+                    .doc
+                    .tree
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        n.parent_id == 0
+                            && n.kind == NodeKind::Struct
+                            && !n.struct_type_name.is_empty()
+                    })
+                    .map(|n| n.struct_type_name.clone())
+                    .collect();
+                let mut type_name = base_type_name.clone();
+                let mut counter = 2;
+                while existing_names.contains(&type_name) {
+                    type_name = format!("{base_type_name}_{counter}");
+                    counter += 1;
+                }
+
+                let was = self.suppress_refresh;
+                self.suppress_refresh = true;
+                self.begin_macro(format!("Open Module {type_name}"));
+
+                let mut root = Node {
+                    kind: NodeKind::Struct,
+                    struct_type_name: type_name.clone(),
+                    class_keyword: "class".to_string(),
+                    name: "base".to_string(),
+                    parent_id: 0,
+                    offset: 0,
+                    comment: module_comment.clone(),
+                    ..Node::default()
+                };
+                root.id = self.doc.tree.reserve_id();
+                let root_id = root.id;
+                self.push_command(Command::Insert {
+                    node: root,
+                    off_adjs: Vec::new(),
+                });
+
+                let is32 = self.doc.tree.pointer_size < 8;
+                let (hex_kind, stride, count) = if is32 {
+                    (NodeKind::Hex32, 4, 16)
+                } else {
+                    (NodeKind::Hex64, 8, 8)
+                };
+                for i in 0..count {
+                    let mut child = Node {
+                        kind: hex_kind,
+                        name: format!("field_{:02x}", i * stride),
+                        parent_id: root_id,
+                        offset: i * stride,
+                        ..Node::default()
+                    };
+                    child.id = self.doc.tree.reserve_id();
+                    self.push_command(Command::Insert {
+                        node: child,
+                        off_adjs: Vec::new(),
+                    });
+                }
+
+                self.end_macro();
+                self.suppress_refresh = was;
+                (root_id, type_name, true)
+            }
+        };
+
+        self.doc.tree.base_address = base;
+        self.doc.tree.base_address_formula.clear();
+        if self.view_root_id != root_id {
+            self.view_root_id = root_id;
+        }
+        self.reset_change_tracking();
+        self.refresh();
+        (root_id, type_name, created)
+    }
+
     /// Editor "New Class" (`controller.cpp:3390`): create a fresh `NewClass[_N]`
     /// class definition (8×Hex64 = 64 bytes) and convert `node_id` into an
     /// embedded struct instance referencing it, shifting siblings to make room.
@@ -3909,7 +4132,6 @@ impl RcxController {
         });
         true
     }
-
 
     /// Add a member to an enum (`Add Member`, `controller.cpp:3364` / `3315`):
     /// append `("NewMember", lastVal+1)`. `at == None` appends; `at == Some(i)`

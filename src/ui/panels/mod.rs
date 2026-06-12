@@ -21,6 +21,7 @@ pub mod bookmarkspanel;
 pub mod docks;
 pub mod modulespanel;
 pub mod scannerpanel;
+pub mod targetpanel;
 pub mod workspace;
 
 use gpui::*;
@@ -44,6 +45,8 @@ pub enum PanelKind {
     /// The right-dock modules/symbols/types list (the C++ View ▸ Modules,
     /// `Ctrl+Shift+Y`). The real view is [`crate::ui::panels::modulespanel::ModulesPanel`].
     Modules,
+    /// The right-dock target/session inspector.
+    Target,
     /// The right-dock bookmarks list (the C++ View ▸ Bookmarks, `Ctrl+Shift+B`).
     /// The real view is [`crate::ui::panels::bookmarkspanel::BookmarksPanel`].
     Bookmarks,
@@ -57,6 +60,7 @@ impl PanelKind {
             PanelKind::Scanner => "Memory Scanner",
             PanelKind::Document => "Document",
             PanelKind::Modules => "Modules",
+            PanelKind::Target => "Target",
             PanelKind::Bookmarks => "Bookmarks",
         }
     }
@@ -69,6 +73,7 @@ impl PanelKind {
             PanelKind::Scanner => "ScannerPanel",
             PanelKind::Document => "DocumentPanel",
             PanelKind::Modules => crate::ui::panels::modulespanel::PANEL_NAME,
+            PanelKind::Target => crate::ui::panels::targetpanel::PANEL_NAME,
             PanelKind::Bookmarks => crate::ui::panels::bookmarkspanel::PANEL_NAME,
         }
     }

@@ -1293,6 +1293,59 @@ fn append_single_field_unknown_id_no_op() {
 }
 
 #[test]
+fn append_hex_fields_to_struct_bulk_is_one_undo_entry() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let before_nodes = c.tree().nodes.len();
+    let before_undo = c.undo_stack().count();
+
+    let ids = c.append_hex_fields_to_struct(root_id, 0x18);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(c.tree().nodes.len(), before_nodes + 3);
+    assert_eq!(c.undo_stack().count(), before_undo + 1);
+
+    let offsets: Vec<i32> = ids
+        .iter()
+        .map(|id| {
+            let idx = c.tree().index_of_id(*id);
+            assert!(idx >= 0, "inserted node {id} exists");
+            let node = &c.tree().nodes[idx as usize];
+            assert_eq!(node.kind, NodeKind::Hex64);
+            assert_eq!(node.parent_id, root_id);
+            node.offset
+        })
+        .collect();
+    assert_eq!(offsets, vec![16, 24, 32]);
+
+    c.undo();
+    for id in ids {
+        assert!(c.tree().index_of_id(id) < 0, "bulk undo removes node {id}");
+    }
+    assert_eq!(c.tree().nodes.len(), before_nodes);
+}
+
+#[test]
+fn append_hex_fields_to_struct_large_run_does_not_flood_undo_stack() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let before_nodes = c.tree().nodes.len();
+    let before_undo = c.undo_stack().count();
+
+    let ids = c.append_hex_fields_to_struct(root_id, 8_000);
+    assert_eq!(ids.len(), 1_000);
+    assert_eq!(c.tree().nodes.len(), before_nodes + 1_000);
+    assert_eq!(c.undo_stack().count(), before_undo + 1);
+
+    let last = *ids.last().unwrap();
+    let last_idx = c.tree().index_of_id(last);
+    assert!(last_idx >= 0);
+    assert_eq!(c.tree().nodes[last_idx as usize].offset, 16 + 999 * 8);
+
+    c.undo();
+    assert_eq!(c.tree().nodes.len(), before_nodes);
+}
+
+#[test]
 fn delete_root_struct() {
     let mut c = make_ctrl();
     let root_id = c.tree().nodes[0].id;
@@ -2021,6 +2074,62 @@ fn create_new_class_struct_uses_class_keyword_and_underscore_names() {
     // Third → `NewClass_3`.
     let (_id3, name3) = c.create_new_class_struct();
     assert_eq!(name3, "NewClass_3");
+}
+
+#[test]
+fn open_module_root_class_creates_and_reuses_module_view() {
+    let mut c = make_ctrl();
+    let (root_id, type_name, created) =
+        c.open_module_root_class(r"C:\games\client.dll", 0x7FF6_0000_0000);
+    assert!(created);
+    assert_eq!(type_name, "Module_client_dll");
+    assert_eq!(c.view_root_id(), root_id);
+    assert_eq!(c.tree().base_address, 0x7FF6_0000_0000);
+    assert!(c.tree().base_address_formula.is_empty());
+
+    let root = &c.tree().nodes[c.tree().index_of_id(root_id) as usize];
+    assert_eq!(root.struct_type_name, "Module_client_dll");
+    assert_eq!(root.class_keyword, "class");
+    assert_eq!(root.name, "base");
+    assert_eq!(root.comment, r"module: C:\games\client.dll");
+    assert_eq!(c.tree().children_of(root_id).len(), 8);
+
+    let (same_id, same_type, created_again) =
+        c.open_module_root_class(r"C:\games\client.dll", 0x7FF7_0000_0000);
+    assert!(!created_again);
+    assert_eq!(same_id, root_id);
+    assert_eq!(same_type, "Module_client_dll");
+    assert_eq!(c.tree().base_address, 0x7FF7_0000_0000);
+    let module_roots = c
+        .tree()
+        .nodes
+        .iter()
+        .filter(|n| n.parent_id == 0 && n.struct_type_name == "Module_client_dll")
+        .count();
+    assert_eq!(module_roots, 1);
+}
+
+#[test]
+fn open_module_root_class_does_not_reuse_unmarked_name_collision() {
+    let mut c = make_ctrl();
+    let user_idx = c.tree_mut().add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Module_client_dll".into(),
+        name: "user_type".into(),
+        parent_id: 0,
+        ..Node::default()
+    });
+    let user_id = c.tree().nodes[user_idx].id;
+
+    let (root_id, type_name, created) = c.open_module_root_class("client.dll", 0x1800_0000);
+    assert!(created);
+    assert_ne!(root_id, user_id);
+    assert_eq!(type_name, "Module_client_dll_2");
+
+    let (same_id, same_type, created_again) = c.open_module_root_class("client.dll", 0x1900_0000);
+    assert!(!created_again);
+    assert_eq!(same_id, root_id);
+    assert_eq!(same_type, "Module_client_dll_2");
 }
 
 #[test]

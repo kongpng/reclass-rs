@@ -111,6 +111,7 @@ impl super::MainWindow {
     menu_action!(on_refresh, RefreshView, "view.refresh");
     menu_action!(on_goto_address, GotoAddressAction, "view.goto_address");
     menu_action!(on_toggle_modules, ToggleModules, "view.modules");
+    menu_action!(on_toggle_target, ToggleTarget, "view.target");
     menu_action!(on_toggle_bookmarks, ToggleBookmarks, "view.bookmarks");
     menu_action!(on_split_editor, SplitEditor, "view.split");
     /// Toggle the top-level menu-bar menu whose Alt-mnemonic is `letter` (the
@@ -235,6 +236,7 @@ impl super::MainWindow {
             "view.project" => self.toggle_left_dock(window, cx),
             "view.scanner" => self.toggle_scanner_dock(&ToggleScanner, window, cx),
             "view.modules" => self.raise_modules(window, cx),
+            "view.target" => self.raise_target(window, cx),
             "view.bookmarks" | "view.symbols" => self.raise_bookmarks(window, cx),
             "view.reset_windows" => self.reset_windows(window, cx),
 

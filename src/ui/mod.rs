@@ -43,6 +43,7 @@ pub mod panels;
 pub mod pickers;
 pub mod plugins;
 pub mod state;
+pub mod target_status;
 pub mod theme_apply;
 pub mod window;
 

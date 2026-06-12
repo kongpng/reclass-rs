@@ -44,6 +44,15 @@ pub struct EditorPalette {
     pub ascii: Hsla,
     pub comment_green: Hsla,
     pub type_hint: Hsla,
+    /// Semantic sub-colors for type-inference chips. These derive from the active
+    /// theme's syntax roles so hints retint with theme changes without hard-coded
+    /// per-token colors.
+    pub type_hint_type: Hsla,
+    pub type_hint_operator: Hsla,
+    pub type_hint_address: Hsla,
+    pub type_hint_number: Hsla,
+    pub type_hint_string: Hsla,
+    pub type_hint_keyword: Hsla,
     pub rtti_hint: Hsla,
     pub enum_chip: Hsla,
     pub tree_conn: Hsla,
@@ -144,12 +153,19 @@ impl EditorPalette {
             // hex/ASCII columns read as dim as C++. Build a faint tone by darkening
             // the muted foreground toward the paper.
             ascii: with_alpha(text_faint(t.muted_foreground), 0.9),
-            comment_green: t.green_light,
-            // Item 38: `IND_TYPE_HINT` is set to `theme.indHintGreen` (≈ #5a8248,
-            // the muted comment-green family), NOT a dim gray. Tie the type-hint
-            // role to the same green the comment annotations use so inference hints
-            // read green.
+            // Comments need to be visually legible against dense row text. Use the
+            // stronger One Dark comment green instead of the muted hint green; type
+            // inference keeps the muted tone below so the two roles remain distinct.
+            comment_green: rgb_u8(0x98, 0xc3, 0x79),
+            // Item 38: `IND_TYPE_HINT` is set to `theme.indHintGreen` (≈ #5a8248),
+            // the muted comment-green family), NOT a dim gray.
             type_hint: t.green_light,
+            type_hint_type: t.blue,
+            type_hint_operator: with_alpha(t.muted_foreground, 0.82),
+            type_hint_address: t.warning,
+            type_hint_number: t.warning,
+            type_hint_string: t.green,
+            type_hint_keyword: t.blue,
             rtti_hint: t.yellow,
             enum_chip: t.link,
             tree_conn: t.muted_foreground,
@@ -225,6 +241,12 @@ impl EditorPalette {
             SpanRole::ClassName => self.class_name,
             SpanRole::CommentGreen => self.comment_green,
             SpanRole::TypeHint => self.type_hint,
+            SpanRole::TypeHintType => self.type_hint_type,
+            SpanRole::TypeHintOperator => self.type_hint_operator,
+            SpanRole::TypeHintAddress => self.type_hint_address,
+            SpanRole::TypeHintNumber => self.type_hint_number,
+            SpanRole::TypeHintString => self.type_hint_string,
+            SpanRole::TypeHintKeyword => self.type_hint_keyword,
             SpanRole::RttiHint => self.rtti_hint,
             SpanRole::EnumChip => self.enum_chip,
             SpanRole::TreeConn => self.tree_conn,

@@ -92,7 +92,11 @@ fn add_byte_submenu(
                     IconName::Copy,
                     Box::new(EditorByteCopyPython),
                 )
-                .menu_with_icon("Edit hex\u{2026}", IconName::Replace, Box::new(EditorByteEditHex))
+                .menu_with_icon(
+                    "Edit hex\u{2026}",
+                    IconName::Replace,
+                    Box::new(EditorByteEditHex),
+                )
                 .menu_with_icon("Zero-fill", IconName::Minus, Box::new(EditorByteZeroFill))
                 .menu_with_icon("Paste hex", IconName::Inbox, Box::new(EditorBytePasteHex))
                 .menu_with_icon(
@@ -385,7 +389,6 @@ impl super::RcxEditor {
         cx: &mut Context<Self>,
     ) {
         let editor_focus = self.focus_handle.clone();
-        let show_comment = self.show_comments();
         // Part D: byte submenu (prepended) + bottom "Clear selection".
         let byte_active = self.byte_sel.is_active();
         let byte_count = self.byte_sel.len() as i32;
@@ -425,13 +428,11 @@ impl super::RcxEditor {
                 })
                 .menu_with_icon("Insert Above", IconName::Plus, Box::new(EditorInsertAbove))
                 .separator()
-                .when(show_comment, |menu| {
-                    menu.menu_with_icon(
-                        SharedString::from(format!("Comment {count} nodes")),
-                        IconName::SquareTerminal,
-                        Box::new(EditorCommentEdit),
-                    )
-                })
+                .menu_with_icon(
+                    SharedString::from(format!("Comment {count} nodes")),
+                    IconName::SquareTerminal,
+                    Box::new(EditorCommentEdit),
+                )
                 .menu_with_icon(
                     SharedString::from(format!("Duplicate {count} nodes")),
                     IconName::Copy,
@@ -612,11 +613,10 @@ impl super::RcxEditor {
         let show_ptr_new_class = !is_container && (byte_size == 4 || byte_size == 8);
         let show_rename = !is_hex_ctx;
         let show_big_endian = is_scalar_numeric_kind(target.kind);
-        // Item 17: Edit Value for writable, non-hex, non-container nodes; Comment
-        // only when the Comments toggle is on.
+        // Item 17: Edit Value for writable, non-hex, non-container nodes. Comment
+        // editing is always available; the Comments toggle only controls display.
         let writable = self.provider_writable();
         let show_edit_value = writable && !is_hex_ctx && !is_container;
-        let show_comment = self.show_comments();
         // ── Item 9: Convert-submenu gates, computed by kind (controller.cpp:3631) ──
         use crate::core::NodeKind as NK;
         let k = target.kind;
@@ -753,19 +753,25 @@ impl super::RcxEditor {
                         Box::new(EditorBeginValueEdit),
                     )
                 })
+                .when(!is_container, |menu| {
+                    menu.menu_with_icon(
+                        "Preview Value",
+                        IconName::Eye,
+                        Box::new(EditorPreviewValue),
+                    )
+                })
                 // Item 16/19: Rename omitted for hex nodes; F2 hint appended.
                 .when(show_rename, |menu| {
                     menu.menu_with_icon("Rename", IconName::SquareTerminal, Box::new(EditorRename))
                 })
                 .menu_with_icon("Change Type", IconName::Frame, Box::new(EditorChangeType))
-                // Item 17: Comment (;) only when the Comments toggle is on.
-                .when(show_comment, |menu| {
-                    menu.menu_with_icon(
-                        "Comment",
-                        IconName::SquareTerminal,
-                        Box::new(EditorCommentEdit),
-                    )
-                })
+                // Item 17: Comment (;). Available regardless of the comments display
+                // toggle so users can add/edit a comment before showing the column.
+                .menu_with_icon(
+                    "Comment",
+                    IconName::SquareTerminal,
+                    Box::new(EditorCommentEdit),
+                )
                 .separator()
                 // Item 15: the C++ Insert submenu offers Insert 4 Above (Hex32,
                 // Shift+Ins) / Insert 8 Above (Hex64, Ins) — the keyboard already
@@ -1034,6 +1040,8 @@ impl super::RcxEditor {
         // linger behind / over the menu (the row under a right-click usually has a
         // hover card pending from the move that preceded the click).
         self.hover_popup = None;
+        self.hover_probe = None;
+        self.memory_preview_rows = super::hover_popup::MEMORY_PREVIEW_MIN_ROWS;
         // Focus the MENU (not the editor) so the keyboard drives it: Up/Down move
         // the highlight, Enter activates the highlighted item, and Esc closes the
         // menu — instead of Esc falling through to the editor and clearing the row

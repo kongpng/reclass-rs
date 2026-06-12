@@ -271,6 +271,20 @@ fn apply_command(tab: &mut TabData, cmd: &Command, is_undo: bool) {
                 tree.invalidate_id_cache();
             }
         }
+        Command::InsertMany { nodes, .. } => {
+            if is_undo {
+                for node in nodes {
+                    remove_subtree(tree, node.id);
+                }
+            } else {
+                for node in nodes {
+                    if tree.index_of_id(node.id) < 0 {
+                        tree.add_node(node.clone());
+                    }
+                }
+                tree.invalidate_id_cache();
+            }
+        }
         Command::Remove {
             node_id, subtree, ..
         } => {

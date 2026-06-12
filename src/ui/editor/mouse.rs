@@ -94,17 +94,17 @@ impl super::RcxEditor {
             return;
         }
 
-        // Hex byte click → byte selection (Shift extends; §9). Mirror the covered
-        // rows into the controller's row selection.
+        // Hex byte Shift-click → byte selection. A plain click on visible bytes
+        // continues into the normal row selection/edit route below; the press
+        // still armed `byte_sel`, so an actual drag can extend the byte range.
         if let Some(addr) = self.byte_addr_for_hit(&lm, &text, hit.col) {
             if modifiers.shift {
                 self.byte_sel.shift_extend_to(addr);
-            } else {
-                self.byte_sel.arm(addr);
+                self.sync_byte_rows();
+                cx.notify();
+                return;
             }
-            self.sync_byte_rows();
-            cx.notify();
-            return;
+            self.byte_sel.arm(addr);
         }
 
         // Footer pill click (item 10): the add-bytes / Top pills dispatch their op.
@@ -587,6 +587,17 @@ impl super::RcxEditor {
     /// the clicked node. A drag already cleared the pending click, so this is a
     /// no-op after a drag.
     pub(super) fn flush_pending_click(&mut self, cx: &mut Context<Self>) {
+        let clear_plain_byte_click = self.drag_on_byte_grid
+            && !self.drag_started
+            && !self.drag_init_mods.shift
+            && !self.drag_init_mods.control
+            && self.byte_sel.is_active();
+        if clear_plain_byte_click {
+            self.byte_sel.clear();
+            self.last_byte_rows.clear();
+        }
+        self.drag_anchor_line = None;
+        self.drag_on_byte_grid = false;
         self.drag_started = false;
         let Some((line, node_id, modifiers)) = self.pending_click.take() else {
             return;

@@ -6,8 +6,8 @@
 //! load-bearing (more specific regions win): CommandRow sub-spans first, then
 //! pointer/array sub-spans, then the generic type/name/value/comment columns,
 //! with the documented redirects (array-header Type → ArrayElementType; array
-//! element type/name → ArrayElementType; hex rows block Name/Value). Pure column
-//! math (given the cell metrics), so it is unit-tested without a display.
+//! element type/name → ArrayElementType). Pure column math (given the cell
+//! metrics), so it is unit-tested without a display.
 
 use crate::compose::{self, ColumnSpan, EditTarget};
 use crate::core::{is_hex_preview, LineKind, LineMeta, NodeKind};
@@ -115,19 +115,21 @@ pub fn target_at_col(
     ) {
         return Some(EditTarget::Type);
     }
-    if !is_hex {
-        if span_contains(
+    if !is_hex
+        && span_contains(
             geometry::resolved_span_for(lm, text, EditTarget::Name, type_w, name_w),
             col,
-        ) {
-            return Some(EditTarget::Name);
-        }
-        if span_contains(
-            geometry::resolved_span_for(lm, text, EditTarget::Value, type_w, name_w),
-            col,
-        ) {
-            return Some(EditTarget::Value);
-        }
+        )
+    {
+        return Some(EditTarget::Name);
+    }
+    let value_span = if is_hex {
+        compose::value_span_for(lm, type_w, name_w)
+    } else {
+        geometry::resolved_span_for(lm, text, EditTarget::Value, type_w, name_w)
+    };
+    if span_contains(value_span, col) {
+        return Some(EditTarget::Value);
     }
     if span_contains(
         geometry::resolved_span_for(lm, text, EditTarget::Comment, type_w, name_w),
@@ -219,6 +221,14 @@ pub fn hit_test_row(
     name_w: i32,
 ) -> HitInfo {
     let col = metrics.col_containing_x(rel_x);
+    hit_test_row_col(lm, text, col, type_w, name_w)
+}
+
+/// Full hit test once the caller has already resolved the display column. The
+/// custom row element uses this after mapping mouse X through the shaped line, so
+/// hit boxes stay glued to the painted glyphs even when a fallback/proportional
+/// font gives spaces and digits different advances.
+pub fn hit_test_row_col(lm: &LineMeta, text: &str, col: i32, type_w: i32, name_w: i32) -> HitInfo {
     // C++ uses `col < kFoldCol + 1` (cols 0-3) — the fold-toggle/cursor zone
     // includes the first content column, so clicking the first glyph of a depth-0
     // fold head toggles it rather than starting a Type edit (editor.cpp:2373).
@@ -274,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn hex_row_blocks_name_and_value_but_not_type() {
+    fn hex_row_value_span_hits_value_but_name_stays_blocked() {
         let lm = field(NodeKind::Hex64, 0);
         let text = "hex64         AB CD EF 01 23 45 67 89   ........";
         // Type still hittable.
@@ -282,10 +292,11 @@ mod tests {
             target_at_col(&lm, text, compose::K_FOLD_COL + 1, 14, 22),
             Some(EditTarget::Type)
         );
-        // A column in the (would-be) value region is NOT a Value target on hex.
+        // The visible byte cells are a Value target; begin_inline_edit has the
+        // hex-overwrite mode for this target.
         let v = target_at_col(&lm, text, 42, 14, 22);
-        assert_ne!(v, Some(EditTarget::Value));
-        assert_ne!(v, Some(EditTarget::Name));
+        assert_eq!(v, Some(EditTarget::Value));
+        assert_ne!(target_at_col(&lm, text, 19, 14, 22), Some(EditTarget::Name));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::core::{
     size_for_kind, ComposeResult, LayoutInfo, LineChip, LineKind, LineMeta, Node, NodeKind,
     NodeTree,
 };
-use crate::provider::{ModuleEntry, NullProvider, Provider};
+use crate::provider::{MemoryRegion, ModuleEntry, NullProvider, Provider, RegionType};
 #[cfg(feature = "symbols")]
 use crate::rtti::walk::{walk_rtti, walk_rtti_itanium, RttiInfo};
 
@@ -238,6 +238,8 @@ pub fn compose_with_symbols(
         scope_name_w: HashMap::new(),
         rtti_modules_cached: false,
         rtti_modules: Vec::new(),
+        hint_regions_cached: false,
+        hint_regions: Vec::new(),
         rtti_cache: HashMap::new(),
     };
 
@@ -732,6 +734,8 @@ struct ComposeState<'a> {
     // (`compose.cpp:85-91`.)
     rtti_modules_cached: bool,
     rtti_modules: Vec<ModuleEntry>,
+    hint_regions_cached: bool,
+    hint_regions: Vec<MemoryRegion>,
     rtti_cache: HashMap<u64, RttiInfo>,
 }
 
@@ -1099,6 +1103,133 @@ fn format_preview(data: &[u8], len: i32, kinds: &[NodeKind]) -> String {
     parts.join(", ")
 }
 
+fn pointer_kind_from_prediction(kinds: &[NodeKind]) -> Option<NodeKind> {
+    kinds
+        .iter()
+        .copied()
+        .find(|k| matches!(k, NodeKind::Pointer32 | NodeKind::Pointer64))
+}
+
+fn pointer_target_from_preview(data: &[u8], pointer_kind: NodeKind) -> Option<u64> {
+    match pointer_kind {
+        NodeKind::Pointer32 if data.len() >= 4 => {
+            let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64;
+            (v != 0 && v != 0xFFFF_FFFF).then_some(v)
+        }
+        NodeKind::Pointer64 if data.len() >= 8 => {
+            let v = u64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            (v != 0 && v != u64::MAX).then_some(v)
+        }
+        _ => None,
+    }
+}
+
+fn cached_hint_regions<'a>(
+    state: &'a mut ComposeState<'_>,
+    prov: &dyn Provider,
+) -> &'a [MemoryRegion] {
+    if !state.hint_regions_cached {
+        state.hint_regions = prov.enumerate_regions();
+        state.hint_regions_cached = true;
+    }
+    &state.hint_regions
+}
+
+fn cached_hint_modules<'a>(
+    state: &'a mut ComposeState<'_>,
+    prov: &dyn Provider,
+) -> &'a [ModuleEntry] {
+    if !state.rtti_modules_cached {
+        state.rtti_modules = prov.enumerate_modules();
+        state.rtti_modules_cached = true;
+    }
+    &state.rtti_modules
+}
+
+fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool {
+    region.readable
+        && len >= 0
+        && addr >= region.base
+        && addr
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= region.base.saturating_add(region.size))
+}
+
+fn provider_can_read_target(provider: &dyn Provider, regions: &[MemoryRegion], addr: u64) -> bool {
+    addr != 0
+        && (provider.is_readable(addr, 1)
+            || regions.iter().any(|r| region_contains_readable(r, addr, 1)))
+        && {
+            let mut probe = [0u8; 1];
+            provider.read(addr, &mut probe)
+        }
+}
+
+fn named_address(
+    provider: &dyn Provider,
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+    addr: u64,
+) -> String {
+    let symbol = provider.get_symbol(addr);
+    if !symbol.is_empty() {
+        return symbol;
+    }
+    if let Some(module) = modules
+        .iter()
+        .find(|m| addr >= m.base && addr.checked_sub(m.base).is_some_and(|rel| rel < m.size))
+    {
+        let name = if module.name.is_empty() {
+            "module"
+        } else {
+            module.name.as_str()
+        };
+        return format!("{name}+0x{:X}", addr.saturating_sub(module.base));
+    }
+    if let Some(region) = regions
+        .iter()
+        .find(|r| region_contains_readable(r, addr, 1))
+    {
+        let tag = match region.region_type {
+            RegionType::Image => "<DATA>",
+            RegionType::Mapped => "<MAPPED>",
+            RegionType::Private => {
+                if region.writable {
+                    "<HEAP>"
+                } else {
+                    "<PRIVATE>"
+                }
+            }
+        };
+        if region.module_name.is_empty() {
+            return format!("{tag}0x{addr:X}");
+        }
+        return format!("{tag}{}.0x{addr:X}", region.module_name);
+    }
+    format!("0x{addr:X}")
+}
+
+fn pointer_type_hint_chip_text(
+    state: &mut ComposeState<'_>,
+    prov: &dyn Provider,
+    data: &[u8],
+    pointer_kind: NodeKind,
+    type_name: &str,
+) -> Option<String> {
+    let Some(target) = pointer_target_from_preview(data, pointer_kind) else {
+        return None;
+    };
+    let regions_owned = cached_hint_regions(state, prov).to_vec();
+    if !provider_can_read_target(prov, &regions_owned, target) {
+        return None;
+    }
+    let modules_owned = cached_hint_modules(state, prov).to_vec();
+    let label = named_address(prov, &regions_owned, &modules_owned, target);
+    Some(format!("{type_name}\u{2713} -> {label}"))
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Chip sanitize helper (`compose.cpp:394-404`).
 // ───────────────────────────────────────────────────────────────────────────
@@ -1381,31 +1512,42 @@ fn compose_leaf(
                 // headless compose never trips its skeleton.
                 if b.iter().any(|&x| x != 0) {
                     let suggestions = crate::core::infer_types(&b, &Default::default(), 3);
-                    if let Some(first) = suggestions.first() {
-                        if first.strength >= 3 {
-                            // Value-preview + bracketed type label, mirroring
-                            // `lm.typeHint` (`compose.cpp:450-458`):
-                            //   "0x7ff718570000 [ptr64]"  /  "-99999+f, -0.0000f [Float×2]"
-                            // When the preview is empty fall back to "[type]"
-                            // (`compose.cpp:457`).
-                            let type_name = crate::core::format_hint(first);
-                            let preview = format_preview(&b, sz, &first.kinds);
-                            let chip_text = if preview.is_empty() {
+                    let mut emitted = 0usize;
+                    for suggestion in suggestions.iter().filter(|s| s.strength >= 3) {
+                        if emitted >= 2 {
+                            break;
+                        }
+                        let kinds = suggestion.kinds.clone();
+                        // Value-preview + bracketed type label, mirroring
+                        // `lm.typeHint` (`compose.cpp:450-458`). Pointer guesses
+                        // are promoted only when the target is actually readable;
+                        // otherwise they are passive noise over arbitrary bytes.
+                        let type_name = crate::core::format_hint(suggestion);
+                        let chip_text = if let Some(ptr_kind) =
+                            pointer_kind_from_prediction(&suggestion.kinds)
+                        {
+                            pointer_type_hint_chip_text(state, prov, &b, ptr_kind, &type_name)
+                        } else {
+                            let preview = format_preview(&b, sz, &suggestion.kinds);
+                            Some(if preview.is_empty() {
                                 format!("[{type_name}]")
                             } else {
                                 format!("{preview} [{type_name}]")
-                            };
-                            let kinds = first.kinds.clone();
-                            push_chip(
-                                &mut line_text,
-                                &mut lm,
-                                ChipKind::TypeHint,
-                                &chip_text,
-                                |c| {
-                                    c.type_hint_kinds = kinds;
-                                },
-                            );
-                        }
+                            })
+                        };
+                        let Some(chip_text) = chip_text else {
+                            continue;
+                        };
+                        push_chip(
+                            &mut line_text,
+                            &mut lm,
+                            ChipKind::TypeHint,
+                            &chip_text,
+                            |c| {
+                                c.type_hint_kinds = kinds;
+                            },
+                        );
+                        emitted += 1;
                     }
                 }
             }
@@ -2024,7 +2166,6 @@ fn compose_parent(
                 }
             }
         }
-
     }
 
     // Footer line.

@@ -20,7 +20,7 @@ pub struct OffsetAdj {
 
 /// `using Command = std::variant<...>` (`core.h:1080-1115`).
 ///
-/// 19 variants (the `OffsetAdj` POD is a helper, not a command).
+/// 20 variants (the `OffsetAdj` POD is a helper, not a command).
 /// `ToggleRelative` toggles a node's RVA flag and is handled in
 /// `applyCommand` (used by the type chooser's "Pointer32 (RVA)" entries).
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +47,13 @@ pub enum Command {
     /// `cmd::Insert` (`core.h:1087`).
     Insert {
         node: Node,
+        off_adjs: Vec<OffsetAdj>,
+    },
+    /// Port extension: bulk insert for generated padding/memory-growth runs.
+    /// Semantically equivalent to a macro of `Insert` commands, but applied as one
+    /// tree mutation so large footer appends do not recompose hundreds of times.
+    InsertMany {
+        nodes: Vec<Node>,
         off_adjs: Vec<OffsetAdj>,
     },
     /// `cmd::Remove` (`core.h:1088-1089`).

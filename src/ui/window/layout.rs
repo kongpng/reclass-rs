@@ -339,21 +339,30 @@ impl super::MainWindow {
         let Some(editor) = editor else {
             self.scanner.update(cx, |p, _| p.set_provider(None));
             self.modules.update(cx, |p, _| p.set_provider(None));
+            self.target.update(cx, |p, _| {
+                p.set_target(
+                    None,
+                    crate::ui::target_status::TargetStatusSummary::no_source(),
+                )
+            });
             self.bookmarks.update(cx, |p, cx| p.set_bookmarks(&[], cx));
             return;
         };
-        let (provider, bookmarks) = {
+        let (provider, target_summary, bookmarks) = {
             let ed = editor.read(cx);
             let ctrl = ed.controller();
             (
                 ctrl.document().provider.clone(),
+                crate::ui::target_status::TargetStatusSummary::for_controller(ctrl),
                 ctrl.document().tree.bookmarks.clone(),
             )
         };
         self.scanner
             .update(cx, |p, _| p.set_provider(Some(provider.clone())));
         self.modules
-            .update(cx, |p, _| p.set_provider(Some(provider)));
+            .update(cx, |p, _| p.set_provider(Some(provider.clone())));
+        self.target
+            .update(cx, |p, _| p.set_target(Some(provider), target_summary));
         self.bookmarks
             .update(cx, |p, cx| p.set_bookmarks(&bookmarks, cx));
     }
@@ -411,6 +420,11 @@ impl super::MainWindow {
             mb.set_command_checked(
                 "view.modules",
                 right_open && right_panel == RightDockPanel::Modules,
+                cx,
+            );
+            mb.set_command_checked(
+                "view.target",
+                right_open && right_panel == RightDockPanel::Target,
                 cx,
             );
             mb.set_command_checked(
@@ -494,6 +508,27 @@ impl super::MainWindow {
         // (and NOT Bookmarks) lights up (item 9).
         self.right_dock_panel = RightDockPanel::Modules;
         let focus = self.modules.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.sync_view_menu_checked(cx);
+        cx.notify();
+    }
+
+    /// View ▸ Target — raise the **Target** tab of the right dock. The bottom
+    /// status-bar target chip routes here too.
+    pub(super) fn raise_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let right_open = self
+            .dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Right, cx);
+        if right_open && self.right_dock_panel == RightDockPanel::Target {
+            self.set_right_dock_open(false, window, cx);
+            self.sync_view_menu_checked(cx);
+            cx.notify();
+            return;
+        }
+        self.set_right_dock_open(true, window, cx);
+        self.right_dock_panel = RightDockPanel::Target;
+        let focus = self.target.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         self.sync_view_menu_checked(cx);
         cx.notify();

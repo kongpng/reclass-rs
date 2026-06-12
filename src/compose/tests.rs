@@ -16,7 +16,9 @@ use super::{
 };
 use crate::core::linemeta::{find_chip, K_COMMAND_ROW_ID};
 use crate::core::{ChipKind, LineKind, LineMeta, Node, NodeKind, NodeTree};
-use crate::provider::{BufferProvider, NullProvider, Provider};
+use crate::provider::{
+    BufferProvider, MemoryRegion, ModuleEntry, NullProvider, Provider, RegionType,
+};
 
 // ── shared builders ─────────────────────────────────────────────────────────
 
@@ -53,6 +55,67 @@ fn count_chips(r: &ComposeResult, k: ChipKind) -> i32 {
         }
     }
     n
+}
+
+struct HighBaseProvider {
+    base: u64,
+    data: Vec<u8>,
+}
+
+impl HighBaseProvider {
+    fn new(base: u64, data: Vec<u8>) -> Self {
+        Self { base, data }
+    }
+}
+
+impl Provider for HighBaseProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        let Some(start) = addr.checked_sub(self.base).map(|v| v as usize) else {
+            return false;
+        };
+        if start.saturating_add(buf.len()) > self.data.len() {
+            return false;
+        }
+        buf.copy_from_slice(&self.data[start..start + buf.len()]);
+        true
+    }
+
+    fn size(&self) -> i32 {
+        self.data.len() as i32
+    }
+
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        if len <= 0 {
+            return len == 0;
+        }
+        let Some(start) = addr.checked_sub(self.base) else {
+            return false;
+        };
+        start
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= self.data.len() as u64)
+    }
+
+    fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+        vec![MemoryRegion {
+            base: self.base,
+            size: self.data.len() as u64,
+            readable: true,
+            writable: true,
+            executable: false,
+            module_name: "synthetic".into(),
+            region_type: RegionType::Mapped,
+        }]
+    }
+
+    fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+        vec![ModuleEntry {
+            name: "synthetic.dll".into(),
+            full_path: "synthetic.dll".into(),
+            base: self.base,
+            size: self.data.len() as u64,
+        }]
+    }
 }
 
 /// `QString::mid(start, end-start)` over UTF-16 units, returned as a String.
@@ -2133,11 +2196,11 @@ fn type_hint_chip_fires_as_overlay() {
     let root_id = tree.nodes[ri].id;
     tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
     let mut data = vec![0u8; (K_STRUCT_BASE + 16) as usize];
-    // Plant two int32s side by side — inferTypes treats this as int32×2 with
-    // strong confidence.
-    data[K_STRUCT_BASE as usize..K_STRUCT_BASE as usize + 4].copy_from_slice(&14i32.to_le_bytes());
+    // Plant two floats side by side; inference should render a value-first
+    // type-hint chip for the strongest suggestion.
+    data[K_STRUCT_BASE as usize..K_STRUCT_BASE as usize + 4].copy_from_slice(&1.5f32.to_le_bytes());
     data[K_STRUCT_BASE as usize + 4..K_STRUCT_BASE as usize + 8]
-        .copy_from_slice(&20i32.to_le_bytes());
+        .copy_from_slice(&2.25f32.to_le_bytes());
     let prov = BufferProvider::new(data, "synthetic");
     // type_hints=true (7th arg) — the TypeHint chip is gated on it
     // (`compose.cpp:441`, `test_rtti_hint.cpp:313`).
@@ -2154,13 +2217,148 @@ fn type_hint_chip_fires_as_overlay() {
         "chip text should carry a bracketed type label: {}",
         c.text
     );
-    // The preview of two int32 lanes (14, 20) should precede the bracket.
+    // The preview of two float lanes should precede the bracket.
     assert!(
-        c.text.contains("14") && c.text.contains("20"),
+        c.text.contains("1.5000f") && c.text.contains("2.2500f"),
         "chip text should preview both lanes: {}",
         c.text
     );
+    assert!(
+        c.text.contains("float"),
+        "chip text should carry the float type label: {}",
+        c.text
+    );
     assert!(!c.type_hint_kinds.is_empty());
+}
+
+#[test]
+fn generic_split_int_type_hint_is_rendered_as_overlay() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
+    let mut data = vec![0u8; (K_STRUCT_BASE + 16) as usize];
+    data[K_STRUCT_BASE as usize..K_STRUCT_BASE as usize + 4].copy_from_slice(&14i32.to_le_bytes());
+    data[K_STRUCT_BASE as usize + 4..K_STRUCT_BASE as usize + 8]
+        .copy_from_slice(&20i32.to_le_bytes());
+    let prov = BufferProvider::new(data, "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, true, true,
+    );
+
+    let chips: Vec<_> = r
+        .meta
+        .iter()
+        .flat_map(|lm| lm.chips.iter())
+        .filter(|c| c.kind == ChipKind::TypeHint)
+        .collect();
+    assert!(
+        chips.len() >= 2,
+        "top-2 split-int inference should render two TypeHint chips: {chips:?}"
+    );
+    assert!(
+        chips
+            .iter()
+            .all(|c| c.start_col >= 0 && c.end_col > c.start_col),
+        "chips should have valid spans: {chips:?}"
+    );
+    assert!(
+        chips.iter().any(|c| c.text.contains("14")
+            && c.text.contains("20")
+            && c.text.contains("int32_t×2")
+            && c.type_hint_kinds == vec![NodeKind::Int32, NodeKind::Int32]),
+        "one chip should carry the signed split-int suggestion: {chips:?}"
+    );
+    assert!(
+        chips.iter().any(|c| c.text.contains("uint32_t×2")
+            && c.type_hint_kinds == vec![NodeKind::UInt32, NodeKind::UInt32]),
+        "one chip should carry the unsigned split-int suggestion: {chips:?}"
+    );
+    let rendered = lines(&r).join("\n");
+    assert!(
+        rendered.contains("int32_t×2") && rendered.contains("uint32_t×2"),
+        "generic split-int predictions should be visible:\n{rendered}"
+    );
+}
+
+#[test]
+fn unreadable_pointer_type_hint_is_suppressed() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
+    let mut data = vec![0u8; (K_STRUCT_BASE + 16) as usize];
+    data[K_STRUCT_BASE as usize..K_STRUCT_BASE as usize + 8]
+        .copy_from_slice(&[0x00, 0x10, 0xB0, 0xA0, 0xF6, 0x7F, 0x00, 0x00]);
+    let prov = BufferProvider::new(data, "synthetic");
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, true, true,
+    );
+
+    assert!(
+        r.meta.iter().flat_map(|lm| lm.chips.iter()).all(|c| {
+            c.kind != ChipKind::TypeHint
+                || !c
+                    .type_hint_kinds
+                    .iter()
+                    .any(|k| matches!(k, NodeKind::Pointer32 | NodeKind::Pointer64))
+        }),
+        "unreadable passive pointer inference should not render a pointer chip: {:?}",
+        r.meta
+    );
+    let rendered = lines(&r).join("\n");
+    assert!(
+        !rendered.contains("ptr64"),
+        "unreadable passive pointer prediction should stay hidden:\n{rendered}"
+    );
+}
+
+#[test]
+fn readable_pointer_type_hint_names_target() {
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
+    let mut data = vec![0u8; 0x80];
+    data[0..8].copy_from_slice(&(BASE + 0x20).to_le_bytes());
+    data[0x20] = 0xAA;
+    let prov = HighBaseProvider::new(BASE, data);
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, true, true,
+    );
+
+    let c = first_chip(&r, ChipKind::TypeHint).expect("readable pointer typehint chip");
+    assert!(
+        c.text.contains("ptr64✓") && c.text.contains("->"),
+        "chip text should mark readable pointer inference: {}",
+        c.text
+    );
+    assert!(
+        c.text.contains("synthetic.dll+0x20"),
+        "chip text should name the pointer target: {}",
+        c.text
+    );
+    assert_eq!(c.type_hint_kinds, vec![NodeKind::Pointer64]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

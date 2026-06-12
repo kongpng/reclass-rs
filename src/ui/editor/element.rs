@@ -35,6 +35,8 @@ pub struct RowPaint {
     pub pills: Vec<PillPaint>,
     pub palette: EditorPalette,
     pub metrics: CellMetrics,
+    pub font: Font,
+    pub font_size: Pixels,
 }
 
 /// A rounded pill background drawn behind a tail/command-row chip, in char-column
@@ -80,11 +82,12 @@ struct HoverDecision {
 
 impl RowElement {
     /// Resolve the cursor shape + hover-span recolor for this row, given the
-    /// row-local mouse X (the C++ `applyHoverCursor`). Reads the editor's live line
-    /// model so hit-testing/coloring stay in lock-step with the painted columns.
+    /// display column under the mouse (the C++ `applyHoverCursor`). Reads the
+    /// editor's live line model so hit-testing/coloring stay in lock-step with the
+    /// painted columns.
     /// Returns `None` when hover styling is suppressed (hover-effects off, or an
     /// inline edit is active — the field owns its own cursor then).
-    fn hover_decision(&self, rel_x: f32, cx: &App) -> Option<HoverDecision> {
+    fn hover_decision_at_col(&self, col: i32, cx: &App) -> Option<HoverDecision> {
         let editor = self.editor.upgrade()?;
         let editor = editor.read(cx);
         // Suppress hover visuals while editing or when hover-effects are off (the
@@ -94,9 +97,8 @@ impl RowElement {
         }
         let lm = editor.line_meta(self.line)?.clone();
         let text = editor.line_text_owned(self.line);
-        let metrics = self.row.metrics;
         let (type_w, name_w) = geometry::effective_widths(&lm);
-        let hit = hit_test::hit_test_row(&lm, &text, rel_x, metrics, type_w, name_w);
+        let hit = hit_test::hit_test_row_col(&lm, &text, col, type_w, name_w);
         let cursor = hit_test::cursor_for_hit(&lm, &text, hit);
         let recolor = geometry::hover_span_for(
             &lm,
@@ -109,6 +111,40 @@ impl RowElement {
         );
         Some(HoverDecision { cursor, recolor })
     }
+}
+
+fn shaped_col_for_x(line: &ShapedLine, text: &str, rel_x: Pixels) -> i32 {
+    let cols = geometry::col_len(text).max(0);
+    if cols <= 0 {
+        return 0;
+    }
+    let x = if rel_x < px(0.0) { px(0.0) } else { rel_x };
+    let mut lo = 0;
+    let mut hi = cols;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let mid_x = line.x_for_index(geometry::byte_for_col(text, mid));
+        if mid_x <= x {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+fn rel_x_for_event_col(
+    position_x: Pixels,
+    left: Pixels,
+    line: Option<&ShapedLine>,
+    text: &str,
+    metrics: CellMetrics,
+) -> f32 {
+    let raw_rel_x = position_x - left;
+    let col = line
+        .map(|line| shaped_col_for_x(line, text, raw_rel_x))
+        .unwrap_or_else(|| metrics.col_containing_x(f32::from(raw_rel_x).max(0.0)));
+    metrics.x_for_col(col) + metrics.cell_width * 0.5
 }
 
 impl IntoElement for RowElement {
@@ -138,7 +174,7 @@ impl Element for RowElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = px(self.row.metrics.line_height).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -151,25 +187,8 @@ impl Element for RowElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-
-        // Per-column hover (items 1/2/3): when the cursor is over this row, resolve
-        // the cursor shape (IBeam / PointingHand / Arrow) and the hovered token's
-        // column span to recolor link-blue (the C++ `applyHoverCursor` /
-        // `IND_HOVER_SPAN`). Computed here from the live line model + current mouse
-        // position so the recolor is folded into the shaped text below, and the
-        // cursor request is carried through to `paint`.
-        let mut hover_cursor: Option<CursorKind> = None;
-        let mut hover_recolor: Option<(i32, i32)> = None;
-        if hitbox.is_hovered(window) {
-            let rel_x = f32::from(window.mouse_position().x - bounds.left()).max(0.0);
-            if let Some(d) = self.hover_decision(rel_x, cx) {
-                hover_cursor = Some(d.cursor);
-                hover_recolor = d.recolor;
-            }
-        }
-
         let text = self.row.text.clone();
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         // An empty row has no glyphs, so it can carry no pills/overlays (both are
         // spans OVER the row text). Bail before shaping.
         if text.is_empty() {
@@ -178,19 +197,15 @@ impl Element for RowElement {
                 pills: Vec::new(),
                 overlays: Vec::new(),
                 hitbox: Some(hitbox),
-                cursor: hover_cursor,
+                cursor: None,
             };
         }
-        let style = window.text_style();
-        let font = style.font();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-
-        let runs = build_text_runs(
+        let mut runs = build_text_runs(
             &text,
             &self.row.runs,
             &self.row.palette,
-            &font,
-            hover_recolor,
+            &self.row.font,
+            None,
         );
         // Shape the line FIRST: pill backgrounds and inline overlays must anchor to
         // the SAME shaped-glyph x-positions the glyphs paint at, not the `col * cell`
@@ -199,9 +214,37 @@ impl Element for RowElement {
         // accumulated enough error that the footer add-bytes pills ran together and
         // bled over the trailing `// 0x80` comment. Map each char column through
         // `line.x_for_index(byte_for_col(..))` — the inverse the painter uses.
-        let line = window
-            .text_system()
-            .shape_line(text.clone(), font_size, &runs, None);
+        let mut line =
+            window
+                .text_system()
+                .shape_line(text.clone(), self.row.font_size, &runs, None);
+
+        // Per-column hover (items 1/2/3): map mouse X through the shaped line, not
+        // through `col * cell_width`. This keeps hover/click spans glued to painted
+        // text even if GPUI falls back to a proportional font where spaces are
+        // narrower than digits.
+        let mut hover_cursor: Option<CursorKind> = None;
+        let mut hover_recolor: Option<(i32, i32)> = None;
+        if hitbox.is_hovered(window) {
+            let rel_x = window.mouse_position().x - bounds.left();
+            let col = shaped_col_for_x(&line, &text, rel_x);
+            if let Some(d) = self.hover_decision_at_col(col, cx) {
+                hover_cursor = Some(d.cursor);
+                hover_recolor = d.recolor;
+            }
+        }
+        if hover_recolor.is_some() {
+            runs = build_text_runs(
+                &text,
+                &self.row.runs,
+                &self.row.palette,
+                &self.row.font,
+                hover_recolor,
+            );
+            line = window
+                .text_system()
+                .shape_line(text.clone(), self.row.font_size, &runs, None);
+        }
         let x_at = |col: i32| -> Pixels {
             bounds.left() + line.x_for_index(geometry::byte_for_col(&text, col.max(0)))
         };
@@ -269,10 +312,11 @@ impl Element for RowElement {
         for quad in prepaint.overlays.drain(..) {
             window.paint_quad(quad);
         }
+        let hit_line = prepaint.line.clone();
         if let Some(line) = prepaint.line.take() {
             let _ = line.paint(
                 bounds.origin,
-                window.line_height(),
+                px(self.row.metrics.line_height),
                 TextAlign::Left,
                 None,
                 window,
@@ -303,16 +347,26 @@ impl Element for RowElement {
             let editor = self.editor.clone();
             let line = self.line;
             let left = bounds.left();
+            let row_text = self.row.text.clone();
+            let metrics = self.row.metrics;
             {
                 let hitbox = hitbox.clone();
                 let editor = editor.clone();
+                let hit_line = hit_line.clone();
+                let row_text = row_text.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                         return;
                     }
                     match event.button {
                         MouseButton::Left => {
-                            let rel_x = f32::from(event.position.x - left).max(0.0);
+                            let rel_x = rel_x_for_event_col(
+                                event.position.x,
+                                left,
+                                hit_line.as_ref(),
+                                &row_text,
+                                metrics,
+                            );
                             let modifiers = event.modifiers;
                             // `click_count == 2` is the double-click-to-edit
                             // affordance (item 26): select the token, then begin its
@@ -330,7 +384,13 @@ impl Element for RowElement {
                         }
                         MouseButton::Right => {
                             let pos = event.position;
-                            let rel_x = f32::from(event.position.x - left).max(0.0);
+                            let rel_x = rel_x_for_event_col(
+                                event.position.x,
+                                left,
+                                hit_line.as_ref(),
+                                &row_text,
+                                metrics,
+                            );
                             let _ = editor.update(cx, |this, cx| {
                                 this.dispatch_row_context_menu(line, rel_x, pos, window, cx);
                             });
@@ -345,11 +405,19 @@ impl Element for RowElement {
             // is armed (a no-op otherwise), so this is cheap. When NOT dragging, the
             // same move drives the hover popup (item 13): the editor resolves the
             // hovered column → value-history / disasm / struct-preview card.
+            let hit_line = hit_line.clone();
+            let row_text = row_text.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
                 }
-                let rel_x = f32::from(event.position.x - left).max(0.0);
+                let rel_x = rel_x_for_event_col(
+                    event.position.x,
+                    left,
+                    hit_line.as_ref(),
+                    &row_text,
+                    metrics,
+                );
                 if event.dragging() {
                     let _ = editor.update(cx, |this, cx| {
                         this.dispatch_row_drag(line, rel_x, window, cx);

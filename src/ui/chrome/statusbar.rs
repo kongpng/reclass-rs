@@ -40,9 +40,11 @@
 //! Gated behind the `ui` feature.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::controller::RcxController;
 use crate::core::{kind_meta, size_for_kind, NodeKind, NodeTree};
+use crate::ui::target_status::{TargetHealth, TargetStatusSummary};
 
 /// The resolved status-bar readout — the pure product of
 /// [`StatusInfo::for_controller`] / [`StatusInfo::from_tree`].
@@ -391,12 +393,14 @@ pub use view::render_status_bar;
 #[cfg(feature = "ui")]
 mod view {
     use super::StatusInfo;
+    use super::{Rc, TargetHealth, TargetStatusSummary};
     use crate::ui::design::{color, icon, tokens};
     use crate::ui::state::DataSource;
     use crate::ui::theme_apply::ThemeRegistryGlobal;
     use gpui::prelude::FluentBuilder as _;
     use gpui::*;
-    use gpui_component::{Icon, Sizable as _};
+    use gpui_component::tooltip::Tooltip;
+    use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 
     /// A faint vertical hairline separating two right-hand status segments — the
     /// Zed status-bar divider (a 1px-wide muted rule with a little vertical
@@ -445,10 +449,16 @@ mod view {
     ///
     /// `info` is the resolved node readout ([`StatusInfo::for_controller`]) — a
     /// live selection (full-contrast path) or the default viewed-struct summary
-    /// (dimmed). `source` is the active document's data source (dimmed when
-    /// disconnected). The theme segment reads the active theme name from the
-    /// global registry (no signature change to keep window-wiring stable).
-    pub fn render_status_bar(info: &StatusInfo, source: &DataSource, cx: &App) -> impl IntoElement {
+    /// (dimmed). `source` is retained as the tab/source fallback, while `target`
+    /// is the provider-backed health summary. Clicking the target cluster opens
+    /// the Target inspector.
+    pub fn render_status_bar(
+        info: &StatusInfo,
+        source: &DataSource,
+        target: &TargetStatusSummary,
+        on_open_target: impl Fn(&mut Window, &mut App) + 'static,
+        cx: &App,
+    ) -> impl IntoElement {
         let muted = color::text_muted(cx);
         let text = color::text(cx);
 
@@ -467,18 +477,27 @@ mod view {
         let info_seg = info.info.clone();
         let has_info = !info_seg.is_empty();
 
-        // Right segment 2: the source readout ("File: x.bin" / "No source"),
-        // dimmed when the source is disconnected (the C++ ×0.40 live opacity).
+        // Right segment 2: the provider-backed target health readout. Falls back
+        // to the tab-level source label only if the target model has no provider.
         let source_label = if source.target.is_empty() {
             source.kind.label().to_string()
         } else {
             format!("{}: {}", source.kind.label(), source.target)
         };
-        let source_color = if source.live {
-            muted
+        let target_label = if target.provider_kind == "None" && source.live {
+            source_label
         } else {
-            color::text_disabled(cx)
+            target.compact_label()
         };
+        let target_tip = target.tooltip_text();
+        let target_health = target.health();
+        let target_color = match target_health {
+            TargetHealth::Live => cx.theme().green,
+            TargetHealth::Static => muted,
+            TargetHealth::Offline => cx.theme().red,
+            TargetHealth::NoSource => color::text_disabled(cx),
+        };
+        let target_open = Rc::new(on_open_target);
 
         // The C++ selection extras (`reclass_right_click_on_address.png`):
         //   "<Struct>.<field> | +0xNN  ↔ <type> (pos/total)  P=ptr F=float S=int U=uint  <Root>: 0xNN (dec)".
@@ -575,7 +594,7 @@ mod view {
                         )
                     }),
             )
-            // Right cluster: (default-only offset/size ·) source · theme,
+            // Right cluster: (default-only offset/size ·) target health · theme,
             // hairline-separated. Each carries a small leading SVG icon (the
             // Assets-stage `design::icon_*` set) for Zed chrome polish.
             .child(
@@ -587,15 +606,48 @@ mod view {
                         row.child(segment(info_seg.clone(), muted))
                             .child(segment_sep(cx))
                     })
-                    .child(
+                    .child({
+                        let target_open = target_open.clone();
                         gpui_component::h_flex()
+                            .id("rcx-status-target")
                             .flex_none()
                             .gap(px(tokens::space::XS))
                             .items_center()
-                            .text_color(source_color)
+                            .max_w(px(360.0))
+                            .text_color(target_color)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(color::hover_overlay(cx)))
+                            .rounded(px(tokens::radius::SM))
+                            .px(px(tokens::space::XS))
+                            .on_click(move |_e, window, cx| {
+                                (target_open)(window, cx);
+                            })
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(SharedString::from(target_tip.clone()))
+                                    .build(window, cx)
+                            })
+                            .child("●")
                             .child(segment_icon(icon::source()))
-                            .child(div().flex_none().child(source_label)),
-                    )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(180.0))
+                                    .truncate()
+                                    .child(target_label),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(muted)
+                                    .child(target.pointer_label()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(muted)
+                                    .child(target.access_label()),
+                            )
+                    })
                     .child(segment_sep(cx))
                     .child(
                         gpui_component::h_flex()

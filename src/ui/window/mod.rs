@@ -55,11 +55,13 @@ use crate::ui::chrome::titlebar::{self, LayoutPreset};
 use crate::ui::panels::bookmarkspanel::BookmarksPanel;
 use crate::ui::panels::docks::{self, LayoutHandles, MAIN_DOCK_AREA};
 use crate::ui::panels::modulespanel::ModulesPanel;
+use crate::ui::panels::targetpanel::TargetPanel;
 use crate::ui::panels::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
     WorkspaceTypeAction,
 };
 use crate::ui::state::{AppState, DocId, ViewMode};
+use crate::ui::target_status::TargetStatusSummary;
 use crate::ui::theme_apply::ThemeRegistryGlobal;
 
 // Cohesive method clusters extracted from the original single `impl MainWindow`
@@ -156,6 +158,7 @@ actions!(
         RefreshView,
         GotoAddressAction,
         ToggleModules,
+        ToggleTarget,
         ToggleBookmarks,
         SplitEditor,
         UnsplitEditor,
@@ -233,8 +236,12 @@ pub struct MainWindow {
     /// window can toggle/observe the right dock (the C++ summon-on-demand panel).
     #[allow(dead_code)]
     modules: Entity<ModulesPanel>,
+    /// The right-dock Target/session inspector.
+    #[allow(dead_code)]
+    target: Entity<TargetPanel>,
     /// The right-dock Bookmarks panel (View ▸ Bookmarks; `Ctrl+Shift+B`). Shares
-    /// the right dock's tab strip with [`modules`](Self::modules).
+    /// the right dock's tab strip with [`modules`](Self::modules) and
+    /// [`target`](Self::target).
     #[allow(dead_code)]
     bookmarks: Entity<BookmarksPanel>,
     /// The in-window menu bar (the titlebar's File/Edit/View/… dropdown row).
@@ -329,8 +336,8 @@ pub struct MainWindow {
     /// kept so its Saved/Cancelled events fire while shown (the dedicated theme
     /// editor; the C++ `editTheme`).
     theme_editor_sub: Option<Subscription>,
-    /// Which right-dock tab the user last raised (Modules vs Bookmarks). The
-    /// right dock tabifies both panels (one `Dock` open flag), so the View ✓
+    /// Which right-dock tab the user last raised (Target vs Modules vs Bookmarks).
+    /// The right dock tabifies all three panels (one `Dock` open flag), so the View ✓
     /// for each must be driven from THIS (which tab is active) AND the dock's
     /// visibility — not from the shared open flag alone (the C++ ties each ✓ to
     /// its own dock's visibility; item 9).
@@ -385,6 +392,7 @@ pub struct MainWindow {
 /// dock's open state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RightDockPanel {
+    Target,
     Modules,
     Bookmarks,
 }
@@ -405,6 +413,7 @@ impl MainWindow {
             document_area,
             workspace,
             modules,
+            target,
             bookmarks,
             // KEEP the scanner handle (previously dropped via `..`): the window
             // must feed it the active document's provider + wire result rows, or
@@ -675,14 +684,14 @@ impl MainWindow {
         )
         .detach();
 
-        // ── Wire the modules dock row activation (double-click → set the active
-        // document's base address to the module base). ──
+        // ── Wire the modules dock row activation (double-click → open/reuse a
+        // module-root class at that module's image base). ──
         cx.subscribe_in(
             &modules,
             window,
             |this, _md, ev: &crate::ui::panels::modulespanel::ModuleAction, window, cx| match ev {
-                crate::ui::panels::modulespanel::ModuleAction::Activate { base, .. } => {
-                    this.navigate_active_editor_to_address(*base, window, cx);
+                crate::ui::panels::modulespanel::ModuleAction::Activate { base, name } => {
+                    this.jump_active_editor_to_module_base(*base, name, window, cx);
                 }
                 crate::ui::panels::modulespanel::ModuleAction::DownloadAll => {
                     this.download_all_module_symbols(window, cx);
@@ -731,6 +740,7 @@ impl MainWindow {
             document_area,
             workspace,
             modules,
+            target,
             bookmarks,
             menubar,
             start_page: None,
@@ -757,9 +767,9 @@ impl MainWindow {
             scanner,
             options_sub: None,
             theme_editor_sub: None,
-            // The right dock defaults to the Modules tab (the first tabified
-            // panel; docks.rs builds [modules, bookmarks]).
-            right_dock_panel: RightDockPanel::Modules,
+            // The right dock defaults to the Target tab (the first tabified
+            // panel; docks.rs builds [target, modules, bookmarks]).
+            right_dock_panel: RightDockPanel::Target,
             pinned_ids: std::collections::HashSet::new(),
             auto_start_mcp,
             brace_wrap,
@@ -1010,14 +1020,28 @@ impl Render for MainWindow {
         // The bottom status bar's active-node readout (app-shell §11): pull the
         // selection/offset/size from the active editor's controller (a read-only
         // borrow), and the active source from the window state.
-        let status_info = self
+        let (status_info, target_summary) = self
             .document_area
             .read(cx)
             .active_editor()
-            .map(|ed| StatusInfo::for_controller(ed.read(cx).controller()))
-            .unwrap_or_default();
+            .map(|ed| {
+                let ed = ed.read(cx);
+                let ctrl = ed.controller();
+                (
+                    StatusInfo::for_controller(ctrl),
+                    TargetStatusSummary::for_controller(ctrl),
+                )
+            })
+            .unwrap_or_else(|| (StatusInfo::default(), TargetStatusSummary::no_source()));
         let source = self.state.active_source();
-        let status_bar = render_status_bar(&status_info, &source, cx);
+        let open_target = {
+            let this = cx.entity().downgrade();
+            move |window: &mut Window, app: &mut App| {
+                let _ = this.update(app, |me, cx| me.raise_target(window, cx));
+            }
+        };
+        let status_bar =
+            render_status_bar(&status_info, &source, &target_summary, open_target, cx);
 
         // Presentation Mode (View ▸ Presentation Mode): fade the surrounding chrome
         // (titlebar + status bar) so the editor surface reads as the focus, like the
@@ -1050,6 +1074,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_goto_address))
             .on_action(cx.listener(Self::on_toggle_modules))
+            .on_action(cx.listener(Self::on_toggle_target))
             .on_action(cx.listener(Self::on_toggle_bookmarks))
             .on_action(cx.listener(Self::on_split_editor))
             .on_action(cx.listener(Self::on_unsplit_editor))

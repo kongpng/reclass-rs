@@ -4,8 +4,32 @@
 //! impl RcxEditor. A child module of editor, so it keeps access to RcxEditor's
 //! private fields and methods.
 
+use crate::core::{format_hint, infer_types, ChipKind, InferHints};
+use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
+
 use super::*;
 use gpui::*;
+
+pub(super) const MEMORY_PREVIEW_MIN_ROWS: usize = 10;
+pub(super) const MEMORY_PREVIEW_MAX_ROWS: usize = 64;
+
+/// Last row/value location that produced, or could refresh, a hover popup.
+#[derive(Clone, Debug)]
+pub(super) struct HoverProbe {
+    pub(super) line: usize,
+    pub(super) rel_x: f32,
+    pub(super) pos: Point<Pixels>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MemoryPreviewRow {
+    offset: u64,
+    kind: &'static str,
+    ascii: String,
+    hex: String,
+    type_hint: Option<String>,
+    pointer_note: Option<String>,
+}
 
 /// The kind of hover popup shown over a row's value column (item 13). The C++
 /// `applyHoverCursor` opens one of three popups depending on the node:
@@ -31,6 +55,14 @@ pub(super) enum HoverPopupKind {
         sub_line: i32,
         resolved_addr: u64,
         set_buttons: bool,
+    },
+    /// ReClass.NET-style memory preview for pointer targets: a compact Hex32/Hex64
+    /// row grid that can be expanded with the mouse wheel while the popup is open.
+    MemoryPreview {
+        target_addr: u64,
+        pointer_size: i32,
+        row_count: usize,
+        rows: Vec<MemoryPreviewRow>,
     },
     /// Disassembly of the code at a function pointer's target (title "Disassembly")
     /// or a hex dump at a void pointer's target (title "Hex Dump").
@@ -80,6 +112,20 @@ pub(super) fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
                 body: bb,
             },
         ) => ta == tb && ba == bb,
+        (
+            HoverPopupKind::MemoryPreview {
+                target_addr: ta,
+                pointer_size: pa,
+                row_count: ra,
+                rows: ra_rows,
+            },
+            HoverPopupKind::MemoryPreview {
+                target_addr: tb,
+                pointer_size: pb,
+                row_count: rb,
+                rows: rb_rows,
+            },
+        ) => ta == tb && pa == pb && ra == rb && ra_rows == rb_rows,
         _ => false,
     }
 }
@@ -161,12 +207,12 @@ pub(super) fn try_parse_int(value_str: &str) -> Option<i64> {
     if t.is_empty() {
         return None;
     }
-    let (hex_body, is_hex) = if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
-    {
-        (rest, true)
-    } else {
-        (t, false)
-    };
+    let (hex_body, is_hex) =
+        if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            (rest, true)
+        } else {
+            (t, false)
+        };
     if is_hex {
         if hex_body.is_empty() || hex_body.len() >= 9 {
             return None; // skip pointer-ish (and empty "0x")
@@ -234,7 +280,10 @@ pub(super) fn history_header(entries: &[(String, i64)], now_ms: i64) -> String {
         let mut neg = 0i32;
         let mut all_numeric = true;
         for k in 0..entries.len().saturating_sub(1) {
-            match (try_parse_int(&entries[k].0), try_parse_int(&entries[k + 1].0)) {
+            match (
+                try_parse_int(&entries[k].0),
+                try_parse_int(&entries[k + 1].0),
+            ) {
                 (Some(a), Some(b)) => {
                     let d = a - b;
                     if d > 0 {
@@ -261,7 +310,10 @@ pub(super) fn history_header(entries: &[(String, i64)], now_ms: i64) -> String {
     // Oldest timestamped entry → "since X".
     let oldest_ms = entries.iter().rev().map(|(_, t)| *t).find(|t| *t > 0);
     if let Some(oldest) = oldest_ms {
-        out.push_str(&format!(" · since {}", fmt_elapsed_compact(now_ms - oldest)));
+        out.push_str(&format!(
+            " · since {}",
+            fmt_elapsed_compact(now_ms - oldest)
+        ));
     }
 
     // Average change interval: span ÷ gaps, when there are ≥ 3 entries and the
@@ -353,6 +405,7 @@ impl super::RcxEditor {
             }
             return;
         }
+        let probe = HoverProbe { line, rel_x, pos };
         let want = if self.hover_effects {
             self.compute_hover_popup(line, rel_x, pos)
         } else {
@@ -366,9 +419,160 @@ impl super::RcxEditor {
         if changed_popup {
             self.hover_popup = want;
         }
+        if self.hover_popup.is_some() {
+            self.hover_probe = Some(probe);
+        } else {
+            self.hover_probe = None;
+            self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
+        }
         if changed_band || changed_popup {
             cx.notify();
         }
+    }
+
+    /// Open a hover-style value preview from an explicit command/menu action.
+    /// Unlike passive hover, this ignores the Hover Effects toggle and shows a
+    /// diagnostic card when the row has no previewable value so the command never
+    /// feels like a dead click.
+    pub(super) fn show_explicit_value_preview(
+        &mut self,
+        line: usize,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.hover_dwell_suppressed = false;
+        self.popup_cursor_inside = false;
+
+        let reason = match self.line_meta(line).cloned() {
+            None => Some("This row is no longer available.".to_string()),
+            Some(lm) if lm.node_idx < 0 || lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID => {
+                Some("This row has no node value to preview.".to_string())
+            }
+            Some(lm) if lm.line_kind == LineKind::Footer => {
+                Some("Footer rows do not have a value preview.".to_string())
+            }
+            Some(lm) => {
+                let (type_w, name_w) = geometry::effective_widths(&lm);
+                let vs = crate::compose::value_span_for(&lm, type_w, name_w);
+                if !vs.valid || vs.end <= vs.start {
+                    Some("This row has no value column to preview.".to_string())
+                } else {
+                    let rel_x = self.metrics.x_for_col(vs.start) + self.metrics.cell_width * 0.5;
+                    if let Some(state) = self.compute_hover_popup(line, rel_x, pos) {
+                        self.hover_popup = Some(state);
+                        self.hover_probe = Some(HoverProbe { line, rel_x, pos });
+                        cx.notify();
+                        return;
+                    }
+                    Some(
+                        "No readable pointer target or value history is available for this value."
+                            .to_string(),
+                    )
+                }
+            }
+        };
+
+        self.hover_probe = None;
+        self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
+        self.hover_popup = Some(HoverPopupState {
+            line,
+            pos,
+            kind: HoverPopupKind::TitleBody {
+                title: "Value Preview".to_string(),
+                body: reason.unwrap_or_else(|| "No preview is available.".to_string()),
+            },
+        });
+        cx.notify();
+    }
+
+    /// Rebuild the currently-open hover popup from the last row/value probe. This
+    /// is used by the live refresh timer so value history and memory preview cards
+    /// keep polling even when the mouse is stationary or inside the popup.
+    pub(super) fn refresh_hover_popup_from_probe(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.is_some()
+            || self.hover_dwell_suppressed
+            || !self.hover_effects
+            || self.hover_popup.is_none()
+        {
+            return;
+        }
+        let Some(probe) = self.hover_probe.clone() else {
+            return;
+        };
+        let want = self.compute_hover_popup(probe.line, probe.rel_x, probe.pos);
+        let changed = match (&self.hover_popup, &want) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.line != b.line || !hover_kind_eq(&a.kind, &b.kind),
+            _ => true,
+        };
+        if changed {
+            self.hover_popup = want;
+            if self.hover_popup.is_none() {
+                self.hover_probe = None;
+                self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
+                self.popup_cursor_inside = false;
+            }
+            cx.notify();
+        } else if matches!(
+            self.hover_popup.as_ref().map(|s| &s.kind),
+            Some(HoverPopupKind::ValueHistory { .. } | HoverPopupKind::MemoryPreview { .. })
+        ) {
+            // Keep relative timestamps and live preview reads painting while open.
+            cx.notify();
+        }
+    }
+
+    /// Expand/contract an open ReClass-style memory preview. Returns true when the
+    /// wheel event was consumed by the popup.
+    pub(super) fn adjust_memory_preview_rows(
+        &mut self,
+        wheel_delta_y: f32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.popup_cursor_inside {
+            return false;
+        }
+        let Some(HoverPopupState {
+            kind: HoverPopupKind::MemoryPreview { .. },
+            ..
+        }) = self.hover_popup.as_ref()
+        else {
+            return false;
+        };
+        if wheel_delta_y == 0.0 {
+            return true;
+        }
+        let next = if wheel_delta_y < 0.0 {
+            self.memory_preview_rows.saturating_add(1)
+        } else {
+            self.memory_preview_rows.saturating_sub(1)
+        };
+        self.memory_preview_rows = next.clamp(MEMORY_PREVIEW_MIN_ROWS, MEMORY_PREVIEW_MAX_ROWS);
+        self.refresh_hover_popup_from_probe(cx);
+        cx.notify();
+        true
+    }
+
+    /// Row hit-testing only fires while the cursor is over a rendered row. If the
+    /// cursor moves into empty editor space, close the active hover card unless it
+    /// is currently being held open by the popup's own hover guard.
+    pub(super) fn dismiss_hover_if_pointer_left_anchor(
+        &mut self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hover_popup.is_none() || self.popup_cursor_inside || self.context_menu.is_some() {
+            return;
+        }
+        let Some(probe) = self.hover_probe.as_ref() else {
+            self.clear_hover_state(cx);
+            return;
+        };
+        let dy = f32::from(pos.y - probe.pos.y).abs();
+        if dy <= self.metrics.line_height {
+            return;
+        }
+        self.clear_hover_state(cx);
     }
 
     /// Compute the hover popup (if any) for the value column under `(line, rel_x)`.
@@ -395,12 +599,12 @@ impl super::RcxEditor {
         if !vs.valid {
             return None;
         }
-        // Item 28: gate strictly on the value span `[vs.start, vs.end)` — the C++
-        // checks `col >= vs.start && col < vs.end`. The prior guard returned None
-        // only for `col < vs.start`, so a cursor PAST the value column end fell
-        // through and showed the popup over the trailing comment area.
         let col = self.metrics.col_containing_x(rel_x);
-        if col < vs.start || col >= vs.end {
+        let in_value_span = col >= vs.start && col < vs.end;
+        let hex_pointer_value_active = hex_pointer_value_active(&lm, col, vs);
+        // Item 28: gate rich hovers to the value span, plus the explicit
+        // pointer TypeHint chip span for inferred Hex32/Hex64 pointers.
+        if !in_value_span && !hex_pointer_value_active {
             return None;
         }
         let _ = text;
@@ -444,11 +648,23 @@ impl super::RcxEditor {
                         return None;
                     }
                 }
-                if let Some(state) = self.pointer_disasm_popup(&lm, is_fp, pos) {
+                if is_fp {
+                    if let Some(state) = self.pointer_disasm_popup(&lm, pos) {
+                        return Some(state);
+                    }
+                } else if let Some(state) = self.pointer_memory_preview_popup(&lm, pos) {
                     return Some(state);
                 }
                 // No readable target — fall through (no popup).
                 return None;
+            }
+
+            // 1a) Hex32/Hex64 value or pointer TypeHint chip → memory preview
+            // when the inferred/stored target is actually readable.
+            if hex_pointer_value_active {
+                if let Some(state) = self.pointer_memory_preview_popup(&lm, pos) {
+                    return Some(state);
+                }
             }
 
             // 1b) Collapsed TYPED pointer → struct-preview card (item 13): the first
@@ -511,18 +727,17 @@ impl super::RcxEditor {
             .unwrap_or(0)
     }
 
-    /// Build the disasm/hex-dump popup for a function/void pointer node by reading
-    /// the pointer value, then the bytes at the target (item 13). `None` when the
-    /// pointer is null/unreadable. Reads through the controller's live provider.
-    fn pointer_disasm_popup(
-        &self,
-        lm: &LineMeta,
-        is_fp: bool,
-        pos: Point<Pixels>,
-    ) -> Option<HoverPopupState> {
+    fn read_pointer_value(&self, lm: &LineMeta) -> Option<(u64, i32)> {
         let prov = &self.controller.document().provider;
-        let is64 = matches!(lm.node_kind, NodeKind::FuncPtr64 | NodeKind::Pointer64);
-        let ptr_val = if is64 {
+        let (is64, size) = match lm.node_kind {
+            NodeKind::Pointer64 | NodeKind::FuncPtr64 | NodeKind::Hex64 => (true, 8),
+            NodeKind::Pointer32 | NodeKind::FuncPtr32 | NodeKind::Hex32 => (false, 4),
+            _ => return None,
+        };
+        if !provider_can_read(&**prov, lm.offset_addr, size) {
+            return None;
+        }
+        let mut ptr_val = if is64 {
             prov.read_u64(lm.offset_addr)
         } else {
             u64::from(prov.read_u32(lm.offset_addr))
@@ -530,39 +745,35 @@ impl super::RcxEditor {
         if ptr_val == 0 || ptr_val == u64::MAX || (!is64 && ptr_val == 0xFFFF_FFFF) {
             return None;
         }
+        let idx = self.controller.tree().index_of_id(lm.node_id);
+        if idx >= 0 && self.controller.tree().nodes[idx as usize].is_relative {
+            ptr_val = ptr_val.wrapping_add(self.controller.tree().base_address);
+        }
+        Some((ptr_val, size))
+    }
+
+    /// Build the disasm popup for a function pointer by reading the pointer value,
+    /// then the bytes at the target. Memory previews for ordinary pointers use
+    /// `pointer_memory_preview_popup`.
+    fn pointer_disasm_popup(&self, lm: &LineMeta, pos: Point<Pixels>) -> Option<HoverPopupState> {
+        let prov = &self.controller.document().provider;
+        let (ptr_val, ptr_size) = self.read_pointer_value(lm)?;
         const MAX_READ: i32 = 128;
-        let bytes = prov.read_bytes(ptr_val, MAX_READ);
-        // Item 29: only bail on an EMPTY read. The C++ shows the popup whenever the
-        // read succeeds and the rendered body is non-empty (a valid pointer into a
-        // zero-filled page still gets a hex dump); the `all-zero` short-circuit was
-        // a Rust-only divergence.
+        let bytes = read_provider_bytes(&**prov, ptr_val, MAX_READ)?;
         if bytes.is_empty() {
             return None;
         }
         let (title, mut body): (String, String) = {
             #[cfg(not(feature = "disasm"))]
             {
-                let _ = is_fp;
                 (String::new(), String::new())
             }
             #[cfg(feature = "disasm")]
             {
-                if is_fp {
-                    (
-                        "Disassembly".to_string(),
-                        crate::disasm::disassemble(
-                            &bytes,
-                            ptr_val,
-                            if is64 { 64 } else { 32 },
-                            MAX_READ,
-                        ),
-                    )
-                } else {
-                    (
-                        "Hex Dump".to_string(),
-                        crate::disasm::hex_dump(&bytes, ptr_val, MAX_READ),
-                    )
-                }
+                (
+                    "Disassembly".to_string(),
+                    crate::disasm::disassemble(&bytes, ptr_val, ptr_size * 8, MAX_READ),
+                )
             }
         };
         // Cap at 6 lines so the popup stays compact (the C++ kMaxLines).
@@ -581,6 +792,40 @@ impl super::RcxEditor {
         })
     }
 
+    fn pointer_memory_preview_popup(
+        &self,
+        lm: &LineMeta,
+        pos: Point<Pixels>,
+    ) -> Option<HoverPopupState> {
+        let prov = &self.controller.document().provider;
+        let (target_addr, pointer_size) = self.read_pointer_value(lm)?;
+        if !target_is_readable(&**prov, target_addr, 1) {
+            return None;
+        }
+        let row_count = self
+            .memory_preview_rows
+            .clamp(MEMORY_PREVIEW_MIN_ROWS, MEMORY_PREVIEW_MAX_ROWS);
+        let len = row_count.saturating_mul(pointer_size.max(1) as usize);
+        let bytes = read_provider_bytes_best_effort(&**prov, target_addr, len, 1)?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let rows = memory_preview_rows(&**prov, pointer_size, row_count, &bytes);
+        if rows.is_empty() {
+            return None;
+        }
+        Some(HoverPopupState {
+            line: lm.node_idx.max(0) as usize,
+            pos,
+            kind: HoverPopupKind::MemoryPreview {
+                target_addr,
+                pointer_size,
+                row_count,
+                rows,
+            },
+        })
+    }
+
     /// Build the struct-preview popup for a collapsed typed pointer (item 13):
     /// compose the referenced struct at the pointer target and show its first few
     /// data lines (skipping the command row). `None` when the pointer has no valid
@@ -594,8 +839,16 @@ impl super::RcxEditor {
         if ref_id == 0 || self.controller.tree().index_of_id(ref_id) < 0 {
             return None;
         }
-        // Compose the referenced struct (same flags the live view uses for layout).
-        let cr = self.controller.document().compose(
+        let (target_addr, _) = self.read_pointer_value(lm)?;
+        if !target_is_readable(&*self.controller.document().provider, target_addr, 1) {
+            return None;
+        }
+        let mut tree = self.controller.tree().clone();
+        tree.base_address = target_addr;
+        // Compose the referenced struct at the pointer target.
+        let cr = crate::compose::compose_with_symbols(
+            &tree,
+            &*self.controller.document().provider,
             ref_id,
             self.compact_columns,
             self.tree_lines(),
@@ -603,6 +856,8 @@ impl super::RcxEditor {
             self.type_hints(),
             self.show_comments(),
             None,
+            true,
+            true,
         );
         // Skip line 0 (the command row); take the first few non-empty data lines.
         const MAX_LINES: usize = 5;
@@ -719,12 +974,20 @@ impl super::RcxEditor {
                     } else {
                         (i + 1).to_string()
                     };
-                    let idx_color = if i == 0 { palette.accent } else { tier_color(tier) };
+                    let idx_color = if i == 0 {
+                        palette.accent
+                    } else {
+                        tier_color(tier)
+                    };
 
                     // Value — bright on the newest, fading on older rows via the
                     // recency tier. Rows that REPEAT the newest value fade an extra
                     // notch (the data point is already shown on row 0).
-                    let mut val_color = if i == 0 { palette.text } else { tier_color(tier) };
+                    let mut val_color = if i == 0 {
+                        palette.text
+                    } else {
+                        tier_color(tier)
+                    };
                     if i > 0 && *v == newest_value {
                         val_color = with_alpha(val_color, 0.6);
                     }
@@ -909,6 +1172,103 @@ impl super::RcxEditor {
                 }
                 card
             }
+            HoverPopupKind::MemoryPreview {
+                target_addr,
+                pointer_size,
+                row_count,
+                rows,
+            } => {
+                let font_size = self.editor_font_size();
+                let font_family = self.editor_font_family();
+                let stride = (*pointer_size).max(1) as usize;
+                let ch = font_size * 0.62;
+                let offset_w = px(ch * 5.0);
+                let type_w = px(ch * 6.0);
+                let ascii_w = px(ch * stride.max(4) as f32);
+                let hex_w = px(ch * (stride.saturating_mul(3).saturating_sub(1)).max(8) as f32);
+                let body_rows: Vec<AnyElement> = rows
+                    .iter()
+                    .cloned()
+                    .map(|row| {
+                        let mut line = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(design::tokens::space::XS))
+                            .text_size(px(font_size))
+                            .font_family(font_family.clone())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(offset_w)
+                                    .text_color(palette.number)
+                                    .child(format!("+{:X}", row.offset)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(type_w)
+                                    .text_color(palette.type_fg)
+                                    .child(row.kind),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(ascii_w)
+                                    .text_color(palette.ascii)
+                                    .child(row.ascii),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(hex_w)
+                                    .text_color(palette.dim)
+                                    .child(row.hex),
+                            );
+                        if let Some(type_hint) = row.type_hint {
+                            let hint_children = semantic_hint_children(&type_hint, false, &palette);
+                            line = line.child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(ch * 28.0))
+                                    .truncate()
+                                    .children(hint_children),
+                            );
+                        }
+                        if let Some(pointer_note) = row.pointer_note {
+                            let note_children = pointer_note_children(&pointer_note, &palette);
+                            line = line.child(
+                                div()
+                                    .flex_grow()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .children(note_children),
+                            );
+                        }
+                        line.into_any_element()
+                    })
+                    .collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(design::tokens::space::XS))
+                    .child(
+                        div()
+                            .text_size(px(design::tokens::font::UI_XS))
+                            .text_color(palette.dim)
+                            .child(format!(
+                                "Memory Preview  0x{target_addr:016X}  {row_count} rows"
+                            )),
+                    )
+                    .children(body_rows)
+                    .child(
+                        div()
+                            .pt(px(design::tokens::space::XS))
+                            .text_size(px(design::tokens::font::UI_XS))
+                            .text_color(palette.dim)
+                            .child("Wheel over preview to resize"),
+                    )
+            }
             HoverPopupKind::TitleBody { title, body } => {
                 let body_rows: Vec<AnyElement> = body
                     .lines()
@@ -964,17 +1324,450 @@ impl super::RcxEditor {
     }
 }
 
+fn provider_can_read(provider: &dyn Provider, addr: u64, len: i32) -> bool {
+    if len <= 0 {
+        return len == 0;
+    }
+    if provider.is_readable(addr, len) {
+        return true;
+    }
+    provider.enumerate_regions().into_iter().any(|r| {
+        r.readable
+            && addr >= r.base
+            && addr
+                .checked_add(len as u64)
+                .is_some_and(|end| end <= r.base.saturating_add(r.size))
+    })
+}
+
+fn hex_pointer_value_active(lm: &LineMeta, col: i32, vs: crate::compose::ColumnSpan) -> bool {
+    if !matches!(lm.node_kind, NodeKind::Hex32 | NodeKind::Hex64) {
+        return false;
+    }
+    let narrowed = geometry::narrow_value_at_first_chip(lm, vs);
+    let span = if narrowed.valid { narrowed } else { vs };
+    (col >= span.start && col < span.end) || pointer_type_hint_chip_active(lm, col)
+}
+
+fn pointer_type_hint_chip_active(lm: &LineMeta, col: i32) -> bool {
+    lm.chips.iter().any(|chip| {
+        chip.kind == ChipKind::TypeHint
+            && col >= chip.start_col
+            && col < chip.end_col
+            && chip
+                .type_hint_kinds
+                .iter()
+                .any(|k| matches!(k, NodeKind::Pointer32 | NodeKind::Pointer64))
+    })
+}
+
+fn read_provider_bytes(provider: &dyn Provider, addr: u64, len: i32) -> Option<Vec<u8>> {
+    if !provider_can_read(provider, addr, len) {
+        return None;
+    }
+    let mut bytes = vec![0u8; len.max(0) as usize];
+    if !provider.read(addr, &mut bytes) {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn readable_tail_len(provider: &dyn Provider, addr: u64, preferred_len: usize) -> usize {
+    if preferred_len == 0 {
+        return 0;
+    }
+    provider
+        .enumerate_regions()
+        .into_iter()
+        .find_map(|region| {
+            if !region.readable || addr < region.base {
+                return None;
+            }
+            let end = region.base.checked_add(region.size)?;
+            if addr >= end {
+                return None;
+            }
+            Some((end - addr).min(preferred_len as u64) as usize)
+        })
+        .unwrap_or(preferred_len)
+}
+
+fn read_provider_bytes_best_effort(
+    provider: &dyn Provider,
+    addr: u64,
+    preferred_len: usize,
+    min_len: usize,
+) -> Option<Vec<u8>> {
+    let cap = readable_tail_len(provider, addr, preferred_len);
+    if cap == 0 {
+        return None;
+    }
+    let min_len = min_len.max(1).min(cap);
+    for len in (min_len..=cap).rev() {
+        let mut bytes = vec![0u8; len];
+        if provider.read(addr, &mut bytes) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn target_is_readable(provider: &dyn Provider, addr: u64, min_len: i32) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let len = min_len.max(1);
+    provider_can_read(provider, addr, len) && {
+        let mut probe = vec![0u8; len as usize];
+        provider.read(addr, &mut probe)
+    }
+}
+
+fn memory_preview_rows(
+    provider: &dyn Provider,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: &[u8],
+) -> Vec<MemoryPreviewRow> {
+    let stride = pointer_size.max(1) as usize;
+    let kind = if pointer_size <= 4 { "hex32" } else { "hex64" };
+    let regions = provider.enumerate_regions();
+    let modules = provider.enumerate_modules();
+    (0..row_count)
+        .map(|row| {
+            let start = row.saturating_mul(stride);
+            let chunk = bytes
+                .get(start..start.saturating_add(stride).min(bytes.len()))
+                .unwrap_or(&[]);
+            let mut hex = String::with_capacity(stride * 3);
+            let mut ascii = String::with_capacity(stride);
+            for i in 0..stride {
+                if let Some(b) = chunk.get(i).copied() {
+                    if i > 0 {
+                        hex.push(' ');
+                    }
+                    hex.push_str(&format!("{b:02X}"));
+                    ascii.push(if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    });
+                } else {
+                    if i > 0 {
+                        hex.push(' ');
+                    }
+                    hex.push_str("  ");
+                    ascii.push(' ');
+                }
+            }
+            let type_hint = memory_preview_type_hint(chunk, pointer_size);
+            let pointer_note =
+                memory_preview_pointer_note(provider, &regions, &modules, chunk, pointer_size);
+            MemoryPreviewRow {
+                offset: start as u64,
+                kind,
+                ascii,
+                hex: format!("{hex:<width$}", width = stride * 3 - 1),
+                type_hint,
+                pointer_note: pointer_note.map(|label| format!("-> {label}")),
+            }
+        })
+        .collect()
+}
+
+fn memory_preview_type_hint(chunk: &[u8], pointer_size: i32) -> Option<String> {
+    if chunk.is_empty() || chunk.iter().all(|&b| b == 0) {
+        return None;
+    }
+    let hints = InferHints {
+        ptr_size: pointer_size,
+        ..Default::default()
+    };
+    let suggestions = infer_types(chunk, &hints, 3);
+    let parts: Vec<String> = suggestions
+        .iter()
+        .filter(|s| s.strength >= 3)
+        .take(2)
+        .map(|suggestion| {
+            let type_name = format_hint(suggestion);
+            let preview = memory_preview_format_hint(chunk, chunk.len() as i32, &suggestion.kinds);
+            if preview.is_empty() {
+                format!("[{type_name}]")
+            } else {
+                format!("{preview} [{type_name}]")
+            }
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+fn memory_preview_pointer_note(
+    provider: &dyn Provider,
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+    chunk: &[u8],
+    pointer_size: i32,
+) -> Option<String> {
+    let target = match pointer_size {
+        4 if chunk.len() >= 4 => {
+            u64::from(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        }
+        8 if chunk.len() >= 8 => u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]),
+        _ => return None,
+    };
+    if target == 0 || target == u64::MAX || (pointer_size == 4 && target == 0xFFFF_FFFF) {
+        return None;
+    }
+    if !regions
+        .iter()
+        .any(|r| region_contains_readable(r, target, 1))
+    {
+        return None;
+    }
+    let mut probe = [0u8; 1];
+    if !provider.read(target, &mut probe) {
+        return None;
+    }
+    Some(memory_preview_named_address(
+        provider, regions, modules, target,
+    ))
+}
+
+fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool {
+    region.readable
+        && len >= 0
+        && addr >= region.base
+        && addr
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= region.base.saturating_add(region.size))
+}
+
+fn memory_preview_named_address(
+    provider: &dyn Provider,
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+    addr: u64,
+) -> String {
+    let symbol = provider.get_symbol(addr);
+    if !symbol.is_empty() {
+        return symbol;
+    }
+    if let Some(module) = modules
+        .iter()
+        .find(|m| addr >= m.base && addr.checked_sub(m.base).is_some_and(|rel| rel < m.size))
+    {
+        let name = if module.name.is_empty() {
+            "module"
+        } else {
+            module.name.as_str()
+        };
+        return format!("{name}+0x{:X}", addr.saturating_sub(module.base));
+    }
+    if let Some(region) = regions
+        .iter()
+        .find(|r| region_contains_readable(r, addr, 1))
+    {
+        let tag = match region.region_type {
+            RegionType::Image => "<DATA>",
+            RegionType::Mapped => "<MAPPED>",
+            RegionType::Private => {
+                if region.writable {
+                    "<HEAP>"
+                } else {
+                    "<PRIVATE>"
+                }
+            }
+        };
+        if region.module_name.is_empty() {
+            return format!("{tag}0x{addr:X}");
+        }
+        return format!("{tag}{}.0x{addr:X}", region.module_name);
+    }
+    format!("0x{addr:X}")
+}
+
+fn memory_preview_format_hint(data: &[u8], len: i32, kinds: &[NodeKind]) -> String {
+    use crate::format as fmt;
+
+    let Some(&k) = kinds.first() else {
+        return String::new();
+    };
+    let len = len.max(0).min(data.len() as i32);
+
+    let load_u16 =
+        |d: &[u8]| -> Option<u16> { (d.len() >= 2).then(|| u16::from_le_bytes([d[0], d[1]])) };
+    let load_u32 = |d: &[u8]| -> Option<u32> {
+        (d.len() >= 4).then(|| u32::from_le_bytes([d[0], d[1], d[2], d[3]]))
+    };
+    let load_u64 = |d: &[u8]| -> Option<u64> {
+        (d.len() >= 8).then(|| u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]))
+    };
+
+    if kinds.len() == 1 {
+        return match k {
+            NodeKind::Float => load_u32(data)
+                .map(|v| fmt::fmt_float(f32::from_bits(v)))
+                .unwrap_or_default(),
+            NodeKind::Double => load_u64(data)
+                .map(|v| fmt::fmt_double(f64::from_bits(v)))
+                .unwrap_or_default(),
+            NodeKind::Int32 => load_u32(data)
+                .map(|v| fmt::fmt_int32(v as i32))
+                .unwrap_or_default(),
+            NodeKind::UInt32 => load_u32(data).map(fmt::fmt_uint32).unwrap_or_default(),
+            NodeKind::Int16 => load_u16(data)
+                .map(|v| fmt::fmt_int16(v as i16))
+                .unwrap_or_default(),
+            NodeKind::UInt16 => load_u16(data).map(fmt::fmt_uint16).unwrap_or_default(),
+            NodeKind::Int64 => load_u64(data)
+                .map(|v| fmt::fmt_int64(v as i64))
+                .unwrap_or_default(),
+            NodeKind::UInt64 => load_u64(data).map(fmt::fmt_uint64).unwrap_or_default(),
+            NodeKind::Pointer64 => load_u64(data).map(fmt::fmt_pointer64).unwrap_or_default(),
+            NodeKind::Pointer32 => load_u32(data).map(fmt::fmt_pointer32).unwrap_or_default(),
+            NodeKind::Bool => data.first().map(|&v| fmt::fmt_bool(v)).unwrap_or_default(),
+            NodeKind::UTF8 => {
+                let n = len.min(8) as usize;
+                let mut s = String::new();
+                for &c in data.iter().take(n) {
+                    if (0x20..=0x7E).contains(&c) {
+                        s.push(c as char);
+                    } else {
+                        break;
+                    }
+                }
+                if s.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{s}\"")
+                }
+            }
+            _ => String::new(),
+        };
+    }
+
+    let part_sz = len / kinds.len() as i32;
+    if part_sz <= 0 {
+        return String::new();
+    }
+    let part_sz_usize = part_sz as usize;
+    let parts: Vec<String> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, &lane)| {
+            let start = i.saturating_mul(part_sz_usize);
+            let end = start.saturating_add(part_sz_usize).min(data.len());
+            let slice = data.get(start..end).unwrap_or(&[]);
+            memory_preview_format_hint(slice, part_sz, std::slice::from_ref(&lane))
+        })
+        .collect();
+    parts.join(", ")
+}
+
+fn semantic_hint_children(
+    text: &str,
+    pointer_hint: bool,
+    palette: &EditorPalette,
+) -> Vec<AnyElement> {
+    let spans = super::geometry::type_hint_semantic_spans(text, pointer_hint);
+    styled_hint_children(text, &spans, palette)
+}
+
+fn pointer_note_children(text: &str, palette: &EditorPalette) -> Vec<AnyElement> {
+    semantic_hint_children(text, true, palette)
+}
+
+fn styled_hint_children(
+    text: &str,
+    spans: &[super::geometry::SpanStyle],
+    palette: &EditorPalette,
+) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    for span in spans {
+        let start = super::geometry::byte_for_col(text, span.start);
+        let end = super::geometry::byte_for_col(text, span.end);
+        if end <= start {
+            continue;
+        }
+        out.push(
+            div()
+                .text_color(palette.role_color(span.role))
+                .child(text[start..end].to_string())
+                .into_any_element(),
+        );
+    }
+    if out.is_empty() && !text.is_empty() {
+        out.push(
+            div()
+                .text_color(palette.type_hint)
+                .child(text.to_string())
+                .into_any_element(),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_number, fmt_elapsed_compact, history_header, recency_tier, try_parse_int,
+        compact_number, fmt_elapsed_compact, hex_pointer_value_active, history_header,
+        hover_kind_eq, memory_preview_rows, memory_preview_type_hint, read_provider_bytes,
+        read_provider_bytes_best_effort, recency_tier, target_is_readable, try_parse_int,
+        HoverPopupKind, MemoryPreviewRow,
     };
+    use crate::compose::ColumnSpan;
+    use crate::core::{ChipKind, LineChip, LineMeta, NodeKind};
+    use crate::provider::{MemoryRegion, Provider, RegionType};
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;
     const H: i64 = 60 * M;
     const D: i64 = 24 * H;
     const W: i64 = 7 * D;
+
+    struct TestProvider {
+        base: u64,
+        data: Vec<u8>,
+        fail_reads: bool,
+    }
+
+    impl Provider for TestProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            if self.fail_reads {
+                return false;
+            }
+            let Some(start) = addr.checked_sub(self.base).map(|v| v as usize) else {
+                return false;
+            };
+            if start + buf.len() > self.data.len() {
+                return false;
+            }
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            self.data.len() as i32
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            vec![MemoryRegion {
+                base: self.base,
+                size: self.data.len() as u64,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "test".into(),
+                region_type: RegionType::Private,
+            }]
+        }
+
+        fn is_readable(&self, _addr: u64, _len: i32) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn fmt_elapsed_compact_tiers() {
@@ -991,13 +1784,190 @@ mod tests {
     }
 
     #[test]
+    fn target_readability_requires_region_and_real_read_success() {
+        let ok = TestProvider {
+            base: 0x1000,
+            data: vec![1, 2, 3, 4],
+            fail_reads: false,
+        };
+        assert!(target_is_readable(&ok, 0x1000, 4));
+        assert_eq!(read_provider_bytes(&ok, 0x1001, 2), Some(vec![2, 3]));
+        assert!(!target_is_readable(&ok, 0x0FFF, 1));
+        assert_eq!(read_provider_bytes(&ok, 0x0FFF, 1), None);
+
+        let failing = TestProvider {
+            base: 0x1000,
+            data: vec![1, 2, 3, 4],
+            fail_reads: true,
+        };
+        assert!(!target_is_readable(&failing, 0x1000, 1));
+        assert_eq!(read_provider_bytes(&failing, 0x1000, 1), None);
+    }
+
+    #[test]
+    fn preview_read_clamps_to_readable_region_tail() {
+        let provider = TestProvider {
+            base: 0x2000,
+            data: vec![0xAA, 0xBB, 0xCC],
+            fail_reads: false,
+        };
+        assert!(target_is_readable(&provider, 0x2002, 1));
+        assert_eq!(read_provider_bytes(&provider, 0x2002, 8), None);
+        assert_eq!(
+            read_provider_bytes_best_effort(&provider, 0x2002, 8, 1),
+            Some(vec![0xCC])
+        );
+    }
+
+    #[test]
+    fn hex_pointer_preview_uses_value_span_and_pointer_type_hint_chip() {
+        let mut lm = LineMeta {
+            node_kind: NodeKind::Hex64,
+            ..Default::default()
+        };
+        let vs = ColumnSpan {
+            start: 10,
+            end: 24,
+            valid: true,
+        };
+        assert!(
+            hex_pointer_value_active(&lm, 12, vs),
+            "hex value span qualifies"
+        );
+        assert!(
+            !hex_pointer_value_active(&lm, 30, vs),
+            "trailing text outside the value span is ignored"
+        );
+
+        lm.chips.push(LineChip {
+            kind: ChipKind::TypeHint,
+            start_col: 24,
+            end_col: 39,
+            text: "14, 20 [int32_t×2]".into(),
+            type_hint_kinds: vec![NodeKind::Int32, NodeKind::Int32],
+            ..Default::default()
+        });
+        assert!(
+            hex_pointer_value_active(&lm, 12, vs),
+            "hex value span still qualifies when a non-pointer chip follows"
+        );
+        assert!(
+            !hex_pointer_value_active(&lm, 30, vs),
+            "non-pointer TypeHint chip span is not a pointer preview target"
+        );
+
+        lm.chips.push(LineChip {
+            kind: ChipKind::TypeHint,
+            start_col: 40,
+            end_col: 57,
+            text: "ptr64\u{2713} -> module+0x10".into(),
+            type_hint_kinds: vec![NodeKind::Pointer64],
+            ..Default::default()
+        });
+        assert!(
+            hex_pointer_value_active(&lm, 45, vs),
+            "pointer TypeHint chip span qualifies as a preview target"
+        );
+    }
+
+    #[test]
+    fn memory_preview_type_hint_renders_pointer_predictions() {
+        let data = [0x00, 0x10, 0xB0, 0xA0, 0xF6, 0x7F, 0x00, 0x00];
+        let hint = memory_preview_type_hint(&data, 8);
+        assert!(
+            hint.as_deref().unwrap_or_default().contains("ptr64"),
+            "memory preview should render passive pointer prediction: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn memory_preview_type_hint_renders_generic_split_ints() {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&14i32.to_le_bytes());
+        data[4..8].copy_from_slice(&20i32.to_le_bytes());
+        let hint = memory_preview_type_hint(&data, 8);
+        assert!(
+            hint.as_deref().unwrap_or_default().contains("int32_t×2")
+                && hint.as_deref().unwrap_or_default().contains("uint32_t×2"),
+            "memory preview should render top-2 split-int predictions: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn memory_preview_rows_are_pointer_sized() {
+        let provider = TestProvider {
+            base: 0x1000,
+            data: vec![0u8; 0x100],
+            fail_reads: false,
+        };
+        let rows = memory_preview_rows(&provider, 4, 2, &[0x41, 0x42, 0, 0x7F, 1, 2, 3, 4]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].offset, 0);
+        assert_eq!(rows[0].kind, "hex32");
+        assert_eq!(rows[0].hex, "41 42 00 7F");
+        assert_eq!(rows[0].ascii, "AB..");
+        assert_eq!(rows[1].offset, 4);
+        assert_eq!(rows[1].hex, "01 02 03 04");
+    }
+
+    #[test]
+    fn memory_preview_rows_note_readable_pointer_values() {
+        let provider = TestProvider {
+            base: 0x2000,
+            data: vec![0xAA],
+            fail_reads: false,
+        };
+        let rows = memory_preview_rows(&provider, 8, 1, &0x2000u64.to_le_bytes());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].pointer_note.as_deref(),
+            Some("-> <PRIVATE>test.0x2000")
+        );
+    }
+
+    #[test]
+    fn memory_preview_identity_changes_when_live_bytes_change() {
+        let a = HoverPopupKind::MemoryPreview {
+            target_addr: 0x1000,
+            pointer_size: 8,
+            row_count: 10,
+            rows: vec![preview_row("01 02 03")],
+        };
+        let b = HoverPopupKind::MemoryPreview {
+            target_addr: 0x1000,
+            pointer_size: 8,
+            row_count: 10,
+            rows: vec![preview_row("01 02 03")],
+        };
+        let changed = HoverPopupKind::MemoryPreview {
+            target_addr: 0x1000,
+            pointer_size: 8,
+            row_count: 10,
+            rows: vec![preview_row("01 02 04")],
+        };
+        assert!(hover_kind_eq(&a, &b));
+        assert!(!hover_kind_eq(&a, &changed));
+    }
+
+    fn preview_row(hex: &str) -> MemoryPreviewRow {
+        MemoryPreviewRow {
+            offset: 0,
+            kind: "hex64",
+            ascii: String::new(),
+            hex: hex.into(),
+            type_hint: None,
+            pointer_note: None,
+        }
+    }
+
+    #[test]
     fn compact_number_kmg() {
         // Below 10_000 → full number.
         assert_eq!(compact_number(0), "0");
         assert_eq!(compact_number(42), "42");
         assert_eq!(compact_number(9999), "9999");
         assert_eq!(compact_number(-9999), "9999"); // magnitude only
-                                                    // K tier.
+                                                   // K tier.
         assert_eq!(compact_number(10_000), "10K");
         assert_eq!(compact_number(1_234_000), "1.23M");
         // M tier.

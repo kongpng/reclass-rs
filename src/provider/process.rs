@@ -112,8 +112,17 @@ impl Provider for LocalProcessProvider {
         self.inner.enumerate_regions()
     }
 
-    fn is_readable(&self, _addr: u64, len: i32) -> bool {
-        self.inner.size() > 0 && len >= 0
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        if len <= 0 {
+            return len == 0;
+        }
+        self.inner.enumerate_regions().into_iter().any(|region| {
+            region.readable
+                && addr >= region.base
+                && addr
+                    .checked_add(len as u64)
+                    .is_some_and(|end| end <= region.base.saturating_add(region.size))
+        })
     }
 
     fn peb(&self) -> u64 {
@@ -1165,5 +1174,21 @@ mod tests {
         assert_eq!(regions[0].region_type, RegionType::Image);
         assert_eq!(regions[1].region_type, RegionType::Mapped);
         assert_eq!(regions[2].region_type, RegionType::Private);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_process_readability_is_address_bound() {
+        use crate::provider::Provider;
+
+        let provider = LocalProcessProvider::attach(&std::process::id().to_string())
+            .expect("attach to current process");
+        let region = provider
+            .enumerate_regions()
+            .into_iter()
+            .find(|r| r.readable && r.size > 0)
+            .expect("current process has a readable mapping");
+        assert!(provider.is_readable(region.base, 1));
+        assert!(!provider.is_readable(1, 1));
     }
 }

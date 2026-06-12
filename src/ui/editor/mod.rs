@@ -32,7 +32,7 @@ pub mod minimap;
 pub mod palette;
 pub mod selection;
 pub mod tab_cycle;
-use hover_popup::{HoverPopupKind, HoverPopupState};
+use hover_popup::{HoverPopupKind, HoverPopupState, HoverProbe, MEMORY_PREVIEW_MIN_ROWS};
 mod context_menu;
 mod debug_view;
 mod popups;
@@ -129,6 +129,7 @@ actions!(
         EditorNavHome,
         EditorNavEnd,
         EditorBeginValueEdit,
+        EditorPreviewValue,
         EditorInsertHex64,
         EditorInsertHex32,
         EditorCommentEdit,
@@ -504,6 +505,9 @@ pub struct RcxEditor {
     /// column (heated value / func-or-void pointer / typed pointer). Cleared when
     /// the cursor leaves the value region or moves to a non-qualifying row.
     hover_popup: Option<HoverPopupState>,
+    /// Last row/value hit-test used to rebuild an open hover popup from timer
+    /// refreshes while the mouse stays still or is over the popup itself.
+    hover_probe: Option<HoverProbe>,
     /// The moving end of a keyboard range-selection (Shift+arrows/page/home/end).
     /// The C++ tracks the Scintilla caret line; here we mirror it so Shift-nav
     /// extends from the last caret position rather than from `first_selected_line`
@@ -678,6 +682,9 @@ pub struct RcxEditor {
     /// the viewport), so the preview returns only after the user re-dwells
     /// elsewhere — Esc "sticks" without globally disabling hover effects.
     hover_dwell_suppressed: bool,
+    /// ReClass.NET memory-preview row count. Reset when the hover popup closes;
+    /// wheel events over the popup expand/contract it.
+    memory_preview_rows: usize,
     /// Item 11: the type-inference quick-convert payload captured when the node
     /// context menu is built — `(node_id, [hint kinds])`. The `EditorHintConvert` /
     /// `EditorHintSplit` actions read this so the dynamic suggested kind(s) survive
@@ -754,6 +761,9 @@ struct EditingField {
     left_px: f32,
     /// PIXEL width of the edited span `[col_start, col_end)`, likewise shaped.
     width_px: f32,
+    /// Comment edits are presented as a labeled row-local field anchored near the
+    /// value/name area instead of over the far-right rendered `// ...` chip.
+    comment_popover: bool,
     /// Item 5: this edit is an ASCII byte-overwrite ('Edit ASCII'). The Value
     /// commit must pass `is_ascii = true` to `set_node_value` so the text is
     /// written per-byte as ASCII (the field opens as a Value edit then switches to
@@ -777,6 +787,7 @@ impl RcxEditor {
             hovered_line: None,
             hovered_node_id: 0,
             hover_popup: None,
+            hover_probe: None,
             caret_line: None,
             drag_anchor_line: None,
             drag_on_byte_grid: false,
@@ -823,6 +834,7 @@ impl RcxEditor {
             cross_doc_composites: Vec::new(),
             popup_cursor_inside: false,
             hover_dwell_suppressed: false,
+            memory_preview_rows: MEMORY_PREVIEW_MIN_ROWS,
             pending_hint_convert: None,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
@@ -959,8 +971,14 @@ impl RcxEditor {
             // A read landed and the snapshot/heat changed — recompose + repaint so
             // the live values + changed-byte heat appear without user input.
             self.controller.refresh();
+            self.refresh_hover_popup_from_probe(cx);
             let _ = self.controller.take_events();
             cx.notify();
+        } else {
+            // Pointer previews read their target directly from the provider. Keep
+            // them polling from the timer even when the main snapshot has no page
+            // work to do.
+            self.refresh_hover_popup_from_probe(cx);
         }
     }
 
@@ -1285,31 +1303,12 @@ impl RcxEditor {
         if count <= 0 {
             return;
         }
-        // The tail offset of the struct = max(child.offset + size) over its
-        // members. For container children (struct/array) `size_for_kind` is 0,
-        // so use the container-aware `struct_span` to measure past them — else
-        // the appended field would land on top of the last child.
-        let tail = {
-            let tree = self.controller.tree();
-            tree.children_of(struct_id)
-                .iter()
-                .map(|&ci| {
-                    let c = &tree.nodes[ci];
-                    let sz = if crate::core::is_container_kind(c.kind) {
-                        tree.struct_span(c.id)
-                    } else {
-                        crate::core::size_for_kind(c.kind).max(0)
-                    };
-                    c.offset + sz
-                })
-                .max()
-                .unwrap_or(0)
-        };
-        for i in 0..count {
-            self.controller
-                .insert_node(struct_id, tail + i * 8, NodeKind::Hex64, "");
+        let inserted = self
+            .controller
+            .append_hex_fields_to_struct(struct_id, bytes);
+        if !inserted.is_empty() {
+            self.after_mutation(cx);
         }
-        self.apply_document(cx);
     }
 
     // ── Inline editing (editor-surface.md §11) ──
@@ -1446,7 +1445,19 @@ impl RcxEditor {
         // hex VALUE column is exactly `"NN NN …"` (single inter-byte spaces), so
         // trimming only the outer column padding preserves the fixed-length string
         // the overwrite positions index against.
-        let mut initial = raw_span.trim().to_string();
+        //
+        // Comment chips render with a decorative `// ` prefix and may be hidden
+        // when Show Comments is off. Seed the edit from the model comment, not the
+        // rendered chip text, so editing an existing comment never stores `//`.
+        let mut initial = if target == EditTarget::Comment && lm.node_idx >= 0 {
+            let tree = self.controller.tree();
+            tree.nodes
+                .get(lm.node_idx as usize)
+                .map(|n| n.comment.clone())
+                .unwrap_or_default()
+        } else {
+            raw_span.trim().to_string()
+        };
 
         let resolved_addr = lm.offset_addr;
         let node_idx = lm.node_idx;
@@ -1529,7 +1540,26 @@ impl RcxEditor {
         // so the edit box lands exactly on the painted token even on the command
         // row (source chip + `▸`/`▾` glyphs) or tree-connector rows. Shared with the
         // command-row hover hitboxes via [`shaped_span_px`].
-        let (left_px, width_px) = self.shaped_span_px(&text, span.start, span.end, window);
+        let comment_popover = target == EditTarget::Comment;
+        let (mut left_px, mut width_px) = self.shaped_span_px(&text, span.start, span.end, window);
+        if comment_popover {
+            // The composed comment span is intentionally far to the right of the
+            // value column. For editing, anchor a compact labeled input at the
+            // actual comment location: over an existing `// ...` chip, or just
+            // after the rendered row text for a new comment. This keeps it obvious
+            // without covering the bytes/value under the cursor.
+            let line_end = text.chars().count() as i32;
+            let anchor = lm
+                .chips
+                .iter()
+                .find(|chip| chip.kind == crate::core::ChipKind::Comment)
+                .map(|chip| chip.start_col)
+                .unwrap_or(line_end + 2);
+            let shaped_col = anchor.min(line_end).max(0);
+            let (anchor_left, _) = self.shaped_span_px(&text, shaped_col, shaped_col, window);
+            left_px = anchor_left + (anchor - shaped_col).max(0) as f32 * self.metrics.cell_width;
+            width_px = (self.metrics.cell_width * 34.0).max(260.0);
+        }
 
         self.last_tab_target = Some(target);
         self.editing = Some(EditingField {
@@ -1539,6 +1569,7 @@ impl RcxEditor {
             col_end: span.end,
             left_px,
             width_px,
+            comment_popover,
             ascii_overwrite: false,
             _subscription: subscription,
         });
@@ -1837,6 +1868,8 @@ impl RcxEditor {
         if self.hover_popup.is_some() {
             self.hover_popup = None;
         }
+        self.hover_probe = None;
+        self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         self.popup_cursor_inside = false;
         self.hover_dwell_suppressed = true;
         if self.byte_sel.is_active() {
@@ -2504,6 +2537,11 @@ impl RcxEditor {
             self.hover_popup = None;
             changed = true;
         }
+        if self.hover_probe.is_some() {
+            self.hover_probe = None;
+            changed = true;
+        }
+        self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         // Item 13: a full hover clear (viewport leave) also drops the
         // cursor-inside-popup guard so a stale flag can't suppress the next popup.
         self.popup_cursor_inside = false;
@@ -3040,6 +3078,20 @@ impl RcxEditor {
         }
     }
 
+    fn action_preview_value(
+        &mut self,
+        _: &EditorPreviewValue,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.action_target() else {
+            return;
+        };
+        let pos = self.context_menu_pos;
+        self.close_context_menu(cx);
+        self.show_explicit_value_preview(target.line, pos, cx);
+    }
+
     fn action_insert_hex64(
         &mut self,
         _: &EditorInsertHex64,
@@ -3083,14 +3135,8 @@ impl RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Item 27: the C++ `;` comment action + accelerator only exist when
-        // `showComments` is on (otherwise the comment chips are invisible, so the
-        // editor is a no-op).
-        if !self.show_comments() {
-            return;
-        }
-        if let Some((line, _lm)) = self.current_node() {
-            self.begin_inline_edit(line, EditTarget::Comment, window, cx);
+        if let Some(target) = self.action_target() {
+            self.begin_inline_edit(target.line, EditTarget::Comment, window, cx);
         }
     }
 
@@ -3790,6 +3836,8 @@ impl RcxEditor {
             pills,
             palette,
             metrics: self.metrics,
+            font: gpui::font(self.editor_font_family()),
+            font_size: px(self.editor_font_size()),
         }
     }
 
@@ -3947,6 +3995,7 @@ impl RcxEditor {
                 e.col_end,
                 e.left_px,
                 e.width_px,
+                e.comment_popover,
             )
         });
         // The "active line" (Zed's active-line bg / reclass's highlighted current
@@ -4366,6 +4415,59 @@ impl RcxEditor {
             }
         }
 
+        // Pointer TypeHint chips (`ptr64✓ -> ...`) are drawn as
+        // trailing text spans, but their visual x position is shaped text, not the
+        // fixed grid. Give them their own shaped hover strip so moving over the
+        // painted chip/address always reaches the preview resolver even if the row
+        // element's generic hitbox is not the topmost hovered element.
+        if !editing_this_row {
+            let text = self.line_text_owned(idx);
+            for (chip_i, chip) in lm.chips.iter().enumerate() {
+                if chip.kind != crate::core::ChipKind::TypeHint
+                    || !chip
+                        .type_hint_kinds
+                        .iter()
+                        .any(|k| matches!(k, NodeKind::Pointer32 | NodeKind::Pointer64))
+                    || chip.end_col <= chip.start_col
+                {
+                    continue;
+                }
+                let (sl, sw) = self.shaped_span_px(&text, chip.start_col, chip.end_col, window);
+                let hover_x = (chip.start_col.max(0) as f32 + 0.5) * cell;
+                text_region = text_region.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "rcx-pointer-typehint-hover-{idx}-{chip_i}"
+                        )))
+                        .absolute()
+                        .top_0()
+                        .left(px(sl))
+                        .h(px(self.metrics.line_height))
+                        .w(px(sw.max(cell)))
+                        .cursor_pointer()
+                        .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, window, cx| {
+                            this.dispatch_row_hover(idx, hover_x, e.position, window, cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.dispatch_row_click(idx, hover_x, e.modifiers, window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.dispatch_row_context_menu(
+                                    idx, hover_x, e.position, window, cx,
+                                );
+                            }),
+                        ),
+                );
+            }
+        }
+
         // Footer add-bytes / Trim / Top pills: transparent SHAPED-position hitboxes
         // so the click box lands exactly on each painted pill. The pill backgrounds
         // are drawn at shaped-glyph x (element.rs), but the row's `col * cell` hit
@@ -4421,7 +4523,8 @@ impl RcxEditor {
         // class NAME on the command row), not after the `{` and not on the `struct`
         // keyword (items 1/2): painted text column `c` and overlay-left `c*cell` are
         // the same pixel by construction.
-        if let Some((field, _col_start, col_end, left_px, width_px)) = editing_here {
+        if let Some((field, _col_start, col_end, left_px, width_px, comment_popover)) = editing_here
+        {
             // PIXEL-accurate placement from the SHAPED prefix/span computed at
             // begin_inline_edit, not `col * cell` — so the box lands exactly on the
             // painted token even on rows with non-mono glyphs (the command row's
@@ -4429,48 +4532,93 @@ impl RcxEditor {
             // pushed the box right of the text ("off-center to the right").
             let left = px(left_px);
             // A generous minimum so short seeds still get a visible field box.
-            let editing_width_px = width_px.max(6.0 * cell);
+            let editing_width_px = if comment_popover {
+                width_px.max(28.0 * cell)
+            } else {
+                width_px.max(6.0 * cell)
+            };
             // The inline field paints over the static row text. Give it a FULLY
             // OPAQUE editor-paper band (not the semi-transparent active-line fill,
             // which let the column's static glyphs — the type token / pre-edit name —
             // bleed through behind the seeded text and read as garbled overlap
             // "hexChex64"/"int64_teateTime"). A 1px accent ring + slight rounding make
             // it read as a Zed inline input.
-            text_region = text_region.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(left)
-                    .h(px(self.metrics.line_height))
-                    .w(px(editing_width_px + cell))
-                    .bg(palette.paper)
-                    .border_1()
-                    .border_color(palette.accent)
-                    .rounded_sm()
-                    // Vertically CENTER the field text in the row box. The static
-                    // row text + the offset gutter are `items_center` (line ~4599),
-                    // but the `FieldInput` element paints its shaped line at
-                    // `bounds.origin` (top-aligned), so without this the edit text
-                    // rode high vs the surrounding text (the "off-center selector").
-                    .flex()
-                    .items_center()
-                    // The field entity's own `Render` carries the focus/key-context
-                    // wrapper (`.track_focus` + `.key_context("RcxFieldInput")` +
-                    // every `.on_action(..)` field handler). Embedding the entity —
-                    // not the raw `FieldElement` — is what establishes the
-                    // `RcxFieldInput` key context on the focused element so keystrokes
-                    // route through `window.handle_input` and the action bindings
-                    // fire (items 1 & 2). The raw `FieldElement` had no key context,
-                    // so typing / backspace / arrows / enter / escape were all inert
-                    // and the caret never painted (its paint is gated on focus).
-                    .child(field.clone()),
-            );
+            if comment_popover {
+                text_region = text_region.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(left)
+                        .h(px(self.metrics.line_height))
+                        .w(px(editing_width_px))
+                        .px(px(6.0))
+                        .bg(palette.paper)
+                        .border_1()
+                        .border_color(palette.comment_green)
+                        .rounded_sm()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(design::tokens::font::UI_XS))
+                                .font_family(self.editor_font_family())
+                                .text_color(palette.comment_green)
+                                .child("Comment"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .child(field.clone()),
+                        ),
+                );
+            } else {
+                text_region = text_region.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(left)
+                        .h(px(self.metrics.line_height))
+                        .w(px(editing_width_px + cell))
+                        .bg(palette.paper)
+                        .border_1()
+                        .border_color(palette.accent)
+                        .rounded_sm()
+                        // Vertically CENTER the field text in the row box. The static
+                        // row text + the offset gutter are `items_center` (line ~4599),
+                        // but the `FieldInput` element paints its shaped line at
+                        // `bounds.origin` (top-aligned), so without this the edit text
+                        // rode high vs the surrounding text (the "off-center selector").
+                        .flex()
+                        .items_center()
+                        // The field entity's own `Render` carries the focus/key-context
+                        // wrapper (`.track_focus` + `.key_context("RcxFieldInput")` +
+                        // every `.on_action(..)` field handler). Embedding the entity —
+                        // not the raw `FieldElement` — is what establishes the
+                        // `RcxFieldInput` key context on the focused element so keystrokes
+                        // route through `window.handle_input` and the action bindings
+                        // fire (items 1 & 2). The raw `FieldElement` had no key context,
+                        // so typing / backspace / arrows / enter / escape were all inert
+                        // and the caret never painted (its paint is gated on focus).
+                        .child(field.clone()),
+                );
+            }
 
             // Item 71/72: the inline-edit HINT comment — a green
             // 'Enter=Save Esc=Cancel' on a valid edit, or a red '! <error>' on an
             // invalid one (the C++ `setEditComment`, editor.cpp:4915/4919). Painted
             // just past the line text so it sits where the row's `//` comment would.
-            if let Some(v) = self.edit_validation.as_ref().filter(|v| v.line == idx) {
+            if let Some(v) = self
+                .edit_validation
+                .as_ref()
+                .filter(|v| !comment_popover && v.line == idx)
+            {
                 let (hint, color) = if v.error.is_empty() {
                     (
                         format!("{}Enter=Save Esc=Cancel", v.hint_prefix),
@@ -5072,22 +5220,17 @@ impl RcxEditor {
         let Some((lo, _)) = self.byte_sel_lo_n() else {
             return;
         };
-        let line = self
-            .controller
-            .last_result()
-            .meta
-            .iter()
-            .position(|lm| {
-                let count = if lm.line_byte_count > 0 {
-                    lm.line_byte_count
-                } else {
-                    crate::core::size_for_kind(lm.node_kind)
-                };
-                is_hex_preview(lm.node_kind)
-                    && lm.line_kind == LineKind::Field
-                    && lo >= lm.offset_addr
-                    && lo < lm.offset_addr + count.max(0) as u64
-            });
+        let line = self.controller.last_result().meta.iter().position(|lm| {
+            let count = if lm.line_byte_count > 0 {
+                lm.line_byte_count
+            } else {
+                crate::core::size_for_kind(lm.node_kind)
+            };
+            is_hex_preview(lm.node_kind)
+                && lm.line_kind == LineKind::Field
+                && lo >= lm.offset_addr
+                && lo < lm.offset_addr + count.max(0) as u64
+        });
         if let Some(line) = line {
             self.begin_inline_edit(line, EditTarget::Value, window, cx);
         }
@@ -6006,6 +6149,7 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_nav_home))
             .on_action(cx.listener(Self::action_nav_end))
             .on_action(cx.listener(Self::action_begin_value_edit))
+            .on_action(cx.listener(Self::action_preview_value))
             .on_action(cx.listener(Self::action_insert_hex64))
             .on_action(cx.listener(Self::action_insert_hex32))
             .on_action(cx.listener(Self::action_comment_edit))
@@ -6062,6 +6206,16 @@ impl Render for RcxEditor {
             // otherwise we return WITHOUT stopping so the uniform_list keeps its
             // native vertical scroll.
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
+                let dy = match ev.delta {
+                    gpui::ScrollDelta::Lines(p) => p.y,
+                    gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+                };
+                if !(ev.modifiers.control || ev.modifiers.platform)
+                    && this.adjust_memory_preview_rows(dy, cx)
+                {
+                    cx.stop_propagation();
+                    return;
+                }
                 if !(ev.modifiers.control || ev.modifiers.platform) {
                     // Plain wheel → the list scrolls natively. Drop the hover band /
                     // popup: the rows slide out from under the stationary cursor, so
@@ -6072,16 +6226,15 @@ impl Render for RcxEditor {
                     this.clear_hover_state(cx);
                     return;
                 }
-                let dy = match ev.delta {
-                    gpui::ScrollDelta::Lines(p) => p.y,
-                    gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
-                };
                 if dy > 0.0 {
                     this.zoom_by(1.0, cx);
                 } else if dy < 0.0 {
                     this.zoom_by(-1.0, cx);
                 }
                 cx.stop_propagation();
+            }))
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _w, cx| {
+                this.dismiss_hover_if_pointer_left_anchor(e.position, cx);
             }))
             // Item 9: when the pointer leaves the editor surface, clear the hover
             // band + node id and dismiss any hover popup (the C++ mouse-leave /

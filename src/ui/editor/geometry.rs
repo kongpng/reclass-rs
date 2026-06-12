@@ -177,8 +177,20 @@ pub enum SpanRole {
     ClassName,
     /// Green comment / symbol / add-comment chip (`IND_HINT_GREEN`).
     CommentGreen,
-    /// The dim type-inference chip (`IND_TYPE_HINT`).
+    /// The fallback type-inference chip foreground (`IND_TYPE_HINT`).
     TypeHint,
+    /// An inferred type token inside a type-hint chip (`ptr64`, `uint32_t×2`).
+    TypeHintType,
+    /// Low-emphasis inference punctuation/operators (`[`, `]`, `,`, `|`, `->`, `✓`).
+    TypeHintOperator,
+    /// An inferred pointer target label/address.
+    TypeHintAddress,
+    /// Numeric preview inside an inference chip (`0x10`, `1.0000f`, `42`).
+    TypeHintNumber,
+    /// Quoted ASCII/string preview inside an inference chip.
+    TypeHintString,
+    /// Keyword-like preview inside an inference chip (`true`, `false`, `nullptr`).
+    TypeHintKeyword,
     /// The amber RTTI chip (`IND_RTTI_HINT`).
     RttiHint,
     /// The enum chip (link-blue, `IND_HOVER_SPAN`).
@@ -279,15 +291,13 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
                 compose::command_row_addr_span(text),
                 SpanRole::Text,
             );
-            // C++ `applyCommandRowPills` ("Root class styling (type dim +
-            // class-name teal)") paints the root-type keyword span with
-            // `IND_HEX_DIM` (= theme.textFaint), so it reads as muted chrome —
-            // NOT the lexer's keyword/blue hue. Use `Dim` to match, like the
-            // sibling chevron/source/brace above.
+            // Keep the root type keyword (`struct`/`class`/`enum`) syntax-colored
+            // so the command row still reads like code; the class name remains the
+            // distinct teal `ClassName` role below.
             push(
                 &mut layers,
                 compose::command_row_root_type_span(text),
-                SpanRole::Dim,
+                SpanRole::Keyword,
             );
             push(
                 &mut layers,
@@ -438,7 +448,24 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
             // lexer-default text in C++ (Operator/Identifier color), NOT a colored
             // link-blue pill. Paint it as the default foreground.
             ChipKind::Enum => SpanRole::Text,
-            ChipKind::TypeHint => SpanRole::TypeHint,
+            ChipKind::TypeHint => {
+                let pointer_hint = chip.type_hint_kinds.iter().any(|k| {
+                    matches!(
+                        k,
+                        crate::core::NodeKind::Pointer32 | crate::core::NodeKind::Pointer64
+                    )
+                });
+                for span in type_hint_semantic_spans(&chip.text, pointer_hint) {
+                    push_role_span(
+                        &mut layers,
+                        chip.start_col + span.start,
+                        chip.start_col + span.end,
+                        n,
+                        span.role,
+                    );
+                }
+                continue;
+            }
             ChipKind::Rtti => SpanRole::RttiHint,
             ChipKind::Symbol | ChipKind::Comment | ChipKind::AddComment => SpanRole::CommentGreen,
         };
@@ -470,6 +497,29 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
     flatten(&layers, n)
 }
 
+/// Semantic color decomposition for a type-inference chip. The result is relative
+/// to `text` (start column 0) and already flattened into disjoint runs.
+pub fn type_hint_semantic_spans(text: &str, pointer_hint: bool) -> Vec<SpanStyle> {
+    let n = col_len(text);
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut layers = vec![SpanStyle {
+        start: 0,
+        end: n,
+        role: SpanRole::TypeHint,
+    }];
+
+    if pointer_hint {
+        add_pointer_type_hint_layers(&mut layers, text, n);
+    } else {
+        add_preview_type_hint_layers(&mut layers, text, n);
+    }
+
+    flatten(&layers, n)
+}
+
 /// Map a `LineMeta::heat_level` (1=cold, 2=warm, 3=hot) to its heat [`SpanRole`],
 /// or `None` for static rows (level 0).
 pub fn heat_role_for_level(level: i32) -> Option<SpanRole> {
@@ -479,6 +529,221 @@ pub fn heat_role_for_level(level: i32) -> Option<SpanRole> {
         3 => Some(SpanRole::HeatHot),
         _ => None,
     }
+}
+
+fn push_role_span(layers: &mut Vec<SpanStyle>, start: i32, end: i32, n: i32, role: SpanRole) {
+    let s = start.max(0).min(n);
+    let e = end.max(0).min(n);
+    if e > s {
+        layers.push(SpanStyle {
+            start: s,
+            end: e,
+            role,
+        });
+    }
+}
+
+fn push_byte_role_span(
+    layers: &mut Vec<SpanStyle>,
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+    n: i32,
+    role: SpanRole,
+) {
+    if end_byte <= start_byte || start_byte >= text.len() {
+        return;
+    }
+    let end_byte = end_byte.min(text.len());
+    push_role_span(
+        layers,
+        col_for_byte(text, start_byte),
+        col_for_byte(text, end_byte),
+        n,
+        role,
+    );
+}
+
+fn add_pointer_type_hint_layers(layers: &mut Vec<SpanStyle>, text: &str, n: i32) {
+    let arrow = text.find("->");
+    let type_end = text
+        .find('\u{2713}')
+        .or(arrow)
+        .or_else(|| text.find(char::is_whitespace))
+        .unwrap_or(text.len());
+    push_byte_role_span(layers, text, 0, type_end, n, SpanRole::TypeHintType);
+
+    if let Some(check) = text.find('\u{2713}') {
+        push_byte_role_span(
+            layers,
+            text,
+            check,
+            check + '\u{2713}'.len_utf8(),
+            n,
+            SpanRole::TypeHintOperator,
+        );
+    }
+
+    if let Some(arrow) = arrow {
+        push_byte_role_span(
+            layers,
+            text,
+            arrow,
+            arrow + "->".len(),
+            n,
+            SpanRole::TypeHintOperator,
+        );
+        let target_start = text[arrow + "->".len()..]
+            .char_indices()
+            .find_map(|(i, ch)| (!ch.is_whitespace()).then_some(arrow + "->".len() + i))
+            .unwrap_or(text.len());
+        push_byte_role_span(
+            layers,
+            text,
+            target_start,
+            text.len(),
+            n,
+            SpanRole::TypeHintAddress,
+        );
+    }
+}
+
+fn add_preview_type_hint_layers(layers: &mut Vec<SpanStyle>, text: &str, n: i32) {
+    style_type_hint_preview_tokens(layers, text, 0, text.len(), n);
+
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find('[') {
+        let start = search_from + rel;
+        let end = text[start..].find(']').map(|i| start + i);
+        push_byte_role_span(
+            layers,
+            text,
+            start,
+            start + '['.len_utf8(),
+            n,
+            SpanRole::TypeHintOperator,
+        );
+        let inner_start = start + '['.len_utf8();
+        let inner_end = end.unwrap_or(text.len());
+        push_byte_role_span(
+            layers,
+            text,
+            inner_start,
+            inner_end,
+            n,
+            SpanRole::TypeHintType,
+        );
+        if let Some(end) = end {
+            push_byte_role_span(
+                layers,
+                text,
+                end,
+                end + ']'.len_utf8(),
+                n,
+                SpanRole::TypeHintOperator,
+            );
+            search_from = end + ']'.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find('|') {
+        let at = search_from + rel;
+        push_byte_role_span(
+            layers,
+            text,
+            at,
+            at + '|'.len_utf8(),
+            n,
+            SpanRole::TypeHintOperator,
+        );
+        search_from = at + '|'.len_utf8();
+    }
+}
+
+fn style_type_hint_preview_tokens(
+    layers: &mut Vec<SpanStyle>,
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+    n: i32,
+) {
+    let mut i = start_byte.min(text.len());
+    let end_byte = end_byte.min(text.len());
+    while i < end_byte {
+        let Some(ch) = text[i..end_byte].chars().next() else {
+            break;
+        };
+        let ch_len = ch.len_utf8();
+        if ch.is_whitespace() {
+            i += ch_len;
+            continue;
+        }
+        if matches!(ch, ',' | '|') {
+            push_byte_role_span(layers, text, i, i + ch_len, n, SpanRole::TypeHintOperator);
+            i += ch_len;
+            continue;
+        }
+        if ch == '"' {
+            let mut j = i + ch_len;
+            while j < end_byte {
+                let Some(next) = text[j..end_byte].chars().next() else {
+                    break;
+                };
+                j += next.len_utf8();
+                if next == '"' {
+                    break;
+                }
+            }
+            push_byte_role_span(layers, text, i, j, n, SpanRole::TypeHintString);
+            i = j;
+            continue;
+        }
+
+        let token_start = i;
+        i += ch_len;
+        while i < end_byte {
+            let Some(next) = text[i..end_byte].chars().next() else {
+                break;
+            };
+            if next.is_whitespace() || matches!(next, ',' | '|' | '[' | ']') {
+                break;
+            }
+            i += next.len_utf8();
+        }
+        if let Some(role) = preview_token_role(&text[token_start..i]) {
+            push_byte_role_span(layers, text, token_start, i, n, role);
+        }
+    }
+}
+
+fn preview_token_role(token: &str) -> Option<SpanRole> {
+    let lower = token.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if matches!(lower.as_str(), "true" | "false" | "nullptr") {
+        return Some(SpanRole::TypeHintKeyword);
+    }
+    looks_like_number_preview(&lower).then_some(SpanRole::TypeHintNumber)
+}
+
+fn looks_like_number_preview(token: &str) -> bool {
+    let s = token
+        .trim_end_matches('f')
+        .trim_start_matches(['+', '-'])
+        .trim_matches('\'');
+    if s.is_empty() {
+        return false;
+    }
+    if let Some(hex) = s.strip_prefix("0x") {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit() || c == '_');
+    }
+    s.chars().any(|c| c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '_' | 'e' | 'E' | '+' | '-'))
 }
 
 /// The footer pill spans (`applyCommandRowPills` / footer pill backgrounds,
@@ -1242,6 +1507,90 @@ mod tests {
     }
 
     #[test]
+    fn style_runs_paint_comment_chips_green() {
+        let mut lm = field_line(0, NodeKind::Int32);
+        let text = "   int32         health                100  // player hp";
+        let comment_start = text.find("//").unwrap() as i32;
+        let comment_end = col_len(text);
+        lm.chips.push(crate::core::LineChip {
+            kind: ChipKind::Comment,
+            start_col: comment_start,
+            end_col: comment_end,
+            text: text[comment_start as usize..].to_string(),
+            ..Default::default()
+        });
+
+        let runs = style_runs(&lm, text, 14, 22);
+        assert!(runs.iter().any(|r| {
+            r.role == SpanRole::CommentGreen && r.start <= comment_start && r.end >= comment_end
+        }));
+    }
+
+    #[test]
+    fn type_hint_semantic_spans_color_preview_parts() {
+        let text = "0x6, \"AB\" [uint32_t×2] | true [bool]";
+        let runs = type_hint_semantic_spans(text, false);
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintNumber),
+            "hex preview should get numeric hint role: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintString),
+            "quoted ASCII preview should get string hint role: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintType),
+            "bracketed inferred type should get type hint role: {runs:?}"
+        );
+        assert!(
+            runs.iter()
+                .filter(|r| r.role == SpanRole::TypeHintType)
+                .count()
+                >= 2,
+            "every bracketed type in joined hints should get type role: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintKeyword),
+            "bool/null preview should get keyword hint role: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintOperator),
+            "brackets, comma, and pipe should get operator hint role: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn style_runs_paint_pointer_type_hint_semantically() {
+        let mut lm = field_line(0, NodeKind::Hex64);
+        let prefix = "   hex64         ........              01 02 03 04 05 06 07 08  ";
+        let chip_text = "ptr64\u{2713} -> 0x7FF600001000";
+        let text = format!("{prefix}{chip_text}");
+        let chip_start = col_len(prefix);
+        lm.chips.push(crate::core::LineChip {
+            kind: ChipKind::TypeHint,
+            start_col: chip_start,
+            end_col: chip_start + col_len(chip_text),
+            text: chip_text.to_string(),
+            type_hint_kinds: vec![NodeKind::Pointer64],
+            ..Default::default()
+        });
+
+        let runs = style_runs(&lm, &text, 14, 22);
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintType),
+            "pointer type token should get type hint role: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintOperator),
+            "pointer check/arrow should get operator hint role: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.role == SpanRole::TypeHintAddress),
+            "pointer target should get address hint role: {runs:?}"
+        );
+    }
+
+    #[test]
     fn hex_row_value_column_is_dim_not_value() {
         let mut lm = field_line(0, NodeKind::Hex64);
         lm.node_kind = NodeKind::Hex64;
@@ -1519,17 +1868,15 @@ mod tests {
     }
 
     #[test]
-    fn command_row_chrome_dims_root_type_and_teals_name() {
+    fn command_row_chrome_colors_root_type_and_teals_name() {
         let lm = LineMeta {
             line_kind: LineKind::CommandRow,
             ..LineMeta::default()
         };
         let text = "[\u{25B8}] source\u{25BE}  0x400000  class Foo {";
         let runs = style_runs(&lm, text, 14, 22);
-        // C++ `applyCommandRowPills` paints the root-type keyword span
-        // ("class") with `IND_HEX_DIM` (= theme.textFaint), NOT the lexer's
-        // keyword/blue hue — it reads as muted chrome. The run covering the
-        // root-type column must therefore be `Dim`.
+        // The root-type keyword ("class") is syntax-colored as a keyword, while
+        // the root name stays teal.
         let rt = compose::command_row_root_type_span(text);
         assert!(rt.valid);
         let rt_run = runs
@@ -1538,13 +1885,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no run covers root-type span {rt:?}: {runs:?}"));
         assert_eq!(
             rt_run.role,
-            SpanRole::Dim,
-            "command-row root-type keyword must be dim (C++ IND_HEX_DIM), not blue: {runs:?}"
-        );
-        // The command row has no keyword/blue chrome at all now.
-        assert!(
-            !runs.iter().any(|r| r.role == SpanRole::Keyword),
-            "command-row must have no Keyword (blue) runs: {runs:?}"
+            SpanRole::Keyword,
+            "command-row root-type keyword must use Keyword color: {runs:?}"
         );
         // Item 11: the command-row base address is painted NEUTRAL (`SpanRole::Text`,
         // the C++ `IND_BASE_ADDR = theme.text`), OVERRIDING the orange number/address

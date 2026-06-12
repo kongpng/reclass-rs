@@ -719,8 +719,8 @@ impl super::MainWindow {
         }
     }
 
-    /// Navigate the active editor to an absolute address (the scanner result-row
-    /// / module-row jump target): rebase the active tree to `addr` + recompose.
+    /// Navigate the active editor to an absolute address (scanner result-row jump
+    /// target): rebase the active tree to `addr` + recompose.
     pub(super) fn navigate_active_editor_to_address(
         &mut self,
         addr: u64,
@@ -733,7 +733,11 @@ impl super::MainWindow {
         };
         editor.update(cx, |ed, cx| {
             let ctrl = ed.controller_mut();
-            ctrl.document_mut().tree.base_address = addr;
+            {
+                let tree = &mut ctrl.document_mut().tree;
+                tree.base_address = addr;
+                tree.base_address_formula.clear();
+            }
             // Reset value-history / heat on a jump (the C++ `resetChangeTracking`
             // on navigate): the old base's per-node change heat + history no longer
             // describes the new region, so clear it before recomposing — otherwise
@@ -742,7 +746,52 @@ impl super::MainWindow {
             ed.apply_document(cx);
         });
         self.rebuild_workspace(cx);
+        self.refresh_docks_for_active(cx);
         self.notify(format!("Jumped to 0x{addr:X}"), window, cx);
+        cx.notify();
+    }
+
+    /// Modules-panel row activation: open/reuse a top-level class for the module,
+    /// set the view base to the module base, and force absolute gutter addresses
+    /// so the selected image base is visible immediately.
+    pub(super) fn jump_active_editor_to_module_base(
+        &mut self,
+        base: u64,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_editor_or_notify("Open a document first.", window, cx)
+        else {
+            return;
+        };
+        self.set_view_option_value(ViewOpt::RelativeOffsets, false, cx);
+        let (root_id, type_name, created) = editor.update(cx, |ed, cx| {
+            let result = ed.controller_mut().open_module_root_class(name, base);
+            ed.apply_document(cx);
+            result
+        });
+        if let Some(t) = self.state.active_tab_mut() {
+            t.view_root = Some(root_id);
+        }
+        self.rebuild_workspace(cx);
+        self.refresh_docks_for_active(cx);
+        if created {
+            self.sync_dirty_state(cx);
+        }
+        if name.is_empty() {
+            self.notify(
+                format!("Opened {type_name} at module base 0x{base:X}"),
+                window,
+                cx,
+            );
+        } else {
+            self.notify(
+                format!("Opened {type_name} at {name}+0x0 (base 0x{base:X})"),
+                window,
+                cx,
+            );
+        }
         cx.notify();
     }
 

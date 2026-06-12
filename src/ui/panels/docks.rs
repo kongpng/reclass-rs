@@ -31,6 +31,7 @@ use crate::ui::chrome::tabs::DocumentArea;
 use crate::ui::panels::bookmarkspanel::BookmarksPanel;
 use crate::ui::panels::modulespanel::ModulesPanel;
 use crate::ui::panels::scannerpanel::ScannerPanel;
+use crate::ui::panels::targetpanel::TargetPanel;
 use crate::ui::panels::workspace::WorkspacePanel;
 
 /// Identity + layout version for the main dock area, used as the `dump`/`load`
@@ -63,6 +64,9 @@ pub struct LayoutHandles {
     /// **right** dock, **closed by default** — summoned from the View menu like
     /// the C++. The window keeps this so it can toggle/observe the dock.
     pub modules: Entity<ModulesPanel>,
+    /// The right-dock Target/session inspector. Shares the right dock's tab strip
+    /// with Modules and Bookmarks and receives the active provider summary.
+    pub target: Entity<TargetPanel>,
     /// The right-dock Bookmarks panel (the C++ View ▸ Bookmarks,
     /// `Ctrl+Shift+B`). Shares the right dock's tab strip with
     /// [`modules`](Self::modules); the window pushes the document's bookmark list
@@ -121,7 +125,8 @@ pub fn build_default_layout(
     let scanner = ScannerPanel::view(window, cx);
     let bottom = DockItem::tabs(vec![Arc::new(scanner.clone())], &weak, window, cx);
 
-    // Right: the Modules / Symbols / Types panel + the Bookmarks panel,
+    // Right: the Target/session inspector + Modules / Symbols / Types panel +
+    // the Bookmarks panel,
     // **tabified together**, **closed by default**. The C++ surfaces both from
     // the View menu (Modules `Ctrl+Shift+Y`, Bookmarks `Ctrl+Shift+B`) — they are
     // not always-present panels, so the dock launches closed; the View toggles
@@ -129,9 +134,14 @@ pub fn build_default_layout(
     // Both panels are still built + registered here so the toggle has them ready
     // — only the dock's `open` flag starts `false`.
     let modules = ModulesPanel::view(window, cx);
+    let target = TargetPanel::view(window, cx);
     let bookmarks = BookmarksPanel::view(window, cx);
     let right = DockItem::tabs(
-        vec![Arc::new(modules.clone()), Arc::new(bookmarks.clone())],
+        vec![
+            Arc::new(target.clone()),
+            Arc::new(modules.clone()),
+            Arc::new(bookmarks.clone()),
+        ],
         &weak,
         window,
         cx,
@@ -148,6 +158,7 @@ pub fn build_default_layout(
         document_area,
         workspace,
         modules,
+        target,
         bookmarks,
         scanner,
     }
