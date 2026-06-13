@@ -355,8 +355,7 @@ fn compose_with_symbols_at_base_inner(
         child_map: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
         child_map_sorted: AHashSet::new(),
         abs_offsets: Vec::new(),
-        scope_type_w: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
-        scope_name_w: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
+        scope_widths: AHashMap::new(),
         enum_member_cache: AHashMap::new(),
         rtti_modules_cached: false,
         rtti_modules: Vec::new(),
@@ -469,12 +468,17 @@ fn compose_with_symbols_at_base_inner(
         };
         let mut max_type_len = K_MIN_TYPE_W;
         let mut max_name_len = K_MIN_NAME_W;
+        let mut scope_width_count = 1usize; // parentId == 0 root-level widths
         for node in &tree.nodes {
             max_type_len = max_type_len.max(node_type_name_len(tree, node));
             max_name_len = max_name_len.max(u16_len(&node.name));
+            if node.kind == NodeKind::Struct || node.kind == NodeKind::Array {
+                scope_width_count = scope_width_count.saturating_add(1);
+            }
         }
         state.type_w = max_type_len.clamp(K_MIN_TYPE_W, type_cap);
         state.name_w = max_name_len.clamp(K_MIN_NAME_W, K_MAX_NAME_W);
+        state.scope_widths.reserve(scope_width_count);
 
         // Per-scope widths (per container, direct non-struct children only).
         for (_i, container) in tree.nodes.iter().enumerate() {
@@ -509,12 +513,12 @@ fn compose_with_symbols_at_base_inner(
                 );
                 scope_max_type = scope_max_type.max(u16_len(&longest));
             }
-            state
-                .scope_type_w
-                .insert(container.id, scope_max_type.clamp(K_MIN_TYPE_W, type_cap));
-            state.scope_name_w.insert(
+            state.scope_widths.insert(
                 container.id,
-                scope_max_name.clamp(K_MIN_NAME_W, K_MAX_NAME_W),
+                (
+                    scope_max_type.clamp(K_MIN_TYPE_W, type_cap),
+                    scope_max_name.clamp(K_MIN_NAME_W, K_MAX_NAME_W),
+                ),
             );
         }
 
@@ -532,12 +536,13 @@ fn compose_with_symbols_at_base_inner(
                 root_max_type = root_max_type.max(node_type_name_len(tree, child));
                 root_max_name = root_max_name.max(u16_len(&child.name));
             }
-            state
-                .scope_type_w
-                .insert(0, root_max_type.clamp(K_MIN_TYPE_W, type_cap));
-            state
-                .scope_name_w
-                .insert(0, root_max_name.clamp(K_MIN_NAME_W, K_MAX_NAME_W));
+            state.scope_widths.insert(
+                0,
+                (
+                    root_max_type.clamp(K_MIN_TYPE_W, type_cap),
+                    root_max_name.clamp(K_MIN_NAME_W, K_MAX_NAME_W),
+                ),
+            );
         }
     }
 
@@ -886,8 +891,7 @@ struct ComposeState<'a> {
     child_map: AHashMap<u64, Vec<i32>>,
     child_map_sorted: AHashSet<u64>,
     abs_offsets: Vec<i64>,
-    scope_type_w: AHashMap<u64, i32>,
-    scope_name_w: AHashMap<u64, i32>,
+    scope_widths: AHashMap<u64, (i32, i32)>,
     enum_member_cache: AHashMap<u64, AHashMap<i64, usize>>,
 
     // ── RTTI auto-detect cache (per compose pass) ──
@@ -910,11 +914,11 @@ impl ComposeState<'_> {
             .is_some_and(|limit| self.meta.len() >= limit)
     }
 
-    fn effective_type_w(&self, scope_id: u64) -> i32 {
-        *self.scope_type_w.get(&scope_id).unwrap_or(&self.type_w)
-    }
-    fn effective_name_w(&self, scope_id: u64) -> i32 {
-        *self.scope_name_w.get(&scope_id).unwrap_or(&self.name_w)
+    fn effective_widths(&self, scope_id: u64) -> (i32, i32) {
+        self.scope_widths
+            .get(&scope_id)
+            .copied()
+            .unwrap_or((self.type_w, self.name_w))
     }
 
     fn enum_member_index(
@@ -1619,8 +1623,7 @@ fn compose_leaf(
         }
     }
 
-    let type_w = state.effective_type_w(scope_id);
-    let name_w = state.effective_name_w(scope_id);
+    let (type_w, name_w) = state.effective_widths(scope_id);
 
     let num_lines = lines_for_kind(node.kind);
 
@@ -2051,8 +2054,7 @@ fn compose_parent(
 
     // Header line.
     if !is_array_child && !is_root_header {
-        let type_w = state.effective_type_w(scope_id);
-        let name_w = state.effective_name_w(scope_id);
+        let (type_w, name_w) = state.effective_widths(scope_id);
 
         let mut lm = LineMeta {
             node_idx,
@@ -2288,8 +2290,7 @@ fn compose_parent(
             && node.element_kind != NodeKind::Array
         {
             let elem_size = size_for_kind(node.element_kind);
-            let e_tw = state.effective_type_w(node.id);
-            let e_nw = state.effective_name_w(node.id);
+            let (e_tw, e_nw) = state.effective_widths(node.id);
             for i in 0..node.array_len {
                 if state.line_limit_reached() {
                     break;
@@ -2399,8 +2400,7 @@ fn compose_parent(
                     state.set_tree_sibling(child_depth, rci < n_ref - 1);
                     let child = tree.nodes[child_idx as usize].clone();
                     if state.visiting.contains(&child.id) {
-                        let type_w = state.effective_type_w(ref_scope_id);
-                        let name_w = state.effective_name_w(ref_scope_id);
+                        let (type_w, name_w) = state.effective_widths(ref_scope_id);
                         let raw_type = render::struct_type_name(&child);
                         let overflow = state.compact_columns && u16_len(&raw_type) > type_w;
                         let mut lm = LineMeta {
@@ -2598,8 +2598,7 @@ fn compose_node(
     let node = tree.nodes[node_idx as usize].clone();
     let abs_addr = resolve_addr(state, tree, node_idx, base, root_id);
 
-    let type_w = state.effective_type_w(scope_id);
-    let name_w = state.effective_name_w(scope_id);
+    let (type_w, name_w) = state.effective_widths(scope_id);
 
     // Pointer deref expansion — merged fold header.
     if (node.kind == NodeKind::Pointer32 || node.kind == NodeKind::Pointer64) && node.ref_id != 0 {
