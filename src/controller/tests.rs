@@ -1273,6 +1273,47 @@ fn append_single_field_repeated_tail_appends_are_contiguous() {
 }
 
 #[test]
+fn append_single_fields_batches_tail_appends() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+    let last_id = find_id(&c, "field_hex");
+    let before_nodes = c.tree().nodes.len();
+    let before_undo = c.undo_stack().count();
+
+    let ids = c.append_single_fields(last_id, 3);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(c.tree().nodes.len(), before_nodes + 3);
+    assert_eq!(c.undo_stack().count(), before_undo + 1);
+
+    let rows: Vec<(i32, String)> = ids
+        .iter()
+        .map(|id| {
+            let idx = c.tree().index_of_id(*id);
+            assert!(idx >= 0, "inserted node {id} exists");
+            let node = &c.tree().nodes[idx as usize];
+            assert_eq!(node.kind, NodeKind::Hex64);
+            assert_eq!(node.parent_id, root_id);
+            (node.offset, node.name.clone())
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (16, "field_0010".to_string()),
+            (24, "field_0018".to_string()),
+            (32, "field_0020".to_string()),
+        ]
+    );
+    assert!(c.selected_ids().contains(ids.last().unwrap()));
+
+    c.undo();
+    for id in ids {
+        assert!(c.tree().index_of_id(id) < 0, "bulk undo removes node {id}");
+    }
+    assert_eq!(c.tree().nodes.len(), before_nodes);
+}
+
+#[test]
 fn append_single_field_walks_up_leaf_to_struct() {
     // Passing a mid-struct leaf id (field_u8) still resolves the enclosing
     // struct and appends at the struct tail.

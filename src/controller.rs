@@ -2862,6 +2862,26 @@ impl RcxController {
         ids
     }
 
+    fn append_container_for_node(&self, node_id: u64) -> Option<Node> {
+        let mut si = self.doc.tree.index_of_id(node_id);
+        if si < 0 {
+            return None;
+        }
+        loop {
+            let n = &self.doc.tree.nodes[si as usize];
+            if matches!(n.kind, NodeKind::Struct | NodeKind::Array) || n.is_enum() {
+                return Some(n.clone());
+            }
+            if n.parent_id == 0 {
+                return None;
+            }
+            si = self.doc.tree.index_of_id(n.parent_id);
+            if si < 0 {
+                return None;
+            }
+        }
+    }
+
     /// `insertNodeAbove(beforeIdx, kind, name)` (`controller.cpp:2488`).
     pub fn insert_node_above(&mut self, before_idx: usize, kind: NodeKind, name: &str) {
         if before_idx >= self.doc.tree.nodes.len() {
@@ -2950,25 +2970,7 @@ impl RcxController {
     ///    anchor, `updateCommandRow` — a subsequent Down appends AFTER this field.
     ///    Returns the new node id so the UI can re-find/scroll to its line.
     pub fn append_single_field(&mut self, node_id: u64) -> Option<u64> {
-        let mut si = self.doc.tree.index_of_id(node_id);
-        if si < 0 {
-            return None;
-        }
-        // Walk up from the leaf to the enclosing Struct/Array/Enum container.
-        loop {
-            let n = &self.doc.tree.nodes[si as usize];
-            if matches!(n.kind, NodeKind::Struct | NodeKind::Array) || n.is_enum() {
-                break;
-            }
-            if n.parent_id == 0 {
-                return None;
-            }
-            si = self.doc.tree.index_of_id(n.parent_id);
-            if si < 0 {
-                return None;
-            }
-        }
-        let container = self.doc.tree.nodes[si as usize].clone();
+        let container = self.append_container_for_node(node_id)?;
         let struct_id = container.id;
 
         // ENUM: append one auto-numbered member (not the struct-field path).
@@ -3037,6 +3039,95 @@ impl RcxController {
         self.anchor_line = -1;
         self.update_command_row();
         Some(new_id)
+    }
+
+    /// Batched form of [`append_single_field`]: resolve the same enclosing
+    /// container once, append `count` tail fields/members in one undo command,
+    /// and refresh once. This is for real batch workflows such as scanner
+    /// "Add as Nodes"; per-key editor growth still calls `append_single_field`
+    /// so every keypress can scroll to the newly visible row.
+    pub fn append_single_fields(&mut self, node_id: u64, count: usize) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let Some(container) = self.append_container_for_node(node_id) else {
+            return Vec::new();
+        };
+        let struct_id = container.id;
+
+        if container.is_enum() {
+            let mut new_members = container.enum_members.clone();
+            let mut next_val = new_members.last().map(|(_, v)| v + 1).unwrap_or(0);
+            for _ in 0..count {
+                new_members.push((format!("Member{}", next_val), next_val));
+                next_val += 1;
+            }
+            self.push_command(Command::ChangeEnumMembers {
+                node_id: struct_id,
+                old_members: container.enum_members,
+                new_members,
+            });
+            self.sel_ids.clear();
+            self.sel_ids.insert(struct_id);
+            self.anchor_line = -1;
+            self.update_command_row();
+            return vec![struct_id; count];
+        }
+
+        let mut target_id = struct_id;
+        if !self.doc.tree.has_children(struct_id) && container.ref_id != 0 {
+            target_id = container.ref_id;
+        }
+        if self.doc.tree.index_of_id(target_id) < 0 {
+            return Vec::new();
+        }
+
+        let mut slot_offset = self
+            .append_tail_cache
+            .filter(|(id, _)| *id == target_id)
+            .map(|(_, tail)| tail)
+            .unwrap_or(0);
+        if slot_offset == 0 {
+            for ci in self.doc.tree.children_of(target_id) {
+                let sib = &self.doc.tree.nodes[ci];
+                let sz = self.node_size(sib);
+                let end = sib.offset + sz;
+                if end > slot_offset {
+                    slot_offset = end;
+                }
+            }
+        }
+
+        let align = alignment_for(NodeKind::Hex64);
+        let mut offset = (slot_offset + align - 1) / align * align;
+        let mut nodes = Vec::with_capacity(count);
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut node = Node {
+                kind: NodeKind::Hex64,
+                name: format!("field_{:04x}", offset),
+                parent_id: target_id,
+                offset,
+                ..Node::default()
+            };
+            node.id = self.doc.tree.reserve_id();
+            ids.push(node.id);
+            nodes.push(node);
+            offset += 8;
+        }
+
+        self.push_command(Command::InsertMany {
+            nodes,
+            off_adjs: Vec::new(),
+        });
+        self.append_tail_cache = Some((target_id, offset));
+        if let Some(&last_id) = ids.last() {
+            self.sel_ids.clear();
+            self.sel_ids.insert(last_id);
+            self.anchor_line = -1;
+            self.update_command_row();
+        }
+        ids
     }
 
     /// `removeNode(nodeIdx)` (`controller.cpp:2513`).

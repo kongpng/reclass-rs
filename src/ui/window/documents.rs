@@ -940,15 +940,13 @@ impl super::MainWindow {
         }
         let added = editor.update(cx, |ed, cx| {
             let view_root = ed.controller().view_root_id();
-            let mut added = 0usize;
-            for _ in addresses {
-                // Append into the view-root container (or its first root struct
-                // when the view root is the whole document). `append_single_field`
-                // walks up to the owning Struct/Array/Enum and adds a tail Hex64.
-                if ed.controller_mut().append_single_field(view_root).is_some() {
-                    added += 1;
-                }
-            }
+            // Append into the view-root container in one controller command.
+            // The older loop called `append_single_field` once per scanner row,
+            // which recomposed after every insert before this single UI repaint.
+            let added = ed
+                .controller_mut()
+                .append_single_fields(view_root, addresses.len())
+                .len();
             ed.apply_document(cx);
             added
         });

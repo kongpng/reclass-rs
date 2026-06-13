@@ -2802,6 +2802,31 @@ fn append_growth_workloads(c: &mut Criterion) {
                 );
             },
         );
+        group.bench_with_input(
+            BenchmarkId::new("single_tail_batched_512_live_refresh", initial_fields),
+            &initial_fields,
+            |b, &initial_fields| {
+                b.iter_batched(
+                    || {
+                        let provider =
+                            Arc::new(LiveLikeProvider::new_float_pairs(initial_fields + 2048));
+                        controller_for(flat_tree(initial_fields, NodeKind::Hex64), provider)
+                    },
+                    |mut controller| {
+                        let root_id = controller.tree().nodes[0].id;
+                        let last_id = *controller
+                            .tree()
+                            .children_of(root_id)
+                            .last()
+                            .map(|&idx| &controller.tree().nodes[idx].id)
+                            .unwrap();
+                        let ids = controller.append_single_fields(last_id, append_count);
+                        black_box(ids.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
         if initial_fields == 1_000 {
             group.bench_with_input(
                 BenchmarkId::new(
