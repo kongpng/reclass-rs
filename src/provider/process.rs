@@ -14,7 +14,7 @@ use super::read_pages_in_runs;
 use super::RegionType;
 use super::{
     normalize_page_list, MemoryRegion, ModuleEntry, ModuleLookup, PageMap, Provider, ThreadInfo,
-    K_PAGE_SIZE,
+    K_MAX_BULK_READ_PAGES, K_PAGE_SIZE,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +120,34 @@ impl LocalProcessProvider {
         }
         Some((readable_pages, out))
     }
+
+    fn sparse_page_request(pages: &[u64]) -> bool {
+        if pages.len() < K_MAX_BULK_READ_PAGES {
+            return false;
+        }
+        let first = pages[0] & !(K_PAGE_SIZE - 1);
+        let last = pages[pages.len() - 1] & !(K_PAGE_SIZE - 1);
+        let Some(span) = (pages.len() as u64 - 1).checked_mul(K_PAGE_SIZE) else {
+            return true;
+        };
+        let compact_end = first.checked_add(span);
+        compact_end != Some(last)
+    }
+
+    fn sparse_uncached_page_read(&self, pages: &[u64]) -> Option<PageMap> {
+        if !Self::sparse_page_request(pages) {
+            return None;
+        }
+        let regions = self
+            .inner
+            .enumerate_regions_with_lookup(&self.module_lookup);
+        self.refresh_readable_ranges(&regions);
+        let (readable_pages, mut out) = self.cached_page_read_plan(pages)?;
+        if !readable_pages.is_empty() {
+            out.extend(self.inner.read_pages(&readable_pages));
+        }
+        Some(out)
+    }
 }
 
 impl Provider for LocalProcessProvider {
@@ -132,6 +160,9 @@ impl Provider for LocalProcessProvider {
             if !readable_pages.is_empty() {
                 out.extend(self.inner.read_pages(&readable_pages));
             }
+            return out;
+        }
+        if let Some(out) = self.sparse_uncached_page_read(pages) {
             return out;
         }
 
@@ -1667,5 +1698,43 @@ mod tests {
             page_map.get(&region.base).map(Vec::as_slice),
             Some(expected.as_slice())
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_process_sparse_uncached_read_pages_prefilters_unreadable_pages() {
+        use crate::provider::Provider;
+
+        let provider = LocalProcessProvider::attach(&std::process::id().to_string())
+            .expect("attach to current process");
+        assert!(provider.readable_ranges.load().is_none());
+
+        let live_bytes = vec![0xA5u8; K_PAGE_SIZE as usize * 2];
+        let readable_addr = live_bytes.as_ptr() as u64;
+        let readable_page = readable_addr & !(K_PAGE_SIZE - 1);
+        let readable_offset = (readable_addr - readable_page) as usize;
+        let mut pages: Vec<u64> = (0..K_MAX_BULK_READ_PAGES as u64)
+            .map(|i| i * K_PAGE_SIZE)
+            .collect();
+        pages.push(readable_page);
+
+        let page_map = provider.read_pages(&pages);
+
+        assert!(provider.readable_ranges.load().is_some());
+        assert_eq!(page_map.len(), K_MAX_BULK_READ_PAGES + 1);
+        assert!(page_map
+            .get(&0)
+            .expect("unreadable page is represented")
+            .iter()
+            .all(|&byte| byte == 0));
+
+        let readable = page_map.get(&readable_page).expect("readable page");
+        let stable_len = 64.min(readable.len().saturating_sub(readable_offset));
+        assert!(stable_len > 0);
+        assert!(readable[readable_offset..readable_offset + stable_len]
+            .iter()
+            .all(|&byte| byte == 0xA5));
+
+        std::hint::black_box(live_bytes);
     }
 }
