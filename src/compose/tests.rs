@@ -1000,6 +1000,55 @@ fn struct_array_still_uses_children() {
     assert!(lines(&r).iter().any(|l| l.contains("val")));
 }
 
+#[test]
+fn struct_array_ref_elements_use_element_base_offsets() {
+    let mut tree = NodeTree::new();
+    let template_idx = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Element".into(),
+        struct_type_name: "Element".into(),
+        collapsed: false,
+        ..Node::default()
+    });
+    let template_id = tree.nodes[template_idx].id;
+    let x_idx = tree.add_node(child(template_id, NodeKind::Hex64, 0, "x"));
+    let y_idx = tree.add_node(child(template_id, NodeKind::Hex64, 8, "y"));
+    let x_id = tree.nodes[x_idx].id;
+    let y_id = tree.nodes[y_idx].id;
+
+    let root_idx = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Root".into(),
+        struct_type_name: "Root".into(),
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root_idx].id;
+    tree.add_node(Node {
+        element_kind: NodeKind::Struct,
+        array_len: 2,
+        ref_id: template_id,
+        collapsed: false,
+        ..child(root_id, NodeKind::Array, 0x20, "items")
+    });
+
+    let prov = NullProvider;
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+    let offsets_for = |id| {
+        r.meta
+            .iter()
+            .filter(|lm| lm.line_kind == LineKind::Field && lm.node_id == id)
+            .map(|lm| lm.offset_addr)
+            .collect::<Vec<_>>()
+    };
+
+    let base = tree.base_address;
+    assert_eq!(offsets_for(x_id), vec![base + 0x20, base + 0x30]);
+    assert_eq!(offsets_for(y_id), vec![base + 0x28, base + 0x38]);
+}
+
 // ── pointers ────────────────────────────────────────────────────────────────
 
 #[test]

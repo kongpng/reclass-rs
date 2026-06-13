@@ -1157,6 +1157,15 @@ fn resolve_addr(
     root_id: u64,
 ) -> u64 {
     if root_id != 0 {
+        let root_idx = tree.index_of_id(root_id);
+        if root_idx >= 0 {
+            let node_idx = node_idx as usize;
+            let root_idx = root_idx as usize;
+            if node_idx < state.abs_offsets.len() && root_idx < state.abs_offsets.len() {
+                let rel = state.abs_offsets[node_idx].wrapping_sub(state.abs_offsets[root_idx]);
+                return base.wrapping_add(rel as u64);
+            }
+        }
         return base.wrapping_add(rel_offset_from_root(tree, node_idx, root_id) as u64);
     }
     state.abs_offsets[node_idx as usize] as u64
