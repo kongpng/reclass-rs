@@ -182,6 +182,7 @@ pub struct TypeEntry {
     /// `buildStructChildren`). Rendered as the tree's expandable children.
     pub children: Vec<FieldChild>,
     search_lower: OnceLock<String>,
+    child_search_lower: OnceLock<String>,
 }
 
 /// A struct field child row — `"<TypeName> <fieldName>"` (the C++
@@ -236,6 +237,7 @@ impl Clone for TypeEntry {
             viewed: self.viewed,
             children: self.children.clone(),
             search_lower: OnceLock::new(),
+            child_search_lower: OnceLock::new(),
         }
     }
 }
@@ -257,6 +259,19 @@ impl Eq for TypeEntry {}
 impl TypeEntry {
     fn search_lower(&self) -> &str {
         self.search_lower.get_or_init(|| self.name.to_lowercase())
+    }
+
+    fn child_search_lower(&self) -> &str {
+        self.child_search_lower.get_or_init(|| {
+            let mut out = String::new();
+            for child in &self.children {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(child.search_lower());
+            }
+            out
+        })
     }
 }
 
@@ -413,6 +428,7 @@ impl WorkspaceModel {
                         viewed: viewed_ids.contains(&n.id),
                         children,
                         search_lower: OnceLock::new(),
+                        child_search_lower: OnceLock::new(),
                     });
                 }
             });
@@ -562,9 +578,13 @@ impl WorkspaceModel {
             .filter_map(|r| match r {
                 WorkspaceRow::Section(_) => None,
                 WorkspaceRow::Type(t) => {
-                    let name_hit = t.search_lower().contains(&q);
-                    let child_hit = t.children.iter().any(|c| c.search_lower().contains(&q));
-                    (name_hit || child_hit).then(|| WorkspaceRow::Type(t.clone()))
+                    if t.search_lower().contains(&q) {
+                        Some(WorkspaceRow::Type(t.clone()))
+                    } else if t.child_search_lower().contains(&q) {
+                        Some(WorkspaceRow::Type(t.clone()))
+                    } else {
+                        None
+                    }
                 }
             })
             .collect();

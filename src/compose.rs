@@ -1826,49 +1826,42 @@ fn compose_leaf(
                     owned_bytes = prov.read_bytes(abs_addr, sz);
                     owned_bytes.as_slice()
                 };
-                // `infer_types` returns empty for all-zero / empty input (the
-                // degenerate inputs the C++ also skips). For non-zero data the
-                // scoring pipeline lives in the `typeinfer` workflow; guard so
-                // headless compose never trips its skeleton.
-                if b.iter().any(|&x| x != 0) {
-                    let suggestions = crate::core::infer_strong_types(&b, &Default::default(), 2);
-                    let mut emitted = 0usize;
-                    for suggestion in suggestions.iter().filter(|s| s.strength >= 3) {
-                        if emitted >= 2 {
-                            break;
-                        }
-                        let kinds = suggestion.kinds.to_vec();
-                        // Value-preview + bracketed type label, mirroring
-                        // `lm.typeHint` (`compose.cpp:450-458`). Pointer guesses
-                        // are promoted only when the target is actually readable;
-                        // otherwise they are passive noise over arbitrary bytes.
-                        let type_name = crate::core::format_hint(suggestion);
-                        let chip_text = if let Some(ptr_kind) =
-                            pointer_kind_from_prediction(&suggestion.kinds)
-                        {
-                            pointer_type_hint_chip_text(state, prov, &b, ptr_kind, &type_name)
+                let suggestions = crate::core::infer_strong_types(&b, &Default::default(), 2);
+                let mut emitted = 0usize;
+                for suggestion in suggestions.iter().filter(|s| s.strength >= 3) {
+                    if emitted >= 2 {
+                        break;
+                    }
+                    let kinds = suggestion.kinds.to_vec();
+                    // Value-preview + bracketed type label, mirroring
+                    // `lm.typeHint` (`compose.cpp:450-458`). Pointer guesses
+                    // are promoted only when the target is actually readable;
+                    // otherwise they are passive noise over arbitrary bytes.
+                    let type_name = crate::core::format_hint(suggestion);
+                    let chip_text =
+                        if let Some(ptr_kind) = pointer_kind_from_prediction(&suggestion.kinds) {
+                            pointer_type_hint_chip_text(state, prov, b, ptr_kind, &type_name)
                         } else {
-                            let preview = format_preview(&b, sz, &suggestion.kinds);
+                            let preview = format_preview(b, sz, &suggestion.kinds);
                             Some(if preview.is_empty() {
                                 format!("[{type_name}]")
                             } else {
                                 format!("{preview} [{type_name}]")
                             })
                         };
-                        let Some(chip_text) = chip_text else {
-                            continue;
-                        };
-                        push_chip(
-                            &mut line_text,
-                            &mut lm,
-                            ChipKind::TypeHint,
-                            &chip_text,
-                            |c| {
-                                c.type_hint_kinds = kinds;
-                            },
-                        );
-                        emitted += 1;
-                    }
+                    let Some(chip_text) = chip_text else {
+                        continue;
+                    };
+                    push_chip(
+                        &mut line_text,
+                        &mut lm,
+                        ChipKind::TypeHint,
+                        &chip_text,
+                        |c| {
+                            c.type_hint_kinds = kinds;
+                        },
+                    );
+                    emitted += 1;
                 }
             }
 

@@ -58,7 +58,9 @@ mod view {
         ) {
             self.provider = provider;
             self.summary = summary;
-            self.refresh_details();
+            // Live module/region enumeration can be expensive; do it only when
+            // the panel is rendered or explicitly refreshed.
+            self.details = None;
         }
 
         fn refresh_details(&mut self) {

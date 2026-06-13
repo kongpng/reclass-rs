@@ -3599,21 +3599,59 @@ impl TargetPanelBenchDetails {
     }
 }
 
+#[derive(Default)]
+struct TargetPanelBenchState {
+    provider: Option<Arc<dyn Provider + Send + Sync>>,
+    summary_label: String,
+    details: Option<TargetPanelBenchDetails>,
+}
+
+impl TargetPanelBenchState {
+    fn set_target(&mut self, provider: Arc<dyn Provider + Send + Sync>, summary_label: &str) {
+        self.provider = Some(provider);
+        self.summary_label.clear();
+        self.summary_label.push_str(summary_label);
+        self.details = None;
+    }
+
+    fn set_target_eager(&mut self, provider: Arc<dyn Provider + Send + Sync>, summary_label: &str) {
+        self.details = Some(TargetPanelBenchDetails::from_provider(provider.as_ref()));
+        self.provider = Some(provider);
+        self.summary_label.clear();
+        self.summary_label.push_str(summary_label);
+    }
+
+    fn metric(&self) -> usize {
+        self.provider
+            .as_ref()
+            .map_or(0, Arc::strong_count)
+            .wrapping_add(self.summary_label.len())
+            .wrapping_add(
+                self.details
+                    .as_ref()
+                    .map_or(0, TargetPanelBenchDetails::metric),
+            )
+    }
+}
+
 fn target_panel_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("target_panel");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(2));
 
     for &mappings in &[1_000usize, 10_000] {
-        let provider = LiveLikeProvider::new_compose_pointer_hint_regions(mappings);
-        let cached_details = TargetPanelBenchDetails::from_provider(&provider);
+        let provider: Arc<dyn Provider + Send + Sync> =
+            Arc::new(LiveLikeProvider::new_compose_pointer_hint_regions(mappings));
+        let cached_details = TargetPanelBenchDetails::from_provider(provider.as_ref());
+        let summary_label = format!("LiveLikeProcess:{mappings}");
         group.throughput(Throughput::Elements(mappings as u64));
         group.bench_with_input(
             BenchmarkId::new("render_enumerate_details", mappings),
             &mappings,
             |b, _| {
                 b.iter(|| {
-                    let details = TargetPanelBenchDetails::from_provider(black_box(&provider));
+                    let details =
+                        TargetPanelBenchDetails::from_provider(black_box(provider.as_ref()));
                     black_box(details.metric());
                 });
             },
@@ -3624,6 +3662,31 @@ fn target_panel_workloads(c: &mut Criterion) {
             |b, _| {
                 b.iter(|| {
                     black_box(cached_details.metric());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("source_switch_set_target", mappings),
+            &mappings,
+            |b, _| {
+                b.iter(|| {
+                    let mut state = TargetPanelBenchState::default();
+                    state.set_target(Arc::clone(black_box(&provider)), black_box(&summary_label));
+                    black_box(state.metric());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("source_switch_eager_details", mappings),
+            &mappings,
+            |b, _| {
+                b.iter(|| {
+                    let mut state = TargetPanelBenchState::default();
+                    state.set_target_eager(
+                        Arc::clone(black_box(&provider)),
+                        black_box(&summary_label),
+                    );
+                    black_box(state.metric());
                 });
             },
         );
