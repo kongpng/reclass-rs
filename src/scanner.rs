@@ -1364,6 +1364,13 @@ fn intersect_constraints(
     regions: Vec<MemoryRegion>,
     constrain_regions: &[AddressRange],
 ) -> Vec<MemoryRegion> {
+    if constraints_strictly_sorted_disjoint(constrain_regions) {
+        if regions.windows(2).all(|pair| pair[0].base <= pair[1].base) {
+            return intersect_sorted_regions_with_constraints(&regions, constrain_regions);
+        }
+        return intersect_unsorted_regions_with_constraints(&regions, constrain_regions);
+    }
+
     let mut constraints = constrain_regions.to_vec();
     constraints.sort_by(|a, b| a.start.cmp(&b.start));
 
@@ -1386,6 +1393,22 @@ fn intersect_constraints(
     }
 
     intersect_unsorted_regions_with_constraints(&regions, &merged)
+}
+
+fn constraints_strictly_sorted_disjoint(constraints: &[AddressRange]) -> bool {
+    let mut last_end = None;
+    for c in constraints {
+        if c.end <= c.start {
+            return false;
+        }
+        if let Some(end) = last_end {
+            if c.start <= end {
+                return false;
+            }
+        }
+        last_end = Some(c.end);
+    }
+    true
 }
 
 fn intersect_sorted_regions_with_constraints(
