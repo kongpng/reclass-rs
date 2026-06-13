@@ -1621,6 +1621,66 @@ fn tree_id_lookup_workloads(c: &mut Criterion) {
     group.finish();
 }
 
+fn tree_selection_normalization_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tree_selection_normalization");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &nodes in &[1_000usize, 10_000, 50_000] {
+        let tree = flat_tree(nodes, NodeKind::Hex64);
+        let selected: HashSet<u64> = tree.nodes.iter().map(|node| node.id).collect();
+        group.throughput(Throughput::Elements(nodes as u64));
+        group.bench_with_input(
+            BenchmarkId::new("flat_all_selected_prefer_ancestors", nodes),
+            &nodes,
+            |b, _| {
+                b.iter(|| {
+                    let normalized = tree.normalize_prefer_ancestors(black_box(&selected));
+                    black_box(normalized.len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("flat_all_selected_prefer_descendants", nodes),
+            &nodes,
+            |b, _| {
+                b.iter(|| {
+                    let normalized = tree.normalize_prefer_descendants(black_box(&selected));
+                    black_box(normalized.len());
+                });
+            },
+        );
+    }
+
+    for &nodes in &[1_000usize, 2_000] {
+        let tree = deep_tree(nodes);
+        let selected: HashSet<u64> = tree.nodes.iter().map(|node| node.id).collect();
+        group.throughput(Throughput::Elements(nodes as u64));
+        group.bench_with_input(
+            BenchmarkId::new("deep_all_selected_prefer_ancestors", nodes),
+            &nodes,
+            |b, _| {
+                b.iter(|| {
+                    let normalized = tree.normalize_prefer_ancestors(black_box(&selected));
+                    black_box(normalized.len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("deep_all_selected_prefer_descendants", nodes),
+            &nodes,
+            |b, _| {
+                b.iter(|| {
+                    let normalized = tree.normalize_prefer_descendants(black_box(&selected));
+                    black_box(normalized.len());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn statusbar_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("statusbar_model");
     group.sample_size(10);
@@ -5257,6 +5317,7 @@ criterion_group!(
     compose_workloads,
     tree_child_access_workloads,
     tree_id_lookup_workloads,
+    tree_selection_normalization_workloads,
     statusbar_workloads,
     editor_line_text_workloads,
     editor_node_line_lookup_workloads,

@@ -738,17 +738,29 @@ impl NodeTree {
     /// `normalizePreferDescendants` (`compose.cpp:1747-1784`) — drop any node
     /// that has a *selected descendant*; keep only the deepest selected nodes.
     pub fn normalize_prefer_descendants(&self, ids: &HashSet<u64>) -> HashSet<u64> {
-        let mut out = HashSet::new();
+        let mut drop_ancestors = HashSet::with_capacity(ids.len());
         for &id in ids {
-            let mut has_selected_descendant = false;
-            for &di in &self.subtree_indices(id) {
-                let did = self.nodes[di].id;
-                if did != id && ids.contains(&did) {
-                    has_selected_descendant = true;
+            let idx = self.index_of_id(id);
+            if idx < 0 {
+                continue;
+            }
+            let mut visited: AHashSet<u64> = AHashSet::new();
+            let mut cur = self.nodes[idx as usize].parent_id;
+            while cur != 0 && visited.insert(cur) {
+                let ci = self.index_of_id(cur);
+                if ci < 0 {
                     break;
                 }
+                if ids.contains(&cur) && !drop_ancestors.insert(cur) {
+                    break;
+                }
+                cur = self.nodes[ci as usize].parent_id;
             }
-            if !has_selected_descendant {
+        }
+
+        let mut out = HashSet::with_capacity(ids.len().saturating_sub(drop_ancestors.len()));
+        for &id in ids {
+            if !drop_ancestors.contains(&id) {
                 out.insert(id);
             }
         }
@@ -1149,6 +1161,29 @@ mod tests {
         assert_eq!(
             t.normalize_prefer_descendants(&sel2),
             [lid].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn normalize_prefer_descendants_keeps_deepest_chain_selection() {
+        let mut t = NodeTree::new();
+        let root = t.add_node(Node {
+            kind: NodeKind::Struct,
+            ..Node::default()
+        });
+        let mut parent_id = t.nodes[root].id;
+        let mut deepest_id = parent_id;
+        let mut selected: HashSet<u64> = [parent_id].into_iter().collect();
+        for _ in 0..1024 {
+            let idx = t.add_node(child(parent_id, NodeKind::Struct, 0));
+            parent_id = t.nodes[idx].id;
+            deepest_id = parent_id;
+            selected.insert(parent_id);
+        }
+
+        assert_eq!(
+            t.normalize_prefer_descendants(&selected),
+            [deepest_id].into_iter().collect()
         );
     }
 
