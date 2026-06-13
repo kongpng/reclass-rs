@@ -1598,13 +1598,23 @@ fn attach_rtti_chip(
     line_text: &mut U16Str,
     lm: &mut LineMeta,
     abs_addr: u64,
+    candidate_bytes: Option<&[u8]>,
     allow_null_cta: bool,
 ) {
-    let mut candidate_bytes = [0u8; 8];
-    if !prov.read(abs_addr, &mut candidate_bytes) {
-        return;
-    }
-    let candidate = u64::from_le_bytes(candidate_bytes);
+    let candidate = if let Some(bytes) = candidate_bytes {
+        if bytes.len() < 8 {
+            return;
+        }
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    } else {
+        let mut candidate_bytes = [0u8; 8];
+        if !prov.read(abs_addr, &mut candidate_bytes) {
+            return;
+        }
+        u64::from_le_bytes(candidate_bytes)
+    };
     if candidate == 0 {
         if allow_null_cta && state.show_rtti {
             push_chip(line_text, lm, ChipKind::Rtti, "(Name class\u{2026})", |c| {
@@ -1725,11 +1735,12 @@ fn compose_leaf(
         }
 
         let mut hex_stack_bytes = [0u8; 16];
+        let mut hex_preview_read_ok = false;
         let hex_preview_bytes = if sub == 0 && state.type_hints && is_hex_node(node.kind) {
             let sz = size_for_kind(node.kind);
             let sz_usize = sz.max(0) as usize;
             if sz > 0 && sz_usize <= hex_stack_bytes.len() {
-                let _ = prov.read(abs_addr, &mut hex_stack_bytes[..sz_usize]);
+                hex_preview_read_ok = prov.read(abs_addr, &mut hex_stack_bytes[..sz_usize]);
                 Some(&hex_stack_bytes[..sz_usize])
             } else {
                 None
@@ -1945,6 +1956,11 @@ fn compose_leaf(
                     &mut line_text,
                     &mut lm,
                     abs_addr,
+                    if node.kind == NodeKind::Hex64 && hex_preview_read_ok {
+                        hex_preview_bytes
+                    } else {
+                        None
+                    },
                     node.kind == NodeKind::Pointer64 || node.kind == NodeKind::Pointer32,
                 );
             }
@@ -2696,7 +2712,7 @@ fn compose_node(
             // `{RTTI: …}` text (`compose.cpp:1217-1241`). The PDB symbol rides
             // in the pointer-header value text via `read_value`
             // (`format.cpp:457`), so no separate Symbol chip.
-            attach_rtti_chip(state, prov, &mut ptr_text, &mut lm, abs_addr, true);
+            attach_rtti_chip(state, prov, &mut ptr_text, &mut lm, abs_addr, None, true);
 
             // NOTE: C++ `composeNode` (`compose.cpp:1213-1257`) attaches ONLY the
             // RTTI hint to a typed-pointer header — never a comment chip. A comment

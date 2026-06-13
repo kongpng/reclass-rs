@@ -45,6 +45,31 @@ fn sorted_child_fast_path_requires_strictly_increasing_offsets() {
     );
 }
 
+#[test]
+fn type_hint_hex64_reuses_preview_bytes_for_rtti_probe() {
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
+
+    let prov = HighBaseProvider::without_modules(BASE, vec![0u8; 8]);
+    let _result = compose(
+        &tree, &prov, root_id, false, false, false, true, false, true, true,
+    );
+
+    assert_eq!(
+        prov.read_calls.get(),
+        1,
+        "Hex64 type hints should reuse the preview read for RTTI candidate decoding"
+    );
+}
+
 fn lines(r: &ComposeResult) -> Vec<String> {
     r.text.split('\n').map(|s| s.to_string()).collect()
 }
