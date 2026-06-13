@@ -88,31 +88,14 @@ impl FindState {
     /// the cursor) — e.g. after the document changed while the bar is open.
     pub fn recompute(&mut self, lines: &[String]) {
         self.matches.clear();
-        let needle = self.query.to_lowercase();
-        if needle.is_empty() {
+        if self.query.is_empty() {
             self.current = None;
             return;
         }
-        let step = needle.chars().count().max(1);
-        for (li, line) in lines.iter().enumerate() {
-            let hay: Vec<char> = line.to_lowercase().chars().collect();
-            let needle_chars: Vec<char> = needle.chars().collect();
-            if needle_chars.len() > hay.len() {
-                continue;
-            }
-            let mut i = 0usize;
-            while i + needle_chars.len() <= hay.len() {
-                if hay[i..i + needle_chars.len()] == needle_chars[..] {
-                    self.matches.push(FindMatch {
-                        line: li,
-                        start: i,
-                        end: i + needle_chars.len(),
-                    });
-                    i += step;
-                } else {
-                    i += 1;
-                }
-            }
+        if self.query.is_ascii() {
+            self.recompute_ascii(lines);
+        } else {
+            self.recompute_unicode(lines);
         }
         // Keep the current index in range if still valid.
         if let Some(c) = self.current {
@@ -122,6 +105,73 @@ impl FindState {
                 } else {
                     Some(0)
                 };
+            }
+        }
+    }
+
+    fn recompute_ascii(&mut self, lines: &[String]) {
+        let needle = self.query.as_bytes().to_vec();
+        let step = needle.len().max(1);
+        for (li, line) in lines.iter().enumerate() {
+            if !line.is_ascii() {
+                self.recompute_unicode_line(li, line);
+                continue;
+            }
+            let hay = line.as_bytes();
+            if needle.len() > hay.len() {
+                continue;
+            }
+            let mut i = 0usize;
+            while i + needle.len() <= hay.len() {
+                if hay[i..i + needle.len()].eq_ignore_ascii_case(&needle) {
+                    self.matches.push(FindMatch {
+                        line: li,
+                        start: i,
+                        end: i + needle.len(),
+                    });
+                    i += step;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn recompute_unicode(&mut self, lines: &[String]) {
+        let needle = self.query.to_lowercase();
+        let needle_chars: Vec<char> = needle.chars().collect();
+        for (li, line) in lines.iter().enumerate() {
+            self.recompute_unicode_chars(li, line, &needle_chars);
+        }
+    }
+
+    fn recompute_unicode_line(&mut self, line_idx: usize, line: &str) {
+        let needle = self.query.to_lowercase();
+        let needle_chars: Vec<char> = needle.chars().collect();
+        self.recompute_unicode_chars(line_idx, line, &needle_chars);
+    }
+
+    fn recompute_unicode_chars(&mut self, line_idx: usize, line: &str, needle_chars: &[char]) {
+        if needle_chars.is_empty() {
+            self.current = None;
+            return;
+        }
+        let step = needle_chars.len().max(1);
+        let hay: Vec<char> = line.to_lowercase().chars().collect();
+        if needle_chars.len() > hay.len() {
+            return;
+        }
+        let mut i = 0usize;
+        while i + needle_chars.len() <= hay.len() {
+            if hay[i..i + needle_chars.len()] == needle_chars[..] {
+                self.matches.push(FindMatch {
+                    line: line_idx,
+                    start: i,
+                    end: i + needle_chars.len(),
+                });
+                i += step;
+            } else {
+                i += 1;
             }
         }
     }
@@ -423,6 +473,20 @@ mod tests {
         // First match is current.
         assert_eq!(s.current_match(), Some(m[0]));
         assert_eq!(s.current_ordinal(), 1);
+    }
+
+    #[test]
+    fn ascii_query_still_searches_non_ascii_lines() {
+        let mut s = FindState::new();
+        s.set_query("CAF", &["  Café value".to_string()]);
+        assert_eq!(
+            s.matches(),
+            &[FindMatch {
+                line: 0,
+                start: 2,
+                end: 5
+            }]
+        );
     }
 
     #[test]

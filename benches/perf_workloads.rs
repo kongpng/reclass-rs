@@ -29,7 +29,7 @@ use reclass::scanner::{
 };
 use reclass::ui::chrome::statusbar::StatusInfo;
 use reclass::ui::editor::palette::EditorPalette;
-use reclass::ui::overlays::findbar::FindMatch;
+use reclass::ui::overlays::findbar::{FindMatch, FindState};
 use reclass::ui::panels::modulespanel::build_module_rows;
 use reclass::ui::panels::scannerpanel::{
     apply_change_all_results, bench_scanner_table_filter_cached, bench_scanner_table_refresh,
@@ -1963,6 +1963,49 @@ fn editor_find_highlight_workloads(c: &mut Criterion) {
             },
         );
     }
+    group.finish();
+}
+
+fn editor_find_search_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("editor_find_search");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &lines_len in &[1_000usize, 10_000, 50_000] {
+        let lines: Vec<String> = (0..lines_len)
+            .map(|i| {
+                format!(
+                    "0x{:08X}    Hex64 field_{i:05} = 0x{:016X} // PlayerHealth",
+                    i * 8,
+                    (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                )
+            })
+            .collect();
+        group.throughput(Throughput::Elements(lines_len as u64));
+        group.bench_with_input(
+            BenchmarkId::new("ascii_many_matches", lines_len),
+            &lines_len,
+            |b, _| {
+                b.iter(|| {
+                    let mut state = FindState::new();
+                    state.set_query(black_box("FIELD"), black_box(&lines));
+                    black_box(state.match_count());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("ascii_no_matches", lines_len),
+            &lines_len,
+            |b, _| {
+                b.iter(|| {
+                    let mut state = FindState::new();
+                    state.set_query(black_box("missing_needle"), black_box(&lines));
+                    black_box(state.match_count());
+                });
+            },
+        );
+    }
+
     group.finish();
 }
 
@@ -5322,6 +5365,7 @@ criterion_group!(
     editor_line_text_workloads,
     editor_node_line_lookup_workloads,
     editor_find_highlight_workloads,
+    editor_find_search_workloads,
     editor_selection_workloads,
     editor_minimap_workloads,
     type_hint_workloads,
