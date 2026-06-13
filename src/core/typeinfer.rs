@@ -11,6 +11,7 @@
 //! the loads here use `from_le_bytes` to match (`detail::loadU16/U32/U64/F32/F64`).
 
 use super::kind::{kind_meta, NodeKind};
+use smallvec::{smallvec, SmallVec};
 
 /// `struct InferHints` (`typeinfer.h:13-20`).
 #[derive(Clone, Copy, Debug)]
@@ -46,7 +47,7 @@ impl Default for InferHints<'_> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeSuggestion {
     /// `len==1`: convert; `len>1`: uniform split.
-    pub kinds: Vec<NodeKind>,
+    pub kinds: SmallVec<[NodeKind; 16]>,
     /// 0-100 feature ratio (passed / checked × 100).
     pub score: i32,
     /// 0=hidden, 1=weak, 2=moderate, 3=strong.
@@ -381,16 +382,20 @@ fn strength_from_score(score: i32) -> i32 {
 /// `struct Candidate` (`typeinfer.h:313-316`).
 #[derive(Clone)]
 struct Candidate {
-    kinds: Vec<NodeKind>,
+    kind: NodeKind,
+    count: i32,
     score: i32,
 }
 
+type CandidateVec = SmallVec<[Candidate; 12]>;
+
 /// `addCandidate` (`typeinfer.h:318-320`).
 #[inline]
-fn add_candidate(out: &mut Vec<Candidate>, k: NodeKind, score: i32) {
-    if score >= 25 {
+fn add_candidate(out: &mut CandidateVec, k: NodeKind, score: i32, min_score: i32) {
+    if score >= min_score {
         out.push(Candidate {
-            kinds: vec![k],
+            kind: k,
+            count: 1,
             score,
         });
     }
@@ -398,17 +403,24 @@ fn add_candidate(out: &mut Vec<Candidate>, k: NodeKind, score: i32) {
 
 /// `addSplitCandidate` (`typeinfer.h:322-327`).
 #[inline]
-fn add_split_candidate(out: &mut Vec<Candidate>, k: NodeKind, count: i32, score: i32) {
-    if score >= 25 {
+fn add_split_candidate(
+    out: &mut CandidateVec,
+    k: NodeKind,
+    count: i32,
+    score: i32,
+    min_score: i32,
+) {
+    if score >= min_score {
         out.push(Candidate {
-            kinds: vec![k; count as usize],
+            kind: k,
+            count,
             score,
         });
     }
 }
 
 /// `tryWhole8` (`typeinfer.h:331-377`).
-fn try_whole8(data: &[u8], h: &InferHints<'_>, out: &mut Vec<Candidate>) {
+fn try_whole8(data: &[u8], h: &InferHints<'_>, out: &mut CandidateVec, min_candidate_score: i32) {
     let u64v = load_u64(data);
 
     // Pointer64
@@ -417,6 +429,7 @@ fn try_whole8(data: &[u8], h: &InferHints<'_>, out: &mut Vec<Candidate>) {
             out,
             NodeKind::Pointer64,
             feature_score(count_ptr_features64(u64v)),
+            min_candidate_score,
         );
     }
 
@@ -446,6 +459,7 @@ fn try_whole8(data: &[u8], h: &InferHints<'_>, out: &mut Vec<Candidate>) {
                 out,
                 NodeKind::Double,
                 feature_score(FeatureResult { passed, checked }),
+                min_candidate_score,
             );
         }
     }
@@ -455,6 +469,7 @@ fn try_whole8(data: &[u8], h: &InferHints<'_>, out: &mut Vec<Candidate>) {
         out,
         NodeKind::UTF8,
         feature_score(count_string_features(data, 8)),
+        min_candidate_score,
     );
 
     // UInt64 / Int64 — only meaningful when value exceeds 32-bit range
@@ -471,6 +486,7 @@ fn try_whole8(data: &[u8], h: &InferHints<'_>, out: &mut Vec<Candidate>) {
             out,
             NodeKind::UInt64,
             feature_score(FeatureResult { passed, checked }),
+            min_candidate_score,
         );
     }
 }
@@ -481,7 +497,8 @@ fn try_whole4(
     min_p: Option<&[u8]>,
     max_p: Option<&[u8]>,
     h: &InferHints<'_>,
-    out: &mut Vec<Candidate>,
+    out: &mut CandidateVec,
+    min_candidate_score: i32,
 ) {
     let u32v = load_u32(data);
 
@@ -490,6 +507,7 @@ fn try_whole4(
         out,
         NodeKind::Float,
         feature_score(count_float_features(u32v, min_p, max_p, h)),
+        min_candidate_score,
     );
 
     // Int32
@@ -497,6 +515,7 @@ fn try_whole4(
         out,
         NodeKind::Int32,
         feature_score(count_int_features(u32v, min_p, max_p, h)),
+        min_candidate_score,
     );
 
     // UInt32
@@ -504,6 +523,7 @@ fn try_whole4(
         out,
         NodeKind::UInt32,
         feature_score(count_int_features(u32v, min_p, max_p, h)),
+        min_candidate_score,
     );
 
     // Flags (only if sparse bits)
@@ -511,6 +531,7 @@ fn try_whole4(
         out,
         NodeKind::UInt32,
         feature_score(count_flag_features(u32v, min_p, max_p, h)),
+        min_candidate_score,
     );
 
     // Pointer32
@@ -519,6 +540,7 @@ fn try_whole4(
             out,
             NodeKind::Pointer32,
             feature_score(count_ptr_features32(u32v)),
+            min_candidate_score,
         );
     }
 }
@@ -529,23 +551,30 @@ fn try_whole2(
     min_p: Option<&[u8]>,
     max_p: Option<&[u8]>,
     h: &InferHints<'_>,
-    out: &mut Vec<Candidate>,
+    out: &mut CandidateVec,
+    min_candidate_score: i32,
 ) {
     let u16v = load_u16(data);
     let score_i = feature_score(count_int16_features(u16v, min_p, max_p, h));
-    add_candidate(out, NodeKind::Int16, score_i);
-    add_candidate(out, NodeKind::UInt16, score_i);
+    add_candidate(out, NodeKind::Int16, score_i, min_candidate_score);
+    add_candidate(out, NodeKind::UInt16, score_i, min_candidate_score);
 }
 
 /// `tryWhole1` (`typeinfer.h:408-412`).
-fn try_whole1(data: &[u8], out: &mut Vec<Candidate>) {
+fn try_whole1(data: &[u8], out: &mut CandidateVec, min_candidate_score: i32) {
     let v = data[0];
     let score = if v == 0 || v == 1 { 50 } else { 25 };
-    add_candidate(out, NodeKind::UInt8, score);
+    add_candidate(out, NodeKind::UInt8, score, min_candidate_score);
 }
 
 /// `trySplitUniform` (`typeinfer.h:416-477`).
-fn try_split_uniform(data: &[u8], len: i32, h: &InferHints<'_>, out: &mut Vec<Candidate>) {
+fn try_split_uniform(
+    data: &[u8],
+    len: i32,
+    h: &InferHints<'_>,
+    out: &mut CandidateVec,
+    min_candidate_score: i32,
+) {
     // 8 → 2×4
     if len == 8 {
         let min_a = h.min_observed;
@@ -579,7 +608,7 @@ fn try_split_uniform(data: &[u8], len: i32, h: &InferHints<'_>, out: &mut Vec<Ca
                     count_float_features(bits_b, min_b, max_b, h)
                 };
                 let score = std::cmp::min(feature_score(r_a), feature_score(r_b));
-                add_split_candidate(out, NodeKind::Float, 2, score);
+                add_split_candidate(out, NodeKind::Float, 2, score, min_candidate_score);
             }
         }
 
@@ -602,7 +631,7 @@ fn try_split_uniform(data: &[u8], len: i32, h: &InferHints<'_>, out: &mut Vec<Ca
                 count_int_features(load_u32(&data[4..8]), min_b, max_b, h)
             };
             let score = std::cmp::min(feature_score(r_a), feature_score(r_b));
-            add_split_candidate(out, NodeKind::Int32, 2, score);
+            add_split_candidate(out, NodeKind::Int32, 2, score, min_candidate_score);
         }
 
         // UInt32×2
@@ -624,7 +653,7 @@ fn try_split_uniform(data: &[u8], len: i32, h: &InferHints<'_>, out: &mut Vec<Ca
                 count_int_features(load_u32(&data[4..8]), min_b, max_b, h)
             };
             let score = std::cmp::min(feature_score(r_a), feature_score(r_b));
-            add_split_candidate(out, NodeKind::UInt32, 2, score);
+            add_split_candidate(out, NodeKind::UInt32, 2, score, min_candidate_score);
         }
     }
 
@@ -646,22 +675,28 @@ fn try_split_uniform(data: &[u8], len: i32, h: &InferHints<'_>, out: &mut Vec<Ca
             min_score = std::cmp::min(min_score, s);
         }
         if any_non_zero {
-            add_split_candidate(out, NodeKind::Int16, count, min_score);
-            add_split_candidate(out, NodeKind::UInt16, count, min_score);
+            add_split_candidate(out, NodeKind::Int16, count, min_score, min_candidate_score);
+            add_split_candidate(out, NodeKind::UInt16, count, min_score, min_candidate_score);
         }
     }
 }
 
 /// `pruneAndRank` (`typeinfer.h:481-518`).
-fn prune_and_rank(mut cands: Vec<Candidate>, max_results: i32) -> Vec<TypeSuggestion> {
+fn prune_and_rank(
+    mut cands: CandidateVec,
+    max_results: i32,
+    min_strength: i32,
+) -> Vec<TypeSuggestion> {
     // Sort descending by score. `std::sort` is not stable; mirror it with an
     // unstable sort so dedup tie-breaks match the C++ as closely as possible.
     cands.sort_by(|a, b| b.score.cmp(&a.score));
 
     // Dedup: keep highest-scoring per unique kinds vector.
-    let mut deduped: Vec<Candidate> = Vec::new();
+    let mut deduped: CandidateVec = SmallVec::new();
     for c in &cands {
-        let dup = deduped.iter().any(|d| d.kinds == c.kinds);
+        let dup = deduped
+            .iter()
+            .any(|d| d.kind == c.kind && d.count == c.count);
         if !dup {
             deduped.push(c.clone());
         }
@@ -680,9 +715,9 @@ fn prune_and_rank(mut cands: Vec<Candidate>, max_results: i32) -> Vec<TypeSugges
     let mut result = Vec::with_capacity(deduped.len());
     for c in &deduped {
         let str_ = strength_from_score(c.score);
-        if str_ > 0 {
+        if str_ >= min_strength {
             result.push(TypeSuggestion {
-                kinds: c.kinds.clone(),
+                kinds: smallvec![c.kind; c.count as usize],
                 score: c.score,
                 strength: str_,
             });
@@ -694,6 +729,25 @@ fn prune_and_rank(mut cands: Vec<Candidate>, max_results: i32) -> Vec<TypeSugges
 /// `inferTypes` (`typeinfer.h:524-548`) — the entry point. Returns up to
 /// `max_results` ranked suggestions for the given byte slice.
 pub fn infer_types(data: &[u8], hints: &InferHints<'_>, max_results: i32) -> Vec<TypeSuggestion> {
+    infer_types_with_min_strength(data, hints, max_results, 1)
+}
+
+/// Hot-path variant for editor chips. Compose and hover only render strong
+/// suggestions, so avoid allocating result entries they will immediately drop.
+pub fn infer_strong_types(
+    data: &[u8],
+    hints: &InferHints<'_>,
+    max_results: i32,
+) -> Vec<TypeSuggestion> {
+    infer_types_with_min_strength(data, hints, max_results, 3)
+}
+
+fn infer_types_with_min_strength(
+    data: &[u8],
+    hints: &InferHints<'_>,
+    max_results: i32,
+    min_strength: i32,
+) -> Vec<TypeSuggestion> {
     let len = data.len() as i32;
     if data.is_empty() {
         return Vec::new();
@@ -702,11 +756,12 @@ pub fn infer_types(data: &[u8], hints: &InferHints<'_>, max_results: i32) -> Vec
         return Vec::new(); // NULL → skip entirely (typeinfer.h:532).
     }
 
-    let mut cands: Vec<Candidate> = Vec::with_capacity(12);
+    let mut cands: CandidateVec = SmallVec::new();
+    let min_candidate_score = min_score_for_strength(min_strength);
 
     // Whole-width candidates.
     if len >= 8 {
-        try_whole8(data, hints, &mut cands);
+        try_whole8(data, hints, &mut cands, min_candidate_score);
     }
     if len == 4 {
         try_whole4(
@@ -715,6 +770,7 @@ pub fn infer_types(data: &[u8], hints: &InferHints<'_>, max_results: i32) -> Vec
             hints.max_observed,
             hints,
             &mut cands,
+            min_candidate_score,
         );
     }
     if len == 2 {
@@ -724,18 +780,29 @@ pub fn infer_types(data: &[u8], hints: &InferHints<'_>, max_results: i32) -> Vec
             hints.max_observed,
             hints,
             &mut cands,
+            min_candidate_score,
         );
     }
     if len == 1 {
-        try_whole1(data, &mut cands);
+        try_whole1(data, &mut cands, min_candidate_score);
     }
 
     // Uniform splits (compete directly with whole-width candidates).
     if len >= 4 {
-        try_split_uniform(data, len, hints, &mut cands);
+        try_split_uniform(data, len, hints, &mut cands, min_candidate_score);
     }
 
-    prune_and_rank(cands, max_results)
+    prune_and_rank(cands, max_results, min_strength)
+}
+
+#[inline]
+fn min_score_for_strength(min_strength: i32) -> i32 {
+    match min_strength {
+        i32::MIN..=0 => 25,
+        1 => 25,
+        2 => 50,
+        _ => 75,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -900,7 +967,7 @@ mod tests {
     #[test]
     fn format_hint_single() {
         let s = TypeSuggestion {
-            kinds: vec![NodeKind::Float],
+            kinds: smallvec![NodeKind::Float],
             score: 0,
             strength: 3,
         };
@@ -910,12 +977,44 @@ mod tests {
     #[test]
     fn format_hint_split() {
         let s = TypeSuggestion {
-            kinds: vec![NodeKind::Float, NodeKind::Float],
+            kinds: smallvec![NodeKind::Float, NodeKind::Float],
             score: 0,
             strength: 3,
         };
         let h = format_hint(&s);
         assert_eq!(h, "float\u{00D7}2");
+    }
+
+    #[test]
+    fn infer_strong_matches_filtering_public_results() {
+        let fixtures = [
+            {
+                let mut d = [0u8; 8];
+                d[..4].copy_from_slice(&1.5f32.to_le_bytes());
+                d[4..].copy_from_slice(&2.25f32.to_le_bytes());
+                d
+            },
+            {
+                let mut d = [0u8; 8];
+                d[..4].copy_from_slice(&14i32.to_le_bytes());
+                d[4..].copy_from_slice(&20i32.to_le_bytes());
+                d
+            },
+            0x0000_7FF6_A0B0_1000u64.to_le_bytes(),
+            0x9E37_79B9_7F4A_7C15u64.to_le_bytes(),
+        ];
+
+        for data in fixtures {
+            let expected: Vec<_> = infer_types(&data, &InferHints::default(), 3)
+                .into_iter()
+                .filter(|s| s.strength >= 3)
+                .take(2)
+                .collect();
+            assert_eq!(
+                infer_strong_types(&data, &InferHints::default(), 2),
+                expected
+            );
+        }
     }
 
     // ── Denormal rejection ──
@@ -948,6 +1047,20 @@ mod tests {
                 data[j as usize] = ((seed >> (j * 3)) ^ ((i + j) as u32)) as u8;
             }
             let _ = infer_types(&data, &InferHints::default(), 3);
+        }
+    }
+
+    #[test]
+    fn infer_strong_matches_displayed_strong_prefix() {
+        let hints = InferHints::default();
+        for i in 0..512u64 {
+            let data = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes();
+            let displayed: Vec<_> = infer_types(&data, &hints, 3)
+                .into_iter()
+                .filter(|s| s.strength >= 3)
+                .take(2)
+                .collect();
+            assert_eq!(infer_strong_types(&data, &hints, 2), displayed);
         }
     }
 }

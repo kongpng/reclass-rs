@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use serde_json::{Map, Value};
+use smallvec::SmallVec;
 
 use crate::compose;
 use crate::core::linemeta::{
@@ -33,13 +35,15 @@ use crate::core::{
 };
 use crate::format;
 use crate::provider::{
-    BufferProvider, MemoryRegion, NullProvider, Provider, SnapshotProvider, K_PAGE_SIZE,
+    BufferProvider, CachedPageProvider, MemoryRegion, NullProvider, Provider, SnapshotProvider,
+    K_PAGE_SIZE,
 };
 
 /// Strip mask for selection ids (footer / array-element / member tag + sub bits).
 /// Mirrors the inline `& ~(...)` in `controller.cpp:5168` etc.
 const SEL_STRIP_MASK: u64 =
     !(K_FOOTER_ID_BIT | K_ARRAY_ELEM_BIT | K_ARRAY_ELEM_MASK | K_MEMBER_BIT | K_MEMBER_SUB_MASK);
+type TrackedValueBytes = SmallVec<[u8; 16]>;
 
 #[inline]
 fn strip_sel(id: u64) -> u64 {
@@ -54,6 +58,67 @@ fn strip_sel(id: u64) -> u64 {
 #[inline]
 pub fn strip_sel_pub(id: u64) -> u64 {
     strip_sel(id)
+}
+
+fn normalize_changed_ranges(ranges: &mut Vec<(i64, i64)>) {
+    ranges.retain(|(start, end)| end > start);
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut write = 0usize;
+    for read in 0..ranges.len() {
+        let (start, end) = ranges[read];
+        if write > 0 && start <= ranges[write - 1].1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(end);
+        } else {
+            ranges[write] = (start, end);
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
+}
+
+fn changed_ranges_intersects(ranges: &[(i64, i64)], start: i64, end: i64) -> bool {
+    if end <= start {
+        return false;
+    }
+    let idx = ranges.partition_point(|(_, range_end)| *range_end <= start);
+    ranges
+        .get(idx)
+        .is_some_and(|(range_start, _)| *range_start < end)
+}
+
+fn changed_byte_indices_for_line(
+    ranges: &[(i64, i64)],
+    offset: i64,
+    byte_count: i32,
+) -> SmallVec<[i32; 16]> {
+    let mut out = SmallVec::new();
+    if byte_count <= 0 {
+        return out;
+    }
+    let end = offset.saturating_add(byte_count as i64);
+    let mut idx = ranges.partition_point(|(_, range_end)| *range_end <= offset);
+    while let Some(&(range_start, range_end)) = ranges.get(idx) {
+        if range_start >= end {
+            break;
+        }
+        let changed_start = range_start.max(offset).saturating_sub(offset);
+        let changed_end = range_end.min(end).saturating_sub(offset);
+        for b in changed_start..changed_end {
+            out.push(b as i32);
+        }
+        idx += 1;
+    }
+    out
+}
+
+fn provider_read_cache_eligible(provider: &dyn Provider) -> bool {
+    if !provider.is_live() {
+        return false;
+    }
+    matches!(
+        provider.kind().as_str(),
+        "LocalProcess" | "RemoteProcess" | "Process" | "KernelProcess" | "WinDbg"
+    )
 }
 
 const K_PAGE_MASK: u64 = !(K_PAGE_SIZE - 1);
@@ -666,6 +731,8 @@ pub struct RcxController {
 
     // View / selection
     last_result: ComposeResult,
+    result_revision: u64,
+    last_compose_stamp: Option<ComposeStamp>,
     sel_ids: HashSet<u64>,
     anchor_line: i64,
     view_root_id: u64,
@@ -689,14 +756,14 @@ pub struct RcxController {
     // auto-refresh state (`controller.h:313-324`)
     snapshot: Option<Box<SnapshotProvider>>,
     prev_pages: PageMap,
-    changed_offsets: HashSet<i64>,
+    changed_ranges: Vec<(i64, i64)>,
     value_history: HashMap<u64, ValueHistory>,
-    last_value_addr: HashMap<u64, u64>,
+    last_value_addr: AHashMap<u64, u64>,
     // nodeId -> raw bytes of the last sampled value. Change-detection keys on
     // this (not the formatted display string) so a no-op reformat of identical
     // bytes — Hex64 "0x0" -> Pointer64 "nullptr", endianness/RVA toggle — doesn't
     // register as a value change and spuriously light the heatmap.
-    last_value_bytes: HashMap<u64, Vec<u8>>,
+    last_value_bytes: AHashMap<u64, TrackedValueBytes>,
     track_values: bool,
     value_track_cooldown: i32,
     refresh_gen: u64,
@@ -719,9 +786,35 @@ pub struct RcxController {
 
     // mock editor (headless viewport tests) — see `EditorView`
     editor: Option<Box<dyn EditorView>>,
+    visible_line_range: Option<(usize, usize)>,
 
     // events out
     events: Vec<ControllerEvent>,
+
+    // Fast path for repeated tail growth. Cleared by every command application;
+    // append paths repopulate it only after their insert command has applied.
+    append_tail_cache: Option<(u64, i32)>,
+    data_extent_cache: Option<(u64, i32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposeStamp {
+    tree_generation: u64,
+    view_root_id: u64,
+    compact_columns: bool,
+    tree_lines: bool,
+    brace_wrap: bool,
+    type_hints: bool,
+    show_comments: bool,
+    show_rtti: bool,
+    show_enum_chips: bool,
+    snapshot_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueRefreshMode {
+    SampleLiveValues,
+    ReuseExistingHeat,
 }
 
 /// `RcxEditor` abstraction so the headless build links without gpui
@@ -755,6 +848,8 @@ impl RcxController {
             doc,
             undo: UndoStack::new(),
             last_result: ComposeResult::default(),
+            result_revision: 0,
+            last_compose_stamp: None,
             sel_ids: HashSet::new(),
             anchor_line: -1,
             view_root_id: 0,
@@ -772,10 +867,10 @@ impl RcxController {
             last_live: false,
             snapshot: None,
             prev_pages: PageMap::new(),
-            changed_offsets: HashSet::new(),
+            changed_ranges: Vec::new(),
             value_history: HashMap::new(),
-            last_value_addr: HashMap::new(),
-            last_value_bytes: HashMap::new(),
+            last_value_addr: AHashMap::new(),
+            last_value_bytes: AHashMap::new(),
             track_values: true,
             value_track_cooldown: 0,
             refresh_gen: 0,
@@ -792,7 +887,10 @@ impl RcxController {
             current_interval_ms: 200,
             timer_active: false,
             editor: None,
+            visible_line_range: None,
             events: Vec::new(),
+            append_tail_cache: None,
+            data_extent_cache: None,
         };
         // `setupAutoRefresh` (`controller.cpp:6515`): start the timer.
         c.apply_adaptive_interval();
@@ -834,6 +932,11 @@ impl RcxController {
     }
     pub fn last_result(&self) -> &ComposeResult {
         &self.last_result
+    }
+    /// Monotonic revision of [`last_result`](Self::last_result). Incremented by
+    /// every controller refresh, including live-provider read completion.
+    pub fn result_revision(&self) -> u64 {
+        self.result_revision
     }
     pub fn selected_ids(&self) -> &HashSet<u64> {
         &self.sel_ids
@@ -903,6 +1006,16 @@ impl RcxController {
     /// Install a mock editor (headless viewport/timer tests).
     pub fn set_editor(&mut self, editor: Box<dyn EditorView>) {
         self.editor = Some(editor);
+    }
+
+    pub fn set_visible_line_range(&mut self, first: usize, last: usize) {
+        if last >= first {
+            self.visible_line_range = Some((first, last));
+        }
+    }
+
+    pub fn clear_visible_line_range(&mut self) {
+        self.visible_line_range = None;
     }
 
     /// Drain queued events (the UI dispatches them to GPUI; tests assert on them).
@@ -1107,7 +1220,7 @@ impl RcxController {
 
     /// `resetChangeTracking()` (`controller.cpp:1881`) — does NOT refresh.
     pub fn reset_change_tracking(&mut self) {
-        self.changed_offsets.clear();
+        self.changed_ranges.clear();
         self.value_history.clear();
         self.last_value_addr.clear();
         self.last_value_bytes.clear();
@@ -1127,6 +1240,8 @@ impl RcxController {
     /// failure / read-only override blocking a write).
     pub fn apply_command(&mut self, cmd: &Command, is_undo: bool) -> bool {
         self.doc.tree.touch();
+        self.append_tail_cache = None;
+        self.data_extent_cache = None;
         let mut success = true;
 
         // Trivial undo/redo field assignments: `n.field = if undo { old } else { new }`.
@@ -1390,7 +1505,11 @@ impl RcxController {
         }
 
         if success && !self.suppress_refresh {
-            self.refresh();
+            if is_transient(cmd) {
+                self.refresh();
+            } else {
+                self.refresh_reusing_value_heat();
+            }
         }
         success
     }
@@ -2460,17 +2579,20 @@ impl RcxController {
             return Vec::new();
         }
 
-        let tail = self
-            .doc
-            .tree
-            .children_of(struct_id)
-            .iter()
-            .map(|&ci| {
-                let child = &self.doc.tree.nodes[ci];
-                child.offset + self.node_size(child)
-            })
-            .max()
-            .unwrap_or(0);
+        let tail = match self.append_tail_cache.filter(|(id, _)| *id == struct_id) {
+            Some((_, tail)) => tail,
+            None => self
+                .doc
+                .tree
+                .children_of(struct_id)
+                .iter()
+                .map(|&ci| {
+                    let child = &self.doc.tree.nodes[ci];
+                    child.offset + self.node_size(child)
+                })
+                .max()
+                .unwrap_or(0),
+        };
 
         let mut nodes = Vec::with_capacity(count as usize);
         let mut ids = Vec::with_capacity(count as usize);
@@ -2492,6 +2614,7 @@ impl RcxController {
             nodes,
             off_adjs: Vec::new(),
         });
+        self.append_tail_cache = Some((struct_id, tail + count.saturating_mul(8)));
         ids
     }
 
@@ -2625,18 +2748,24 @@ impl RcxController {
         // EMBEDDED-STRUCT redirect: an embedded placeholder with no children but a
         // refId → append into the referenced root class instead.
         let mut target_id = struct_id;
-        if self.doc.tree.children_of(struct_id).is_empty() && container.ref_id != 0 {
+        if !self.doc.tree.has_children(struct_id) && container.ref_id != 0 {
             target_id = container.ref_id;
         }
 
         // STRUCT/ARRAY field append — HARDCODED Hex64 at the container tail.
-        let mut slot_offset = 0i32;
-        for ci in self.doc.tree.children_of(target_id) {
-            let sib = &self.doc.tree.nodes[ci];
-            let sz = self.node_size(sib);
-            let end = sib.offset + sz;
-            if end > slot_offset {
-                slot_offset = end;
+        let mut slot_offset = self
+            .append_tail_cache
+            .filter(|(id, _)| *id == target_id)
+            .map(|(_, tail)| tail)
+            .unwrap_or(0);
+        if slot_offset == 0 {
+            for ci in self.doc.tree.children_of(target_id) {
+                let sib = &self.doc.tree.nodes[ci];
+                let sz = self.node_size(sib);
+                let end = sib.offset + sz;
+                if end > slot_offset {
+                    slot_offset = end;
+                }
             }
         }
         let align = alignment_for(NodeKind::Hex64);
@@ -2655,6 +2784,7 @@ impl RcxController {
             node: n,
             off_adjs: Vec::new(),
         });
+        self.append_tail_cache = Some((target_id, offset + 8));
 
         // SELECTION MOVE: clear then select the new field so the next Down appends
         // after it and the user can immediately retype its kind.
@@ -2795,7 +2925,7 @@ impl RcxController {
         if ref_id == 0 {
             return;
         }
-        if !self.doc.tree.children_of(parent_id).is_empty() {
+        if self.doc.tree.has_children(parent_id) {
             return; // already materialized
         }
 
@@ -4834,10 +4964,52 @@ impl RcxController {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl RcxController {
+    fn current_compose_stamp(&self) -> ComposeStamp {
+        ComposeStamp {
+            tree_generation: self.doc.tree.generation(),
+            view_root_id: self.view_root_id,
+            compact_columns: self.compact_columns,
+            tree_lines: self.tree_lines,
+            brace_wrap: self.brace_wrap,
+            type_hints: self.type_hints,
+            show_comments: self.show_comments,
+            show_rtti: self.show_rtti,
+            show_enum_chips: self.show_enum_chips,
+            snapshot_active: self.snapshot.is_some(),
+        }
+    }
+
+    /// Recompose only when the tree/view/options differ from the last composed
+    /// state. Returns true when a refresh was performed.
+    pub fn refresh_if_stale(&mut self) -> bool {
+        let stamp = self.current_compose_stamp();
+        if self.last_compose_stamp == Some(stamp) {
+            return false;
+        }
+        self.refresh();
+        true
+    }
+
     /// `RcxController::refresh()` (`controller.cpp:1891`). The headless pure
     /// steps 1-6 (compose + change-highlight + value-tracking + selection-prune)
     /// run; the editor-apply tail (steps 7-9) is a no-op without a real editor.
     pub fn refresh(&mut self) {
+        self.refresh_impl(ValueRefreshMode::SampleLiveValues);
+    }
+
+    fn refresh_reusing_value_heat(&mut self) {
+        self.refresh_impl(ValueRefreshMode::ReuseExistingHeat);
+    }
+
+    fn refresh_impl(&mut self, value_refresh_mode: ValueRefreshMode) {
+        let compose_stamp = self.current_compose_stamp();
+        let live_read_cache = if self.snapshot.is_none()
+            && provider_read_cache_eligible(self.doc.provider.as_ref())
+        {
+            Some(CachedPageProvider::new(Arc::clone(&self.doc.provider)))
+        } else {
+            None
+        };
         // Build the PDB symbol-lookup callback (`controller.cpp:1911-1918`). The
         // C++ builds `symLookup` whenever a provider is attached and passes it
         // into compose in BOTH branches, so each hex/pointer row with no user
@@ -4888,6 +5060,20 @@ impl RcxController {
                 self.show_rtti,
                 self.show_enum_chips,
             )
+        } else if let Some(cache) = &live_read_cache {
+            compose::compose_with_symbols(
+                &self.doc.tree,
+                cache,
+                self.view_root_id,
+                self.compact_columns,
+                self.tree_lines,
+                self.brace_wrap,
+                self.type_hints,
+                self.show_comments,
+                sym,
+                self.show_rtti,
+                self.show_enum_chips,
+            )
         } else {
             self.doc.compose(
                 self.view_root_id,
@@ -4901,8 +5087,7 @@ impl RcxController {
         };
 
         // Change-highlight pass.
-        if !self.changed_offsets.is_empty() {
-            let base = self.doc.tree.base_address;
+        if !self.changed_ranges.is_empty() {
             // Snapshot the per-line node info we need (avoid borrow conflicts).
             let meta_len = self.last_result.meta.len();
             for i in 0..meta_len {
@@ -4913,33 +5098,23 @@ impl RcxController {
                 if node_idx < 0 || node_idx as usize >= self.doc.tree.nodes.len() {
                     continue;
                 }
-                let offset = offset_addr as i64 - base as i64;
+                let offset = offset_addr as i64;
                 let node = &self.doc.tree.nodes[node_idx as usize];
                 if is_hex_node(node.kind) {
-                    let mut changed_idx: Vec<i32> = Vec::new();
-                    let mut data_changed = false;
-                    for b in 0..line_byte_count {
-                        if self.changed_offsets.contains(&(offset + b as i64)) {
-                            changed_idx.push(b);
-                            data_changed = true;
-                        }
-                    }
-                    if data_changed {
+                    let changed_idx = changed_byte_indices_for_line(
+                        &self.changed_ranges,
+                        offset,
+                        line_byte_count,
+                    );
+                    if !changed_idx.is_empty() {
                         let lm = &mut self.last_result.meta[i];
                         lm.changed_byte_indices.extend(changed_idx);
                         lm.data_changed = true;
                     }
                 } else {
                     let sz = self.node_size(node);
-                    let mut data_changed = false;
-                    let mut b = offset;
-                    while b < offset + sz as i64 {
-                        if self.changed_offsets.contains(&b) {
-                            data_changed = true;
-                            break;
-                        }
-                        b += 1;
-                    }
+                    let data_changed =
+                        changed_ranges_intersects(&self.changed_ranges, offset, offset + sz as i64);
                     if data_changed {
                         self.last_result.meta[i].data_changed = true;
                     }
@@ -4947,8 +5122,18 @@ impl RcxController {
             }
         }
 
-        // Value-tracking pass.
-        self.value_tracking_pass();
+        // Value-tracking pass. Structural commands recompose the rows but do not
+        // need to re-sample every live field immediately; the next live snapshot
+        // refresh will record real byte changes. Reusing the existing heat keeps
+        // command refreshes cheap without inventing stale provider caches.
+        match value_refresh_mode {
+            ValueRefreshMode::SampleLiveValues => {
+                self.value_tracking_pass(
+                    live_read_cache.as_ref().map(|cache| cache as &dyn Provider),
+                );
+            }
+            ValueRefreshMode::ReuseExistingHeat => self.reuse_existing_value_heat(),
+        }
 
         // Prune stale selections.
         let mut valid: HashSet<u64> = HashSet::new();
@@ -4963,10 +5148,40 @@ impl RcxController {
         // (custom_types / editor apply / command row / overlays — UI; skipped
         // headlessly. `selectionChanged` is emitted via update_command_row.)
         self.update_command_row();
+        self.last_compose_stamp = Some(compose_stamp);
+        self.result_revision = self.result_revision.wrapping_add(1);
+    }
+
+    fn reuse_existing_value_heat(&mut self) {
+        if !self.track_values {
+            for lm in &mut self.last_result.meta {
+                lm.heat_level = 0;
+            }
+            return;
+        }
+
+        for lm in &mut self.last_result.meta {
+            lm.heat_level = self
+                .value_history
+                .get(&lm.node_id)
+                .map_or(0, |history| history.heat_level());
+        }
+    }
+
+    fn value_tracking_line_range(&self) -> std::ops::Range<usize> {
+        let meta_len = self.last_result.meta.len();
+        let Some((first, last)) = self.visible_line_range else {
+            return 0..meta_len;
+        };
+        if first >= meta_len {
+            return meta_len..meta_len;
+        }
+        let end = last.saturating_add(1).min(meta_len);
+        first..end
     }
 
     /// Step 4 of refresh — value history + heat. Split out for clarity.
-    fn value_tracking_pass(&mut self) {
+    fn value_tracking_pass(&mut self, live_read_cache: Option<&dyn Provider>) {
         // Resolve the tracking provider (snapshot if live, else real if valid+live).
         let use_snapshot = self.snapshot.as_ref().map_or(false, |s| s.is_live());
         let use_real = !use_snapshot && self.doc.provider.is_valid() && self.doc.provider.is_live();
@@ -4984,8 +5199,8 @@ impl RcxController {
             return;
         }
 
-        let meta_len = self.last_result.meta.len();
-        for i in 0..meta_len {
+        let line_range = self.value_tracking_line_range();
+        for i in line_range {
             let (node_idx, node_id, offset_addr, sub_line, line_kind, is_cont) = {
                 let lm = &self.last_result.meta[i];
                 (
@@ -5006,58 +5221,80 @@ impl RcxController {
             if line_kind != LineKind::Field {
                 continue;
             }
-            let node = self.doc.tree.nodes[node_idx as usize].clone();
+            let node = &self.doc.tree.nodes[node_idx as usize];
             if matches!(node.kind, NodeKind::Struct | NodeKind::Array) {
                 continue;
             }
             if is_func_ptr(node.kind) {
                 continue;
             }
+            let node_kind = node.kind;
+            let ptr_depth = node.ptr_depth;
+            let ref_id = node.ref_id;
+            let element_kind = node.element_kind;
             let addr = offset_addr;
             let sz = node.byte_size();
 
-            // Read the value through the chosen provider. Capture the raw bytes
-            // and the deref-target pointer here too, inside the same borrow
-            // scope, so we can mutate `self` afterward without a borrow clash.
-            let (val, raw_bytes, ptr_u64) = {
+            // Read raw bytes first so stable rows can skip value-string
+            // formatting. Deref-target primitive pointers still format every
+            // pass because their meaningful value lives at *ptr, not in the
+            // pointer slot bytes.
+            let mut inline_raw = [0u8; 16];
+            let mut heap_raw: Vec<u8> = Vec::new();
+            let ptr_u64 = {
                 let prov: &dyn Provider = if use_snapshot {
                     self.snapshot.as_ref().unwrap().as_ref()
+                } else if let Some(cache) = live_read_cache {
+                    cache
                 } else {
                     &*self.doc.provider
                 };
                 if sz <= 0 || !prov.is_readable(addr, sz) {
                     continue;
                 }
-                let val = format::read_value(&node, prov, addr, sub_line);
-                let raw_bytes = prov.read_bytes(addr, sz);
+                let raw_len = sz as usize;
+                if raw_len <= inline_raw.len() {
+                    let raw = &mut inline_raw[..raw_len];
+                    if !prov.read(addr, raw) {
+                        raw.fill(0);
+                    }
+                } else {
+                    heap_raw = prov.read_bytes(addr, sz);
+                }
                 // deref guard — mirrors read_value's Pointer64 deref condition
                 // EXACTLY (keep ref_id == 0): only a non-null Pointer64 with
                 // ptr_depth>0 + a valid primitive target dereferences its
                 // target, so its meaningful value lives at *ptr. Those keep
                 // string-based detection; everything else uses the byte path.
-                let ptr_u64 = if node.kind == NodeKind::Pointer64
-                    && node.ptr_depth > 0
-                    && node.ref_id == 0
-                    && is_valid_primitive_ptr_target(node.element_kind)
+                let ptr_u64 = if node_kind == NodeKind::Pointer64
+                    && ptr_depth > 0
+                    && ref_id == 0
+                    && is_valid_primitive_ptr_target(element_kind)
                 {
                     prov.read_u64(addr)
                 } else {
                     0
                 };
-                (val, raw_bytes, ptr_u64)
+                ptr_u64
             };
-            if val.is_empty() {
-                continue;
-            }
-            if let Some(&prev_addr) = self.last_value_addr.get(&node_id) {
-                if prev_addr != addr {
+            let raw_bytes: &[u8] = if heap_raw.is_empty() {
+                &inline_raw[..sz as usize]
+            } else {
+                &heap_raw
+            };
+            match self.last_value_addr.get(&node_id).copied() {
+                Some(prev_addr) if prev_addr == addr => {}
+                Some(_) => {
                     self.value_history.remove(&node_id);
                     self.last_value_bytes.remove(&node_id);
+                    self.last_value_addr.insert(node_id, addr);
+                }
+                None => {
+                    self.last_value_addr.insert(node_id, addr);
                 }
             }
-            self.last_value_addr.insert(node_id, addr);
 
-            let should_record = if ptr_u64 != 0 {
+            let raw_changed = if ptr_u64 != 0 {
                 // A deref-target pointer: let record()'s internal string dedup
                 // decide so a target-memory change still registers.
                 true
@@ -5065,17 +5302,35 @@ impl RcxController {
                 let changed = self
                     .last_value_bytes
                     .get(&node_id)
-                    .map_or(true, |b| b != &raw_bytes);
+                    .map_or(true, |b| b.as_slice() != raw_bytes);
                 if changed {
-                    self.last_value_bytes.insert(node_id, raw_bytes);
+                    self.last_value_bytes
+                        .insert(node_id, TrackedValueBytes::from_slice(raw_bytes));
                 }
                 changed
             };
             // ALWAYS create the entry (heat_level needs it, even when not
             // recording — mirrors C++ fetching m_valueHistory[id]).
             let vh = self.value_history.entry(node_id).or_default();
-            if should_record {
-                vh.record(&val);
+            if raw_changed {
+                let val = {
+                    let prov: &dyn Provider = if use_snapshot {
+                        self.snapshot.as_ref().unwrap().as_ref()
+                    } else if let Some(cache) = live_read_cache {
+                        cache
+                    } else {
+                        &*self.doc.provider
+                    };
+                    if ptr_u64 == 0 {
+                        format::read_display_value_from_bytes(node, prov, raw_bytes, sub_line)
+                            .unwrap_or_else(|| format::read_value(node, prov, addr, sub_line))
+                    } else {
+                        format::read_value(node, prov, addr, sub_line)
+                    }
+                };
+                if !val.is_empty() {
+                    vh.record(&val);
+                }
             }
             let heat = vh.heat_level();
             self.last_result.meta[i].heat_level = heat;

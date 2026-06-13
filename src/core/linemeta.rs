@@ -6,6 +6,10 @@
 //! `:1130-1148` (column constants). `compose` produces these; the structs and
 //! the selection-id math live in core as part of the model contract.
 
+use std::sync::OnceLock;
+
+use ahash::AHashMap;
+
 use super::kind::NodeKind;
 
 // ── Markers (`core.h:182-193`) — bit indices for `LineMeta::marker_mask`. ──
@@ -320,6 +324,32 @@ pub struct ComposeResult {
     pub max_line_len: i32,
     /// char offset of the start of each line in `text`.
     pub line_starts: Vec<i32>,
+    /// UTF-8 byte offset of the start of each line in `text`.
+    pub line_byte_starts: Vec<usize>,
+    /// Lazily-built first non-footer/non-continuation display line per node id.
+    pub(crate) node_line_index: OnceLock<AHashMap<u64, usize>>,
+}
+
+impl ComposeResult {
+    pub fn line_for_node(&self, node_id: u64) -> Option<usize> {
+        self.node_line_index().get(&node_id).copied()
+    }
+
+    fn node_line_index(&self) -> &AHashMap<u64, usize> {
+        self.node_line_index.get_or_init(|| {
+            let mut index = AHashMap::with_capacity(self.meta.len());
+            for (line, lm) in self.meta.iter().enumerate() {
+                if lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+                    continue;
+                }
+                if lm.line_kind == LineKind::Footer || lm.is_continuation {
+                    continue;
+                }
+                index.entry(lm.node_id).or_insert(line);
+            }
+            index
+        })
+    }
 }
 
 #[cfg(test)]

@@ -5,15 +5,17 @@
 //! It paints one tiny proportional bar per composed display line, colored by node
 //! kind / line role, into a fixed-width column on the editor's right edge, with a
 //! translucent **viewport indicator** rectangle marking the slice currently
-//! visible in the editor. It is intentionally cheap: the bar list is derived once
-//! per frame from the existing [`ComposeResult`](crate::core::ComposeResult) line
-//! metas (no re-layout, no text shaping), and the whole thing is a single custom
-//! [`Element`] that paints a stack of `fill` quads.
+//! visible in the editor. It is intentionally cheap: the bar list is derived from
+//! the existing [`ComposeResult`](crate::core::ComposeResult) line metas (no
+//! re-layout, no text shaping) and cached by the host between result revisions;
+//! the whole thing is a single custom [`Element`] that paints a stack of `fill`
+//! quads.
 //!
 //! Toggled by [`RcxEditor::set_minimap`](super::RcxEditor::set_minimap). The pure
 //! geometry (line → bar Y, viewport slice → indicator rect) is unit-tested below.
 
 use gpui::*;
+use std::sync::Arc;
 
 use super::palette::EditorPalette;
 use crate::core::{LineKind, LineMeta, NodeKind};
@@ -90,7 +92,7 @@ pub struct MinimapChrome {
 /// The minimap element. Paints `rows` scaled to fill its bounds vertically, plus
 /// the viewport indicator for `[visible_start, visible_end)` over `total` lines.
 pub struct Minimap {
-    pub rows: Vec<MinimapRow>,
+    pub rows: Arc<[MinimapRow]>,
     pub chrome: MinimapChrome,
     /// Total composed line count (== `rows.len()`, carried explicitly for the
     /// viewport math so an empty document degrades gracefully).

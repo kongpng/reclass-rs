@@ -2,7 +2,7 @@
 //!
 //! Target strings mirror the C++ plugin: `"rpm:{pid}:{name}"`.
 
-use super::{MemoryRegion, ModuleEntry, Provider};
+use super::{MemoryRegion, ModuleEntry, PageMap, Provider};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteProcessTarget {
@@ -64,6 +64,10 @@ impl Provider for RemoteProcessProvider {
         self.inner.read(addr, buf)
     }
 
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        self.inner.read_pages(pages)
+    }
+
     fn size(&self) -> i32 {
         self.inner.size()
     }
@@ -81,6 +85,10 @@ impl Provider for RemoteProcessProvider {
     }
 
     fn is_live(&self) -> bool {
+        true
+    }
+
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
         true
     }
 
@@ -105,7 +113,11 @@ impl Provider for RemoteProcessProvider {
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
-        Vec::new()
+        self.inner.enumerate_regions()
+    }
+
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        true
     }
 
     fn is_readable(&self, _addr: u64, len: i32) -> bool {
@@ -129,8 +141,11 @@ mod platform {
     use bytemuck::from_bytes;
     use rcx_rpc::{
         req_name, rsp_name, shm_name, RcxRpcHeader, RcxRpcModuleEntry, RcxRpcReadEntry,
-        RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_SHM_SIZE, RCX_RPC_STATUS_OK,
-        RPC_CMD_ENUM_MODULES, RPC_CMD_PING, RPC_CMD_READ_BATCH, RPC_CMD_WRITE,
+        RcxRpcRegionEntry, RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_MAX_BATCH,
+        RCX_RPC_REGION_EXECUTABLE, RCX_RPC_REGION_IMAGE, RCX_RPC_REGION_MAPPED,
+        RCX_RPC_REGION_READABLE, RCX_RPC_REGION_WRITABLE, RCX_RPC_SHM_SIZE, RCX_RPC_STATUS_OK,
+        RPC_CMD_ENUM_MODULES, RPC_CMD_ENUM_REGIONS, RPC_CMD_PING, RPC_CMD_READ_BATCH,
+        RPC_CMD_WRITE,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
@@ -146,12 +161,15 @@ mod platform {
     };
 
     use super::RemoteProcessTarget;
-    use crate::provider::ModuleEntry;
+    use crate::provider::{
+        normalize_page_list, MemoryRegion, ModuleEntry, ModuleLookup, PageMap, RegionType,
+        K_PAGE_SIZE,
+    };
 
     pub struct Inner {
         target: RemoteProcessTarget,
         ipc: IpcClient,
-        modules: Vec<ModuleEntry>,
+        module_lookup: ModuleLookup,
         base: u64,
         pointer_size: i32,
     }
@@ -174,13 +192,16 @@ mod platform {
             Ok(Self {
                 target,
                 ipc,
-                modules,
+                module_lookup: ModuleLookup::new(modules),
                 base,
                 pointer_size,
             })
         }
         pub fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
             self.ipc.read_single(addr, buf)
+        }
+        pub fn read_pages(&self, pages: &[u64]) -> PageMap {
+            self.ipc.read_pages(pages)
         }
         pub fn write(&self, addr: u64, data: &[u8]) -> bool {
             self.ipc.write_single(addr, data)
@@ -201,21 +222,16 @@ mod platform {
             self.base
         }
         pub fn get_symbol(&self, addr: u64) -> String {
-            self.modules
-                .iter()
-                .find(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
-                .map(|m| format!("{}+0x{:x}", m.name, addr - m.base))
-                .unwrap_or_default()
+            self.module_lookup.symbol_for_addr_lower(addr)
         }
         pub fn symbol_to_address(&self, name: &str) -> u64 {
-            self.modules
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(name))
-                .map(|m| m.base)
-                .unwrap_or(0)
+            self.module_lookup.symbol_to_address(name)
         }
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {
-            self.modules.clone()
+            self.module_lookup.clone_modules()
+        }
+        pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.ipc.enumerate_regions()
         }
     }
 
@@ -302,6 +318,10 @@ mod platform {
             unsafe { (self.view.Value as *mut u8).add(RCX_RPC_DATA_OFFSET) }
         }
 
+        fn header_ptr(&self) -> *mut RcxRpcHeader {
+            self.view.Value as *mut RcxRpcHeader
+        }
+
         fn signal_and_wait(&self, timeout_ms: u32) -> bool {
             unsafe {
                 SetEvent(self.h_req) != 0
@@ -314,7 +334,7 @@ mod platform {
                 return false;
             };
             unsafe {
-                let hdr = &mut *(self.view.Value as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 hdr.command = RPC_CMD_PING;
                 hdr.status = RCX_RPC_STATUS_OK;
             }
@@ -330,7 +350,7 @@ mod platform {
                 return false;
             };
             unsafe {
-                let hdr = &mut *(self.view.Value as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 let data = self.data_ptr();
                 hdr.command = RPC_CMD_READ_BATCH;
                 hdr.request_count = 1;
@@ -352,6 +372,66 @@ mod platform {
             }
         }
 
+        fn read_pages(&self, pages: &[u64]) -> PageMap {
+            let mut out = PageMap::new();
+            if pages.is_empty() {
+                return out;
+            }
+
+            let normalized_pages = normalize_page_list(pages);
+            let pages = normalized_pages.as_slice();
+            out.reserve(pages.len());
+
+            let max_entries = rpc_read_page_capacity();
+            for chunk in pages.chunks(max_entries) {
+                self.read_page_batch(chunk, &mut out);
+            }
+            out
+        }
+
+        fn read_page_batch(&self, pages: &[u64], out: &mut PageMap) {
+            let Ok(_guard) = self.lock.lock() else {
+                insert_zero_pages(pages, out);
+                return;
+            };
+            unsafe {
+                let hdr = &mut *self.header_ptr();
+                let data = self.data_ptr();
+                let entry_size = size_of::<RcxRpcReadEntry>();
+                let table_len = pages.len() * entry_size;
+                hdr.command = RPC_CMD_READ_BATCH;
+                hdr.request_count = pages.len() as u32;
+                hdr.status = RCX_RPC_STATUS_OK;
+                hdr.response_count = 0;
+                hdr.total_data_used = 0;
+                for (i, &page_addr) in pages.iter().enumerate() {
+                    let entry = data.add(i * entry_size) as *mut RcxRpcReadEntry;
+                    (*entry).address = page_addr;
+                    (*entry).length = K_PAGE_SIZE as u32;
+                    (*entry).data_offset = (table_len + i * K_PAGE_SIZE as usize) as u32;
+                }
+
+                if !self.signal_and_wait(2000) {
+                    insert_zero_pages(pages, out);
+                    return;
+                }
+
+                let responses = (hdr.response_count as usize).min(pages.len());
+                for (i, &page_addr) in pages.iter().enumerate() {
+                    let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                    if i < responses {
+                        let entry = data.add(i * entry_size) as *const RcxRpcReadEntry;
+                        copy_nonoverlapping(
+                            data.add((*entry).data_offset as usize),
+                            bytes.as_mut_ptr(),
+                            K_PAGE_SIZE as usize,
+                        );
+                    }
+                    out.insert(page_addr, bytes);
+                }
+            }
+        }
+
         fn write_single(&self, addr: u64, data_in: &[u8]) -> bool {
             if data_in.is_empty() || data_in.len() > RCX_RPC_DATA_SIZE {
                 return false;
@@ -360,7 +440,7 @@ mod platform {
                 return false;
             };
             unsafe {
-                let hdr = &mut *(self.view.Value as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 let data = self.data_ptr();
                 hdr.command = RPC_CMD_WRITE;
                 hdr.write_address = addr;
@@ -376,7 +456,7 @@ mod platform {
                 return Vec::new();
             };
             unsafe {
-                let hdr = &mut *(self.view.Value as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 hdr.command = RPC_CMD_ENUM_MODULES;
                 hdr.status = RCX_RPC_STATUS_OK;
                 if !self.signal_and_wait(3000) || hdr.status != RCX_RPC_STATUS_OK {
@@ -408,6 +488,67 @@ mod platform {
                 }
                 out
             }
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            let Ok(_guard) = self.lock.lock() else {
+                return Vec::new();
+            };
+            unsafe {
+                let hdr = &mut *self.header_ptr();
+                hdr.command = RPC_CMD_ENUM_REGIONS;
+                hdr.status = RCX_RPC_STATUS_OK;
+                if !self.signal_and_wait(3000) || hdr.status != RCX_RPC_STATUS_OK {
+                    return Vec::new();
+                }
+                let data = self.data_ptr();
+                let count = hdr.response_count as usize;
+                let max_entries = (RCX_RPC_DATA_SIZE / size_of::<RcxRpcRegionEntry>()).min(count);
+                let mut out = Vec::with_capacity(max_entries);
+                for i in 0..max_entries {
+                    let off = i * size_of::<RcxRpcRegionEntry>();
+                    let entry = from_bytes::<RcxRpcRegionEntry>(std::slice::from_raw_parts(
+                        data.add(off),
+                        size_of::<RcxRpcRegionEntry>(),
+                    ));
+                    let name_off = entry.name_offset as usize;
+                    let name_len = entry.name_length as usize;
+                    if name_off.saturating_add(name_len) > RCX_RPC_DATA_SIZE {
+                        continue;
+                    }
+                    let raw = std::slice::from_raw_parts(data.add(name_off), name_len);
+                    out.push(MemoryRegion {
+                        base: entry.base,
+                        size: entry.size,
+                        readable: (entry.flags & RCX_RPC_REGION_READABLE) != 0,
+                        writable: (entry.flags & RCX_RPC_REGION_WRITABLE) != 0,
+                        executable: (entry.flags & RCX_RPC_REGION_EXECUTABLE) != 0,
+                        module_name: decode_utf16_bytes(raw),
+                        region_type: rpc_region_type(entry.region_type),
+                    });
+                }
+                out
+            }
+        }
+    }
+
+    fn rpc_region_type(kind: u32) -> RegionType {
+        match kind {
+            RCX_RPC_REGION_IMAGE => RegionType::Image,
+            RCX_RPC_REGION_MAPPED => RegionType::Mapped,
+            _ => RegionType::Private,
+        }
+    }
+
+    fn rpc_read_page_capacity() -> usize {
+        (RCX_RPC_DATA_SIZE / (size_of::<RcxRpcReadEntry>() + K_PAGE_SIZE as usize))
+            .min(RCX_RPC_MAX_BATCH)
+            .max(1)
+    }
+
+    fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
+        for &page_addr in pages {
+            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize]);
         }
     }
 
@@ -664,17 +805,23 @@ mod platform {
     use procfs::process::{MMPermissions, MMapPath, Process};
     use rcx_rpc::{
         req_name, rsp_name, shm_name, RcxRpcHeader, RcxRpcModuleEntry, RcxRpcReadEntry,
-        RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_SHM_SIZE, RCX_RPC_STATUS_OK,
-        RPC_CMD_ENUM_MODULES, RPC_CMD_PING, RPC_CMD_READ_BATCH, RPC_CMD_WRITE,
+        RcxRpcRegionEntry, RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_MAX_BATCH,
+        RCX_RPC_REGION_EXECUTABLE, RCX_RPC_REGION_IMAGE, RCX_RPC_REGION_MAPPED,
+        RCX_RPC_REGION_READABLE, RCX_RPC_REGION_WRITABLE, RCX_RPC_SHM_SIZE, RCX_RPC_STATUS_OK,
+        RPC_CMD_ENUM_MODULES, RPC_CMD_ENUM_REGIONS, RPC_CMD_PING, RPC_CMD_READ_BATCH,
+        RPC_CMD_WRITE,
     };
 
     use super::RemoteProcessTarget;
-    use crate::provider::ModuleEntry;
+    use crate::provider::{
+        normalize_page_list, MemoryRegion, ModuleEntry, ModuleLookup, PageMap, RegionType,
+        K_PAGE_SIZE,
+    };
 
     pub struct Inner {
         target: RemoteProcessTarget,
         ipc: IpcClient,
-        modules: Vec<ModuleEntry>,
+        module_lookup: ModuleLookup,
         base: u64,
         pointer_size: i32,
     }
@@ -697,13 +844,16 @@ mod platform {
             Ok(Self {
                 target,
                 ipc,
-                modules,
+                module_lookup: ModuleLookup::new(modules),
                 base,
                 pointer_size,
             })
         }
         pub fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
             self.ipc.read_single(addr, buf)
+        }
+        pub fn read_pages(&self, pages: &[u64]) -> PageMap {
+            self.ipc.read_pages(pages)
         }
         pub fn write(&self, addr: u64, data: &[u8]) -> bool {
             self.ipc.write_single(addr, data)
@@ -728,21 +878,16 @@ mod platform {
             self.base
         }
         pub fn get_symbol(&self, addr: u64) -> String {
-            self.modules
-                .iter()
-                .find(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
-                .map(|m| format!("{}+0x{:x}", m.name, addr - m.base))
-                .unwrap_or_default()
+            self.module_lookup.symbol_for_addr_lower(addr)
         }
         pub fn symbol_to_address(&self, name: &str) -> u64 {
-            self.modules
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(name))
-                .map(|m| m.base)
-                .unwrap_or(0)
+            self.module_lookup.symbol_to_address(name)
         }
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {
-            self.modules.clone()
+            self.module_lookup.clone_modules()
+        }
+        pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.ipc.enumerate_regions()
         }
     }
 
@@ -859,6 +1004,10 @@ mod platform {
             unsafe { (self.view as *mut u8).add(RCX_RPC_DATA_OFFSET) }
         }
 
+        fn header_ptr(&self) -> *mut RcxRpcHeader {
+            self.view as *mut RcxRpcHeader
+        }
+
         fn signal_and_wait(&self, timeout_ms: u32) -> bool {
             if !self.is_connected() {
                 return false;
@@ -887,7 +1036,7 @@ mod platform {
                 return false;
             };
             unsafe {
-                let hdr = &mut *(self.view as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 hdr.command = RPC_CMD_PING;
                 hdr.status = RCX_RPC_STATUS_OK;
             }
@@ -903,7 +1052,7 @@ mod platform {
                 return false;
             };
             unsafe {
-                let hdr = &mut *(self.view as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 let data = self.data_ptr();
                 hdr.command = RPC_CMD_READ_BATCH;
                 hdr.request_count = 1;
@@ -925,6 +1074,66 @@ mod platform {
             }
         }
 
+        fn read_pages(&self, pages: &[u64]) -> PageMap {
+            let mut out = PageMap::new();
+            if pages.is_empty() {
+                return out;
+            }
+
+            let normalized_pages = normalize_page_list(pages);
+            let pages = normalized_pages.as_slice();
+            out.reserve(pages.len());
+
+            let max_entries = rpc_read_page_capacity();
+            for chunk in pages.chunks(max_entries) {
+                self.read_page_batch(chunk, &mut out);
+            }
+            out
+        }
+
+        fn read_page_batch(&self, pages: &[u64], out: &mut PageMap) {
+            let Ok(_guard) = self.lock.lock() else {
+                insert_zero_pages(pages, out);
+                return;
+            };
+            unsafe {
+                let hdr = &mut *self.header_ptr();
+                let data = self.data_ptr();
+                let entry_size = size_of::<RcxRpcReadEntry>();
+                let table_len = pages.len() * entry_size;
+                hdr.command = RPC_CMD_READ_BATCH;
+                hdr.request_count = pages.len() as u32;
+                hdr.status = RCX_RPC_STATUS_OK;
+                hdr.response_count = 0;
+                hdr.total_data_used = 0;
+                for (i, &page_addr) in pages.iter().enumerate() {
+                    let entry = data.add(i * entry_size) as *mut RcxRpcReadEntry;
+                    (*entry).address = page_addr;
+                    (*entry).length = K_PAGE_SIZE as u32;
+                    (*entry).data_offset = (table_len + i * K_PAGE_SIZE as usize) as u32;
+                }
+
+                if !self.signal_and_wait(2000) {
+                    insert_zero_pages(pages, out);
+                    return;
+                }
+
+                let responses = (hdr.response_count as usize).min(pages.len());
+                for (i, &page_addr) in pages.iter().enumerate() {
+                    let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                    if i < responses {
+                        let entry = data.add(i * entry_size) as *const RcxRpcReadEntry;
+                        copy_nonoverlapping(
+                            data.add((*entry).data_offset as usize),
+                            bytes.as_mut_ptr(),
+                            K_PAGE_SIZE as usize,
+                        );
+                    }
+                    out.insert(page_addr, bytes);
+                }
+            }
+        }
+
         fn write_single(&self, addr: u64, data_in: &[u8]) -> bool {
             if data_in.is_empty() || data_in.len() > RCX_RPC_DATA_SIZE {
                 return false;
@@ -933,7 +1142,7 @@ mod platform {
                 return false;
             };
             unsafe {
-                let hdr = &mut *(self.view as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 let data = self.data_ptr();
                 hdr.command = RPC_CMD_WRITE;
                 hdr.write_address = addr;
@@ -949,7 +1158,7 @@ mod platform {
                 return Vec::new();
             };
             unsafe {
-                let hdr = &mut *(self.view as *mut RcxRpcHeader);
+                let hdr = &mut *self.header_ptr();
                 hdr.command = RPC_CMD_ENUM_MODULES;
                 hdr.status = RCX_RPC_STATUS_OK;
                 if !self.signal_and_wait(3000) || hdr.status != RCX_RPC_STATUS_OK {
@@ -981,6 +1190,67 @@ mod platform {
                 }
                 out
             }
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            let Ok(_guard) = self.lock.lock() else {
+                return Vec::new();
+            };
+            unsafe {
+                let hdr = &mut *self.header_ptr();
+                hdr.command = RPC_CMD_ENUM_REGIONS;
+                hdr.status = RCX_RPC_STATUS_OK;
+                if !self.signal_and_wait(3000) || hdr.status != RCX_RPC_STATUS_OK {
+                    return Vec::new();
+                }
+                let data = self.data_ptr();
+                let count = hdr.response_count as usize;
+                let max_entries = (RCX_RPC_DATA_SIZE / size_of::<RcxRpcRegionEntry>()).min(count);
+                let mut out = Vec::with_capacity(max_entries);
+                for i in 0..max_entries {
+                    let off = i * size_of::<RcxRpcRegionEntry>();
+                    let entry = from_bytes::<RcxRpcRegionEntry>(std::slice::from_raw_parts(
+                        data.add(off),
+                        size_of::<RcxRpcRegionEntry>(),
+                    ));
+                    let name_off = entry.name_offset as usize;
+                    let name_len = entry.name_length as usize;
+                    if name_off.saturating_add(name_len) > RCX_RPC_DATA_SIZE {
+                        continue;
+                    }
+                    let raw = std::slice::from_raw_parts(data.add(name_off), name_len);
+                    out.push(MemoryRegion {
+                        base: entry.base,
+                        size: entry.size,
+                        readable: (entry.flags & RCX_RPC_REGION_READABLE) != 0,
+                        writable: (entry.flags & RCX_RPC_REGION_WRITABLE) != 0,
+                        executable: (entry.flags & RCX_RPC_REGION_EXECUTABLE) != 0,
+                        module_name: String::from_utf8_lossy(raw).into_owned(),
+                        region_type: rpc_region_type(entry.region_type),
+                    });
+                }
+                out
+            }
+        }
+    }
+
+    fn rpc_region_type(kind: u32) -> RegionType {
+        match kind {
+            RCX_RPC_REGION_IMAGE => RegionType::Image,
+            RCX_RPC_REGION_MAPPED => RegionType::Mapped,
+            _ => RegionType::Private,
+        }
+    }
+
+    fn rpc_read_page_capacity() -> usize {
+        (RCX_RPC_DATA_SIZE / (size_of::<RcxRpcReadEntry>() + K_PAGE_SIZE as usize))
+            .min(RCX_RPC_MAX_BATCH)
+            .max(1)
+    }
+
+    fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
+        for &page_addr in pages {
+            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize]);
         }
     }
 
@@ -1313,7 +1583,7 @@ mod platform {
 #[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::RemoteProcessTarget;
-    use crate::provider::ModuleEntry;
+    use crate::provider::{MemoryRegion, ModuleEntry, PageMap};
 
     pub struct Inner {
         target: RemoteProcessTarget,
@@ -1328,6 +1598,9 @@ mod platform {
         }
         pub fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
             false
+        }
+        pub fn read_pages(&self, _pages: &[u64]) -> PageMap {
+            PageMap::new()
         }
         pub fn write(&self, _addr: u64, _data: &[u8]) -> bool {
             false
@@ -1354,6 +1627,9 @@ mod platform {
             0
         }
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            Vec::new()
+        }
+        pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
             Vec::new()
         }
     }

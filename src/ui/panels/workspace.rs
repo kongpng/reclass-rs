@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -161,7 +162,7 @@ pub enum WorkspaceRow {
 
 /// A navigable top-level type row: which document + node it is, its display
 /// name, badge, and member-field count (the right-aligned pill).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct TypeEntry {
     /// The owning open document (the C++ dock pointer; here a stable [`DocId`]).
     pub doc: DocId,
@@ -180,11 +181,12 @@ pub struct TypeEntry {
     /// The struct's field child rows (empty for enums; the C++
     /// `buildStructChildren`). Rendered as the tree's expandable children.
     pub children: Vec<FieldChild>,
+    search_lower: OnceLock<String>,
 }
 
 /// A struct field child row — `"<TypeName> <fieldName>"` (the C++
 /// `buildStructChildren` child display).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct FieldChild {
     /// The field node id.
     pub id: u64,
@@ -198,6 +200,7 @@ pub struct FieldChild {
     /// at a glance instead of reading as a flat list of identical gray rows
     /// (the editor's address column on a collapsed struct's members).
     pub offset: i32,
+    search_lower: OnceLock<String>,
 }
 
 impl FieldChild {
@@ -215,7 +218,70 @@ impl FieldChild {
             format!("{} {}", self.type_name, self.field_name)
         }
     }
+
+    fn search_lower(&self) -> &str {
+        self.search_lower
+            .get_or_init(|| self.display().to_lowercase())
+    }
 }
+
+impl Clone for TypeEntry {
+    fn clone(&self) -> Self {
+        Self {
+            doc: self.doc,
+            id: self.id,
+            name: self.name.clone(),
+            badge: self.badge,
+            field_count: self.field_count,
+            viewed: self.viewed,
+            children: self.children.clone(),
+            search_lower: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for TypeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.doc == other.doc
+            && self.id == other.id
+            && self.name == other.name
+            && self.badge == other.badge
+            && self.field_count == other.field_count
+            && self.viewed == other.viewed
+            && self.children == other.children
+    }
+}
+
+impl Eq for TypeEntry {}
+
+impl TypeEntry {
+    fn search_lower(&self) -> &str {
+        self.search_lower.get_or_init(|| self.name.to_lowercase())
+    }
+}
+
+impl Clone for FieldChild {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            type_name: self.type_name.clone(),
+            field_name: self.field_name.clone(),
+            offset: self.offset,
+            search_lower: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for FieldChild {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.type_name == other.type_name
+            && self.field_name == other.field_name
+            && self.offset == other.offset
+    }
+}
+
+impl Eq for FieldChild {}
 
 /// Format a member offset as the editor-style `+0xNN` address chip (uppercase
 /// hex, no leading zeros — matching the editor gutter's compact relative
@@ -310,43 +376,46 @@ impl WorkspaceModel {
         let mut entries: Vec<TypeEntry> = Vec::new();
 
         for d in docs {
-            for &idx in d.tree.children_of(0).iter() {
-                let n = &d.tree.nodes[idx];
-                // Top-level types are Struct nodes; the class keyword
-                // distinguishes struct/class/union/enum (the C++ only walks
-                // NodeKind::Struct top-levels).
-                if n.kind != NodeKind::Struct {
-                    continue;
+            d.tree.with_children(0, |children| {
+                for &idx in children {
+                    let n = &d.tree.nodes[idx];
+                    // Top-level types are Struct nodes; the class keyword
+                    // distinguishes struct/class/union/enum (the C++ only walks
+                    // NodeKind::Struct top-levels).
+                    if n.kind != NodeKind::Struct {
+                        continue;
+                    }
+                    let keyword = n.resolved_class_keyword();
+                    let is_enum = keyword == "enum";
+                    let is_union = keyword == "union";
+                    let badge = if is_enum {
+                        TypeBadge::Enum
+                    } else if is_union {
+                        TypeBadge::Union
+                    } else {
+                        TypeBadge::Struct
+                    };
+
+                    // Field count + children (enums use their member count and have
+                    // no field children; the C++ `typeDisplayString`).
+                    let (field_count, children) = if is_enum {
+                        (n.enum_members.len(), Vec::new())
+                    } else {
+                        Self::struct_children(d.tree, n.id, d.doc)
+                    };
+
+                    entries.push(TypeEntry {
+                        doc: d.doc,
+                        id: n.id,
+                        name: type_name(n),
+                        badge,
+                        field_count,
+                        viewed: viewed_ids.contains(&n.id),
+                        children,
+                        search_lower: OnceLock::new(),
+                    });
                 }
-                let keyword = n.resolved_class_keyword();
-                let is_enum = keyword == "enum";
-                let is_union = keyword == "union";
-                let badge = if is_enum {
-                    TypeBadge::Enum
-                } else if is_union {
-                    TypeBadge::Union
-                } else {
-                    TypeBadge::Struct
-                };
-
-                // Field count + children (enums use their member count and have
-                // no field children; the C++ `typeDisplayString`).
-                let (field_count, children) = if is_enum {
-                    (n.enum_members.len(), Vec::new())
-                } else {
-                    Self::struct_children(d.tree, n.id, d.doc)
-                };
-
-                entries.push(TypeEntry {
-                    doc: d.doc,
-                    id: n.id,
-                    name: type_name(n),
-                    badge,
-                    field_count,
-                    viewed: viewed_ids.contains(&n.id),
-                    children,
-                });
-            }
+            });
         }
 
         // ── Sort by field count (descending), then name for a stable order. ──
@@ -409,6 +478,7 @@ impl WorkspaceModel {
                 type_name: member_type_name(m),
                 field_name: m.name.clone(),
                 offset: m.offset,
+                search_lower: OnceLock::new(),
             });
         }
         let count = children.len();
@@ -492,11 +562,8 @@ impl WorkspaceModel {
             .filter_map(|r| match r {
                 WorkspaceRow::Section(_) => None,
                 WorkspaceRow::Type(t) => {
-                    let name_hit = t.name.to_lowercase().contains(&q);
-                    let child_hit = t
-                        .children
-                        .iter()
-                        .any(|c| c.display().to_lowercase().contains(&q));
+                    let name_hit = t.search_lower().contains(&q);
+                    let child_hit = t.children.iter().any(|c| c.search_lower().contains(&q));
                     (name_hit || child_hit).then(|| WorkspaceRow::Type(t.clone()))
                 }
             })
@@ -1924,6 +1991,15 @@ mod tests {
         // Filter by a field name (only Player has "stamina").
         let by_field = m.filtered("stamina");
         let names: Vec<&str> = by_field.type_entries().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Player"]);
+
+        // Combined child display text still matches exactly like the rendered
+        // "TypeName fieldName" label, even though filtering uses cached keys.
+        let by_child_display = m.filtered("float stamina");
+        let names: Vec<&str> = by_child_display
+            .type_entries()
+            .map(|t| t.name.as_str())
+            .collect();
         assert_eq!(names, vec!["Player"]);
 
         // Empty filter returns the full model (sections intact).

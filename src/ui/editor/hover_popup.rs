@@ -4,11 +4,12 @@
 //! impl RcxEditor. A child module of editor, so it keeps access to RcxEditor's
 //! private fields and methods.
 
-use crate::core::{format_hint, infer_types, ChipKind, InferHints};
+use crate::core::{format_hint, infer_strong_types, ChipKind, InferHints};
 use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
 
 use super::*;
 use gpui::*;
+use std::sync::{Arc, Weak};
 
 pub(super) const MEMORY_PREVIEW_MIN_ROWS: usize = 10;
 pub(super) const MEMORY_PREVIEW_MAX_ROWS: usize = 64;
@@ -19,6 +20,78 @@ pub(super) struct HoverProbe {
     pub(super) line: usize,
     pub(super) rel_x: f32,
     pub(super) pos: Point<Pixels>,
+}
+
+pub(super) struct HoverMemoryMaps {
+    result_revision: u64,
+    provider: Weak<dyn Provider + Send + Sync>,
+    regions: Vec<MemoryRegion>,
+    modules: Vec<ModuleEntry>,
+    region_order: MemoryPreviewLookupOrder,
+    module_order: MemoryPreviewLookupOrder,
+    modules_loaded: bool,
+}
+
+impl HoverMemoryMaps {
+    fn with_regions(
+        result_revision: u64,
+        provider: &Arc<dyn Provider + Send + Sync>,
+        regions: Vec<MemoryRegion>,
+    ) -> Self {
+        let region_order = region_lookup_order(&regions);
+        let module_order = module_lookup_order(&[]);
+        Self {
+            result_revision,
+            provider: Arc::downgrade(provider),
+            regions,
+            modules: Vec::new(),
+            region_order,
+            module_order,
+            modules_loaded: false,
+        }
+    }
+
+    fn with_regions_modules(
+        result_revision: u64,
+        provider: &Arc<dyn Provider + Send + Sync>,
+        regions: Vec<MemoryRegion>,
+        modules: Vec<ModuleEntry>,
+    ) -> Self {
+        let region_order = region_lookup_order(&regions);
+        let module_order = module_lookup_order(&modules);
+        Self {
+            result_revision,
+            provider: Arc::downgrade(provider),
+            regions,
+            modules,
+            region_order,
+            module_order,
+            modules_loaded: true,
+        }
+    }
+
+    fn matches(&self, result_revision: u64, provider: &Arc<dyn Provider + Send + Sync>) -> bool {
+        self.result_revision == result_revision
+            && self
+                .provider
+                .upgrade()
+                .is_some_and(|cached| Arc::ptr_eq(&cached, provider))
+    }
+
+    fn set_modules(&mut self, modules: Vec<ModuleEntry>) {
+        self.module_order = module_lookup_order(&modules);
+        self.modules = modules;
+        self.modules_loaded = true;
+    }
+
+    fn lookup(&self) -> MemoryPreviewLookup<'_> {
+        MemoryPreviewLookup::with_orders(
+            &self.regions,
+            &self.modules,
+            &self.region_order,
+            &self.module_order,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +496,7 @@ impl super::RcxEditor {
             self.hover_probe = Some(probe);
         } else {
             self.hover_probe = None;
+            self.hover_memory_maps = None;
             self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         }
         if changed_band || changed_popup {
@@ -473,6 +547,7 @@ impl super::RcxEditor {
         };
 
         self.hover_probe = None;
+        self.hover_memory_maps = None;
         self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         self.hover_popup = Some(HoverPopupState {
             line,
@@ -509,6 +584,7 @@ impl super::RcxEditor {
             self.hover_popup = want;
             if self.hover_popup.is_none() {
                 self.hover_probe = None;
+                self.hover_memory_maps = None;
                 self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
                 self.popup_cursor_inside = false;
             }
@@ -580,7 +656,7 @@ impl super::RcxEditor {
     /// popup state to show, or `None`. Mirrors the kind selection in editor.cpp
     /// `applyHoverCursor` (value history vs disasm/hex vs struct preview).
     fn compute_hover_popup(
-        &self,
+        &mut self,
         line: usize,
         rel_x: f32,
         pos: Point<Pixels>,
@@ -728,13 +804,30 @@ impl super::RcxEditor {
     }
 
     fn read_pointer_value(&self, lm: &LineMeta) -> Option<(u64, i32)> {
+        self.read_pointer_value_with_regions(lm, None)
+    }
+
+    fn read_pointer_value_with_regions(
+        &self,
+        lm: &LineMeta,
+        regions: Option<&[MemoryRegion]>,
+    ) -> Option<(u64, i32)> {
+        self.read_pointer_value_with_lookup(lm, None, regions)
+    }
+
+    fn read_pointer_value_with_lookup(
+        &self,
+        lm: &LineMeta,
+        lookup: Option<&MemoryPreviewLookup<'_>>,
+        regions: Option<&[MemoryRegion]>,
+    ) -> Option<(u64, i32)> {
         let prov = &self.controller.document().provider;
         let (is64, size) = match lm.node_kind {
             NodeKind::Pointer64 | NodeKind::FuncPtr64 | NodeKind::Hex64 => (true, 8),
             NodeKind::Pointer32 | NodeKind::FuncPtr32 | NodeKind::Hex32 => (false, 4),
             _ => return None,
         };
-        if !provider_can_read(&**prov, lm.offset_addr, size) {
+        if !provider_can_read_with_lookup(&**prov, lookup, regions, lm.offset_addr, size) {
             return None;
         }
         let mut ptr_val = if is64 {
@@ -793,24 +886,59 @@ impl super::RcxEditor {
     }
 
     fn pointer_memory_preview_popup(
-        &self,
+        &mut self,
         lm: &LineMeta,
         pos: Point<Pixels>,
     ) -> Option<HoverPopupState> {
-        let prov = &self.controller.document().provider;
-        let (target_addr, pointer_size) = self.read_pointer_value(lm)?;
-        if !target_is_readable(&**prov, target_addr, 1) {
+        let prov = self.controller.document().provider.clone();
+        let result_revision = self.controller.result_revision();
+        let needs_maps = self
+            .hover_memory_maps
+            .as_ref()
+            .is_none_or(|maps| !maps.matches(result_revision, &prov));
+        if needs_maps {
+            let regions = prov.enumerate_regions();
+            let modules = prov.enumerate_modules();
+            self.hover_memory_maps = Some(HoverMemoryMaps::with_regions_modules(
+                result_revision,
+                &prov,
+                regions,
+                modules,
+            ));
+        } else if self
+            .hover_memory_maps
+            .as_ref()
+            .is_some_and(|maps| !maps.modules_loaded)
+        {
+            let modules = prov.enumerate_modules();
+            if let Some(maps) = self.hover_memory_maps.as_mut() {
+                maps.set_modules(modules);
+            }
+        }
+        let maps = self.hover_memory_maps.as_ref()?;
+        let lookup = maps.lookup();
+        let (target_addr, pointer_size) =
+            self.read_pointer_value_with_lookup(lm, Some(&lookup), Some(&maps.regions))?;
+        if target_addr == 0 {
             return None;
         }
         let row_count = self
             .memory_preview_rows
             .clamp(MEMORY_PREVIEW_MIN_ROWS, MEMORY_PREVIEW_MAX_ROWS);
         let len = row_count.saturating_mul(pointer_size.max(1) as usize);
-        let bytes = read_provider_bytes_best_effort(&**prov, target_addr, len, 1)?;
+        let bytes = read_provider_bytes_best_effort_with_lookup(
+            &*prov,
+            Some(&lookup),
+            Some(&maps.regions),
+            target_addr,
+            len,
+            1,
+        )?;
         if bytes.is_empty() {
             return None;
         }
-        let rows = memory_preview_rows(&**prov, pointer_size, row_count, &bytes);
+        let rows =
+            memory_preview_rows_with_lookup(&*prov, pointer_size, row_count, &bytes, &lookup);
         if rows.is_empty() {
             return None;
         }
@@ -830,7 +958,11 @@ impl super::RcxEditor {
     /// compose the referenced struct at the pointer target and show its first few
     /// data lines (skipping the command row). `None` when the pointer has no valid
     /// struct ref. Mirrors editor.cpp's struct-preview popup.
-    fn struct_preview_popup(&self, lm: &LineMeta, pos: Point<Pixels>) -> Option<HoverPopupState> {
+    fn struct_preview_popup(
+        &mut self,
+        lm: &LineMeta,
+        pos: Point<Pixels>,
+    ) -> Option<HoverPopupState> {
         let ref_id = {
             let tree = self.controller.tree();
             let n = tree.nodes.get(lm.node_idx as usize)?;
@@ -839,17 +971,39 @@ impl super::RcxEditor {
         if ref_id == 0 || self.controller.tree().index_of_id(ref_id) < 0 {
             return None;
         }
-        let (target_addr, _) = self.read_pointer_value(lm)?;
-        if !target_is_readable(&*self.controller.document().provider, target_addr, 1) {
+        let prov = self.controller.document().provider.clone();
+        let result_revision = self.controller.result_revision();
+        let needs_regions = self
+            .hover_memory_maps
+            .as_ref()
+            .is_none_or(|maps| !maps.matches(result_revision, &prov));
+        if needs_regions {
+            let regions = prov.enumerate_regions();
+            self.hover_memory_maps = Some(HoverMemoryMaps::with_regions(
+                result_revision,
+                &prov,
+                regions,
+            ));
+        }
+        let maps = self.hover_memory_maps.as_ref()?;
+        let lookup = maps.lookup();
+        let (target_addr, _) =
+            self.read_pointer_value_with_lookup(lm, Some(&lookup), Some(&maps.regions))?;
+        if !target_is_readable_with_lookup(
+            &*prov,
+            Some(&lookup),
+            Some(&maps.regions),
+            target_addr,
+            1,
+        ) {
             return None;
         }
-        let mut tree = self.controller.tree().clone();
-        tree.base_address = target_addr;
         // Compose the referenced struct at the pointer target.
-        let cr = crate::compose::compose_with_symbols(
-            &tree,
-            &*self.controller.document().provider,
+        let cr = crate::compose::compose_preview_with_symbols_at_base(
+            self.controller.tree(),
+            &*prov,
             ref_id,
+            target_addr,
             self.compact_columns,
             self.tree_lines(),
             true,
@@ -858,6 +1012,7 @@ impl super::RcxEditor {
             None,
             true,
             true,
+            MAX_LINES + 1,
         );
         // Skip line 0 (the command row); take the first few non-empty data lines.
         const MAX_LINES: usize = 5;
@@ -1325,8 +1480,24 @@ impl super::RcxEditor {
 }
 
 fn provider_can_read(provider: &dyn Provider, addr: u64, len: i32) -> bool {
+    provider_can_read_cached(provider, None, addr, len)
+}
+
+fn provider_can_read_cached(
+    provider: &dyn Provider,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    len: i32,
+) -> bool {
     if len <= 0 {
         return len == 0;
+    }
+    if let Some(regions) = regions {
+        if !regions.is_empty() {
+            return regions
+                .iter()
+                .any(|r| region_contains_readable(r, addr, len));
+        }
     }
     if provider.is_readable(addr, len) {
         return true;
@@ -1338,6 +1509,24 @@ fn provider_can_read(provider: &dyn Provider, addr: u64, len: i32) -> bool {
                 .checked_add(len as u64)
                 .is_some_and(|end| end <= r.base.saturating_add(r.size))
     })
+}
+
+fn provider_can_read_with_lookup(
+    provider: &dyn Provider,
+    lookup: Option<&MemoryPreviewLookup<'_>>,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    len: i32,
+) -> bool {
+    if len <= 0 {
+        return len == 0;
+    }
+    if let Some(lookup) = lookup {
+        if !lookup.regions.is_empty() {
+            return lookup.is_readable(addr, len);
+        }
+    }
+    provider_can_read_cached(provider, regions, addr, len)
 }
 
 fn hex_pointer_value_active(lm: &LineMeta, col: i32, vs: crate::compose::ColumnSpan) -> bool {
@@ -1372,14 +1561,17 @@ fn read_provider_bytes(provider: &dyn Provider, addr: u64, len: i32) -> Option<V
     Some(bytes)
 }
 
-fn readable_tail_len(provider: &dyn Provider, addr: u64, preferred_len: usize) -> usize {
+fn readable_tail_len_cached(
+    provider: &dyn Provider,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    preferred_len: usize,
+) -> usize {
     if preferred_len == 0 {
         return 0;
     }
-    provider
-        .enumerate_regions()
-        .into_iter()
-        .find_map(|region| {
+    let from_regions = |regions: &[MemoryRegion]| {
+        regions.iter().find_map(|region| {
             if !region.readable || addr < region.base {
                 return None;
             }
@@ -1389,50 +1581,168 @@ fn readable_tail_len(provider: &dyn Provider, addr: u64, preferred_len: usize) -
             }
             Some((end - addr).min(preferred_len as u64) as usize)
         })
-        .unwrap_or(preferred_len)
+    };
+    if let Some(regions) = regions {
+        if let Some(len) = from_regions(regions) {
+            return len;
+        }
+    }
+    from_regions(&provider.enumerate_regions()).unwrap_or(preferred_len)
 }
 
+fn readable_tail_len_with_lookup(
+    provider: &dyn Provider,
+    lookup: Option<&MemoryPreviewLookup<'_>>,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    preferred_len: usize,
+) -> usize {
+    if preferred_len == 0 {
+        return 0;
+    }
+    if let Some(lookup) = lookup {
+        if !lookup.regions.is_empty() {
+            return lookup.readable_tail_len(addr, preferred_len).unwrap_or(0);
+        }
+    }
+    readable_tail_len_cached(provider, regions, addr, preferred_len)
+}
+
+#[cfg(test)]
 fn read_provider_bytes_best_effort(
     provider: &dyn Provider,
     addr: u64,
     preferred_len: usize,
     min_len: usize,
 ) -> Option<Vec<u8>> {
-    let cap = readable_tail_len(provider, addr, preferred_len);
+    read_provider_bytes_best_effort_cached(provider, None, addr, preferred_len, min_len)
+}
+
+#[cfg(test)]
+fn read_provider_bytes_best_effort_cached(
+    provider: &dyn Provider,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    preferred_len: usize,
+    min_len: usize,
+) -> Option<Vec<u8>> {
+    let cap = readable_tail_len_cached(provider, regions, addr, preferred_len);
+    read_provider_bytes_best_effort_capped(provider, addr, cap, min_len)
+}
+
+fn read_provider_bytes_best_effort_with_lookup(
+    provider: &dyn Provider,
+    lookup: Option<&MemoryPreviewLookup<'_>>,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    preferred_len: usize,
+    min_len: usize,
+) -> Option<Vec<u8>> {
+    let cap = readable_tail_len_with_lookup(provider, lookup, regions, addr, preferred_len);
+    read_provider_bytes_best_effort_capped(provider, addr, cap, min_len)
+}
+
+fn read_provider_bytes_best_effort_capped(
+    provider: &dyn Provider,
+    addr: u64,
+    cap: usize,
+    min_len: usize,
+) -> Option<Vec<u8>> {
     if cap == 0 {
         return None;
     }
     let min_len = min_len.max(1).min(cap);
-    for len in (min_len..=cap).rev() {
-        let mut bytes = vec![0u8; len];
-        if provider.read(addr, &mut bytes) {
-            return Some(bytes);
+    let mut scratch = vec![0u8; cap];
+    if provider.read(addr, &mut scratch) {
+        return Some(scratch);
+    }
+    let mut lo = min_len;
+    let mut hi = cap.saturating_sub(1);
+    let mut best_len = 0usize;
+    while lo <= hi {
+        let len = lo + (hi - lo) / 2;
+        if provider.read(addr, &mut scratch[..len]) {
+            best_len = len;
+            lo = len + 1;
+        } else if len == 0 {
+            break;
+        } else {
+            hi = len - 1;
         }
     }
-    None
+    if best_len >= min_len {
+        scratch.truncate(best_len);
+        Some(scratch)
+    } else {
+        None
+    }
 }
 
 fn target_is_readable(provider: &dyn Provider, addr: u64, min_len: i32) -> bool {
+    target_is_readable_cached(provider, None, addr, min_len)
+}
+
+fn target_is_readable_cached(
+    provider: &dyn Provider,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    min_len: i32,
+) -> bool {
+    target_is_readable_with_lookup(provider, None, regions, addr, min_len)
+}
+
+fn target_is_readable_with_lookup(
+    provider: &dyn Provider,
+    lookup: Option<&MemoryPreviewLookup<'_>>,
+    regions: Option<&[MemoryRegion]>,
+    addr: u64,
+    min_len: i32,
+) -> bool {
     if addr == 0 {
         return false;
     }
     let len = min_len.max(1);
-    provider_can_read(provider, addr, len) && {
+    provider_can_read_with_lookup(provider, lookup, regions, addr, len) && {
         let mut probe = vec![0u8; len as usize];
         provider.read(addr, &mut probe)
     }
 }
 
+#[cfg(test)]
 fn memory_preview_rows(
     provider: &dyn Provider,
     pointer_size: i32,
     row_count: usize,
     bytes: &[u8],
 ) -> Vec<MemoryPreviewRow> {
-    let stride = pointer_size.max(1) as usize;
-    let kind = if pointer_size <= 4 { "hex32" } else { "hex64" };
     let regions = provider.enumerate_regions();
     let modules = provider.enumerate_modules();
+    memory_preview_rows_with_maps(provider, pointer_size, row_count, bytes, &regions, &modules)
+}
+
+fn memory_preview_rows_with_maps(
+    provider: &dyn Provider,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: &[u8],
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+) -> Vec<MemoryPreviewRow> {
+    let region_order = region_lookup_order(regions);
+    let module_order = module_lookup_order(modules);
+    let lookup = MemoryPreviewLookup::with_orders(regions, modules, &region_order, &module_order);
+    memory_preview_rows_with_lookup(provider, pointer_size, row_count, bytes, &lookup)
+}
+
+fn memory_preview_rows_with_lookup(
+    provider: &dyn Provider,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: &[u8],
+    lookup: &MemoryPreviewLookup<'_>,
+) -> Vec<MemoryPreviewRow> {
+    let stride = pointer_size.max(1) as usize;
+    let kind = if pointer_size <= 4 { "hex32" } else { "hex64" };
     (0..row_count)
         .map(|row| {
             let start = row.saturating_mul(stride);
@@ -1446,7 +1756,7 @@ fn memory_preview_rows(
                     if i > 0 {
                         hex.push(' ');
                     }
-                    hex.push_str(&format!("{b:02X}"));
+                    push_hex_byte(&mut hex, b);
                     ascii.push(if b.is_ascii_graphic() || b == b' ' {
                         b as char
                     } else {
@@ -1461,18 +1771,244 @@ fn memory_preview_rows(
                 }
             }
             let type_hint = memory_preview_type_hint(chunk, pointer_size);
-            let pointer_note =
-                memory_preview_pointer_note(provider, &regions, &modules, chunk, pointer_size);
+            let pointer_note = memory_preview_pointer_note(provider, lookup, chunk, pointer_size);
             MemoryPreviewRow {
                 offset: start as u64,
                 kind,
                 ascii,
-                hex: format!("{hex:<width$}", width = stride * 3 - 1),
+                hex: pad_hex_field(hex, stride * 3 - 1),
                 type_hint,
-                pointer_note: pointer_note.map(|label| format!("-> {label}")),
+                pointer_note,
             }
         })
         .collect()
+}
+
+#[doc(hidden)]
+pub fn bench_memory_preview_rows_with_maps(
+    provider: &dyn Provider,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: &[u8],
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+) -> usize {
+    memory_preview_rows_with_maps(provider, pointer_size, row_count, bytes, regions, modules)
+        .into_iter()
+        .map(|row| {
+            row.hex.len()
+                + row.ascii.len()
+                + row.type_hint.as_deref().map_or(0, str::len)
+                + row.pointer_note.as_deref().map_or(0, str::len)
+        })
+        .sum()
+}
+
+#[doc(hidden)]
+pub struct BenchMemoryPreviewLookup {
+    region_order: MemoryPreviewLookupOrder,
+    module_order: MemoryPreviewLookupOrder,
+}
+
+#[doc(hidden)]
+pub fn bench_memory_preview_lookup_orders(
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+) -> BenchMemoryPreviewLookup {
+    BenchMemoryPreviewLookup {
+        region_order: region_lookup_order(regions),
+        module_order: module_lookup_order(modules),
+    }
+}
+
+#[doc(hidden)]
+pub fn bench_memory_preview_rows_with_cached_lookup(
+    provider: &dyn Provider,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: &[u8],
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+    orders: &BenchMemoryPreviewLookup,
+) -> usize {
+    let lookup = MemoryPreviewLookup::with_orders(
+        regions,
+        modules,
+        &orders.region_order,
+        &orders.module_order,
+    );
+    memory_preview_rows_with_lookup(provider, pointer_size, row_count, bytes, &lookup)
+        .into_iter()
+        .map(|row| {
+            row.hex.len()
+                + row.ascii.len()
+                + row.type_hint.as_deref().map_or(0, str::len)
+                + row.pointer_note.as_deref().map_or(0, str::len)
+        })
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn bench_pointer_memory_preview_with_maps(
+    provider: &dyn Provider,
+    pointer_addr: u64,
+    pointer_size: i32,
+    row_count: usize,
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+) -> usize {
+    let region_order = region_lookup_order(regions);
+    let module_order = module_lookup_order(modules);
+    let lookup = MemoryPreviewLookup::with_orders(regions, modules, &region_order, &module_order);
+    if !provider_can_read_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        pointer_addr,
+        pointer_size,
+    ) {
+        return 0;
+    }
+    let target = if pointer_size <= 4 {
+        u64::from(provider.read_u32(pointer_addr))
+    } else {
+        provider.read_u64(pointer_addr)
+    };
+    if target == 0 {
+        return 0;
+    }
+    let len = row_count.saturating_mul(pointer_size.max(1) as usize);
+    let Some(bytes) = read_provider_bytes_best_effort_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        target,
+        len,
+        1,
+    ) else {
+        return 0;
+    };
+    memory_preview_rows_with_lookup(provider, pointer_size, row_count, &bytes, &lookup)
+        .into_iter()
+        .map(|row| {
+            row.hex.len()
+                + row.ascii.len()
+                + row.type_hint.as_deref().map_or(0, str::len)
+                + row.pointer_note.as_deref().map_or(0, str::len)
+        })
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn bench_pointer_memory_preview_with_cached_lookup(
+    provider: &dyn Provider,
+    pointer_addr: u64,
+    pointer_size: i32,
+    row_count: usize,
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+    orders: &BenchMemoryPreviewLookup,
+) -> usize {
+    let lookup = MemoryPreviewLookup::with_orders(
+        regions,
+        modules,
+        &orders.region_order,
+        &orders.module_order,
+    );
+    if !provider_can_read_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        pointer_addr,
+        pointer_size,
+    ) {
+        return 0;
+    }
+    let target = if pointer_size <= 4 {
+        u64::from(provider.read_u32(pointer_addr))
+    } else {
+        provider.read_u64(pointer_addr)
+    };
+    if target == 0 {
+        return 0;
+    }
+    let len = row_count.saturating_mul(pointer_size.max(1) as usize);
+    let Some(bytes) = read_provider_bytes_best_effort_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        target,
+        len,
+        1,
+    ) else {
+        return 0;
+    };
+    memory_preview_rows_with_lookup(provider, pointer_size, row_count, &bytes, &lookup)
+        .into_iter()
+        .map(|row| {
+            row.hex.len()
+                + row.ascii.len()
+                + row.type_hint.as_deref().map_or(0, str::len)
+                + row.pointer_note.as_deref().map_or(0, str::len)
+        })
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn bench_struct_preview_preflight_reenumerate(
+    provider: &dyn Provider,
+    pointer_addr: u64,
+    pointer_size: i32,
+) -> usize {
+    if !provider_can_read(provider, pointer_addr, pointer_size) {
+        return 0;
+    }
+    let target = if pointer_size <= 4 {
+        u64::from(provider.read_u32(pointer_addr))
+    } else {
+        provider.read_u64(pointer_addr)
+    };
+    if !target_is_readable(provider, target, 1) {
+        return 0;
+    }
+    target as usize
+}
+
+#[doc(hidden)]
+pub fn bench_struct_preview_preflight_with_regions(
+    provider: &dyn Provider,
+    pointer_addr: u64,
+    pointer_size: i32,
+    regions: &[MemoryRegion],
+) -> usize {
+    let region_order = region_lookup_order(regions);
+    let modules: &[ModuleEntry] = &[];
+    let module_order = module_lookup_order(modules);
+    let lookup = MemoryPreviewLookup::with_orders(regions, modules, &region_order, &module_order);
+    if !provider_can_read_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        pointer_addr,
+        pointer_size,
+    ) {
+        return 0;
+    }
+    let target = if pointer_size <= 4 {
+        u64::from(provider.read_u32(pointer_addr))
+    } else {
+        provider.read_u64(pointer_addr)
+    };
+    if target == 0
+        || !provider_can_read_with_lookup(provider, Some(&lookup), Some(regions), target, 1)
+    {
+        return 0;
+    }
+    let mut probe = [0u8; 1];
+    if !provider.read(target, &mut probe) {
+        return 0;
+    }
+    (target as usize).wrapping_add(probe[0] as usize)
 }
 
 fn memory_preview_type_hint(chunk: &[u8], pointer_size: i32) -> Option<String> {
@@ -1483,28 +2019,36 @@ fn memory_preview_type_hint(chunk: &[u8], pointer_size: i32) -> Option<String> {
         ptr_size: pointer_size,
         ..Default::default()
     };
-    let suggestions = infer_types(chunk, &hints, 3);
-    let parts: Vec<String> = suggestions
-        .iter()
-        .filter(|s| s.strength >= 3)
-        .take(2)
-        .map(|suggestion| {
-            let type_name = format_hint(suggestion);
-            let preview = memory_preview_format_hint(chunk, chunk.len() as i32, &suggestion.kinds);
-            if preview.is_empty() {
-                format!("[{type_name}]")
-            } else {
-                format!("{preview} [{type_name}]")
-            }
-        })
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(" | "))
+    let suggestions = infer_strong_types(chunk, &hints, 2);
+    let mut out = String::new();
+    let mut emitted = 0usize;
+    for suggestion in &suggestions {
+        if emitted >= 2 {
+            break;
+        }
+        if emitted > 0 {
+            out.push_str(" | ");
+        }
+        let type_name = format_hint(suggestion);
+        let preview = memory_preview_format_hint(chunk, chunk.len() as i32, &suggestion.kinds);
+        if preview.is_empty() {
+            out.push('[');
+            out.push_str(&type_name);
+            out.push(']');
+        } else {
+            out.push_str(&preview);
+            out.push_str(" [");
+            out.push_str(&type_name);
+            out.push(']');
+        }
+        emitted += 1;
+    }
+    (emitted > 0).then_some(out)
 }
 
 fn memory_preview_pointer_note(
     provider: &dyn Provider,
-    regions: &[MemoryRegion],
-    modules: &[ModuleEntry],
+    lookup: &MemoryPreviewLookup<'_>,
     chunk: &[u8],
     pointer_size: i32,
 ) -> Option<String> {
@@ -1520,19 +2064,10 @@ fn memory_preview_pointer_note(
     if target == 0 || target == u64::MAX || (pointer_size == 4 && target == 0xFFFF_FFFF) {
         return None;
     }
-    if !regions
-        .iter()
-        .any(|r| region_contains_readable(r, target, 1))
-    {
+    if !lookup.is_readable(target, 1) {
         return None;
     }
-    let mut probe = [0u8; 1];
-    if !provider.read(target, &mut probe) {
-        return None;
-    }
-    Some(memory_preview_named_address(
-        provider, regions, modules, target,
-    ))
+    Some(memory_preview_named_address(provider, lookup, target))
 }
 
 fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool {
@@ -1546,29 +2081,22 @@ fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool 
 
 fn memory_preview_named_address(
     provider: &dyn Provider,
-    regions: &[MemoryRegion],
-    modules: &[ModuleEntry],
+    lookup: &MemoryPreviewLookup<'_>,
     addr: u64,
 ) -> String {
     let symbol = provider.get_symbol(addr);
     if !symbol.is_empty() {
-        return symbol;
+        return prefixed_pointer_note(&symbol);
     }
-    if let Some(module) = modules
-        .iter()
-        .find(|m| addr >= m.base && addr.checked_sub(m.base).is_some_and(|rel| rel < m.size))
-    {
+    if let Some(module) = lookup.find_module(addr) {
         let name = if module.name.is_empty() {
             "module"
         } else {
             module.name.as_str()
         };
-        return format!("{name}+0x{:X}", addr.saturating_sub(module.base));
+        return format!("-> {name}+0x{:X}", addr.saturating_sub(module.base));
     }
-    if let Some(region) = regions
-        .iter()
-        .find(|r| region_contains_readable(r, addr, 1))
-    {
+    if let Some(region) = lookup.find_region(addr, 1) {
         let tag = match region.region_type {
             RegionType::Image => "<DATA>",
             RegionType::Mapped => "<MAPPED>",
@@ -1581,11 +2109,177 @@ fn memory_preview_named_address(
             }
         };
         if region.module_name.is_empty() {
-            return format!("{tag}0x{addr:X}");
+            return format!("-> {tag}0x{addr:X}");
         }
-        return format!("{tag}{}.0x{addr:X}", region.module_name);
+        return format!("-> {tag}{}.0x{addr:X}", region.module_name);
     }
-    format!("0x{addr:X}")
+    format!("-> 0x{addr:X}")
+}
+
+fn prefixed_pointer_note(label: &str) -> String {
+    let mut out = String::with_capacity(label.len() + 3);
+    out.push_str("-> ");
+    out.push_str(label);
+    out
+}
+
+fn push_hex_byte(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0F) as usize] as char);
+}
+
+fn pad_hex_field(mut hex: String, width: usize) -> String {
+    if hex.len() < width {
+        hex.extend(std::iter::repeat_n(' ', width - hex.len()));
+    }
+    hex
+}
+
+struct MemoryPreviewLookup<'a> {
+    regions: &'a [MemoryRegion],
+    modules: &'a [ModuleEntry],
+    region_order: &'a MemoryPreviewLookupOrder,
+    module_order: &'a MemoryPreviewLookupOrder,
+}
+
+enum MemoryPreviewLookupOrder {
+    Input,
+    Sorted(Vec<usize>),
+    Linear,
+}
+
+impl<'a> MemoryPreviewLookup<'a> {
+    fn with_orders(
+        regions: &'a [MemoryRegion],
+        modules: &'a [ModuleEntry],
+        region_order: &'a MemoryPreviewLookupOrder,
+        module_order: &'a MemoryPreviewLookupOrder,
+    ) -> Self {
+        Self {
+            regions,
+            modules,
+            region_order,
+            module_order,
+        }
+    }
+
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        self.find_region(addr, len).is_some()
+    }
+
+    fn find_region(&self, addr: u64, len: i32) -> Option<&'a MemoryRegion> {
+        match &self.region_order {
+            MemoryPreviewLookupOrder::Input => {
+                let idx = self.regions.partition_point(|r| r.base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| self.regions.get(i))
+                    .filter(|region| region_contains_readable(region, addr, len))
+            }
+            MemoryPreviewLookupOrder::Sorted(indices) => {
+                let idx = indices.partition_point(|&i| self.regions[i].base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| indices.get(i))
+                    .and_then(|&i| self.regions.get(i))
+                    .filter(|region| region_contains_readable(region, addr, len))
+            }
+            MemoryPreviewLookupOrder::Linear => self
+                .regions
+                .iter()
+                .find(|region| region_contains_readable(region, addr, len)),
+        }
+    }
+
+    fn readable_tail_len(&self, addr: u64, preferred_len: usize) -> Option<usize> {
+        let region = self.find_region(addr, 1)?;
+        let end = region.base.checked_add(region.size)?;
+        (addr < end).then(|| (end - addr).min(preferred_len as u64) as usize)
+    }
+
+    fn find_module(&self, addr: u64) -> Option<&'a ModuleEntry> {
+        match &self.module_order {
+            MemoryPreviewLookupOrder::Input => {
+                let idx = self.modules.partition_point(|m| m.base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| self.modules.get(i))
+                    .filter(|module| module_contains(module, addr))
+            }
+            MemoryPreviewLookupOrder::Sorted(indices) => {
+                let idx = indices.partition_point(|&i| self.modules[i].base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| indices.get(i))
+                    .and_then(|&i| self.modules.get(i))
+                    .filter(|module| module_contains(module, addr))
+            }
+            MemoryPreviewLookupOrder::Linear => self
+                .modules
+                .iter()
+                .find(|module| module_contains(module, addr)),
+        }
+    }
+}
+
+fn region_lookup_order(regions: &[MemoryRegion]) -> MemoryPreviewLookupOrder {
+    if memory_regions_non_overlapping_in_order(regions) {
+        return MemoryPreviewLookupOrder::Input;
+    }
+    let mut indices: Vec<usize> = (0..regions.len()).collect();
+    indices.sort_unstable_by_key(|&i| regions[i].base);
+    if memory_regions_non_overlapping_by_index(regions, &indices) {
+        MemoryPreviewLookupOrder::Sorted(indices)
+    } else {
+        MemoryPreviewLookupOrder::Linear
+    }
+}
+
+fn module_lookup_order(modules: &[ModuleEntry]) -> MemoryPreviewLookupOrder {
+    if modules_non_overlapping_in_order(modules) {
+        return MemoryPreviewLookupOrder::Input;
+    }
+    let mut indices: Vec<usize> = (0..modules.len()).collect();
+    indices.sort_unstable_by_key(|&i| modules[i].base);
+    if modules_non_overlapping_by_index(modules, &indices) {
+        MemoryPreviewLookupOrder::Sorted(indices)
+    } else {
+        MemoryPreviewLookupOrder::Linear
+    }
+}
+
+fn memory_regions_non_overlapping_in_order(regions: &[MemoryRegion]) -> bool {
+    regions.windows(2).all(|pair| {
+        let left_end = pair[0].base.saturating_add(pair[0].size);
+        left_end <= pair[1].base
+    })
+}
+
+fn memory_regions_non_overlapping_by_index(regions: &[MemoryRegion], indices: &[usize]) -> bool {
+    indices.windows(2).all(|pair| {
+        let left = &regions[pair[0]];
+        let right = &regions[pair[1]];
+        left.base.saturating_add(left.size) <= right.base
+    })
+}
+
+fn modules_non_overlapping_in_order(modules: &[ModuleEntry]) -> bool {
+    modules.windows(2).all(|pair| {
+        let left_end = pair[0].base.saturating_add(pair[0].size);
+        left_end <= pair[1].base
+    })
+}
+
+fn modules_non_overlapping_by_index(modules: &[ModuleEntry], indices: &[usize]) -> bool {
+    indices.windows(2).all(|pair| {
+        let left = &modules[pair[0]];
+        let right = &modules[pair[1]];
+        left.base.saturating_add(left.size) <= right.base
+    })
+}
+
+fn module_contains(module: &ModuleEntry, addr: u64) -> bool {
+    addr >= module.base
+        && addr
+            .checked_sub(module.base)
+            .is_some_and(|rel| rel < module.size)
 }
 
 fn memory_preview_format_hint(data: &[u8], len: i32, kinds: &[NodeKind]) -> String {
@@ -1653,17 +2347,21 @@ fn memory_preview_format_hint(data: &[u8], len: i32, kinds: &[NodeKind]) -> Stri
         return String::new();
     }
     let part_sz_usize = part_sz as usize;
-    let parts: Vec<String> = kinds
-        .iter()
-        .enumerate()
-        .map(|(i, &lane)| {
-            let start = i.saturating_mul(part_sz_usize);
-            let end = start.saturating_add(part_sz_usize).min(data.len());
-            let slice = data.get(start..end).unwrap_or(&[]);
-            memory_preview_format_hint(slice, part_sz, std::slice::from_ref(&lane))
-        })
-        .collect();
-    parts.join(", ")
+    let mut out = String::new();
+    for (i, &lane) in kinds.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let start = i.saturating_mul(part_sz_usize);
+        let end = start.saturating_add(part_sz_usize).min(data.len());
+        let slice = data.get(start..end).unwrap_or(&[]);
+        out.push_str(&memory_preview_format_hint(
+            slice,
+            part_sz,
+            std::slice::from_ref(&lane),
+        ));
+    }
+    out
 }
 
 fn semantic_hint_children(
@@ -1713,13 +2411,17 @@ fn styled_hint_children(
 mod tests {
     use super::{
         compact_number, fmt_elapsed_compact, hex_pointer_value_active, history_header,
-        hover_kind_eq, memory_preview_rows, memory_preview_type_hint, read_provider_bytes,
-        read_provider_bytes_best_effort, recency_tier, target_is_readable, try_parse_int,
-        HoverPopupKind, MemoryPreviewRow,
+        hover_kind_eq, memory_preview_rows, memory_preview_rows_with_maps,
+        memory_preview_type_hint, read_provider_bytes, read_provider_bytes_best_effort,
+        read_provider_bytes_best_effort_cached, recency_tier, target_is_readable,
+        target_is_readable_cached, try_parse_int, HoverMemoryMaps, HoverPopupKind,
+        MemoryPreviewRow,
     };
     use crate::compose::ColumnSpan;
     use crate::core::{ChipKind, LineChip, LineMeta, NodeKind};
-    use crate::provider::{MemoryRegion, Provider, RegionType};
+    use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
+    use std::cell::Cell;
+    use std::sync::Arc;
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;
@@ -1766,6 +2468,99 @@ mod tests {
 
         fn is_readable(&self, _addr: u64, _len: i32) -> bool {
             false
+        }
+    }
+
+    struct CountingProvider {
+        inner: TestProvider,
+        read_calls: Cell<usize>,
+        region_calls: Cell<usize>,
+        module_calls: Cell<usize>,
+    }
+
+    impl CountingProvider {
+        fn new(base: u64, data: Vec<u8>) -> Self {
+            CountingProvider {
+                inner: TestProvider {
+                    base,
+                    data,
+                    fail_reads: false,
+                },
+                read_calls: Cell::new(0),
+                region_calls: Cell::new(0),
+                module_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl Provider for CountingProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.read_calls.set(self.read_calls.get() + 1);
+            self.inner.read(addr, buf)
+        }
+
+        fn size(&self) -> i32 {
+            self.inner.size()
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.region_calls.set(self.region_calls.get() + 1);
+            self.inner.enumerate_regions()
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.module_calls.set(self.module_calls.get() + 1);
+            vec![ModuleEntry {
+                name: "benchmod".into(),
+                full_path: String::new(),
+                base: self.inner.base,
+                size: self.inner.data.len() as u64,
+            }]
+        }
+
+        fn is_readable(&self, _addr: u64, _len: i32) -> bool {
+            false
+        }
+    }
+
+    struct PartialTailProvider {
+        data: Vec<u8>,
+        read_calls: Cell<usize>,
+    }
+
+    impl PartialTailProvider {
+        fn new(len: usize) -> Self {
+            let mut data = vec![0u8; len];
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(11).wrapping_add(7);
+            }
+            Self {
+                data,
+                read_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl Provider for PartialTailProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.read_calls.set(self.read_calls.get() + 1);
+            let start = addr as usize;
+            let Some(end) = start.checked_add(buf.len()) else {
+                return false;
+            };
+            if end > self.data.len() {
+                return false;
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            self.data.len() as i32
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            Vec::new()
         }
     }
 
@@ -1923,6 +2718,277 @@ mod tests {
             rows[0].pointer_note.as_deref(),
             Some("-> <PRIVATE>test.0x2000")
         );
+    }
+
+    #[test]
+    fn memory_preview_pointer_notes_do_not_probe_each_live_target() {
+        let provider = CountingProvider::new(0x2000, vec![0xAA]);
+        let regions = provider.enumerate_regions();
+        let modules = provider.enumerate_modules();
+
+        let rows = memory_preview_rows_with_maps(
+            &provider,
+            8,
+            1,
+            &0x2000u64.to_le_bytes(),
+            &regions,
+            &modules,
+        );
+
+        assert_eq!(rows[0].pointer_note.as_deref(), Some("-> benchmod+0x0"));
+        assert_eq!(
+            provider.read_calls.get(),
+            0,
+            "pointer-note labels should use the fresh region/module maps, not per-row target reads"
+        );
+    }
+
+    #[test]
+    fn memory_preview_cached_helpers_reuse_region_and_module_maps() {
+        let provider = CountingProvider::new(0x2000, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let regions = provider.enumerate_regions();
+        let modules = provider.enumerate_modules();
+        assert_eq!(provider.region_calls.get(), 1);
+        assert_eq!(provider.module_calls.get(), 1);
+
+        assert!(target_is_readable_cached(
+            &provider,
+            Some(&regions),
+            0x2000,
+            1
+        ));
+        assert_eq!(
+            read_provider_bytes_best_effort_cached(&provider, Some(&regions), 0x2002, 8, 1),
+            Some(vec![0xCC, 0xDD])
+        );
+        let rows = memory_preview_rows_with_maps(
+            &provider,
+            8,
+            1,
+            &0x2000u64.to_le_bytes(),
+            &regions,
+            &modules,
+        );
+        assert_eq!(rows[0].pointer_note.as_deref(), Some("-> benchmod+0x0"));
+        assert_eq!(provider.region_calls.get(), 1);
+        assert_eq!(provider.module_calls.get(), 1);
+    }
+
+    #[test]
+    fn hover_memory_maps_are_scoped_to_provider_and_result_revision() {
+        let provider: Arc<dyn Provider + Send + Sync> = Arc::new(TestProvider {
+            base: 0x2000,
+            data: vec![0xAA],
+            fail_reads: false,
+        });
+        let other_provider: Arc<dyn Provider + Send + Sync> = Arc::new(TestProvider {
+            base: 0x3000,
+            data: vec![0xBB],
+            fail_reads: false,
+        });
+        let regions = vec![
+            MemoryRegion {
+                base: 0x4000,
+                size: 0x100,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: String::new(),
+                region_type: RegionType::Private,
+            },
+            MemoryRegion {
+                base: 0x2000,
+                size: 0x100,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: String::new(),
+                region_type: RegionType::Private,
+            },
+        ];
+        let modules = vec![
+            ModuleEntry {
+                name: "late.dll".into(),
+                full_path: String::new(),
+                base: 0x8000,
+                size: 0x100,
+            },
+            ModuleEntry {
+                name: "early.dll".into(),
+                full_path: String::new(),
+                base: 0x6000,
+                size: 0x100,
+            },
+        ];
+        let maps = HoverMemoryMaps::with_regions_modules(11, &provider, regions, modules);
+
+        assert!(maps.matches(11, &provider));
+        assert!(!maps.matches(12, &provider));
+        assert!(!maps.matches(11, &other_provider));
+
+        let lookup = maps.lookup();
+        assert!(lookup.is_readable(0x2008, 1));
+        assert_eq!(
+            lookup.find_module(0x6008).map(|m| m.name.as_str()),
+            Some("early.dll")
+        );
+    }
+
+    #[test]
+    fn hover_memory_maps_can_upgrade_region_cache_with_modules() {
+        let provider: Arc<dyn Provider + Send + Sync> = Arc::new(TestProvider {
+            base: 0x2000,
+            data: vec![0xAA],
+            fail_reads: false,
+        });
+        let regions = vec![MemoryRegion {
+            base: 0x2000,
+            size: 0x100,
+            readable: true,
+            writable: false,
+            executable: false,
+            module_name: String::new(),
+            region_type: RegionType::Private,
+        }];
+        let modules = vec![ModuleEntry {
+            name: "target.dll".into(),
+            full_path: String::new(),
+            base: 0x2000,
+            size: 0x100,
+        }];
+        let mut maps = HoverMemoryMaps::with_regions(11, &provider, regions);
+
+        assert!(maps.matches(11, &provider));
+        assert!(!maps.modules_loaded);
+
+        maps.set_modules(modules);
+
+        assert!(maps.modules_loaded);
+        let lookup = maps.lookup();
+        assert!(lookup.is_readable(0x2008, 1));
+        assert_eq!(
+            lookup.find_module(0x2008).map(|m| m.name.as_str()),
+            Some("target.dll")
+        );
+    }
+
+    #[test]
+    fn best_effort_preview_finds_partial_tail_without_linear_retry() {
+        let provider = PartialTailProvider::new(64);
+        let bytes = read_provider_bytes_best_effort(&provider, 0, 4096, 1).unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert!(
+            provider.read_calls.get() <= 16,
+            "expected logarithmic retry bound, got {} reads",
+            provider.read_calls.get()
+        );
+    }
+
+    #[test]
+    fn memory_preview_lookup_handles_unsorted_region_and_module_maps() {
+        let provider = TestProvider {
+            base: 0x5000,
+            data: vec![0xAA],
+            fail_reads: false,
+        };
+        let regions = vec![
+            MemoryRegion {
+                base: 0x9000,
+                size: 0x1000,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "later".into(),
+                region_type: RegionType::Private,
+            },
+            MemoryRegion {
+                base: 0x5000,
+                size: 0x1000,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "target".into(),
+                region_type: RegionType::Private,
+            },
+        ];
+        let modules = vec![
+            ModuleEntry {
+                name: "later.dll".into(),
+                full_path: String::new(),
+                base: 0x9000,
+                size: 0x1000,
+            },
+            ModuleEntry {
+                name: "target.dll".into(),
+                full_path: String::new(),
+                base: 0x5000,
+                size: 0x1000,
+            },
+        ];
+        let rows = memory_preview_rows_with_maps(
+            &provider,
+            8,
+            1,
+            &0x5000u64.to_le_bytes(),
+            &regions,
+            &modules,
+        );
+
+        assert_eq!(rows[0].pointer_note.as_deref(), Some("-> target.dll+0x0"));
+    }
+
+    #[test]
+    fn memory_preview_lookup_preserves_linear_order_for_overlapping_modules() {
+        let provider = TestProvider {
+            base: 0x5000,
+            data: vec![0xAA],
+            fail_reads: false,
+        };
+        let regions = vec![
+            MemoryRegion {
+                base: 0x4000,
+                size: 0x3000,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "wide".into(),
+                region_type: RegionType::Private,
+            },
+            MemoryRegion {
+                base: 0x5000,
+                size: 0x1000,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "specific".into(),
+                region_type: RegionType::Private,
+            },
+        ];
+        let modules = vec![
+            ModuleEntry {
+                name: "wide.dll".into(),
+                full_path: String::new(),
+                base: 0x4000,
+                size: 0x3000,
+            },
+            ModuleEntry {
+                name: "specific.dll".into(),
+                full_path: String::new(),
+                base: 0x5000,
+                size: 0x1000,
+            },
+        ];
+
+        let rows = memory_preview_rows_with_maps(
+            &provider,
+            8,
+            1,
+            &0x5000u64.to_le_bytes(),
+            &regions,
+            &modules,
+        );
+
+        assert_eq!(rows[0].pointer_note.as_deref(), Some("-> wide.dll+0x1000"));
     }
 
     #[test]

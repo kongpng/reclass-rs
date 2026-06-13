@@ -1040,8 +1040,7 @@ impl Render for MainWindow {
                 let _ = this.update(app, |me, cx| me.raise_target(window, cx));
             }
         };
-        let status_bar =
-            render_status_bar(&status_info, &source, &target_summary, open_target, cx);
+        let status_bar = render_status_bar(&status_info, &source, &target_summary, open_target, cx);
 
         // Presentation Mode (View ▸ Presentation Mode): fade the surrounding chrome
         // (titlebar + status bar) so the editor surface reads as the focus, like the

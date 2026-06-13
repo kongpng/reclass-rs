@@ -3,12 +3,19 @@
 //! Target strings mirror the C++ plugin: `"pid:name"` or plain `"pid"`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::plugin::contract::ProcessInfo;
+use arc_swap::ArcSwapOption;
 
+#[cfg(not(any(target_os = "linux", windows)))]
+use super::read_pages_in_runs;
 #[cfg(any(target_os = "linux", test))]
 use super::RegionType;
-use super::{MemoryRegion, ModuleEntry, Provider, ThreadInfo};
+use super::{
+    normalize_page_list, MemoryRegion, ModuleEntry, ModuleLookup, PageMap, Provider, ThreadInfo,
+    K_PAGE_SIZE,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessTarget {
@@ -46,12 +53,21 @@ impl ProcessTarget {
 
 pub struct LocalProcessProvider {
     inner: platform::Inner,
+    readable_ranges: ArcSwapOption<Vec<(u64, u64)>>,
+    module_lookup: ModuleLookup,
 }
 
 impl LocalProcessProvider {
     pub fn attach(target: &str) -> Result<Self, String> {
         let parsed = ProcessTarget::parse(target)?;
-        platform::Inner::attach(parsed).map(|inner| Self { inner })
+        platform::Inner::attach(parsed).map(|inner| {
+            let modules = inner.enumerate_modules();
+            Self {
+                inner,
+                readable_ranges: ArcSwapOption::from(None),
+                module_lookup: ModuleLookup::new(modules),
+            }
+        })
     }
 
     pub fn can_handle(target: &str) -> bool {
@@ -61,11 +77,74 @@ impl LocalProcessProvider {
     pub fn enumerate_processes() -> Vec<ProcessInfo> {
         platform::enumerate_processes()
     }
+
+    fn refresh_readable_ranges(&self, regions: &[MemoryRegion]) {
+        self.readable_ranges
+            .store(Some(Arc::new(readable_ranges_from_regions(regions))));
+    }
+
+    fn cached_is_readable(&self, addr: u64, len: i32) -> Option<bool> {
+        let cached = self.readable_ranges.load();
+        let ranges = cached.as_ref()?;
+        (!ranges.is_empty()).then(|| readable_ranges_contains(ranges, addr, len))
+    }
+
+    fn cached_page_read_plan(&self, pages: &[u64]) -> Option<(Vec<u64>, PageMap)> {
+        let cached = self.readable_ranges.load();
+        let ranges = cached.as_ref()?;
+        if ranges.is_empty() {
+            return None;
+        }
+
+        let normalized = normalize_page_list(pages);
+        let mut readable_pages = Vec::new();
+        let mut out = PageMap::new();
+        out.reserve(normalized.as_slice().len());
+        let mut range_idx = 0usize;
+        for &page_addr in normalized.as_slice() {
+            while ranges
+                .get(range_idx)
+                .is_some_and(|(_, range_end)| *range_end <= page_addr)
+            {
+                range_idx += 1;
+            }
+            let page_end = page_addr.saturating_add(K_PAGE_SIZE);
+            let readable = ranges
+                .get(range_idx)
+                .is_some_and(|(start, range_end)| page_addr >= *start && page_end <= *range_end);
+            if readable {
+                readable_pages.push(page_addr);
+            } else {
+                out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize]);
+            }
+        }
+        Some((readable_pages, out))
+    }
 }
 
 impl Provider for LocalProcessProvider {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
         self.inner.read(addr, buf)
+    }
+
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        if let Some((readable_pages, mut out)) = self.cached_page_read_plan(pages) {
+            if !readable_pages.is_empty() {
+                out.extend(self.inner.read_pages(&readable_pages));
+            }
+            return out;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            return self.inner.read_pages(pages);
+        }
+        #[cfg(windows)]
+        {
+            return self.inner.read_pages(pages);
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        read_pages_in_runs(pages, |addr, buf| self.inner.read(addr, buf))
     }
 
     fn size(&self) -> i32 {
@@ -88,6 +167,10 @@ impl Provider for LocalProcessProvider {
         true
     }
 
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> String {
         "LocalProcess".to_string()
     }
@@ -101,28 +184,38 @@ impl Provider for LocalProcessProvider {
     }
 
     fn get_symbol(&self, addr: u64) -> String {
-        self.inner.get_symbol(addr)
+        self.module_lookup.symbol_for_addr_lower(addr)
     }
 
     fn symbol_to_address(&self, name: &str) -> u64 {
-        self.inner.symbol_to_address(name)
+        self.module_lookup.symbol_to_address(name)
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
-        self.inner.enumerate_regions()
+        let regions = self.inner.enumerate_regions();
+        self.refresh_readable_ranges(&regions);
+        regions
+    }
+
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        true
     }
 
     fn is_readable(&self, addr: u64, len: i32) -> bool {
         if len <= 0 {
             return len == 0;
         }
-        self.inner.enumerate_regions().into_iter().any(|region| {
-            region.readable
-                && addr >= region.base
-                && addr
-                    .checked_add(len as u64)
-                    .is_some_and(|end| end <= region.base.saturating_add(region.size))
-        })
+        match self.cached_is_readable(addr, len) {
+            Some(true) => return true,
+            Some(false) => return false,
+            None => {}
+        }
+
+        let regions = self.inner.enumerate_regions();
+        let ranges = readable_ranges_from_regions(&regions);
+        let readable = readable_ranges_contains(&ranges, addr, len);
+        self.readable_ranges.store(Some(Arc::new(ranges)));
+        readable
     }
 
     fn peb(&self) -> u64 {
@@ -134,7 +227,7 @@ impl Provider for LocalProcessProvider {
     }
 
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
-        self.inner.enumerate_modules()
+        self.module_lookup.clone_modules()
     }
 }
 
@@ -144,6 +237,52 @@ fn module_name_from_path(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn readable_ranges_from_regions(regions: &[MemoryRegion]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<_> = regions
+        .iter()
+        .filter(|region| region.readable && region.size > 0)
+        .filter_map(|region| {
+            let end = region.base.saturating_add(region.size);
+            (end > region.base).then_some((region.base, end))
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+
+    merge_readable_ranges(ranges)
+}
+
+fn merge_readable_ranges(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+#[doc(hidden)]
+pub fn bench_readable_ranges_from_regions(regions: &[MemoryRegion]) -> Vec<(u64, u64)> {
+    readable_ranges_from_regions(regions)
+}
+
+fn readable_ranges_contains(ranges: &[(u64, u64)], addr: u64, len: i32) -> bool {
+    if len <= 0 {
+        return len == 0;
+    }
+    let Some(end) = addr.checked_add(len as u64) else {
+        return false;
+    };
+    let idx = ranges.partition_point(|(_, range_end)| *range_end <= addr);
+    ranges
+        .get(idx)
+        .is_some_and(|(start, range_end)| addr >= *start && end <= *range_end)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -265,7 +404,7 @@ mod platform {
     use nix::unistd::Pid;
 
     use crate::plugin::contract::ProcessInfo;
-    use crate::provider::{MemoryRegion, ModuleEntry, ThreadInfo};
+    use crate::provider::{MemoryRegion, ModuleEntry, PageMap, ThreadInfo, K_PAGE_SIZE};
 
     use super::{
         module_entries_from_maps, parse_maps_text, regions_from_maps, MapEntry, ProcessTarget,
@@ -349,6 +488,112 @@ mod platform {
             }
         }
 
+        pub fn read_pages(&self, pages: &[u64]) -> PageMap {
+            let mut out = PageMap::new();
+            if pages.is_empty() {
+                return out;
+            }
+
+            let normalized_pages = super::normalize_page_list(pages);
+            let pages = normalized_pages.as_slice();
+            out.reserve(pages.len());
+            let compact_runs = pages.len() <= super::super::K_MAX_BULK_READ_PAGES;
+
+            let mut run_start = 0usize;
+            while run_start < pages.len() {
+                let mut run_end = run_start + 1;
+                while run_end < pages.len()
+                    && run_end - run_start < super::super::K_MAX_BULK_READ_PAGES
+                    && pages[run_end - 1]
+                        .checked_add(K_PAGE_SIZE)
+                        .is_some_and(|next| next == pages[run_end])
+                {
+                    run_end += 1;
+                }
+                self.read_page_run(&pages[run_start..run_end], compact_runs, &mut out);
+                run_start = run_end;
+            }
+
+            out
+        }
+
+        fn read_page_run(&self, pages: &[u64], compact: bool, out: &mut PageMap) {
+            if pages.is_empty() {
+                return;
+            }
+            if pages.len() == 1 {
+                let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                let _ = self.read(pages[0], &mut bytes);
+                out.insert(pages[0], bytes);
+                return;
+            }
+
+            if !compact {
+                let mut page_bytes: Vec<Vec<u8>> = (0..pages.len())
+                    .map(|_| vec![0u8; K_PAGE_SIZE as usize])
+                    .collect();
+                let mut local: Vec<IoSliceMut<'_>> = page_bytes
+                    .iter_mut()
+                    .map(|bytes| IoSliceMut::new(bytes.as_mut_slice()))
+                    .collect();
+                let remote = [RemoteIoVec {
+                    base: pages[0] as usize,
+                    len: pages.len() * K_PAGE_SIZE as usize,
+                }];
+                let read = process_vm_readv(Pid::from_raw(self.pid as i32), &mut local, &remote)
+                    .unwrap_or(0);
+                let full_pages = (read / K_PAGE_SIZE as usize).min(pages.len());
+                drop(local);
+                if full_pages > 0 {
+                    for (page_addr, bytes) in pages
+                        .iter()
+                        .copied()
+                        .take(full_pages)
+                        .zip(page_bytes.drain(..full_pages))
+                    {
+                        out.insert(page_addr, bytes);
+                    }
+                    if full_pages == pages.len() {
+                        return;
+                    }
+                }
+
+                for &page_addr in &pages[full_pages..] {
+                    let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                    let _ = self.read(page_addr, &mut bytes);
+                    out.insert(page_addr, bytes);
+                }
+                return;
+            }
+
+            let run_len = pages.len() * K_PAGE_SIZE as usize;
+            let mut bytes = vec![0u8; run_len];
+            let mut local = [IoSliceMut::new(bytes.as_mut_slice())];
+            let remote = [RemoteIoVec {
+                base: pages[0] as usize,
+                len: run_len,
+            }];
+            let read =
+                process_vm_readv(Pid::from_raw(self.pid as i32), &mut local, &remote).unwrap_or(0);
+            let full_pages = (read / K_PAGE_SIZE as usize).min(pages.len());
+            if full_pages > 0 {
+                for (idx, &page_addr) in pages.iter().take(full_pages).enumerate() {
+                    let start = idx * K_PAGE_SIZE as usize;
+                    let end = start + K_PAGE_SIZE as usize;
+                    out.insert(page_addr, bytes[start..end].to_vec());
+                }
+                if full_pages == pages.len() {
+                    return;
+                }
+            }
+
+            for &page_addr in &pages[full_pages..] {
+                let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                let _ = self.read(page_addr, &mut bytes);
+                out.insert(page_addr, bytes);
+            }
+        }
+
         pub fn write(&self, addr: u64, data: &[u8]) -> bool {
             if data.is_empty() || !self.writable {
                 return false;
@@ -390,22 +635,6 @@ mod platform {
 
         pub fn base(&self) -> u64 {
             self.base
-        }
-
-        pub fn get_symbol(&self, addr: u64) -> String {
-            self.modules
-                .iter()
-                .find(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
-                .map(|m| format!("{}+0x{:x}", m.name, addr - m.base))
-                .unwrap_or_default()
-        }
-
-        pub fn symbol_to_address(&self, name: &str) -> u64 {
-            self.modules
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(name))
-                .map(|m| m.base)
-                .unwrap_or(0)
         }
 
         pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
@@ -496,7 +725,9 @@ mod platform {
     use std::ptr::null_mut;
 
     use crate::plugin::contract::ProcessInfo;
-    use crate::provider::{MemoryRegion, ModuleEntry, RegionType, ThreadInfo};
+    use crate::provider::{
+        MemoryRegion, ModuleEntry, ModuleLookup, PageMap, RegionType, ThreadInfo, K_PAGE_SIZE,
+    };
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
     };
@@ -706,6 +937,93 @@ mod platform {
                 read > 0
             }
         }
+
+        pub fn read_pages(&self, pages: &[u64]) -> PageMap {
+            let mut out = PageMap::new();
+            if pages.is_empty() {
+                return out;
+            }
+
+            let normalized_pages = super::normalize_page_list(pages);
+            let pages = normalized_pages.as_slice();
+            out.reserve(pages.len());
+
+            let mut run_start = 0usize;
+            while run_start < pages.len() {
+                let mut run_end = run_start + 1;
+                while run_end < pages.len()
+                    && run_end - run_start < super::super::K_MAX_BULK_READ_PAGES
+                    && pages[run_end - 1]
+                        .checked_add(K_PAGE_SIZE)
+                        .is_some_and(|next| next == pages[run_end])
+                {
+                    run_end += 1;
+                }
+                self.read_page_run(&pages[run_start..run_end], &mut out);
+                run_start = run_end;
+            }
+
+            out
+        }
+
+        fn read_page_run(&self, pages: &[u64], out: &mut PageMap) {
+            if pages.is_empty() {
+                return;
+            }
+            if pages.len() == 1 {
+                let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                let _ = self.read_full(pages[0], &mut bytes);
+                out.insert(pages[0], bytes);
+                return;
+            }
+
+            let run_len = pages.len() * K_PAGE_SIZE as usize;
+            let mut bytes = vec![0u8; run_len];
+            let read = self.read_available(pages[0], &mut bytes);
+            let full_pages = (read / K_PAGE_SIZE as usize).min(pages.len());
+            if full_pages > 0 {
+                for (idx, &page_addr) in pages.iter().take(full_pages).enumerate() {
+                    let start = idx * K_PAGE_SIZE as usize;
+                    let end = start + K_PAGE_SIZE as usize;
+                    out.insert(page_addr, bytes[start..end].to_vec());
+                }
+                if full_pages == pages.len() {
+                    return;
+                }
+            }
+
+            for &page_addr in &pages[full_pages..] {
+                let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+                let _ = self.read_full(page_addr, &mut bytes);
+                out.insert(page_addr, bytes);
+            }
+        }
+
+        fn read_full(&self, addr: u64, buf: &mut [u8]) -> bool {
+            let read = self.read_available(addr, buf);
+            if read < buf.len() {
+                buf[read..].fill(0);
+            }
+            read == buf.len()
+        }
+
+        fn read_available(&self, addr: u64, buf: &mut [u8]) -> usize {
+            if buf.is_empty() || self.handle.is_null() {
+                return 0;
+            }
+            unsafe {
+                let mut read = 0usize;
+                let _ = ReadProcessMemory(
+                    self.handle,
+                    addr as *const c_void,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len(),
+                    &mut read,
+                );
+                read.min(buf.len())
+            }
+        }
+
         pub fn write(&self, addr: u64, data: &[u8]) -> bool {
             if data.is_empty() || self.handle.is_null() || !self.writable {
                 return false;
@@ -740,20 +1058,6 @@ mod platform {
         }
         pub fn base(&self) -> u64 {
             self.base
-        }
-        pub fn get_symbol(&self, addr: u64) -> String {
-            self.modules
-                .iter()
-                .find(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
-                .map(|m| format!("{}+0x{:x}", m.name, addr - m.base))
-                .unwrap_or_default()
-        }
-        pub fn symbol_to_address(&self, name: &str) -> u64 {
-            self.modules
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(name))
-                .map(|m| m.base)
-                .unwrap_or(0)
         }
         pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
             unsafe { enumerate_regions_for(self.handle, &self.modules) }
@@ -1000,6 +1304,7 @@ mod platform {
 
     unsafe fn enumerate_regions_for(handle: HANDLE, modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
         let mut regions = Vec::new();
+        let module_lookup = ModuleLookup::new(modules.to_vec());
         let mut addr = 0usize;
         loop {
             let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
@@ -1044,9 +1349,8 @@ mod platform {
                     } else {
                         RegionType::Private
                     };
-                    let module_name = modules
-                        .iter()
-                        .find(|m| base >= m.base && base < m.base.saturating_add(m.size))
+                    let module_name = module_lookup
+                        .find_by_addr(base)
                         .map(|m| m.name.clone())
                         .unwrap_or_default();
                     regions.push(MemoryRegion {
@@ -1114,12 +1418,6 @@ mod platform {
         pub fn base(&self) -> u64 {
             0
         }
-        pub fn get_symbol(&self, _addr: u64) -> String {
-            String::new()
-        }
-        pub fn symbol_to_address(&self, _name: &str) -> u64 {
-            0
-        }
         pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
             Vec::new()
         }
@@ -1142,6 +1440,7 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::K_PAGE_SIZE;
 
     #[test]
     fn parses_pid_targets() {
@@ -1176,6 +1475,104 @@ mod tests {
         assert_eq!(regions[2].region_type, RegionType::Private);
     }
 
+    #[test]
+    fn readable_ranges_are_sorted_merged_and_bound_checked() {
+        let regions = vec![
+            MemoryRegion {
+                base: 0x3000,
+                size: 0x1000,
+                readable: true,
+                ..MemoryRegion::default()
+            },
+            MemoryRegion {
+                base: 0x1000,
+                size: 0x1000,
+                readable: true,
+                ..MemoryRegion::default()
+            },
+            MemoryRegion {
+                base: 0x2000,
+                size: 0x1000,
+                readable: true,
+                ..MemoryRegion::default()
+            },
+            MemoryRegion {
+                base: 0x5000,
+                size: 0x1000,
+                readable: false,
+                ..MemoryRegion::default()
+            },
+        ];
+
+        let ranges = readable_ranges_from_regions(&regions);
+
+        assert_eq!(ranges, vec![(0x1000, 0x4000)]);
+        assert!(readable_ranges_contains(&ranges, 0x1000, 1));
+        assert!(readable_ranges_contains(&ranges, 0x3FFF, 1));
+        assert!(!readable_ranges_contains(&ranges, 0x4000, 1));
+        assert!(!readable_ranges_contains(&ranges, 0x5000, 1));
+        assert!(!readable_ranges_contains(&ranges, u64::MAX, 8));
+    }
+
+    #[test]
+    fn readable_ranges_ordered_input_uses_same_canonical_ranges() {
+        let regions = vec![
+            MemoryRegion {
+                base: 0x1000,
+                size: 0x1000,
+                readable: true,
+                ..MemoryRegion::default()
+            },
+            MemoryRegion {
+                base: 0x2000,
+                size: 0x1000,
+                readable: true,
+                ..MemoryRegion::default()
+            },
+            MemoryRegion {
+                base: 0x5000,
+                size: 0x1000,
+                readable: true,
+                ..MemoryRegion::default()
+            },
+        ];
+
+        assert_eq!(
+            readable_ranges_from_regions(&regions),
+            vec![(0x1000, 0x3000), (0x5000, 0x6000)]
+        );
+    }
+
+    #[test]
+    fn module_lookup_indexes_ranges_and_names() {
+        let lookup = ModuleLookup::new(vec![
+            ModuleEntry {
+                name: "Second.dll".into(),
+                base: 0x3000,
+                size: 0x1000,
+                ..ModuleEntry::default()
+            },
+            ModuleEntry {
+                name: "First.dll".into(),
+                base: 0x1000,
+                size: 0x1000,
+                ..ModuleEntry::default()
+            },
+            ModuleEntry {
+                name: "First.dll".into(),
+                base: 0x5000,
+                size: 0x1000,
+                ..ModuleEntry::default()
+            },
+        ]);
+
+        assert_eq!(lookup.find_by_addr(0x1004).unwrap().name, "First.dll");
+        assert_eq!(lookup.find_by_addr(0x3004).unwrap().name, "Second.dll");
+        assert!(lookup.find_by_addr(0x2000).is_none());
+        assert_eq!(lookup.symbol_to_address("first.DLL"), 0x1000);
+        assert_eq!(lookup.symbol_to_address("missing.dll"), 0);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn local_process_readability_is_address_bound() {
@@ -1190,5 +1587,61 @@ mod tests {
             .expect("current process has a readable mapping");
         assert!(provider.is_readable(region.base, 1));
         assert!(!provider.is_readable(1, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_process_bulk_read_pages_matches_direct_reads() {
+        use crate::provider::Provider;
+
+        let provider = LocalProcessProvider::attach(&std::process::id().to_string())
+            .expect("attach to current process");
+        let region = provider
+            .enumerate_regions()
+            .into_iter()
+            .find(|r| r.readable && r.size >= K_PAGE_SIZE * 2)
+            .expect("current process has a two-page readable mapping");
+        let pages = [region.base, region.base + K_PAGE_SIZE];
+        let page_map = provider.read_pages(&pages);
+
+        assert_eq!(page_map.len(), pages.len());
+        for page_addr in pages {
+            let mut expected = vec![0u8; K_PAGE_SIZE as usize];
+            assert!(provider.read(page_addr, &mut expected));
+            assert_eq!(
+                page_map.get(&page_addr).map(Vec::as_slice),
+                Some(expected.as_slice())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_process_cached_readability_zero_fills_unreadable_pages() {
+        use crate::provider::Provider;
+
+        let provider = LocalProcessProvider::attach(&std::process::id().to_string())
+            .expect("attach to current process");
+        let region = provider
+            .enumerate_regions()
+            .into_iter()
+            .find(|r| r.readable && r.size >= K_PAGE_SIZE)
+            .expect("current process has a readable mapping");
+
+        let page_map = provider.read_pages(&[0, region.base]);
+
+        assert_eq!(page_map.len(), 2);
+        assert!(page_map
+            .get(&0)
+            .expect("unreadable page is represented")
+            .iter()
+            .all(|&byte| byte == 0));
+
+        let mut expected = vec![0u8; K_PAGE_SIZE as usize];
+        assert!(provider.read(region.base, &mut expected));
+        assert_eq!(
+            page_map.get(&region.base).map(Vec::as_slice),
+            Some(expected.as_slice())
+        );
     }
 }

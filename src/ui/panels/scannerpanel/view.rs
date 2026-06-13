@@ -172,6 +172,31 @@ pub(super) struct DisplayRow {
     pub(super) module: String,
 }
 
+#[derive(Clone, Debug)]
+struct DisplayRowSearch {
+    display: DisplayRow,
+    address_lower: String,
+    value_lower: String,
+    module_lower: String,
+}
+
+impl DisplayRowSearch {
+    fn new(display: DisplayRow) -> Self {
+        Self {
+            address_lower: display.row.address_text.to_lowercase(),
+            value_lower: display.row.value_text.to_lowercase(),
+            module_lower: display.module.to_lowercase(),
+            display,
+        }
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.address_lower.contains(query)
+            || self.value_lower.contains(query)
+            || self.module_lower.contains(query)
+    }
+}
+
 /// The [`TableDelegate`] backing the results [`DataTable`]: owns the displayed
 /// rows and paints the Address cell with the dimmed leading-zero prefix (the
 /// C++ `AddressDelegate`). Sorting is wired via [`TableDelegate::perform_sort`]
@@ -179,7 +204,8 @@ pub(super) struct DisplayRow {
 /// `populateTable(showPrevious)` — the Previous→Δ column only appears after a
 /// re-scan; `show_module` appears when any row has a module name.
 struct ScanResultsDelegate {
-    rows: Vec<DisplayRow>,
+    display_cache: Arc<[DisplayRowSearch]>,
+    rows: Vec<usize>,
     show_previous: bool,
     show_module: bool,
     /// The total live result count (the C++ `m_results.size()`), shown in the
@@ -201,11 +227,27 @@ impl ScanResultsDelegate {
 
     fn new() -> Self {
         ScanResultsDelegate {
+            display_cache: Vec::<DisplayRowSearch>::new().into(),
             rows: Vec::new(),
             show_previous: false,
             show_module: false,
             result_count: 0,
         }
+    }
+
+    fn row_display(&self, row_ix: usize) -> Option<&DisplayRow> {
+        self.rows
+            .get(row_ix)
+            .and_then(|cache_ix| self.display_cache.get(*cache_ix))
+            .map(|entry| &entry.display)
+    }
+
+    fn displayed_addresses(&self) -> Vec<u64> {
+        self.rows
+            .iter()
+            .filter_map(|cache_ix| self.display_cache.get(*cache_ix))
+            .map(|entry| entry.display.row.address)
+            .collect()
     }
 }
 
@@ -251,7 +293,7 @@ impl TableDelegate for ScanResultsDelegate {
         _cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
         let mut row = div().id(("scanner-result-row", row_ix));
-        if let Some(d) = self.rows.get(row_ix) {
+        if let Some(d) = self.row_display(row_ix) {
             let address = d.row.address;
             let address_text: SharedString = d.row.address_text.clone().into();
             row = row.on_drag(
@@ -290,17 +332,29 @@ impl TableDelegate for ScanResultsDelegate {
     ) {
         let asc = !matches!(sort, ColumnSort::Descending);
         let module_ix = self.module_col_ix();
+        let cache = self.display_cache.clone();
         if col_ix == module_ix && self.show_module {
-            self.rows.sort_by(|a, b| a.module.cmp(&b.module));
+            self.rows
+                .sort_by(|a, b| cache[*a].display.module.cmp(&cache[*b].display.module));
         } else {
             match col_ix {
-                COL_ADDRESS => self.rows.sort_by_key(|r| r.row.address),
-                COL_PREVIOUS => self
+                COL_ADDRESS => self
                     .rows
-                    .sort_by(|a, b| a.row.previous_text.cmp(&b.row.previous_text)),
-                _ => self
-                    .rows
-                    .sort_by(|a, b| a.row.value_text.cmp(&b.row.value_text)),
+                    .sort_by_key(|cache_ix| cache[*cache_ix].display.row.address),
+                COL_PREVIOUS => self.rows.sort_by(|a, b| {
+                    cache[*a]
+                        .display
+                        .row
+                        .previous_text
+                        .cmp(&cache[*b].display.row.previous_text)
+                }),
+                _ => self.rows.sort_by(|a, b| {
+                    cache[*a]
+                        .display
+                        .row
+                        .value_text
+                        .cmp(&cache[*b].display.row.value_text)
+                }),
             }
         }
         if !asc {
@@ -315,7 +369,7 @@ impl TableDelegate for ScanResultsDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(d) = self.rows.get(row_ix) else {
+        let Some(d) = self.row_display(row_ix) else {
             return div();
         };
         let row = &d.row;
@@ -385,7 +439,7 @@ impl TableDelegate for ScanResultsDelegate {
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
-        let Some(d) = self.rows.get(row_ix) else {
+        let Some(d) = self.row_display(row_ix) else {
             return String::new();
         };
         let module_ix = self.module_col_ix();
@@ -419,6 +473,11 @@ pub struct ScannerPanel {
     /// the Re-scan / inline-edit paths re-read + filter. The table delegate
     /// holds the formatted, filtered display view derived from these.
     results: Vec<ScanResult>,
+    /// Cached formatted rows for the first [`MAX_DISPLAY_ROWS`] scan results.
+    /// Rebuilt only when scan results or scan formatting state changes; filter
+    /// keystrokes reuse the lowercase search keys instead of reformatting rows.
+    display_cache: Arc<[DisplayRowSearch]>,
+    display_cache_show_module: bool,
     /// Whether a re-scan has run yet — drives the Previous→Δ column
     /// (the C++ `populateTable(showPrevious)`).
     show_previous: bool,
@@ -542,8 +601,7 @@ impl ScannerPanel {
                     let addr = table
                         .read(cx)
                         .delegate()
-                        .rows
-                        .get(*row_ix)
+                        .row_display(*row_ix)
                         .map(|r| r.row.address);
                     if let Some(address) = addr {
                         cx.emit(ScannerNav { address });
@@ -557,8 +615,7 @@ impl ScannerPanel {
                     let addr = table
                         .read(cx)
                         .delegate()
-                        .rows
-                        .get(*row_ix)
+                        .row_display(*row_ix)
                         .map(|r| r.row.address);
                     if let Some(address) = addr {
                         if *col_ix == COL_ADDRESS {
@@ -582,6 +639,8 @@ impl ScannerPanel {
             filter_input,
             table,
             results: Vec::new(),
+            display_cache: Vec::<DisplayRowSearch>::new().into(),
+            display_cache_show_module: false,
             show_previous: false,
             undo_stack: Vec::new(),
             generation: 0,
@@ -1186,6 +1245,8 @@ impl ScannerPanel {
 
         self.reset_armed = false;
         self.results.clear();
+        self.display_cache = Vec::<DisplayRowSearch>::new().into();
+        self.display_cache_show_module = false;
         self.undo_stack.clear();
         self.show_previous = false;
         self.generation = 0;
@@ -1204,8 +1265,7 @@ impl ScannerPanel {
         self.table
             .read(cx)
             .delegate()
-            .rows
-            .get(ix)
+            .row_display(ix)
             .map(|r| r.row.address)
     }
 
@@ -1236,8 +1296,7 @@ impl ScannerPanel {
         self.table
             .read(cx)
             .delegate()
-            .rows
-            .get(ix)
+            .row_display(ix)
             .map(|r| (r.row.address, r.row.value_text.clone()))
     }
 
@@ -1386,18 +1445,7 @@ impl ScannerPanel {
         cx: &mut Context<Self>,
     ) {
         let total = results.len();
-        let mut wrote = 0usize;
-        for (addr, new_bytes) in results {
-            if let Some(nb) = new_bytes {
-                if let Some(r) = self.results.iter_mut().find(|r| r.address == addr) {
-                    // C++ Change All reassigns only scanValue (scannerpanel.cpp:984),
-                    // keeping previousValue as the last-rescan snapshot — do not
-                    // overwrite it here (would render a spurious Previous→Δ delta).
-                    r.scan_value = nb;
-                }
-                wrote += 1;
-            }
-        }
+        let wrote = super::apply_change_all_results(&mut self.results, results);
         self.status = format!("Wrote to {wrote}/{total} addresses");
         self.refresh_table(cx);
         cx.notify();
@@ -1408,13 +1456,7 @@ impl ScannerPanel {
     /// sort/filter (it reads the displayed-row list).
     /// The addresses of every currently-displayed result row (delegate order).
     fn displayed_addresses(&self, cx: &App) -> Vec<u64> {
-        self.table
-            .read(cx)
-            .delegate()
-            .rows
-            .iter()
-            .map(|r| r.row.address)
-            .collect()
+        self.table.read(cx).delegate().displayed_addresses()
     }
 
     fn copy_all_addresses(&mut self, cx: &mut Context<Self>) {
@@ -1471,66 +1513,40 @@ impl ScannerPanel {
 
     /// Re-apply the post-scan filter to the displayed rows.
     fn apply_filter(&mut self, cx: &mut Context<Self>) {
-        self.refresh_table(cx);
+        self.apply_filter_to_table(cx);
         cx.notify();
     }
 
-    /// Build the formatted display rows from the live [`ScanResult`] list
-    /// (capped at [`MAX_DISPLAY_ROWS`]), computing the per-row delta + module
-    /// metadata, then push the post-scan-filtered view into the table.
-    fn refresh_table(&mut self, cx: &mut Context<Self>) {
+    fn rebuild_display_cache(&mut self) {
+        let (display_cache, show_module) =
+            build_display_cache(&self.results, &self.form, self.show_previous);
+        self.display_cache = display_cache;
+        self.display_cache_show_module = show_module;
+    }
+
+    fn apply_filter_to_table(&mut self, cx: &mut Context<Self>) {
         let query = self.filter_text(cx);
         let show_previous = self.show_previous;
-        let vt = self.form.value_type;
-
-        // Format every result into a ScanRow, computing the delta from the
-        // recorded previous value (the C++ populateTable foreground tint).
-        let all: Vec<DisplayRow> = self
-            .results
-            .iter()
-            .take(MAX_DISPLAY_ROWS)
-            .map(|r| {
-                let mut row = ScanRow::from_result(&self.form, r);
-                let mut delta_dir = 0;
-                if show_previous && !r.previous_value.is_empty() {
-                    let d = compute_delta(vt, &r.previous_value, &r.scan_value);
-                    delta_dir = d.direction;
-                    let changed = r.previous_value != r.scan_value;
-                    row.previous_text = previous_delta_text(&row.previous_text, &d, changed);
-                }
-                DisplayRow {
-                    row,
-                    delta_dir,
-                    module: r.region_module.clone(),
-                }
-            })
-            .collect();
-
-        let show_module = all.iter().any(|d| !d.module.is_empty());
-
-        // Post-scan substring filter against the formatted row strings.
-        let q = query.trim().to_lowercase();
-        let rows: Vec<DisplayRow> = if q.is_empty() {
-            all
-        } else {
-            all.into_iter()
-                .filter(|d| {
-                    d.row.address_text.to_lowercase().contains(&q)
-                        || d.row.value_text.to_lowercase().contains(&q)
-                        || d.module.to_lowercase().contains(&q)
-                })
-                .collect()
-        };
-
+        let rows = filter_display_cache(&self.display_cache, &query);
+        let show_module = self.display_cache_show_module;
         let result_count = self.results.len();
         self.table.update(cx, |state, cx| {
             let del = state.delegate_mut();
+            del.display_cache = self.display_cache.clone();
             del.rows = rows;
             del.show_previous = show_previous;
             del.show_module = show_module;
             del.result_count = result_count;
             cx.notify();
         });
+    }
+
+    /// Build the formatted display rows from the live [`ScanResult`] list
+    /// (capped at [`MAX_DISPLAY_ROWS`]), computing the per-row delta + module
+    /// metadata, then push the post-scan-filtered view into the table.
+    fn refresh_table(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_display_cache();
+        self.apply_filter_to_table(cx);
     }
 
     /// The current value type / scan mode (so the window can decode/encode
@@ -1567,7 +1583,7 @@ impl ScannerPanel {
         if let Some(r) = self.results.get_mut(row) {
             r.address = new_address;
             if !new_value.is_empty() {
-                r.scan_value = new_value;
+                r.scan_value = new_value.into();
             }
             self.refresh_table(cx);
             cx.notify();
@@ -1581,7 +1597,7 @@ impl ScannerPanel {
             // C++ onCellEdited reassigns only scanValue (scannerpanel.cpp:1888),
             // leaving previousValue as the last-rescan snapshot — do not overwrite
             // it (would render a spurious Previous→Δ delta on the edited row).
-            r.scan_value = new_value;
+            r.scan_value = new_value.into();
             self.status = format!("Wrote {} bytes to 0x{:X}", r.scan_value.len(), r.address);
             self.refresh_table(cx);
             cx.notify();
@@ -1628,7 +1644,7 @@ impl ScannerPanel {
         let rows: Vec<(u64, Vec<u8>, String)> = self
             .results
             .iter()
-            .map(|r| (r.address, r.scan_value.clone(), r.region_module.clone()))
+            .map(|r| (r.address, r.scan_value.to_vec(), r.region_module.clone()))
             .collect();
         // The C++ `saveResultsTo` writes `m_lastScanMode` / `m_lastValueType`
         // (scannerpanel.cpp:2397-2398) — the mode + type of the *last* scan,
@@ -1731,6 +1747,121 @@ impl ScannerPanel {
     }
 }
 
+fn build_display_row(form: &ScannerForm, show_previous: bool, r: &ScanResult) -> DisplayRow {
+    let mut row = ScanRow::from_result(form, r);
+    let mut delta_dir = 0;
+    if show_previous && !r.previous_value.is_empty() {
+        let d = compute_delta(form.value_type, &r.previous_value, &r.scan_value);
+        delta_dir = d.direction;
+        let changed = r.previous_value != r.scan_value;
+        row.previous_text = previous_delta_text(&row.previous_text, &d, changed);
+    }
+    DisplayRow {
+        row,
+        delta_dir,
+        module: r.region_module.clone(),
+    }
+}
+
+fn build_display_cache(
+    results: &[ScanResult],
+    form: &ScannerForm,
+    show_previous: bool,
+) -> (Arc<[DisplayRowSearch]>, bool) {
+    let rows: Vec<DisplayRowSearch> = results
+        .iter()
+        .take(MAX_DISPLAY_ROWS)
+        .map(|r| DisplayRowSearch::new(build_display_row(form, show_previous, r)))
+        .collect();
+    let show_module = rows.iter().any(|d| !d.display.module.is_empty());
+    (rows.into(), show_module)
+}
+
+fn filter_display_cache(cache: &[DisplayRowSearch], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return (0..cache.len()).collect();
+    }
+    cache
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.matches(&q))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn bench_scanner_table_refresh(
+    results: &[ScanResult],
+    form: &ScannerForm,
+    query: &str,
+) -> usize {
+    let (cache, show_module) = build_display_cache(results, form, false);
+    let rows = filter_display_cache(&cache, query);
+    rows.into_iter().fold(show_module as usize, |acc, row| {
+        let row = &cache[row].display;
+        acc.wrapping_add(row.row.address_text.len())
+            .wrapping_add(row.row.value_text.len())
+            .wrapping_add(row.module.len())
+    })
+}
+
+#[doc(hidden)]
+pub fn bench_scanner_table_filter_cached(
+    results: &[ScanResult],
+    form: &ScannerForm,
+    query: &str,
+) -> usize {
+    let (cache, show_module) = build_display_cache(results, form, false);
+    let mut total = show_module as usize;
+    for _ in 0..8 {
+        let rows = filter_display_cache(&cache, query);
+        total = total.wrapping_add(rows.into_iter().fold(0usize, |acc, row| {
+            let row = &cache[row].display;
+            acc.wrapping_add(row.row.address_text.len())
+                .wrapping_add(row.row.value_text.len())
+                .wrapping_add(row.module.len())
+        }));
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_display_cache, filter_display_cache};
+    use crate::scanner::ScanResult;
+    use crate::ui::panels::scannerpanel::ScannerForm;
+
+    #[test]
+    fn display_cache_filter_matches_address_value_and_module() {
+        let form = ScannerForm::default();
+        let results = vec![
+            ScanResult {
+                address: 0x0000_7FF6_0000_1000,
+                scan_value: 0x1337u32.to_le_bytes().to_vec().into(),
+                previous_value: Default::default(),
+                region_module: "client.dll".to_string(),
+            },
+            ScanResult {
+                address: 0x0000_7FF6_0000_2000,
+                scan_value: 0x2468u32.to_le_bytes().to_vec().into(),
+                previous_value: Default::default(),
+                region_module: "engine.dll".to_string(),
+            },
+        ];
+        let (cache, show_module) = build_display_cache(&results, &form, false);
+
+        assert!(show_module);
+        assert_eq!(filter_display_cache(&cache, "  ").len(), 2);
+        let matches = filter_display_cache(&cache, "1000");
+        assert_eq!(cache[matches[0]].display.row.address, results[0].address);
+        let matches = filter_display_cache(&cache, "4919");
+        assert_eq!(cache[matches[0]].display.row.address, results[0].address);
+        let matches = filter_display_cache(&cache, "ENGINE");
+        assert_eq!(cache[matches[0]].display.row.address, results[1].address);
+    }
+}
+
 /// Apply the post-scan value overrides to `results`: always clear the previous
 /// snapshot, and — on an exact-value scan (`pattern` Some) — overwrite each
 /// scan_value with the searched bytes (the C++ onScanFinished loop).
@@ -1738,7 +1869,7 @@ fn apply_scan_overrides(results: &mut [ScanResult], pattern: Option<&[u8]>) {
     for r in results {
         r.previous_value.clear();
         if let Some(pat) = pattern {
-            r.scan_value = pat.to_vec();
+            r.scan_value = pat.into();
         }
     }
 }

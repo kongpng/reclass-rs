@@ -351,7 +351,7 @@ impl super::RcxEditor {
         }
         let n = &tree.nodes[idx as usize];
         let is_ptr = matches!(n.kind, NodeKind::Pointer32 | NodeKind::Pointer64);
-        let is_embedded_ref = n.kind == NodeKind::Struct && tree.children_of(n.id).is_empty();
+        let is_embedded_ref = n.kind == NodeKind::Struct && !tree.has_children(n.id);
         if n.ref_id != 0 && (is_ptr || is_embedded_ref) {
             return n.ref_id;
         }
@@ -417,7 +417,7 @@ impl super::RcxEditor {
             "+1" => {
                 if grow_id != 0 && grow_id != K_COMMAND_ROW_ID {
                     self.controller.append_single_field(grow_id);
-                    self.apply_document(cx);
+                    self.after_mutation(cx);
                 }
                 true
             }

@@ -3113,7 +3113,10 @@ mod tests {
         );
 
         // The expand toggle is present and reads "+ Show all types (N)".
-        assert!(has_toggle(&model), "expand toggle row exists in simple mode");
+        assert!(
+            has_toggle(&model),
+            "expand toggle row exists in simple mode"
+        );
         let label = toggle_label(&model).unwrap();
         assert!(
             label.starts_with("+ Show all types ("),
@@ -3137,7 +3140,10 @@ mod tests {
         // the toggle flips to the collapse label (Unicode U+2212 minus).
         model.toggle_show_all();
         let names = real_row_names(&model);
-        assert!(names.contains(&"Vec3".to_string()), "Vec3 shown when expanded");
+        assert!(
+            names.contains(&"Vec3".to_string()),
+            "Vec3 shown when expanded"
+        );
         assert!(
             names.contains(&"UNICODE_STRING".to_string()),
             "UNICODE_STRING shown when expanded"
@@ -3193,7 +3199,10 @@ mod tests {
         );
         // The toggle row is still appended in the flat sort.
         assert!(has_toggle(&model), "toggle row appended in the flat sort");
-        assert_eq!(toggle_label(&model).as_deref(), Some("+ Show all types (2)"));
+        assert_eq!(
+            toggle_label(&model).as_deref(),
+            Some("+ Show all types (2)")
+        );
 
         // Same for the Size sort.
         model.set_sort_mode(SortMode::Size);

@@ -7,8 +7,10 @@
 //! vtable/.rdata bytes that weren't pre-fetched). Pages never fetched read as
 //! zeros.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+
+use ahash::AHashMap;
 
 use super::{MemoryRegion, ModuleEntry, Provider, ThreadInfo};
 
@@ -17,7 +19,7 @@ pub const K_PAGE_SIZE: u64 = 4096;
 const K_PAGE_MASK: u64 = !(K_PAGE_SIZE - 1);
 
 /// `using PageMap = QHash<uint64_t, QByteArray>` (`snapshot_provider.h:33`).
-pub type PageMap = HashMap<u64, Vec<u8>>;
+pub type PageMap = AHashMap<u64, Vec<u8>>;
 
 /// Page table + logical extent — mutated by `update_pages`/`merge_pages`/
 /// `patch_pages` (and `write`) through `&self`, so it lives behind a lock
@@ -33,6 +35,7 @@ pub struct SnapshotProvider {
     real: Option<Arc<dyn Provider + Send + Sync>>,
     inner: RwLock<SnapshotInner>,
     permanent_pages: RwLock<HashSet<u64>>,
+    real_readable_ranges: RwLock<Option<Vec<(u64, u64)>>>,
 }
 
 impl SnapshotProvider {
@@ -46,6 +49,7 @@ impl SnapshotProvider {
             real,
             inner: RwLock::new(SnapshotInner { pages, main_extent }),
             permanent_pages: RwLock::new(HashSet::new()),
+            real_readable_ranges: RwLock::new(None),
         }
     }
 
@@ -54,6 +58,7 @@ impl SnapshotProvider {
         let mut inner = self.inner.write().unwrap();
         inner.pages = pages;
         inner.main_extent = main_extent;
+        self.invalidate_real_readable_ranges();
     }
 
     /// `mergePages(fresh, mainExtent)` (`snapshot_provider.h:139-143`) — fresh
@@ -64,6 +69,7 @@ impl SnapshotProvider {
             inner.pages.insert(*k, v.clone());
         }
         inner.main_extent = main_extent;
+        self.invalidate_real_readable_ranges();
     }
 
     /// `markPermanent(pageAddr)` (`snapshot_provider.h:148-150`).
@@ -73,6 +79,7 @@ impl SnapshotProvider {
             .unwrap()
             .insert(page_addr & K_PAGE_MASK);
     }
+
     /// `isPermanent(pageAddr)` (`snapshot_provider.h:151-153`).
     pub fn is_permanent(&self, page_addr: u64) -> bool {
         self.permanent_pages
@@ -115,6 +122,78 @@ impl SnapshotProvider {
     pub fn permanent_pages(&self) -> RwLockReadGuard<'_, HashSet<u64>> {
         self.permanent_pages.read().unwrap()
     }
+
+    fn invalidate_real_readable_ranges(&self) {
+        *self.real_readable_ranges.write().unwrap() = None;
+    }
+
+    fn real_readable_ranges_lookup(&self, addr: u64, len: i32) -> (bool, bool) {
+        let cached = self.real_readable_ranges.read().unwrap();
+        if let Some(ranges) = cached.as_ref() {
+            return (
+                readable_ranges_contain(ranges.as_slice(), addr, len),
+                ranges.is_empty(),
+            );
+        }
+        drop(cached);
+
+        let ranges = readable_ranges_from_real(&self.real);
+        let mut cached = self.real_readable_ranges.write().unwrap();
+        if cached.is_none() {
+            *cached = Some(ranges);
+        }
+        drop(cached);
+
+        let cached = self.real_readable_ranges.read().unwrap();
+        let ranges = cached.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        (
+            readable_ranges_contain(ranges, addr, len),
+            ranges.is_empty(),
+        )
+    }
+}
+
+fn readable_ranges_from_real(real: &Option<Arc<dyn Provider + Send + Sync>>) -> Vec<(u64, u64)> {
+    let Some(real) = real else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<(u64, u64)> = real
+        .enumerate_regions()
+        .into_iter()
+        .filter_map(|region| {
+            if !region.readable || region.size == 0 {
+                return None;
+            }
+            let end = region.base.saturating_add(region.size);
+            (end > region.base).then_some((region.base, end))
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut write = 0usize;
+    for read in 0..ranges.len() {
+        let (start, end) = ranges[read];
+        if write > 0 && start <= ranges[write - 1].1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(end);
+        } else {
+            ranges[write] = (start, end);
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
+    ranges
+}
+
+fn readable_ranges_contain(ranges: &[(u64, u64)], addr: u64, len: i32) -> bool {
+    if len <= 0 {
+        return len == 0;
+    }
+    let Some(end) = addr.checked_add(len as u64) else {
+        return false;
+    };
+    let idx = ranges.partition_point(|(_, range_end)| *range_end <= addr);
+    ranges
+        .get(idx)
+        .is_some_and(|(start, range_end)| *start <= addr && end <= *range_end)
 }
 
 impl Provider for SnapshotProvider {
@@ -123,6 +202,18 @@ impl Provider for SnapshotProvider {
             return false;
         }
         let inner = self.inner.read().unwrap();
+        let page_off = (addr & (K_PAGE_SIZE - 1)) as usize;
+        if inner.pages.is_empty() && page_off + buf.len() <= K_PAGE_SIZE as usize {
+            drop(inner);
+            if let Some(real) = &self.real {
+                if !real.read(addr, buf) {
+                    buf.fill(0);
+                }
+            } else {
+                buf.fill(0);
+            }
+            return true;
+        }
         let mut cur = addr;
         let mut off = 0usize;
         while off < buf.len() {
@@ -137,11 +228,10 @@ impl Provider for SnapshotProvider {
                     *b = 0;
                 }
             } else if let Some(real) = &self.real {
-                let mut tmp = vec![0u8; chunk];
-                if !real.read(cur, &mut tmp) {
-                    tmp.iter_mut().for_each(|b| *b = 0);
+                let out = &mut buf[off..off + chunk];
+                if !real.read(cur, out) {
+                    out.fill(0);
                 }
-                buf[off..off + chunk].copy_from_slice(&tmp);
             } else {
                 for b in &mut buf[off..off + chunk] {
                     *b = 0;
@@ -163,18 +253,25 @@ impl Provider for SnapshotProvider {
             Some(e) => e,
             None => return false,
         };
-        let inner = self.inner.read().unwrap();
-        let mut p = addr & K_PAGE_MASK;
-        while p < end {
-            if !inner.pages.contains_key(&p) {
-                if let Some(real) = &self.real {
-                    if real.is_readable(addr, len) {
+        {
+            let inner = self.inner.read().unwrap();
+            let mut p = addr & K_PAGE_MASK;
+            while p < end {
+                if !inner.pages.contains_key(&p) {
+                    drop(inner);
+                    let (readable, ranges_empty) = self.real_readable_ranges_lookup(addr, len);
+                    if readable {
                         return true;
                     }
+                    if ranges_empty {
+                        if let Some(real) = &self.real {
+                            return real.is_readable(addr, len);
+                        }
+                    }
+                    return false;
                 }
-                return false;
+                p += K_PAGE_SIZE;
             }
-            p += K_PAGE_SIZE;
         }
         true
     }
@@ -250,6 +347,7 @@ impl Provider for SnapshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn reads_from_pages_and_zero_fills_holes() {
@@ -300,5 +398,111 @@ mod tests {
         let snap = SnapshotProvider::new(None, PageMap::new(), 0);
         assert!(!snap.is_writable());
         assert!(!snap.write(0, &[1, 2, 3]));
+    }
+
+    struct FailingReadProvider;
+
+    impl Provider for FailingReadProvider {
+        fn read(&self, _addr: u64, buf: &mut [u8]) -> bool {
+            buf.fill(0xCC);
+            false
+        }
+
+        fn size(&self) -> i32 {
+            0x1000
+        }
+
+        fn is_readable(&self, _addr: u64, len: i32) -> bool {
+            len >= 0
+        }
+    }
+
+    #[test]
+    fn missing_page_real_read_failure_zero_fills_output() {
+        let real: Arc<dyn Provider + Send + Sync> = Arc::new(FailingReadProvider);
+        let snap = SnapshotProvider::new(Some(real), PageMap::new(), 0);
+        let mut buf = [0xAAu8; 8];
+
+        assert!(snap.read(0x20, &mut buf));
+        assert_eq!(buf, [0u8; 8]);
+    }
+
+    struct RegionCountingProvider {
+        regions: RwLock<Vec<MemoryRegion>>,
+        enumerate_calls: AtomicUsize,
+        readable_calls: AtomicUsize,
+    }
+
+    impl RegionCountingProvider {
+        fn new(regions: Vec<MemoryRegion>) -> Self {
+            Self {
+                regions: RwLock::new(regions),
+                enumerate_calls: AtomicUsize::new(0),
+                readable_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_regions(&self, regions: Vec<MemoryRegion>) {
+            *self.regions.write().unwrap() = regions;
+        }
+    }
+
+    impl Provider for RegionCountingProvider {
+        fn read(&self, _addr: u64, buf: &mut [u8]) -> bool {
+            buf.fill(0);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            0
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.enumerate_calls.fetch_add(1, Ordering::Relaxed);
+            self.regions.read().unwrap().clone()
+        }
+
+        fn is_readable(&self, _addr: u64, _len: i32) -> bool {
+            self.readable_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    fn region(base: u64, size: u64, readable: bool) -> MemoryRegion {
+        MemoryRegion {
+            base,
+            size,
+            readable,
+            writable: false,
+            executable: false,
+            module_name: String::new(),
+            region_type: super::super::RegionType::Private,
+        }
+    }
+
+    #[test]
+    fn snapshot_readability_uses_cached_real_ranges_and_refreshes_on_merge() {
+        let real = Arc::new(RegionCountingProvider::new(vec![
+            region(0x4000, 0x1000, true),
+            region(0x1000, 0x1000, true),
+            region(0x3000, 0x1000, false),
+        ]));
+        let real_dyn: Arc<dyn Provider + Send + Sync> = real.clone();
+        let snap = SnapshotProvider::new(Some(real_dyn), PageMap::new(), 0);
+
+        assert_eq!(real.enumerate_calls.load(Ordering::Relaxed), 0);
+        assert!(snap.is_readable(0x1000, 8));
+        assert!(snap.is_readable(0x4000, 8));
+        assert!(!snap.is_readable(0x3000, 8));
+        assert_eq!(real.enumerate_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(real.readable_calls.load(Ordering::Relaxed), 0);
+
+        real.set_regions(vec![region(0x8000, 0x1000, true)]);
+        snap.merge_pages(&PageMap::new(), 0);
+
+        assert!(!snap.is_readable(0x1000, 8));
+        assert!(snap.is_readable(0x8000, 8));
+        assert_eq!(real.enumerate_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(real.readable_calls.load(Ordering::Relaxed), 0);
     }
 }

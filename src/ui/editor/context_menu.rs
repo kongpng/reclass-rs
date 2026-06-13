@@ -1041,6 +1041,7 @@ impl super::RcxEditor {
         // hover card pending from the move that preceded the click).
         self.hover_popup = None;
         self.hover_probe = None;
+        self.hover_memory_maps = None;
         self.memory_preview_rows = super::hover_popup::MEMORY_PREVIEW_MIN_ROWS;
         // Focus the MENU (not the editor) so the keyboard drives it: Up/Down move
         // the highlight, Enter activates the highlighted item, and Esc closes the

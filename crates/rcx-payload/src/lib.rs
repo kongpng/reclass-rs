@@ -9,9 +9,12 @@ mod windows_payload {
 
     use rcx_rpc::{
         req_name, rsp_name, shm_name, RcxRpcHeader, RcxRpcModuleEntry, RcxRpcReadEntry,
-        RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_HEADER_SIZE, RCX_RPC_SHM_SIZE,
+        RcxRpcRegionEntry, RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_HEADER_SIZE,
+        RCX_RPC_REGION_EXECUTABLE, RCX_RPC_REGION_IMAGE, RCX_RPC_REGION_MAPPED,
+        RCX_RPC_REGION_PRIVATE, RCX_RPC_REGION_READABLE, RCX_RPC_REGION_WRITABLE, RCX_RPC_SHM_SIZE,
         RCX_RPC_STATUS_ERROR, RCX_RPC_STATUS_OK, RCX_RPC_STATUS_PARTIAL, RCX_RPC_VERSION,
-        RPC_CMD_ENUM_MODULES, RPC_CMD_PING, RPC_CMD_READ_BATCH, RPC_CMD_SHUTDOWN, RPC_CMD_WRITE,
+        RPC_CMD_ENUM_MODULES, RPC_CMD_ENUM_REGIONS, RPC_CMD_PING, RPC_CMD_READ_BATCH,
+        RPC_CMD_SHUTDOWN, RPC_CMD_WRITE,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, HANDLE, HINSTANCE, HMODULE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
@@ -19,9 +22,9 @@ mod windows_payload {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Memory::{
         CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, VirtualQuery, FILE_MAP_ALL_ACCESS,
-        MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT, PAGE_EXECUTE_READ,
-        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
-        PAGE_READWRITE, PAGE_WRITECOPY,
+        MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED,
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
     };
     use windows_sys::Win32::System::ProcessStatus::{
         EnumProcessModules, GetModuleBaseNameW, GetModuleInformation, MODULEINFO,
@@ -215,6 +218,129 @@ mod windows_payload {
         hdr.status = RCX_RPC_STATUS_OK;
     }
 
+    struct EncodedRegion {
+        base: u64,
+        size: u64,
+        name: Vec<u8>,
+        flags: u32,
+        region_type: u32,
+    }
+
+    unsafe fn handle_enum_regions(hdr: &mut RcxRpcHeader, data: *mut u8) {
+        let h_proc = GetCurrentProcess();
+        let mut regions = Vec::new();
+        let mut addr = 0usize;
+
+        loop {
+            let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
+            if VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) == 0
+            {
+                break;
+            }
+
+            if mbi.State == MEM_COMMIT {
+                let readable = is_readable_protect(mbi.Protect);
+                if readable {
+                    let writable = is_writable_protect(mbi.Protect);
+                    let executable = (mbi.Protect
+                        & (PAGE_EXECUTE
+                            | PAGE_EXECUTE_READ
+                            | PAGE_EXECUTE_READWRITE
+                            | PAGE_EXECUTE_WRITECOPY))
+                        != 0;
+                    let region_type = if mbi.Type == MEM_IMAGE {
+                        RCX_RPC_REGION_IMAGE
+                    } else if mbi.Type == MEM_MAPPED {
+                        RCX_RPC_REGION_MAPPED
+                    } else {
+                        RCX_RPC_REGION_PRIVATE
+                    };
+                    let mut flags = RCX_RPC_REGION_READABLE;
+                    if writable {
+                        flags |= RCX_RPC_REGION_WRITABLE;
+                    }
+                    if executable {
+                        flags |= RCX_RPC_REGION_EXECUTABLE;
+                    }
+                    let mut module_name = [0u16; 260];
+                    let name_len = if mbi.Type == MEM_IMAGE {
+                        GetModuleBaseNameW(
+                            h_proc,
+                            mbi.AllocationBase as HMODULE,
+                            module_name.as_mut_ptr(),
+                            module_name.len() as u32,
+                        ) as usize
+                    } else {
+                        0
+                    };
+                    let name = std::slice::from_raw_parts(
+                        module_name.as_ptr() as *const u8,
+                        name_len * size_of::<u16>(),
+                    )
+                    .to_vec();
+                    regions.push(EncodedRegion {
+                        base: mbi.BaseAddress as u64,
+                        size: mbi.RegionSize as u64,
+                        name,
+                        flags,
+                        region_type,
+                    });
+                }
+            }
+
+            let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            if next <= addr {
+                break;
+            }
+            addr = next;
+        }
+
+        write_region_entries(hdr, data, regions);
+    }
+
+    unsafe fn write_region_entries(
+        hdr: &mut RcxRpcHeader,
+        data: *mut u8,
+        regions: Vec<EncodedRegion>,
+    ) {
+        let max_entries = RCX_RPC_DATA_SIZE / size_of::<RcxRpcRegionEntry>();
+        let count = regions.len().min(max_entries);
+        let entry_bytes = count * size_of::<RcxRpcRegionEntry>();
+        let mut name_data_off = entry_bytes as u32;
+        let mut written = 0usize;
+
+        for (i, region) in regions.into_iter().take(count).enumerate() {
+            let name_len = region
+                .name
+                .len()
+                .min(RCX_RPC_DATA_SIZE.saturating_sub(name_data_off as usize));
+            let entry = data.add(i * size_of::<RcxRpcRegionEntry>()) as *mut RcxRpcRegionEntry;
+            (*entry).base = region.base;
+            (*entry).size = region.size;
+            (*entry).name_offset = name_data_off;
+            (*entry).name_length = name_len as u32;
+            (*entry).flags = region.flags;
+            (*entry).region_type = region.region_type;
+            if name_len > 0 {
+                copy_nonoverlapping(
+                    region.name.as_ptr(),
+                    data.add(name_data_off as usize),
+                    name_len,
+                );
+                name_data_off += name_len as u32;
+            }
+            written += 1;
+        }
+
+        hdr.response_count = written as u32;
+        hdr.total_data_used = name_data_off;
+        hdr.status = RCX_RPC_STATUS_OK;
+    }
+
     unsafe extern "system" fn poll_timer_callback(_: *mut c_void, _: bool) {
         if MAPPED_VIEW.Value.is_null() || H_REQ_EVENT.is_null() || H_RSP_EVENT.is_null() {
             return;
@@ -231,6 +357,7 @@ mod windows_payload {
             RPC_CMD_READ_BATCH => handle_read_batch(hdr, data),
             RPC_CMD_WRITE => handle_write(hdr, data),
             RPC_CMD_ENUM_MODULES => handle_enum_modules(hdr, data),
+            RPC_CMD_ENUM_REGIONS => handle_enum_regions(hdr, data),
             RPC_CMD_PING => {}
             RPC_CMD_SHUTDOWN => {
                 payload_cleanup();
@@ -371,10 +498,12 @@ mod linux_payload {
 
     use rcx_rpc::{
         req_name, rsp_name, shm_name, RcxRpcHeader, RcxRpcModuleEntry, RcxRpcReadEntry,
-        RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_HEADER_SIZE, RCX_RPC_MAX_BATCH,
-        RCX_RPC_SHM_SIZE, RCX_RPC_STATUS_ERROR, RCX_RPC_STATUS_OK, RCX_RPC_STATUS_PARTIAL,
-        RCX_RPC_VERSION, RPC_CMD_ENUM_MODULES, RPC_CMD_PING, RPC_CMD_READ_BATCH, RPC_CMD_SHUTDOWN,
-        RPC_CMD_WRITE,
+        RcxRpcRegionEntry, RCX_RPC_DATA_OFFSET, RCX_RPC_DATA_SIZE, RCX_RPC_HEADER_SIZE,
+        RCX_RPC_MAX_BATCH, RCX_RPC_REGION_EXECUTABLE, RCX_RPC_REGION_IMAGE, RCX_RPC_REGION_MAPPED,
+        RCX_RPC_REGION_PRIVATE, RCX_RPC_REGION_READABLE, RCX_RPC_REGION_WRITABLE, RCX_RPC_SHM_SIZE,
+        RCX_RPC_STATUS_ERROR, RCX_RPC_STATUS_OK, RCX_RPC_STATUS_PARTIAL, RCX_RPC_VERSION,
+        RPC_CMD_ENUM_MODULES, RPC_CMD_ENUM_REGIONS, RPC_CMD_PING, RPC_CMD_READ_BATCH,
+        RPC_CMD_SHUTDOWN, RPC_CMD_WRITE,
     };
 
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -520,6 +649,75 @@ mod linux_payload {
         hdr.status = RCX_RPC_STATUS_OK;
     }
 
+    struct MapRegion {
+        start: u64,
+        end: u64,
+        readable: bool,
+        writable: bool,
+        executable: bool,
+        name: Vec<u8>,
+        region_type: u32,
+    }
+
+    unsafe fn handle_enum_regions(hdr: &mut RcxRpcHeader, data: *mut u8) {
+        let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+            hdr.status = RCX_RPC_STATUS_ERROR;
+            hdr.response_count = 0;
+            return;
+        };
+
+        let regions = maps
+            .lines()
+            .filter_map(parse_region_map_line)
+            .collect::<Vec<_>>();
+        write_region_entries(hdr, data, regions);
+    }
+
+    unsafe fn write_region_entries(hdr: &mut RcxRpcHeader, data: *mut u8, regions: Vec<MapRegion>) {
+        let max_entries = RCX_RPC_DATA_SIZE / size_of::<RcxRpcRegionEntry>();
+        let count = regions.len().min(max_entries);
+        let entry_bytes = count * size_of::<RcxRpcRegionEntry>();
+        let mut name_data_off = entry_bytes as u32;
+        let mut written = 0usize;
+
+        for (i, region) in regions.into_iter().take(count).enumerate() {
+            if region.end <= region.start || !region.readable {
+                continue;
+            }
+            let mut flags = RCX_RPC_REGION_READABLE;
+            if region.writable {
+                flags |= RCX_RPC_REGION_WRITABLE;
+            }
+            if region.executable {
+                flags |= RCX_RPC_REGION_EXECUTABLE;
+            }
+            let name_len = region
+                .name
+                .len()
+                .min(RCX_RPC_DATA_SIZE.saturating_sub(name_data_off as usize));
+            let entry = data.add(i * size_of::<RcxRpcRegionEntry>()) as *mut RcxRpcRegionEntry;
+            (*entry).base = region.start;
+            (*entry).size = region.end - region.start;
+            (*entry).name_offset = name_data_off;
+            (*entry).name_length = name_len as u32;
+            (*entry).flags = flags;
+            (*entry).region_type = region.region_type;
+            if name_len > 0 {
+                copy_nonoverlapping(
+                    region.name.as_ptr(),
+                    data.add(name_data_off as usize),
+                    name_len,
+                );
+                name_data_off += name_len as u32;
+            }
+            written += 1;
+        }
+
+        hdr.response_count = written as u32;
+        hdr.total_data_used = name_data_off;
+        hdr.status = RCX_RPC_STATUS_OK;
+    }
+
     extern "C" fn server_thread_func(_: *mut libc::c_void) -> *mut libc::c_void {
         unsafe {
             THREAD_RUNNING.store(true, Ordering::Release);
@@ -547,6 +745,7 @@ mod linux_payload {
                     RPC_CMD_READ_BATCH => handle_read_batch(hdr, data),
                     RPC_CMD_WRITE => handle_write(hdr, data),
                     RPC_CMD_ENUM_MODULES => handle_enum_modules(hdr, data),
+                    RPC_CMD_ENUM_REGIONS => handle_enum_regions(hdr, data),
                     RPC_CMD_PING => {}
                     RPC_CMD_SHUTDOWN => SHUTDOWN.store(true, Ordering::Release),
                     _ => hdr.status = RCX_RPC_STATUS_ERROR,
@@ -720,6 +919,50 @@ mod linux_payload {
         ))
     }
 
+    fn parse_region_map_line(line: &str) -> Option<MapRegion> {
+        let mut parts = line.split_whitespace();
+        let range = parts.next()?;
+        let perms = parts.next()?;
+        let _offset = parts.next()?;
+        let _dev = parts.next()?;
+        let _inode = parts.next()?;
+        if perms.len() < 3 {
+            return None;
+        }
+        let path = parts.collect::<Vec<_>>().join(" ");
+        let path = path.trim();
+        let readable = perms.as_bytes().first() == Some(&b'r');
+        if !readable {
+            return None;
+        }
+        let writable = perms.as_bytes().get(1) == Some(&b'w');
+        let executable = perms.as_bytes().get(2) == Some(&b'x');
+        let (start, end) = range.split_once('-')?;
+        let mut name = Vec::new();
+        let mut region_type = RCX_RPC_REGION_PRIVATE;
+        if path.starts_with('/') && !path.starts_with("/dev/") && !path.starts_with("/memfd:") {
+            let basename = Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path);
+            name.extend_from_slice(basename.as_bytes());
+            region_type = if executable {
+                RCX_RPC_REGION_IMAGE
+            } else {
+                RCX_RPC_REGION_MAPPED
+            };
+        }
+        Some(MapRegion {
+            start: u64::from_str_radix(start, 16).ok()?,
+            end: u64::from_str_radix(end, 16).ok()?,
+            readable,
+            writable,
+            executable,
+            name,
+            region_type,
+        })
+    }
+
     fn first_executable_mapping() -> u64 {
         let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
             return 0;
@@ -790,6 +1033,31 @@ mod linux_payload {
     #[no_mangle]
     pub unsafe extern "C" fn RcxPayloadInit() -> bool {
         init_impl()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_region_map_line_classifies_readable_file_and_heap_regions() {
+            let image = parse_region_map_line("7f00-8000 r-xp 00000000 00:00 1 /tmp/game/bin/game")
+                .unwrap();
+            assert_eq!(image.start, 0x7f00);
+            assert_eq!(image.end, 0x8000);
+            assert!(image.readable);
+            assert!(image.executable);
+            assert!(!image.writable);
+            assert_eq!(image.region_type, RCX_RPC_REGION_IMAGE);
+            assert_eq!(image.name, b"game");
+
+            let heap = parse_region_map_line("9000-a000 rw-p 00000000 00:00 0 [heap]").unwrap();
+            assert_eq!(heap.region_type, RCX_RPC_REGION_PRIVATE);
+            assert!(heap.name.is_empty());
+            assert!(heap.writable);
+
+            assert!(parse_region_map_line("a000-b000 ---p 00000000 00:00 0").is_none());
+        }
     }
 }
 

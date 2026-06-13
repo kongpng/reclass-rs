@@ -362,7 +362,7 @@ pub fn fmt_float(v: f32) -> String {
     // Round half-AWAY-from-zero (Qt `QString::number(av,'f',dec)`), NOT Rust's
     // built-in round-half-to-even, so e.g. 37428.5 → "37429.f".
     for dec in (0..=4).rev() {
-        let mut body = fmt_fixed_away(f64::from(av), dec as usize);
+        let mut body = fmt_fixed_away_f32_body(av, dec as usize);
         body += if dec == 0 { ".f" } else { "f" };
         if body.len() == 7 {
             if v < 0.0 {
@@ -373,6 +373,30 @@ pub fn fmt_float(v: f32) -> String {
     }
     // Rounding pushed past 99999 — use overflow cap
     if v < 0.0 { "-99999+f" } else { "99999+f" }.to_string()
+}
+
+fn fmt_fixed_away_f32_body(v: f32, frac: usize) -> String {
+    debug_assert!(v.is_finite() && v >= 0.0 && frac <= 4);
+    const POW10: [u64; 5] = [1, 10, 100, 1_000, 10_000];
+    let scale = POW10[frac];
+    let rounded = (f64::from(v) * scale as f64 + 0.5).floor() as u64;
+    let int_part = rounded / scale;
+    if frac == 0 {
+        return int_part.to_string();
+    }
+    let frac_part = rounded % scale;
+    let mut out = int_part.to_string();
+    out.push('.');
+    push_zero_padded_u64(&mut out, frac_part, frac);
+    out
+}
+
+fn push_zero_padded_u64(out: &mut String, value: u64, width: usize) {
+    let text = value.to_string();
+    for _ in text.len()..width {
+        out.push('0');
+    }
+    out.push_str(&text);
 }
 
 /// `fmt::fmtDouble(double v)` (`format.cpp:209-216`). `'g',6`, then force a `.0`
@@ -932,11 +956,7 @@ pub fn fmt_ascii_and_bytes(
 ) -> String {
     let slot = slot_bytes.max(size_bytes);
     let slot_usize = slot.max(0) as usize;
-    let b = if prov.is_readable(addr, slot) {
-        prov.read_bytes(addr, slot)
-    } else {
-        vec![0u8; slot_usize]
-    };
+    let b = prov.read_bytes(addr, slot);
     format!(
         "{}  {}",
         bytes_to_ascii(&b, slot_usize),
@@ -950,6 +970,208 @@ pub fn fmt_ascii_and_bytes(
 enum ValueMode {
     Display,
     Editable,
+}
+
+fn read_le<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+    (bytes.len() >= N).then(|| bytes[..N].try_into().unwrap())
+}
+
+fn format_vec_f32_from_bytes(kind: NodeKind, bytes: &[u8]) -> Option<String> {
+    let count = size_for_kind(kind) as usize / 4;
+    if bytes.len() < count.saturating_mul(4) {
+        return None;
+    }
+    let mut out = String::with_capacity(count.saturating_mul(12));
+    for i in 0..count {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let start = i * 4;
+        let lane = u32::from_le_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ]);
+        out.push_str(&fmt_float(f32::from_bits(lane)));
+    }
+    Some(out)
+}
+
+fn format_deref_primitive_from_bytes(
+    kind: NodeKind,
+    bytes: &[u8],
+    mode: ValueMode,
+) -> Option<String> {
+    let display = mode == ValueMode::Display;
+    Some(match kind {
+        NodeKind::Int8 => fmt_int8(*bytes.first()? as i8),
+        NodeKind::Int16 => fmt_int16(i16::from_le_bytes(read_le::<2>(bytes)?)),
+        NodeKind::Int32 => fmt_int32(i32::from_le_bytes(read_le::<4>(bytes)?)),
+        NodeKind::Int64 => fmt_int64(i64::from_le_bytes(read_le::<8>(bytes)?)),
+        NodeKind::UInt8 => fmt_uint8(*bytes.first()?),
+        NodeKind::UInt16 => fmt_uint16(u16::from_le_bytes(read_le::<2>(bytes)?)),
+        NodeKind::UInt32 => fmt_uint32(u32::from_le_bytes(read_le::<4>(bytes)?)),
+        NodeKind::UInt64 => fmt_uint64(u64::from_le_bytes(read_le::<8>(bytes)?)),
+        NodeKind::Float16 => {
+            let s = fmt_float16(u16::from_le_bytes(read_le::<2>(bytes)?));
+            if display {
+                s
+            } else {
+                s.trim().to_string()
+            }
+        }
+        NodeKind::Float => {
+            let s = fmt_float(f32::from_bits(u32::from_le_bytes(read_le::<4>(bytes)?)));
+            if display {
+                s
+            } else {
+                s.trim().to_string()
+            }
+        }
+        NodeKind::Double => {
+            let s = fmt_double(f64::from_bits(u64::from_le_bytes(read_le::<8>(bytes)?)));
+            if display {
+                s
+            } else {
+                s.trim().to_string()
+            }
+        }
+        NodeKind::Bool => fmt_bool(*bytes.first()?),
+        NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => format_vec_f32_from_bytes(kind, bytes)?,
+        _ => return None,
+    })
+}
+
+/// Display-format a node from bytes the caller already read. This intentionally
+/// covers only cases where the display value is fully determined by `bytes`
+/// (plus optional symbol lookup for pointer text). Dereference pointers can
+/// depend on target memory and should keep using [`read_value`].
+pub fn read_display_value_from_bytes(
+    node: &Node,
+    prov: &dyn Provider,
+    bytes: &[u8],
+    sub_line: i32,
+) -> Option<String> {
+    let be = node.big_endian;
+    let load_u16 = |bytes: &[u8]| -> Option<u16> {
+        let mut value = u16::from_le_bytes(read_le::<2>(bytes)?);
+        if be {
+            value = value.swap_bytes();
+        }
+        Some(value)
+    };
+    let load_u32 = |bytes: &[u8]| -> Option<u32> {
+        let mut value = u32::from_le_bytes(read_le::<4>(bytes)?);
+        if be {
+            value = value.swap_bytes();
+        }
+        Some(value)
+    };
+    let load_u64 = |bytes: &[u8]| -> Option<u64> {
+        let mut value = u64::from_le_bytes(read_le::<8>(bytes)?);
+        if be {
+            value = value.swap_bytes();
+        }
+        Some(value)
+    };
+
+    Some(match node.kind {
+        NodeKind::Hex8 => hex_val(u64::from(*bytes.first()?)),
+        NodeKind::Hex16 => hex_val(u64::from(load_u16(bytes)?)),
+        NodeKind::Hex32 => hex_val(u64::from(load_u32(bytes)?)),
+        NodeKind::Hex64 => hex_val(load_u64(bytes)?),
+        NodeKind::Hex128 => {
+            let mut b = read_le::<16>(bytes)?;
+            if be {
+                b.reverse();
+            }
+            let lo = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            if hi == 0 {
+                hex_val(lo)
+            } else {
+                format!("0x{:X}{}", hi, left_pad_zeros(&format!("{lo:X}"), 16))
+            }
+        }
+        NodeKind::Int8 => fmt_int8(*bytes.first()? as i8),
+        NodeKind::Int16 => fmt_int16(load_u16(bytes)? as i16),
+        NodeKind::Int32 => fmt_int32(load_u32(bytes)? as i32),
+        NodeKind::Int64 => fmt_int64(load_u64(bytes)? as i64),
+        NodeKind::Int128 | NodeKind::UInt128 => {
+            let mut b = read_le::<16>(bytes)?;
+            if be {
+                b.reverse();
+            }
+            if node.kind == NodeKind::Int128 {
+                fmt_int128(&b)
+            } else {
+                fmt_uint128(&b)
+            }
+        }
+        NodeKind::UInt8 => fmt_uint8(*bytes.first()?),
+        NodeKind::UInt16 => fmt_uint16(load_u16(bytes)?),
+        NodeKind::UInt32 => fmt_uint32(load_u32(bytes)?),
+        NodeKind::UInt64 => fmt_uint64(load_u64(bytes)?),
+        NodeKind::Float16 => fmt_float16(load_u16(bytes)?),
+        NodeKind::Float => fmt_float(f32::from_bits(load_u32(bytes)?)),
+        NodeKind::Double => fmt_double(f64::from_bits(load_u64(bytes)?)),
+        NodeKind::Bool => fmt_bool(*bytes.first()?),
+        NodeKind::Pointer32 | NodeKind::FuncPtr32 => ptr32_value(prov, load_u32(bytes)?, true),
+        NodeKind::Pointer64 | NodeKind::FuncPtr64 => {
+            let value = load_u64(bytes)?;
+            if node.kind == NodeKind::Pointer64
+                && node.ptr_depth > 0
+                && is_valid_primitive_ptr_target(node.element_kind)
+                && value != 0
+            {
+                return None;
+            }
+            ptr64_value(prov, value, true)
+        }
+        NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => {
+            format_vec_f32_from_bytes(node.kind, bytes)?
+        }
+        NodeKind::Mat4x4 => {
+            if !(0..4).contains(&sub_line) {
+                return Some("?".to_string());
+            }
+            let start = sub_line as usize * 16;
+            let row = bytes.get(start..start + 16)?;
+            let mut line = String::with_capacity(56);
+            line.push_str("row");
+            line.push(char::from(b'0' + sub_line as u8));
+            line.push_str(" [");
+            for c in 0..4 {
+                if c > 0 {
+                    line.push_str(", ");
+                }
+                let start = c * 4;
+                let lane = u32::from_le_bytes(row[start..start + 4].try_into().unwrap());
+                line.push_str(&fmt_float(f32::from_bits(lane)));
+            }
+            line.push(']');
+            line
+        }
+        NodeKind::UTF8 => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let s = String::from_utf8_lossy(&bytes[..end]).into_owned();
+            format!("\"{}\"", sanitize_string(&s))
+        }
+        NodeKind::UTF16 => {
+            let units = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]));
+            let mut s: String = char::decode_utf16(units)
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .collect();
+            if let Some(end) = s.find('\u{0}') {
+                s.truncate(end);
+            }
+            format!("L\"{}\"", sanitize_string(&s))
+        }
+        _ => return None,
+    })
 }
 
 /// `readValueImpl(node, prov, addr, subLine, mode)` (`format.cpp:362-503`).
@@ -1121,20 +1343,34 @@ fn read_value_impl(
                 let mut target = val;
                 let mut d = 1;
                 while d < node.ptr_depth && target != 0 {
-                    target = if prov.is_readable(target, 8) {
-                        prov.read_u64(target)
+                    let mut bytes = [0u8; 8];
+                    target = if prov.read(target, &mut bytes) {
+                        u64::from_le_bytes(bytes)
                     } else {
                         0
                     };
                     d += 1;
                 }
-                if target != 0 && prov.is_readable(target, size_for_kind(node.element_kind)) {
-                    let tmp = Node {
-                        kind: node.element_kind,
-                        str_len: node.str_len,
-                        ..Node::default()
-                    };
-                    let deref_val = read_value_impl(&tmp, prov, target, 0, mode);
+                let target_size = size_for_kind(node.element_kind);
+                let mut stack_probe = [0u8; 16];
+                let mut heap_probe;
+                let probe = if target_size > 0 && target_size as usize <= stack_probe.len() {
+                    &mut stack_probe[..target_size as usize]
+                } else {
+                    heap_probe = vec![0u8; target_size.max(0) as usize];
+                    heap_probe.as_mut_slice()
+                };
+                if target != 0 && target_size > 0 && prov.read(target, probe) {
+                    let deref_val =
+                        format_deref_primitive_from_bytes(node.element_kind, probe, mode)
+                            .unwrap_or_else(|| {
+                                let tmp = Node {
+                                    kind: node.element_kind,
+                                    str_len: node.str_len,
+                                    ..Node::default()
+                                };
+                                read_value_impl(&tmp, prov, target, 0, mode)
+                            });
                     if display {
                         // Arrow to deref target value + symbol on the pointer's
                         // own value (`format.cpp:443-449`).
@@ -1158,11 +1394,12 @@ fn read_value_impl(
             ptr64_value(prov, val, display)
         }
         NodeKind::Vec2 | NodeKind::Vec3 | NodeKind::Vec4 => {
-            let count = size_for_kind(node.kind) / 4;
-            let parts: Vec<String> = (0..count)
-                .map(|i| fmt_float(prov.read_f32(addr + (i as u64) * 4)))
-                .collect();
-            parts.join(", ")
+            let size = size_for_kind(node.kind).max(0) as usize;
+            let mut bytes = [0u8; 16];
+            let len = size.min(bytes.len());
+            let data = &mut bytes[..len];
+            let _ = prov.read(addr, data);
+            format_vec_f32_from_bytes(node.kind, data).unwrap_or_default()
         }
         NodeKind::Mat4x4 => {
             if !display {
@@ -1171,14 +1408,22 @@ fn read_value_impl(
             if !(0..4).contains(&sub_line) {
                 return "?".to_string();
             }
-            let mut line = format!("row{sub_line} [");
+            let row_addr = addr + (sub_line as u64) * 16;
+            let mut bytes = [0u8; 16];
+            let _ = prov.read(row_addr, &mut bytes);
+            let mut line = String::with_capacity(56);
+            line.push_str("row");
+            line.push(char::from(b'0' + sub_line as u8));
+            line.push_str(" [");
             for c in 0..4 {
                 if c > 0 {
-                    line += ", ";
+                    line.push_str(", ");
                 }
-                line += &fmt_float(prov.read_f32(addr + ((sub_line * 4 + c) as u64) * 4));
+                let start = c as usize * 4;
+                let lane = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+                line.push_str(&fmt_float(f32::from_bits(lane)));
             }
-            line += "]";
+            line.push(']');
             line
         }
         NodeKind::UTF8 => {
@@ -1241,6 +1486,64 @@ pub fn fmt_node_line(
     type_override: &str,
     compact: bool,
 ) -> String {
+    fmt_node_line_impl(
+        node,
+        prov,
+        addr,
+        depth,
+        sub_line,
+        comment,
+        col_type,
+        col_name,
+        type_override,
+        compact,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fmt_node_line_with_hex_preview_bytes(
+    node: &Node,
+    prov: &dyn Provider,
+    addr: u64,
+    depth: i32,
+    sub_line: i32,
+    comment: &str,
+    col_type: i32,
+    col_name: i32,
+    type_override: &str,
+    compact: bool,
+    hex_preview_bytes: &[u8],
+) -> String {
+    fmt_node_line_impl(
+        node,
+        prov,
+        addr,
+        depth,
+        sub_line,
+        comment,
+        col_type,
+        col_name,
+        type_override,
+        compact,
+        Some(hex_preview_bytes),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fmt_node_line_impl(
+    node: &Node,
+    prov: &dyn Provider,
+    addr: u64,
+    depth: i32,
+    sub_line: i32,
+    comment: &str,
+    col_type: i32,
+    col_name: i32,
+    type_override: &str,
+    compact: bool,
+    hex_preview_bytes: Option<&[u8]>,
+) -> String {
     let ind = indent(depth);
 
     let raw_type = if type_override.is_empty() {
@@ -1285,14 +1588,20 @@ pub fn fmt_node_line(
     if is_hex_preview(node.kind) {
         let sz = size_for_kind(node.kind);
         let sz_usize = sz.max(0) as usize;
-        let b = if prov.is_readable(addr, sz) {
-            prov.read_bytes(addr, sz)
+        let mut stack_bytes = [0u8; 16];
+        let owned_bytes;
+        let b = if let Some(bytes) = hex_preview_bytes {
+            bytes
+        } else if sz > 0 && sz_usize <= stack_bytes.len() {
+            let _ = prov.read(addr, &mut stack_bytes[..sz_usize]);
+            &stack_bytes[..sz_usize]
         } else {
-            vec![0u8; sz_usize]
+            owned_bytes = prov.read_bytes(addr, sz);
+            owned_bytes.as_slice()
         };
-        let ascii = left_justified(&bytes_to_ascii(&b, sz_usize), col_name.max(0) as usize);
+        let ascii = left_justified(&bytes_to_ascii(b, sz_usize), col_name.max(0) as usize);
         let hex_w = (23).max(sz * 3 - 1).max(0) as usize;
-        let hex = left_justified(&bytes_to_hex(&b, sz_usize), hex_w);
+        let hex = left_justified(&bytes_to_hex(b, sz_usize), hex_w);
         return format!("{ind}{ty}{SEP}{ascii}{SEP}{hex}{cmt_suffix}");
     }
 
@@ -1870,12 +2179,50 @@ pub fn fmt_bitfield_member(
 mod tests {
     use super::*;
     use crate::provider::BufferProvider;
+    use std::cell::Cell;
     use std::sync::Mutex;
 
     // Serializes tests that mutate the global type-name override seam
     // (`G_TYPE_NAME_FN`) so they can't interleave under the parallel test
     // runner and observe each other's provider state.
     static TYPE_NAME_SEAM_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CountingReadProvider {
+        data: Vec<u8>,
+        read_calls: Cell<usize>,
+        readable_calls: Cell<usize>,
+    }
+
+    impl CountingReadProvider {
+        fn new(data: Vec<u8>) -> Self {
+            CountingReadProvider {
+                data,
+                read_calls: Cell::new(0),
+                readable_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl Provider for CountingReadProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.read_calls.set(self.read_calls.get() + 1);
+            let start = addr as usize;
+            if start + buf.len() > self.data.len() {
+                return false;
+            }
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            self.data.len() as i32
+        }
+
+        fn is_readable(&self, _addr: u64, _len: i32) -> bool {
+            self.readable_calls.set(self.readable_calls.get() + 1);
+            true
+        }
+    }
 
     // ── testTypeName (test_format.cpp:9-13) ──
     #[test]
@@ -1948,6 +2295,185 @@ mod tests {
         );
         assert_eq!(fmt_offset_margin(0x10, false, 16), "0000000000000010 ");
         assert_eq!(fmt_offset_margin(0x10, false, 4), "0010 ");
+    }
+
+    #[test]
+    fn byte_preview_formatting_reads_without_readability_preflight() {
+        let provider = CountingReadProvider::new(vec![0x41, 0x42, 0x00, 0x7F]);
+
+        let preview = fmt_ascii_and_bytes(&provider, 0, 4, 4);
+        assert!(preview.contains("AB.."));
+        assert_eq!(provider.read_calls.get(), 1);
+        assert_eq!(provider.readable_calls.get(), 0);
+
+        let node = Node {
+            kind: NodeKind::Hex32,
+            name: "bytes".into(),
+            ..Node::default()
+        };
+        let line = fmt_node_line(&node, &provider, 0, 0, 0, "", COL_TYPE, COL_NAME, "", false);
+        assert!(line.contains("41 42 00 7F"));
+        assert_eq!(provider.read_calls.get(), 2);
+        assert_eq!(provider.readable_calls.get(), 0);
+    }
+
+    #[test]
+    fn primitive_pointer_deref_formats_without_readability_preflight() {
+        let mut data = vec![0u8; 32];
+        data[0..8].copy_from_slice(&8u64.to_le_bytes());
+        data[8..16].copy_from_slice(&16u64.to_le_bytes());
+        data[16..20].copy_from_slice(&42i32.to_le_bytes());
+        let provider = CountingReadProvider::new(data);
+        let node = Node {
+            kind: NodeKind::Pointer64,
+            ptr_depth: 2,
+            element_kind: NodeKind::Int32,
+            ..Node::default()
+        };
+
+        let value = read_value(&node, &provider, 0, 0);
+
+        assert_eq!(value, "-> 42");
+        assert_eq!(
+            provider.readable_calls.get(),
+            0,
+            "primitive pointer deref formatting should not preflight live provider readability"
+        );
+        assert_eq!(
+            provider.read_calls.get(),
+            3,
+            "pointer, indirect target, and target value should each be read once"
+        );
+    }
+
+    #[test]
+    fn vector_value_formats_with_one_provider_read() {
+        let mut data = Vec::new();
+        for value in [1.0f32, 2.5, 3.0, 4.25] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let provider = CountingReadProvider::new(data);
+        let node = Node {
+            kind: NodeKind::Vec4,
+            ..Node::default()
+        };
+
+        let value = read_value(&node, &provider, 0, 0);
+
+        assert_eq!(value.matches(',').count(), 3);
+        assert!(value.contains(&fmt_float(1.0)));
+        assert!(value.contains(&fmt_float(4.25)));
+        assert_eq!(provider.readable_calls.get(), 0);
+        assert_eq!(
+            provider.read_calls.get(),
+            1,
+            "Vec4 formatting should coalesce lane reads into one provider read"
+        );
+    }
+
+    #[test]
+    fn mat4x4_row_formats_with_one_provider_read() {
+        let mut data = Vec::new();
+        for value in [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.5, 7.0, 8.25, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let provider = CountingReadProvider::new(data);
+        let node = Node {
+            kind: NodeKind::Mat4x4,
+            ..Node::default()
+        };
+
+        let value = read_value(&node, &provider, 0, 1);
+
+        assert!(value.starts_with("row1 ["));
+        assert_eq!(value.matches(',').count(), 3);
+        assert!(value.contains(&fmt_float(5.0)));
+        assert!(value.contains(&fmt_float(8.25)));
+        assert_eq!(provider.readable_calls.get(), 0);
+        assert_eq!(
+            provider.read_calls.get(),
+            1,
+            "Mat4x4 row formatting should coalesce lane reads into one provider read"
+        );
+    }
+
+    #[test]
+    fn display_value_from_bytes_formats_vector_without_provider_read() {
+        let mut data = Vec::new();
+        for value in [1.0f32, 2.5, 3.0, 4.25] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let provider = CountingReadProvider::new(data.clone());
+        let node = Node {
+            kind: NodeKind::Vec4,
+            ..Node::default()
+        };
+
+        let value = read_display_value_from_bytes(&node, &provider, &data, 0).unwrap();
+
+        assert_eq!(value.matches(',').count(), 3);
+        assert!(value.contains(&fmt_float(1.0)));
+        assert!(value.contains(&fmt_float(4.25)));
+        assert_eq!(provider.read_calls.get(), 0);
+        assert_eq!(provider.readable_calls.get(), 0);
+    }
+
+    #[test]
+    fn display_value_from_bytes_formats_hex64_without_provider_read() {
+        let data = 0x1234_ABCD_0000_0042u64.to_le_bytes().to_vec();
+        let provider = CountingReadProvider::new(data.clone());
+        let node = Node {
+            kind: NodeKind::Hex64,
+            ..Node::default()
+        };
+
+        let value = read_display_value_from_bytes(&node, &provider, &data, 0).unwrap();
+
+        assert_eq!(value, "0x1234abcd00000042");
+        assert_eq!(provider.read_calls.get(), 0);
+        assert_eq!(provider.readable_calls.get(), 0);
+    }
+
+    #[test]
+    fn display_value_from_bytes_formats_mat4x4_row_without_provider_read() {
+        let mut data = Vec::new();
+        for value in [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.5, 7.0, 8.25, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let provider = CountingReadProvider::new(data.clone());
+        let node = Node {
+            kind: NodeKind::Mat4x4,
+            ..Node::default()
+        };
+
+        let value = read_display_value_from_bytes(&node, &provider, &data, 1).unwrap();
+
+        assert!(value.starts_with("row1 ["));
+        assert_eq!(value.matches(',').count(), 3);
+        assert!(value.contains(&fmt_float(5.0)));
+        assert!(value.contains(&fmt_float(8.25)));
+        assert_eq!(provider.read_calls.get(), 0);
+        assert_eq!(provider.readable_calls.get(), 0);
+    }
+
+    #[test]
+    fn display_value_from_bytes_defers_deref_pointer_to_provider_path() {
+        let provider = CountingReadProvider::new(0x1000u64.to_le_bytes().to_vec());
+        let node = Node {
+            kind: NodeKind::Pointer64,
+            ptr_depth: 1,
+            element_kind: NodeKind::Int32,
+            ..Node::default()
+        };
+
+        assert!(read_display_value_from_bytes(&node, &provider, &provider.data, 0).is_none());
+        assert_eq!(provider.read_calls.get(), 0);
     }
 
     // ── testFmtStructHeader (test_format.cpp:99-114) ──
@@ -2568,5 +3094,42 @@ mod tests {
             disp.ends_with("// mod!gPtr"),
             "deref branch should append symbol of the pointer value: {disp}"
         );
+    }
+
+    #[test]
+    fn test_pointer_deref_vec4_stack_sized_target() {
+        struct Vec4DerefProv;
+        impl crate::provider::Provider for Vec4DerefProv {
+            fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+                match addr {
+                    0 => {
+                        let bytes = 0x100u64.to_le_bytes();
+                        buf.copy_from_slice(&bytes[..buf.len()]);
+                    }
+                    0x100 => {
+                        let values = [1.0f32, 2.5, 3.0, 4.25];
+                        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        buf.copy_from_slice(&bytes[..buf.len()]);
+                    }
+                    _ => buf.fill(0),
+                }
+                true
+            }
+
+            fn size(&self) -> i32 {
+                4096
+            }
+        }
+        let node = Node {
+            kind: NodeKind::Pointer64,
+            ptr_depth: 1,
+            element_kind: NodeKind::Vec4,
+            ..Node::default()
+        };
+        let disp = read_value(&node, &Vec4DerefProv, 0, 0);
+        assert!(disp.starts_with("-> "), "deref arrow expected: {disp}");
+        assert_eq!(disp.matches(',').count(), 3);
+        assert!(disp.contains(&fmt_float(1.0)));
+        assert!(disp.contains(&fmt_float(4.25)));
     }
 }

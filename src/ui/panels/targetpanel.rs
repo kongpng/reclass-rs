@@ -26,13 +26,14 @@ mod view {
     use gpui_component::tooltip::Tooltip;
     use gpui_component::{ActiveTheme as _, Sizable as _};
 
-    use crate::provider::{MemoryRegion, ModuleEntry, Provider, ThreadInfo};
+    use crate::provider::{ModuleEntry, Provider};
     use crate::ui::design::{color, icon, tokens};
     use crate::ui::target_status::{TargetHealth, TargetStatusSummary};
 
     pub struct TargetPanel {
         provider: Option<Arc<dyn Provider + Send + Sync>>,
         summary: TargetStatusSummary,
+        details: Option<TargetDetails>,
         focus_handle: FocusHandle,
     }
 
@@ -41,6 +42,7 @@ mod view {
             TargetPanel {
                 provider: None,
                 summary: TargetStatusSummary::no_source(),
+                details: None,
                 focus_handle: cx.focus_handle(),
             }
         }
@@ -56,6 +58,19 @@ mod view {
         ) {
             self.provider = provider;
             self.summary = summary;
+            self.refresh_details();
+        }
+
+        fn refresh_details(&mut self) {
+            self.details = self
+                .provider
+                .as_ref()
+                .map(|provider| TargetDetails::from_provider(provider.as_ref()));
+        }
+
+        fn refresh_details_notify(&mut self, cx: &mut Context<Self>) {
+            self.refresh_details();
+            cx.notify();
         }
     }
 
@@ -80,10 +95,10 @@ mod view {
     impl Render for TargetPanel {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let summary = self.summary.clone();
-            let details = self
-                .provider
-                .as_ref()
-                .map(|p| TargetDetails::from_provider(p.as_ref()));
+            if self.provider.is_some() && self.details.is_none() {
+                self.refresh_details();
+            }
+            let details = self.details.as_ref();
 
             gpui_component::v_flex()
                 .id("rcx-target-panel")
@@ -91,7 +106,7 @@ mod view {
                 .size_full()
                 .bg(color::panel_bg(cx))
                 .text_color(color::text(cx))
-                .child(render_header(&summary, cx))
+                .child(render_header(&summary, &cx.entity(), cx))
                 .child(
                     div().flex_1().min_h_0().child(match details {
                         Some(details) if summary.health() != TargetHealth::NoSource => {
@@ -111,22 +126,35 @@ mod view {
     #[derive(Clone, Debug, Default)]
     struct TargetDetails {
         modules: Vec<ModuleEntry>,
-        regions: Vec<MemoryRegion>,
+        region_count: usize,
+        readable_regions: usize,
+        writable_regions: usize,
+        executable_regions: usize,
         peb: u64,
-        tebs: Vec<ThreadInfo>,
+        tebs_count: usize,
         has_kernel_paging: bool,
         cr3: u64,
     }
 
     impl TargetDetails {
         fn from_provider(provider: &dyn Provider) -> Self {
+            let mut modules = provider.enumerate_modules();
+            modules.sort_by_key(|m| m.base);
+            let regions = provider.enumerate_regions();
+            let readable_regions = regions.iter().filter(|r| r.readable).count();
+            let writable_regions = regions.iter().filter(|r| r.writable).count();
+            let executable_regions = regions.iter().filter(|r| r.executable).count();
+            let has_kernel_paging = provider.has_kernel_paging();
             TargetDetails {
-                modules: provider.enumerate_modules(),
-                regions: provider.enumerate_regions(),
+                modules,
+                region_count: regions.len(),
+                readable_regions,
+                writable_regions,
+                executable_regions,
                 peb: provider.peb(),
-                tebs: provider.tebs(),
-                has_kernel_paging: provider.has_kernel_paging(),
-                cr3: if provider.has_kernel_paging() {
+                tebs_count: provider.tebs().len(),
+                has_kernel_paging,
+                cr3: if has_kernel_paging {
                     provider.get_cr3()
                 } else {
                     0
@@ -135,7 +163,11 @@ mod view {
         }
     }
 
-    fn render_header(summary: &TargetStatusSummary, cx: &App) -> impl IntoElement {
+    fn render_header(
+        summary: &TargetStatusSummary,
+        view: &Entity<TargetPanel>,
+        cx: &Context<TargetPanel>,
+    ) -> impl IntoElement {
         crate::ui::design::panel_header_strip(cx)
             .child(
                 gpui_component::h_flex()
@@ -154,19 +186,21 @@ mod view {
                             .child("Target"),
                     ),
             )
+            .child({
+                let view = view.clone();
+                refresh_target_button(cx).on_click(move |_e, _w, cx| {
+                    view.update(cx, |this, cx| this.refresh_details_notify(cx));
+                })
+            })
             .child(health_badge(summary, cx))
     }
 
     fn render_body(
         summary: &TargetStatusSummary,
-        details: TargetDetails,
+        details: &TargetDetails,
         cx: &App,
     ) -> impl IntoElement {
         let module_count = details.modules.len();
-        let region_count = details.regions.len();
-        let readable_regions = details.regions.iter().filter(|r| r.readable).count();
-        let writable_regions = details.regions.iter().filter(|r| r.writable).count();
-        let executable_regions = details.regions.iter().filter(|r| r.executable).count();
 
         crate::ui::design::panel_list("rcx-target-list")
             .gap(px(tokens::space::MD))
@@ -194,7 +228,7 @@ mod view {
                         ("Write", bool_label(summary.writable)),
                         ("Live", bool_label(summary.live)),
                         ("Modules", count_label(module_count)),
-                        ("Regions", count_label(region_count)),
+                        ("Regions", count_label(details.region_count)),
                         ("Paging", bool_label(details.has_kernel_paging)),
                     ],
                     cx,
@@ -202,10 +236,10 @@ mod view {
                 section(
                     "Regions",
                     vec![
-                        ("Total", count_label(region_count)),
-                        ("Readable", count_label(readable_regions)),
-                        ("Writable", count_label(writable_regions)),
-                        ("Executable", count_label(executable_regions)),
+                        ("Total", count_label(details.region_count)),
+                        ("Readable", count_label(details.readable_regions)),
+                        ("Writable", count_label(details.writable_regions)),
+                        ("Executable", count_label(details.executable_regions)),
                     ],
                     cx,
                 ),
@@ -213,7 +247,7 @@ mod view {
                     "Process",
                     vec![
                         ("PEB", hex_or_unavailable(details.peb)),
-                        ("TEBs", count_label(details.tebs.len())),
+                        ("TEBs", count_label(details.tebs_count)),
                         ("Modules", count_label(module_count)),
                     ],
                     cx,
@@ -252,7 +286,7 @@ mod view {
                 ),
             ])
             .when(!details.modules.is_empty(), |list| {
-                list.child(module_preview(details.modules, cx))
+                list.child(module_preview(&details.modules, cx))
             })
     }
 
@@ -294,18 +328,16 @@ mod view {
             )
     }
 
-    fn module_preview(modules: Vec<ModuleEntry>, cx: &App) -> AnyElement {
-        let mut modules = modules;
-        modules.sort_by_key(|m| m.base);
+    fn module_preview(modules: &[ModuleEntry], cx: &App) -> AnyElement {
         let rows: Vec<AnyElement> = modules
-            .into_iter()
+            .iter()
             .take(6)
             .enumerate()
             .map(|(ix, m)| {
                 let name = if m.name.is_empty() {
                     "(unnamed)".to_string()
                 } else {
-                    m.name
+                    m.name.clone()
                 };
                 let tooltip = format!("{} · base 0x{:X} · size 0x{:X}", name, m.base, m.size);
                 gpui_component::h_flex()
@@ -348,6 +380,21 @@ mod view {
             .child(crate::ui::design::section_label("Modules Preview", cx))
             .children(rows)
             .into_any_element()
+    }
+
+    fn refresh_target_button(cx: &App) -> Stateful<Div> {
+        div()
+            .id("rcx-target-refresh")
+            .flex_none()
+            .size(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(tokens::radius::MD))
+            .text_color(color::text_muted(cx))
+            .hover(|s| s.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
+            .tooltip(|window, cx| Tooltip::new("Refresh target details").build(window, cx))
+            .child(icon::refresh().with_size(px(12.0)))
     }
 
     fn health_badge(summary: &TargetStatusSummary, cx: &App) -> impl IntoElement {
@@ -396,6 +443,97 @@ mod view {
             "-".to_string()
         } else {
             value.to_string()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::TargetDetails;
+        use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
+        use std::cell::Cell;
+
+        struct CountingTargetProvider {
+            module_calls: Cell<usize>,
+            region_calls: Cell<usize>,
+        }
+
+        impl CountingTargetProvider {
+            fn new() -> Self {
+                Self {
+                    module_calls: Cell::new(0),
+                    region_calls: Cell::new(0),
+                }
+            }
+        }
+
+        impl Provider for CountingTargetProvider {
+            fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+                false
+            }
+
+            fn size(&self) -> i32 {
+                1
+            }
+
+            fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+                self.module_calls.set(self.module_calls.get() + 1);
+                vec![
+                    ModuleEntry {
+                        name: "late.dll".into(),
+                        full_path: String::new(),
+                        base: 0x4000,
+                        size: 0x100,
+                    },
+                    ModuleEntry {
+                        name: "early.dll".into(),
+                        full_path: String::new(),
+                        base: 0x1000,
+                        size: 0x100,
+                    },
+                ]
+            }
+
+            fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+                self.region_calls.set(self.region_calls.get() + 1);
+                vec![
+                    MemoryRegion {
+                        base: 0x1000,
+                        size: 0x100,
+                        readable: true,
+                        writable: false,
+                        executable: true,
+                        module_name: "early.dll".into(),
+                        region_type: RegionType::Image,
+                    },
+                    MemoryRegion {
+                        base: 0x2000,
+                        size: 0x100,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        module_name: String::new(),
+                        region_type: RegionType::Private,
+                    },
+                ]
+            }
+        }
+
+        #[test]
+        fn target_details_snapshot_enumerates_once_and_precomputes_render_counts() {
+            let provider = CountingTargetProvider::new();
+
+            let details = TargetDetails::from_provider(&provider);
+
+            assert_eq!(provider.module_calls.get(), 1);
+            assert_eq!(provider.region_calls.get(), 1);
+            assert_eq!(
+                details.modules.iter().map(|m| m.base).collect::<Vec<_>>(),
+                vec![0x1000, 0x4000]
+            );
+            assert_eq!(details.region_count, 2);
+            assert_eq!(details.readable_regions, 2);
+            assert_eq!(details.writable_regions, 1);
+            assert_eq!(details.executable_regions, 1);
         }
     }
 }

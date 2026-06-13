@@ -408,6 +408,8 @@ mod tests {
             layout: LayoutInfo::default(),
             max_line_len: text.encode_utf16().count() as i32,
             line_starts: vec![0],
+            line_byte_starts: vec![0],
+            node_line_index: Default::default(),
         }
     }
 

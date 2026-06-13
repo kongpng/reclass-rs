@@ -16,7 +16,7 @@
 //! matches Qt exactly. Internally the buffer is a [`Utf16Buf`]; the final
 //! [`ComposeResult::text`] is converted to a `String` once at the end.
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap, AHashSet};
 
 use crate::core::linemeta::{ChipKind, K_COMMAND_ROW_ID};
 use crate::core::{
@@ -26,7 +26,7 @@ use crate::core::{
 };
 use crate::provider::{MemoryRegion, ModuleEntry, NullProvider, Provider, RegionType};
 #[cfg(feature = "symbols")]
-use crate::rtti::walk::{walk_rtti, walk_rtti_itanium, RttiInfo};
+use crate::rtti::walk::{walk_rtti_itanium_with_modules, walk_rtti_with_modules, RttiInfo};
 
 // When the `symbols` feature is disabled the RTTI walker (`crate::rtti`) is not
 // compiled. The composition engine is always-on (it does not depend on heavy
@@ -56,6 +56,12 @@ pub use crate::core::linemeta::{
 const SC_FOLDLEVELBASE: i32 = 0x400;
 const SC_FOLDLEVELHEADERFLAG: i32 = 0x2000;
 const GOLDEN_RATIO: u64 = 0x9E37_79B9_7F4A_7C15;
+const PREFIX_EMPTY: [u16; 3] = [b' ' as u16, b' ' as u16, b' ' as u16];
+const PREFIX_COLLAPSED: [u16; 3] = [b' ' as u16, 0x25B8, b' ' as u16];
+const PREFIX_EXPANDED: [u16; 3] = [b' ' as u16, 0x25BE, b' ' as u16];
+const TREE_PIPE: u16 = 0x2502;
+const TREE_TEE: u16 = 0x251C;
+const TREE_ELBOW: u16 = 0x2514;
 
 // Marker bit indices (`core.h:182-193`) — the canonical definitions live in
 // `core::linemeta`; imported here for the markerMask math.
@@ -91,6 +97,15 @@ impl Utf16Buf {
     fn push_str16(&mut self, s: &U16Str) {
         self.units.extend_from_slice(&s.units);
     }
+    fn push_units(&mut self, units: &[u16]) {
+        self.units.extend_from_slice(units);
+    }
+    fn push_tree_segment(&mut self, glyph: u16) {
+        self.units.push(glyph);
+        for _ in 1..K_TREE_INDENT {
+            self.units.push(b' ' as u16);
+        }
+    }
     /// Code unit at `i` (0 if out of range).
     fn unit_at(&self, i: usize) -> u16 {
         self.units.get(i).copied().unwrap_or(0)
@@ -108,9 +123,6 @@ struct U16Str {
 }
 
 impl U16Str {
-    fn new() -> Self {
-        U16Str { units: Vec::new() }
-    }
     fn from_str(s: &str) -> Self {
         U16Str {
             units: s.encode_utf16().collect(),
@@ -207,14 +219,122 @@ pub fn compose_with_symbols(
     show_rtti: bool,
     show_enum_chips: bool,
 ) -> ComposeResult {
+    compose_with_symbols_at_base(
+        tree,
+        provider,
+        view_root_id,
+        tree.base_address,
+        compact_columns,
+        tree_lines,
+        brace_wrap,
+        type_hints,
+        show_comments,
+        symbol_lookup,
+        show_rtti,
+        show_enum_chips,
+    )
+}
+
+/// Full compose entry point with an explicit base address. This is used by
+/// pointer hover previews that render a referenced struct at a live target
+/// address without cloning and mutating the whole tree.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_with_symbols_at_base(
+    tree: &NodeTree,
+    provider: &dyn Provider,
+    view_root_id: u64,
+    base_address: u64,
+    compact_columns: bool,
+    tree_lines: bool,
+    brace_wrap: bool,
+    type_hints: bool,
+    show_comments: bool,
+    symbol_lookup: SymbolLookupFn<'_>,
+    show_rtti: bool,
+    show_enum_chips: bool,
+) -> ComposeResult {
+    compose_with_symbols_at_base_inner(
+        tree,
+        provider,
+        view_root_id,
+        base_address,
+        compact_columns,
+        tree_lines,
+        brace_wrap,
+        type_hints,
+        show_comments,
+        symbol_lookup,
+        show_rtti,
+        show_enum_chips,
+        None,
+    )
+}
+
+/// Preview compose path for hover cards that only display the first few lines.
+/// Normal compose remains unbounded; this avoids formatting and provider reads
+/// for rows that the popup immediately discards.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_preview_with_symbols_at_base(
+    tree: &NodeTree,
+    provider: &dyn Provider,
+    view_root_id: u64,
+    base_address: u64,
+    compact_columns: bool,
+    tree_lines: bool,
+    brace_wrap: bool,
+    type_hints: bool,
+    show_comments: bool,
+    symbol_lookup: SymbolLookupFn<'_>,
+    show_rtti: bool,
+    show_enum_chips: bool,
+    max_lines: usize,
+) -> ComposeResult {
+    compose_with_symbols_at_base_inner(
+        tree,
+        provider,
+        view_root_id,
+        base_address,
+        compact_columns,
+        tree_lines,
+        brace_wrap,
+        type_hints,
+        show_comments,
+        symbol_lookup,
+        show_rtti,
+        show_enum_chips,
+        Some(max_lines),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_with_symbols_at_base_inner(
+    tree: &NodeTree,
+    provider: &dyn Provider,
+    view_root_id: u64,
+    base_address: u64,
+    compact_columns: bool,
+    tree_lines: bool,
+    brace_wrap: bool,
+    type_hints: bool,
+    show_comments: bool,
+    symbol_lookup: SymbolLookupFn<'_>,
+    show_rtti: bool,
+    show_enum_chips: bool,
+    line_limit: Option<usize>,
+) -> ComposeResult {
+    let expected_lines = tree.nodes.len().saturating_mul(3);
+    let line_capacity = line_limit
+        .map(|limit| expected_lines.min(limit))
+        .unwrap_or(expected_lines);
     let mut state = ComposeState {
-        text: Utf16Buf::with_capacity(tree.nodes.len() * 80),
-        meta: Vec::with_capacity(tree.nodes.len() * 3),
-        line_starts: Vec::new(),
+        text: Utf16Buf::with_capacity(line_capacity * 80),
+        meta: Vec::with_capacity(line_capacity),
+        line_starts: Vec::with_capacity(line_capacity),
         max_line_len: 0,
-        visiting: HashSet::new(),
-        ptr_visiting: HashSet::new(),
-        virtual_ptr_refs: HashSet::new(),
+        line_limit,
+        visiting: AHashSet::new(),
+        ptr_visiting: AHashSet::new(),
+        virtual_ptr_refs: AHashSet::new(),
         current_line: 0,
         type_w: K_COL_TYPE,
         name_w: K_COL_NAME,
@@ -231,16 +351,20 @@ pub fn compose_with_symbols(
         sibling_stack: Vec::new(),
         current_ptr_base: 0,
         current_under_ptr: false,
-        child_map: HashMap::new(),
-        child_map_sorted: HashSet::new(),
+        base_address,
+        child_map: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
+        child_map_sorted: AHashSet::new(),
         abs_offsets: Vec::new(),
-        scope_type_w: HashMap::new(),
-        scope_name_w: HashMap::new(),
+        scope_type_w: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
+        scope_name_w: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
+        enum_member_cache: AHashMap::new(),
         rtti_modules_cached: false,
         rtti_modules: Vec::new(),
+        rtti_modules_indexable: false,
         hint_regions_cached: false,
         hint_regions: Vec::new(),
-        rtti_cache: HashMap::new(),
+        hint_regions_indexable: false,
+        rtti_cache: AHashMap::new(),
     };
 
     // Precompute parent→children map (`compose.cpp:1527-1528`).
@@ -312,13 +436,13 @@ pub fn compose_with_symbols(
             }
         }
         for v in state.abs_offsets.iter_mut() {
-            *v = v.wrapping_add(tree.base_address as i64);
+            *v = v.wrapping_add(state.base_address as i64);
         }
     }
 
     // Hex-digit tier (`compose.cpp:1589-1599`).
     {
-        let mut max_addr = tree.base_address;
+        let mut max_addr = state.base_address;
         for &a in &state.abs_offsets {
             let addr = a as u64;
             if addr > max_addr {
@@ -433,11 +557,11 @@ pub fn compose_with_symbols(
             fold_level: SC_FOLDLEVELBASE,
             fold_head: false,
             offset_text: render::fmt_offset_margin(
-                tree.base_address,
+                state.base_address,
                 false,
                 state.offset_hex_digits,
             ),
-            offset_addr: tree.base_address,
+            offset_addr: state.base_address,
             ptr_base: state.current_ptr_base,
             marker_mask: 0,
             effective_type_w: state.type_w,
@@ -467,25 +591,54 @@ pub fn compose_with_symbols(
     // Walk roots (`compose.cpp:1726-1736`).
     let roots = state.child_indices(0).to_vec();
     for idx in roots {
+        if state.line_limit_reached() {
+            break;
+        }
         if view_root_id != 0 && tree.nodes[idx as usize].id != view_root_id {
             continue;
         }
         compose_node(&mut state, tree, provider, idx, 0, 0, 0, false, 0, -1, 0);
     }
 
+    let text = state.text.to_string();
+    let line_starts: Vec<i32> = state.line_starts.iter().map(|&v| v as i32).collect();
+    let line_byte_starts = line_byte_starts_from_newlines(&text, line_starts.len());
+
     ComposeResult {
-        text: state.text.to_string(),
+        text,
         meta: state.meta,
         layout: LayoutInfo {
             type_w: state.type_w,
             name_w: state.name_w,
             offset_hex_digits: state.offset_hex_digits,
-            base_address: tree.base_address,
+            base_address: state.base_address,
             tree_lines,
         },
         max_line_len: state.max_line_len,
-        line_starts: state.line_starts.iter().map(|&v| v as i32).collect(),
+        line_starts,
+        line_byte_starts,
+        node_line_index: Default::default(),
     }
+}
+
+fn line_byte_starts_from_newlines(text: &str, expected_lines: usize) -> Vec<usize> {
+    if expected_lines == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(expected_lines);
+    out.push(0);
+    for (i, &byte) in text.as_bytes().iter().enumerate() {
+        if byte == b'\n' {
+            out.push(i + 1);
+            if out.len() == expected_lines {
+                break;
+            }
+        }
+    }
+    while out.len() < expected_lines {
+        out.push(text.len());
+    }
+    out
 }
 
 #[inline]
@@ -522,6 +675,18 @@ fn std_sort_by_abs(v: &mut [i32], abs: &[i64]) {
     let n = v.len();
     introsort_loop(v, 0, n, lg(n) * 2, &key);
     final_insertion_sort(v, 0, n, &key);
+}
+
+fn children_strictly_increasing_by_abs(children: &[i32], abs_offsets: &[i64]) -> bool {
+    children.windows(2).all(|pair| {
+        let Some(left) = abs_offsets.get(pair[0] as usize) else {
+            return false;
+        };
+        let Some(right) = abs_offsets.get(pair[1] as usize) else {
+            return false;
+        };
+        left < right
+    })
 }
 
 fn move_median_to_first<K: Fn(i32) -> i64>(
@@ -698,9 +863,10 @@ struct ComposeState<'a> {
     meta: Vec<LineMeta>,
     line_starts: Vec<usize>,
     max_line_len: i32,
-    visiting: HashSet<u64>,
-    ptr_visiting: HashSet<u64>,
-    virtual_ptr_refs: HashSet<u64>,
+    line_limit: Option<usize>,
+    visiting: AHashSet<u64>,
+    ptr_visiting: AHashSet<u64>,
+    virtual_ptr_refs: AHashSet<u64>,
     current_line: i32,
     type_w: i32,
     name_w: i32,
@@ -721,11 +887,13 @@ struct ComposeState<'a> {
     /// emitted row's [`LineMeta::under_ptr`] so the gutter measures pointer-deref
     /// children from the pointer target base even when that base is 0 (null target).
     current_under_ptr: bool,
-    child_map: HashMap<u64, Vec<i32>>,
-    child_map_sorted: HashSet<u64>,
+    base_address: u64,
+    child_map: AHashMap<u64, Vec<i32>>,
+    child_map_sorted: AHashSet<u64>,
     abs_offsets: Vec<i64>,
-    scope_type_w: HashMap<u64, i32>,
-    scope_name_w: HashMap<u64, i32>,
+    scope_type_w: AHashMap<u64, i32>,
+    scope_name_w: AHashMap<u64, i32>,
+    enum_member_cache: AHashMap<u64, AHashMap<i64, usize>>,
 
     // ── RTTI auto-detect cache (per compose pass) ──
     // Module list is fetched lazily on the first vtable candidate. `walk_rtti`
@@ -734,17 +902,40 @@ struct ComposeState<'a> {
     // (`compose.cpp:85-91`.)
     rtti_modules_cached: bool,
     rtti_modules: Vec<ModuleEntry>,
+    rtti_modules_indexable: bool,
     hint_regions_cached: bool,
     hint_regions: Vec<MemoryRegion>,
-    rtti_cache: HashMap<u64, RttiInfo>,
+    hint_regions_indexable: bool,
+    rtti_cache: AHashMap<u64, RttiInfo>,
 }
 
 impl ComposeState<'_> {
+    fn line_limit_reached(&self) -> bool {
+        self.line_limit
+            .is_some_and(|limit| self.meta.len() >= limit)
+    }
+
     fn effective_type_w(&self, scope_id: u64) -> i32 {
         *self.scope_type_w.get(&scope_id).unwrap_or(&self.type_w)
     }
     fn effective_name_w(&self, scope_id: u64) -> i32 {
         *self.scope_name_w.get(&scope_id).unwrap_or(&self.name_w)
+    }
+
+    fn enum_member_index(
+        &mut self,
+        enum_id: u64,
+        enum_members: &[(String, i64)],
+        value: i64,
+    ) -> Option<usize> {
+        let members = self.enum_member_cache.entry(enum_id).or_insert_with(|| {
+            let mut lookup = AHashMap::with_capacity(enum_members.len());
+            for (idx, (_, val)) in enum_members.iter().enumerate() {
+                lookup.entry(*val).or_insert(idx);
+            }
+            lookup
+        });
+        members.get(&value).copied()
     }
 
     /// `setTreeSibling(childDepth, hasMoreSiblings)` (`compose.cpp:121-126`).
@@ -765,19 +956,32 @@ impl ComposeState<'_> {
     /// `childIndices(state, parentId)` (`compose.cpp:245-258`) — lazily sorts
     /// children by absolute offset on first access (stable sort).
     fn child_indices(&mut self, parent_id: u64) -> &[i32] {
-        if !self.child_map.contains_key(&parent_id) {
+        let Some(child_count) = self.child_map.get(&parent_id).map(Vec::len) else {
             return &[];
+        };
+        if child_count <= 1 {
+            return self
+                .child_map
+                .get(&parent_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
         }
-        if !self.child_map_sorted.contains(&parent_id) {
-            // Sort a detached copy against abs_offsets, then write back.
-            // **Fidelity:** the C++ uses `std::sort` (`compose.cpp:252`), which
-            // is UNSTABLE; the byte-exact golden EPROCESS dumps depend on its
-            // exact ordering of equal-offset roots. Rust's `slice::sort` is
-            // stable and would reorder them differently, so we reproduce
-            // libstdc++'s introsort (`std_sort_by_abs`) verbatim.
-            let mut children = self.child_map.remove(&parent_id).unwrap();
-            std_sort_by_abs(&mut children, &self.abs_offsets);
-            self.child_map.insert(parent_id, children);
+        let needs_sort = !self.child_map_sorted.contains(&parent_id);
+        if needs_sort {
+            let already_sorted = self.child_map.get(&parent_id).is_some_and(|children| {
+                children_strictly_increasing_by_abs(children, &self.abs_offsets)
+            });
+            if !already_sorted {
+                // Sort a detached copy against abs_offsets, then write back.
+                // **Fidelity:** the C++ uses `std::sort` (`compose.cpp:252`), which
+                // is UNSTABLE; the byte-exact golden EPROCESS dumps depend on its
+                // exact ordering of equal-offset roots. Rust's `slice::sort` is
+                // stable and would reorder them differently, so we reproduce
+                // libstdc++'s introsort (`std_sort_by_abs`) verbatim.
+                let mut children = self.child_map.remove(&parent_id).unwrap();
+                std_sort_by_abs(&mut children, &self.abs_offsets);
+                self.child_map.insert(parent_id, children);
+            }
             self.child_map_sorted.insert(parent_id);
         }
         self.child_map
@@ -788,6 +992,10 @@ impl ComposeState<'_> {
 
     /// `emitLine(lineText, LineMeta&&)` (`compose.cpp:128-193`).
     fn emit_line(&mut self, line_text: &U16Str, lm: &mut LineMeta) {
+        if self.line_limit_reached() {
+            return;
+        }
+
         // Stamp the pointer-deref scope onto every row (single choke point) so the
         // gutter can tell a pointer child from a plain field even when the pointer
         // target base is 0.
@@ -805,12 +1013,12 @@ impl ComposeState<'_> {
             // no prefix — flush left
         } else if lm.fold_head {
             if lm.fold_collapsed {
-                self.text.push_str16(&U16Str::from_str(" \u{25B8} "));
+                self.text.push_units(&PREFIX_COLLAPSED);
             } else {
-                self.text.push_str16(&U16Str::from_str(" \u{25BE} "));
+                self.text.push_units(&PREFIX_EXPANDED);
             }
         } else {
-            self.text.push_str16(&U16Str::from_str("   "));
+            self.text.push_units(&PREFIX_EMPTY);
         }
 
         // Replace leading indent spaces with Unicode tree connectors. Each level
@@ -819,28 +1027,24 @@ impl ComposeState<'_> {
         // the connectors scale with the indent width and stay aligned with the
         // `K_TREE_INDENT`-spaced indent the rest of the layout assumes.
         if self.tree_lines && lm.depth > 0 {
-            let mut tree_indent = U16Str::new();
             let big_d = lm.depth;
             let is_footer = lm.line_kind == LineKind::Footer;
-            let pad = " ".repeat((K_TREE_INDENT - 1).max(0) as usize);
             for d in 0..big_d {
                 let active =
                     (d as usize) < self.sibling_stack.len() && self.sibling_stack[d as usize];
                 let glyph = if is_footer || d < big_d - 1 {
                     if active {
-                        "\u{2502}"
+                        TREE_PIPE
                     } else {
-                        " "
+                        b' ' as u16
                     }
                 } else if active {
-                    "\u{251C}"
+                    TREE_TEE
                 } else {
-                    "\u{2514}"
+                    TREE_ELBOW
                 };
-                tree_indent.push_str(glyph);
-                tree_indent.push_str(&pad);
+                self.text.push_tree_segment(glyph);
             }
-            self.text.push_str16(&tree_indent);
             // lineText.mid(D * kTreeIndent) — slice off the leading indent.
             let skip = (big_d * K_TREE_INDENT) as usize;
             for i in skip..line_text.len() {
@@ -870,7 +1074,7 @@ impl ComposeState<'_> {
             }
         }
 
-        self.meta.push(lm.clone());
+        self.meta.push(std::mem::take(lm));
         self.current_line += 1;
 
         // Track longest line (trailing spaces excluded).
@@ -924,7 +1128,7 @@ fn resolve_pointer_target(tree: &NodeTree, ref_id: u64) -> String {
 /// `relOffsetFromRoot` (`compose.cpp:218-233`).
 fn rel_offset_from_root(tree: &NodeTree, idx: i32, root_id: u64) -> i64 {
     let mut total: i64 = 0;
-    let mut visited: HashSet<u64> = HashSet::new();
+    let mut visited: AHashSet<u64> = AHashSet::new();
     let mut cur = idx;
     while cur >= 0 && (cur as usize) < tree.nodes.len() {
         let nid = tree.nodes[cur as usize].id;
@@ -981,6 +1185,7 @@ fn rtti_for_vtable(state: &mut ComposeState, prov: &dyn Provider, candidate_addr
 
     if !state.rtti_modules_cached {
         state.rtti_modules = prov.enumerate_modules();
+        state.rtti_modules_indexable = modules_are_indexable(&state.rtti_modules);
         state.rtti_modules_cached = true;
     }
 
@@ -988,20 +1193,19 @@ fn rtti_for_vtable(state: &mut ComposeState, prov: &dyn Provider, candidate_addr
     // the `symbols` feature is on and the RTTI walker can overwrite `info`.)
     #[cfg_attr(not(feature = "symbols"), allow(unused_mut))]
     let mut info = RttiInfo::default();
-    let mut in_module = false;
-    for m in &state.rtti_modules {
-        if candidate_addr >= m.base && candidate_addr < m.base.wrapping_add(m.size) {
-            in_module = true;
-            break;
-        }
-    }
+    let in_module = find_module(
+        &state.rtti_modules,
+        state.rtti_modules_indexable,
+        candidate_addr,
+    )
+    .is_some();
     #[cfg(feature = "symbols")]
     if in_module {
         // Try MSVC RTTI first (signature-validated, lower false-positive risk).
         // Fall back to Itanium ABI for GCC/Clang/MinGW binaries.
-        info = walk_rtti(prov, candidate_addr, 8, 0);
+        info = walk_rtti_with_modules(prov, &state.rtti_modules, candidate_addr, 8, 0);
         if !info.ok {
-            info = walk_rtti_itanium(prov, candidate_addr, 8, 0);
+            info = walk_rtti_itanium_with_modules(prov, &state.rtti_modules, candidate_addr, 8, 0);
         }
     }
     // `symbols` off: `in_module` is computed but the walker is unavailable, so
@@ -1091,16 +1295,16 @@ fn format_preview(data: &[u8], len: i32, kinds: &[NodeKind]) -> String {
     // Split: show each part (uniform split into `kinds.len()` lanes).
     let part_sz = len / kinds.len() as i32;
     let part_sz_usize = part_sz.max(0) as usize;
-    let parts: Vec<String> = kinds
-        .iter()
-        .enumerate()
-        .map(|(i, &lane)| {
-            let start = i * part_sz_usize;
-            let slice = data.get(start..).unwrap_or(&[]);
-            format_preview(slice, part_sz, std::slice::from_ref(&lane))
-        })
-        .collect();
-    parts.join(", ")
+    let mut out = String::new();
+    for (i, &lane) in kinds.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let start = i * part_sz_usize;
+        let slice = data.get(start..).unwrap_or(&[]);
+        out.push_str(&format_preview(slice, part_sz, std::slice::from_ref(&lane)));
+    }
+    out
 }
 
 fn pointer_kind_from_prediction(kinds: &[NodeKind]) -> Option<NodeKind> {
@@ -1126,26 +1330,34 @@ fn pointer_target_from_preview(data: &[u8], pointer_kind: NodeKind) -> Option<u6
     }
 }
 
-fn cached_hint_regions<'a>(
-    state: &'a mut ComposeState<'_>,
-    prov: &dyn Provider,
-) -> &'a [MemoryRegion] {
+fn ensure_hint_regions(state: &mut ComposeState<'_>, prov: &dyn Provider) {
     if !state.hint_regions_cached {
         state.hint_regions = prov.enumerate_regions();
+        state.hint_regions_indexable = regions_are_indexable(&state.hint_regions);
         state.hint_regions_cached = true;
     }
-    &state.hint_regions
 }
 
-fn cached_hint_modules<'a>(
-    state: &'a mut ComposeState<'_>,
-    prov: &dyn Provider,
-) -> &'a [ModuleEntry] {
+fn ensure_hint_modules(state: &mut ComposeState<'_>, prov: &dyn Provider) {
     if !state.rtti_modules_cached {
         state.rtti_modules = prov.enumerate_modules();
+        state.rtti_modules_indexable = modules_are_indexable(&state.rtti_modules);
         state.rtti_modules_cached = true;
     }
-    &state.rtti_modules
+}
+
+fn regions_are_indexable(regions: &[MemoryRegion]) -> bool {
+    regions.windows(2).all(|pair| {
+        let left_end = pair[0].base.saturating_add(pair[0].size);
+        left_end <= pair[1].base
+    })
+}
+
+fn modules_are_indexable(modules: &[ModuleEntry]) -> bool {
+    modules.windows(2).all(|pair| {
+        let left_end = pair[0].base.saturating_add(pair[0].size);
+        left_end <= pair[1].base
+    })
 }
 
 fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool {
@@ -1157,30 +1369,83 @@ fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool 
             .is_some_and(|end| end <= region.base.saturating_add(region.size))
 }
 
-fn provider_can_read_target(provider: &dyn Provider, regions: &[MemoryRegion], addr: u64) -> bool {
-    addr != 0
-        && (provider.is_readable(addr, 1)
-            || regions.iter().any(|r| region_contains_readable(r, addr, 1)))
-        && {
-            let mut probe = [0u8; 1];
-            provider.read(addr, &mut probe)
-        }
+fn find_readable_region<'a>(
+    regions: &'a [MemoryRegion],
+    indexable: bool,
+    addr: u64,
+    len: i32,
+) -> Option<&'a MemoryRegion> {
+    if indexable {
+        let idx = regions.partition_point(|r| r.base <= addr);
+        return idx
+            .checked_sub(1)
+            .and_then(|i| regions.get(i))
+            .filter(|region| region_contains_readable(region, addr, len));
+    }
+    regions
+        .iter()
+        .find(|region| region_contains_readable(region, addr, len))
+}
+
+fn module_contains(module: &ModuleEntry, addr: u64) -> bool {
+    addr >= module.base
+        && addr
+            .checked_sub(module.base)
+            .is_some_and(|rel| rel < module.size)
+}
+
+fn find_module<'a>(
+    modules: &'a [ModuleEntry],
+    indexable: bool,
+    addr: u64,
+) -> Option<&'a ModuleEntry> {
+    if indexable && modules.len() > 4 {
+        let idx = modules.partition_point(|m| m.base <= addr);
+        return idx
+            .checked_sub(1)
+            .and_then(|i| modules.get(i))
+            .filter(|module| module_contains(module, addr));
+    }
+    modules.iter().find(|module| module_contains(module, addr))
+}
+
+fn provider_can_read_target(
+    provider: &dyn Provider,
+    regions: &[MemoryRegion],
+    regions_indexable: bool,
+    addr: u64,
+) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let readable = if regions.is_empty() {
+        provider.is_readable(addr, 1)
+    } else {
+        find_readable_region(regions, regions_indexable, addr, 1).is_some()
+    };
+    if !readable {
+        return false;
+    }
+    if !regions.is_empty() && provider.trusts_enumerated_region_readability() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    provider.read(addr, &mut probe)
 }
 
 fn named_address(
     provider: &dyn Provider,
     regions: &[MemoryRegion],
+    regions_indexable: bool,
     modules: &[ModuleEntry],
+    modules_indexable: bool,
     addr: u64,
 ) -> String {
     let symbol = provider.get_symbol(addr);
     if !symbol.is_empty() {
         return symbol;
     }
-    if let Some(module) = modules
-        .iter()
-        .find(|m| addr >= m.base && addr.checked_sub(m.base).is_some_and(|rel| rel < m.size))
-    {
+    if let Some(module) = find_module(modules, modules_indexable, addr) {
         let name = if module.name.is_empty() {
             "module"
         } else {
@@ -1188,10 +1453,7 @@ fn named_address(
         };
         return format!("{name}+0x{:X}", addr.saturating_sub(module.base));
     }
-    if let Some(region) = regions
-        .iter()
-        .find(|r| region_contains_readable(r, addr, 1))
-    {
+    if let Some(region) = find_readable_region(regions, regions_indexable, addr, 1) {
         let tag = match region.region_type {
             RegionType::Image => "<DATA>",
             RegionType::Mapped => "<MAPPED>",
@@ -1221,12 +1483,24 @@ fn pointer_type_hint_chip_text(
     let Some(target) = pointer_target_from_preview(data, pointer_kind) else {
         return None;
     };
-    let regions_owned = cached_hint_regions(state, prov).to_vec();
-    if !provider_can_read_target(prov, &regions_owned, target) {
+    ensure_hint_regions(state, prov);
+    if !provider_can_read_target(
+        prov,
+        &state.hint_regions,
+        state.hint_regions_indexable,
+        target,
+    ) {
         return None;
     }
-    let modules_owned = cached_hint_modules(state, prov).to_vec();
-    let label = named_address(prov, &regions_owned, &modules_owned, target);
+    ensure_hint_modules(state, prov);
+    let label = named_address(
+        prov,
+        &state.hint_regions,
+        state.hint_regions_indexable,
+        &state.rtti_modules,
+        state.rtti_modules_indexable,
+        target,
+    );
     Some(format!("{type_name}\u{2713} -> {label}"))
 }
 
@@ -1267,10 +1541,11 @@ fn attach_rtti_chip(
     abs_addr: u64,
     allow_null_cta: bool,
 ) {
-    if !prov.is_readable(abs_addr, 8) {
+    let mut candidate_bytes = [0u8; 8];
+    if !prov.read(abs_addr, &mut candidate_bytes) {
         return;
     }
-    let candidate = prov.read_u64(abs_addr);
+    let candidate = u64::from_le_bytes(candidate_bytes);
     if candidate == 0 {
         if allow_null_cta && state.show_rtti {
             push_chip(line_text, lm, ChipKind::Rtti, "(Name class\u{2026})", |c| {
@@ -1297,7 +1572,10 @@ fn compose_leaf(
     abs_addr: u64,
     scope_id: u64,
 ) {
-    let node = tree.nodes[node_idx as usize].clone();
+    if state.line_limit_reached() {
+        return;
+    }
+    let node = &tree.nodes[node_idx as usize];
 
     let mut parent_abs_addr = 0u64;
     if depth > 0 {
@@ -1388,18 +1666,48 @@ fn compose_leaf(
             lm.line_byte_count = size_for_kind(node.kind);
         }
 
-        let mut line_text = render::fmt_node_line(
-            &node,
-            prov,
-            abs_addr,
-            depth,
-            sub,
-            "",
-            type_w,
-            name_w,
-            &ptr_type_override,
-            state.compact_columns,
-        );
+        let mut hex_stack_bytes = [0u8; 16];
+        let hex_preview_bytes = if sub == 0 && state.type_hints && is_hex_node(node.kind) {
+            let sz = size_for_kind(node.kind);
+            let sz_usize = sz.max(0) as usize;
+            if sz > 0 && sz_usize <= hex_stack_bytes.len() {
+                let _ = prov.read(abs_addr, &mut hex_stack_bytes[..sz_usize]);
+                Some(&hex_stack_bytes[..sz_usize])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut line_text = if let Some(bytes) = hex_preview_bytes {
+            render::fmt_node_line_with_hex_preview_bytes(
+                &node,
+                prov,
+                abs_addr,
+                depth,
+                sub,
+                "",
+                type_w,
+                name_w,
+                &ptr_type_override,
+                state.compact_columns,
+                bytes,
+            )
+        } else {
+            render::fmt_node_line(
+                &node,
+                prov,
+                abs_addr,
+                depth,
+                sub,
+                "",
+                type_w,
+                name_w,
+                &ptr_type_override,
+                state.compact_columns,
+            )
+        };
 
         // ── Chip block (sub == 0): Enum, [TypeHint], Rtti, Comment ──
         if sub == 0 {
@@ -1417,42 +1725,49 @@ fn compose_leaf(
                         | NodeKind::Int32
                         | NodeKind::Int64
                 )
-                && prov.is_readable(abs_addr, node.byte_size())
             {
                 let ref_idx = tree.index_of_id(node.ref_id);
                 if ref_idx >= 0 {
                     let ref_node = &tree.nodes[ref_idx as usize];
                     if ref_node.is_enum() && !ref_node.enum_members.is_empty() {
-                        let v: i64 = match node.kind {
-                            NodeKind::UInt8 => prov.read_u8(abs_addr) as i64,
-                            NodeKind::UInt16 => prov.read_u16(abs_addr) as i64,
-                            NodeKind::UInt32 => prov.read_u32(abs_addr) as i64,
-                            NodeKind::UInt64 => prov.read_u64(abs_addr) as i64,
-                            NodeKind::Int8 => (prov.read_u8(abs_addr) as i8) as i64,
-                            NodeKind::Int16 => (prov.read_u16(abs_addr) as i16) as i64,
-                            NodeKind::Int32 => (prov.read_u32(abs_addr) as i32) as i64,
-                            NodeKind::Int64 => prov.read_u64(abs_addr) as i64,
-                            _ => 0,
-                        };
-                        let member_name = ref_node
-                            .enum_members
-                            .iter()
-                            .find(|(_, val)| *val == v)
-                            .map(|(name, _)| name.clone());
-                        if let Some(name) = member_name {
-                            if !name.is_empty() {
-                                let chip_text = format!("({name})");
-                                let ref_id = node.ref_id;
-                                push_chip(
-                                    &mut line_text,
-                                    &mut lm,
-                                    ChipKind::Enum,
-                                    &chip_text,
-                                    |c| {
-                                        c.enum_current_value = v;
-                                        c.enum_ref_node_id = ref_id;
-                                    },
-                                );
+                        let sz = node.byte_size();
+                        let mut bytes = [0u8; 8];
+                        if sz > 0 && prov.read(abs_addr, &mut bytes[..sz as usize]) {
+                            let v: i64 = match node.kind {
+                                NodeKind::UInt8 => bytes[0] as i64,
+                                NodeKind::UInt16 => u16::from_le_bytes([bytes[0], bytes[1]]) as i64,
+                                NodeKind::UInt32 => {
+                                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                                        as i64
+                                }
+                                NodeKind::UInt64 => u64::from_le_bytes(bytes) as i64,
+                                NodeKind::Int8 => (bytes[0] as i8) as i64,
+                                NodeKind::Int16 => i16::from_le_bytes([bytes[0], bytes[1]]) as i64,
+                                NodeKind::Int32 => {
+                                    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                                        as i64
+                                }
+                                NodeKind::Int64 => i64::from_le_bytes(bytes),
+                                _ => 0,
+                            };
+                            let member_name = state
+                                .enum_member_index(ref_node.id, &ref_node.enum_members, v)
+                                .map(|idx| ref_node.enum_members[idx].0.clone());
+                            if let Some(name) = member_name {
+                                if !name.is_empty() {
+                                    let chip_text = format!("({name})");
+                                    let ref_id = node.ref_id;
+                                    push_chip(
+                                        &mut line_text,
+                                        &mut lm,
+                                        ChipKind::Enum,
+                                        &chip_text,
+                                        |c| {
+                                            c.enum_current_value = v;
+                                            c.enum_ref_node_id = ref_id;
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -1501,23 +1816,30 @@ fn compose_leaf(
             // the green chip is suppressed (`test_rtti_hint.cpp:313`).
             if state.type_hints && is_hex_node(node.kind) {
                 let sz = size_for_kind(node.kind);
-                let b = if prov.is_readable(abs_addr, sz) {
-                    prov.read_bytes(abs_addr, sz)
+                let mut stack_bytes = [0u8; 16];
+                let owned_bytes;
+                let b = if let Some(bytes) = hex_preview_bytes {
+                    bytes
+                } else if sz > 0 && (sz as usize) <= stack_bytes.len() {
+                    let len = sz as usize;
+                    let _ = prov.read(abs_addr, &mut stack_bytes[..len]);
+                    &stack_bytes[..len]
                 } else {
-                    vec![0u8; sz as usize]
+                    owned_bytes = prov.read_bytes(abs_addr, sz);
+                    owned_bytes.as_slice()
                 };
                 // `infer_types` returns empty for all-zero / empty input (the
                 // degenerate inputs the C++ also skips). For non-zero data the
                 // scoring pipeline lives in the `typeinfer` workflow; guard so
                 // headless compose never trips its skeleton.
                 if b.iter().any(|&x| x != 0) {
-                    let suggestions = crate::core::infer_types(&b, &Default::default(), 3);
+                    let suggestions = crate::core::infer_strong_types(&b, &Default::default(), 2);
                     let mut emitted = 0usize;
                     for suggestion in suggestions.iter().filter(|s| s.strength >= 3) {
                         if emitted >= 2 {
                             break;
                         }
-                        let kinds = suggestion.kinds.clone();
+                        let kinds = suggestion.kinds.to_vec();
                         // Value-preview + bracketed type label, mirroring
                         // `lm.typeHint` (`compose.cpp:450-458`). Pointer guesses
                         // are promoted only when the target is actually readable;
@@ -1636,10 +1958,13 @@ fn compose_parent(
     array_element_idx: i32,
     array_container_addr: u64,
 ) {
+    if state.line_limit_reached() {
+        return;
+    }
     if depth > MAX_COMPOSE_DEPTH {
         return;
     }
-    let node = tree.nodes[node_idx as usize].clone();
+    let node = &tree.nodes[node_idx as usize];
     let abs_addr = resolve_addr(state, tree, node_idx, base, root_id);
 
     // Cycle detection.
@@ -1801,6 +2126,9 @@ fn compose_parent(
             let order: Vec<usize> = order.into_iter().map(|x| x as usize).collect();
 
             for (oi, &mi) in order.iter().enumerate() {
+                if state.line_limit_reached() {
+                    break;
+                }
                 state.set_tree_sibling(child_depth, oi < order.len() - 1);
                 let (mname, mval) = &node.enum_members[mi];
                 let mut lm = LineMeta {
@@ -1857,6 +2185,9 @@ fn compose_parent(
             }
             let count = node.bitfield_members.len();
             for mi in 0..count {
+                if state.line_limit_reached() {
+                    break;
+                }
                 state.set_tree_sibling(child_depth, mi < count - 1);
                 let m = &node.bitfield_members[mi];
                 let bit_val = render::extract_bits(
@@ -1932,6 +2263,9 @@ fn compose_parent(
             let e_tw = state.effective_type_w(node.id);
             let e_nw = state.effective_name_w(node.id);
             for i in 0..node.array_len {
+                if state.line_limit_reached() {
+                    break;
+                }
                 state.set_tree_sibling(child_depth, i < node.array_len - 1);
                 let elem_addr = abs_addr.wrapping_add(i as u64 * elem_size as u64);
                 let elem_type_str = format!("{}[{}]", render::type_name_raw(node.element_kind), i);
@@ -2001,6 +2335,9 @@ fn compose_parent(
                     elem_size = 1;
                 }
                 for i in 0..node.array_len {
+                    if state.line_limit_reached() {
+                        break;
+                    }
                     state.set_tree_sibling(child_depth, i < node.array_len - 1);
                     let elem_base = abs_addr.wrapping_add(i as u64 * elem_size as u64);
                     compose_parent(
@@ -2028,6 +2365,9 @@ fn compose_parent(
                 let ref_scope_id = node.ref_id;
                 let n_ref = ref_children.len();
                 for (rci, &child_idx) in ref_children.iter().enumerate() {
+                    if state.line_limit_reached() {
+                        break;
+                    }
                     state.set_tree_sibling(child_depth, rci < n_ref - 1);
                     let child = tree.nodes[child_idx as usize].clone();
                     if state.visiting.contains(&child.id) {
@@ -2095,6 +2435,9 @@ fn compose_parent(
         let mut gap_bytes: i32 = 0;
         let n_reg = regular.len();
         for ri in 0..n_reg {
+            if state.line_limit_reached() {
+                break;
+            }
             let child_idx = regular[ri];
             let child = &tree.nodes[child_idx as usize];
 
@@ -2170,6 +2513,10 @@ fn compose_parent(
 
     // Footer line.
     if !is_array_child && (!node.collapsed || is_root_header) {
+        if state.line_limit_reached() {
+            state.visiting.remove(&node.id);
+            return;
+        }
         let sz = tree.struct_span(node.id);
         let mut lm = LineMeta {
             node_idx,
@@ -2214,6 +2561,9 @@ fn compose_node(
     array_element_idx: i32,
     array_container_addr: u64,
 ) {
+    if state.line_limit_reached() {
+        return;
+    }
     if depth > MAX_COMPOSE_DEPTH {
         return;
     }
@@ -2333,12 +2683,15 @@ fn compose_node(
         if !effective_collapsed {
             let sz = node.byte_size();
             let mut ptr_val = 0u64;
-            if prov.is_valid() && sz > 0 && prov.is_readable(abs_addr, sz) {
-                ptr_val = if node.kind == NodeKind::Pointer32 {
-                    prov.read_u32(abs_addr) as u64
-                } else {
-                    prov.read_u64(abs_addr)
-                };
+            if prov.is_valid() && sz > 0 {
+                let mut bytes = [0u8; 8];
+                if prov.read(abs_addr, &mut bytes[..sz as usize]) {
+                    ptr_val = if node.kind == NodeKind::Pointer32 {
+                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
+                    } else {
+                        u64::from_le_bytes(bytes)
+                    };
+                }
                 if ptr_val != 0
                     && (ptr_val == u64::MAX
                         || (node.kind == NodeKind::Pointer32 && ptr_val == 0xFFFF_FFFF))
@@ -2347,7 +2700,7 @@ fn compose_node(
                 }
             }
 
-            // Relative pointer (RVA): target = tree.base_address + value.
+            // Relative pointer (RVA): target = active compose base + value.
             // Matches PE/COFF/ELF RVA convention — values are offsets from
             // the document's base (imageBase when attached at module load),
             // NOT from the recursion-time parent base. Using `base` (the
@@ -2355,7 +2708,7 @@ fn compose_node(
             // literal `value` since base=0 at root, which read e.g.
             // NT_HEADERS at 0x78 instead of imageBase+0x78.
             if node.is_relative && ptr_val != 0 {
-                ptr_val = ptr_val.wrapping_add(tree.base_address);
+                ptr_val = ptr_val.wrapping_add(state.base_address);
             }
 
             // Follow extra indirection levels (** struct pointers).
@@ -2363,14 +2716,15 @@ fn compose_node(
             while d < node.ptr_depth && ptr_val != 0 {
                 let is64 = node.kind == NodeKind::Pointer64;
                 let psz = if is64 { 8 } else { 4 };
-                if !prov.is_readable(ptr_val, psz) {
+                let mut bytes = [0u8; 8];
+                if !prov.read(ptr_val, &mut bytes[..psz as usize]) {
                     ptr_val = 0;
                     break;
                 }
                 ptr_val = if is64 {
-                    prov.read_u64(ptr_val)
+                    u64::from_le_bytes(bytes)
                 } else {
-                    prov.read_u32(ptr_val) as u64
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
                 };
                 if ptr_val == u64::MAX || (!is64 && ptr_val == 0xFFFF_FFFF) {
                     ptr_val = 0;
@@ -2379,7 +2733,17 @@ fn compose_node(
             }
 
             let mut p_base = ptr_val;
-            let ptr_readable = ptr_val != 0 && prov.is_readable(p_base, 1);
+            let ptr_readable = if ptr_val != 0 {
+                ensure_hint_regions(state, prov);
+                provider_can_read_target(
+                    prov,
+                    &state.hint_regions,
+                    state.hint_regions_indexable,
+                    p_base,
+                )
+            } else {
+                false
+            };
             let null_prov = NullProvider;
             let child_prov: &dyn Provider = if ptr_readable { prov } else { &null_prov };
             if !ptr_readable {
@@ -3184,6 +3548,36 @@ mod render {
             col_name,
             type_override,
             compact,
+        ))
+    }
+
+    /// `fmtNodeLine(...)`, using caller-owned bytes for the hex preview column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fmt_node_line_with_hex_preview_bytes(
+        node: &Node,
+        prov: &dyn Provider,
+        addr: u64,
+        depth: i32,
+        sub_line: i32,
+        comment: &str,
+        col_type: i32,
+        col_name: i32,
+        type_override: &str,
+        compact: bool,
+        hex_preview_bytes: &[u8],
+    ) -> U16Str {
+        U16Str::from_str(&crate::format::fmt_node_line_with_hex_preview_bytes(
+            node,
+            prov,
+            addr,
+            depth,
+            sub_line,
+            comment,
+            col_type,
+            col_name,
+            type_override,
+            compact,
+            hex_preview_bytes,
         ))
     }
 

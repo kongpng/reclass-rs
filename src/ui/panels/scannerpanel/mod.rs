@@ -26,6 +26,8 @@
 //!
 //! Gated behind the `ui` feature.
 
+use ahash::AHashMap;
+
 use crate::scanner::{
     natural_alignment, parse_signature, serialize_value, value_size_for_type, ScanCondition,
     ScanRequest, ScanResult, ValueType,
@@ -795,6 +797,49 @@ pub fn delete_rows(mut results: Vec<ScanResult>, rows: &[usize]) -> Vec<ScanResu
     results
 }
 
+/// Apply the Change-All writeback payload to scanner results.
+///
+/// The window emits writebacks in result order in the normal live-provider path,
+/// so this first takes a direct O(n) zip path. If an integration returns
+/// out-of-order addresses, fall back to an address index instead of the old
+/// per-update linear search. Only `scan_value` is changed; `previous_value`
+/// remains the last rescan snapshot, matching the C++ panel behavior.
+pub fn apply_change_all_results(
+    results: &mut [ScanResult],
+    writebacks: Vec<(u64, Option<Vec<u8>>)>,
+) -> usize {
+    let ordered = writebacks.len() == results.len()
+        && writebacks
+            .iter()
+            .zip(results.iter())
+            .all(|((addr, _), result)| *addr == result.address);
+
+    let mut wrote = 0usize;
+    if ordered {
+        for (result, (_, new_bytes)) in results.iter_mut().zip(writebacks) {
+            if let Some(bytes) = new_bytes {
+                result.scan_value = bytes.into();
+                wrote += 1;
+            }
+        }
+        return wrote;
+    }
+
+    let mut by_address = AHashMap::with_capacity(results.len());
+    for (idx, result) in results.iter().enumerate() {
+        by_address.entry(result.address).or_insert(idx);
+    }
+    for (addr, new_bytes) in writebacks {
+        if let Some(bytes) = new_bytes {
+            if let Some(&idx) = by_address.get(&addr) {
+                results[idx].scan_value = bytes.into();
+            }
+            wrote += 1;
+        }
+    }
+    wrote
+}
+
 /// Parse a "Change All Values" replacement string into raw bytes, per the last
 /// scan mode + value type (the C++ batch-write parse, scannerpanel.cpp:945-978).
 ///
@@ -1307,8 +1352,8 @@ fn deserialize_result_rows(json: &str) -> Vec<ScanResult> {
                             out.push(ScanResult {
                                 address,
                                 region_module: module,
-                                scan_value: value,
-                                previous_value: Vec::new(),
+                                scan_value: value.into(),
+                                previous_value: Default::default(),
                             });
                         }
                     }
@@ -1324,8 +1369,8 @@ fn deserialize_result_rows(json: &str) -> Vec<ScanResult> {
 
 #[cfg(feature = "ui")]
 pub use view::{
-    scanner_panel_key_bindings, ScannerAddNodes, ScannerBatchEdit, ScannerDragAddress, ScannerEdit,
-    ScannerNav, ScannerPanel,
+    bench_scanner_table_filter_cached, bench_scanner_table_refresh, scanner_panel_key_bindings,
+    ScannerAddNodes, ScannerBatchEdit, ScannerDragAddress, ScannerEdit, ScannerNav, ScannerPanel,
 };
 
 #[cfg(feature = "ui")]
@@ -1334,11 +1379,12 @@ mod view;
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_delta, delete_rows, deserialize_results_json, filter_rows, first_scan_status,
-        format_addresses_for_clipboard, format_float, format_value, parse_change_all_bytes,
-        previous_delta_text, rescan_status, serialize_results_json, shortcut_scan_target,
-        split_address_dim, stage_breadcrumb, truncation_banner, value_type_entries, CondEntry,
-        ScanMode, ScanRow, ScanShortcut, ScannerForm, FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
+        apply_change_all_results, compute_delta, delete_rows, deserialize_results_json,
+        filter_rows, first_scan_status, format_addresses_for_clipboard, format_float, format_value,
+        parse_change_all_bytes, previous_delta_text, rescan_status, serialize_results_json,
+        shortcut_scan_target, split_address_dim, stage_breadcrumb, truncation_banner,
+        value_type_entries, CondEntry, ScanMode, ScanRow, ScanShortcut, ScannerForm,
+        FAST_SCAN_ALIGNMENTS, MAX_DISPLAY_ROWS,
     };
     use crate::scanner::{ScanCondition, ScanResult, ValueType};
     use crate::theme::manager::MemSettings;
@@ -1547,10 +1593,10 @@ mod tests {
         let parsed = &doc.results;
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].address, 0x401000);
-        assert_eq!(parsed[0].scan_value, vec![0x39, 0x05, 0x00, 0x00]);
+        assert_eq!(&parsed[0].scan_value[..], &[0x39, 0x05, 0x00, 0x00]);
         assert_eq!(parsed[0].region_module, "");
         assert_eq!(parsed[1].address, 0x7ff0);
-        assert_eq!(parsed[1].scan_value, vec![0xFF]);
+        assert_eq!(&parsed[1].scan_value[..], &[0xFF]);
         assert_eq!(parsed[1].region_module, "game.exe");
         // The saved scan mode + value type round-trip (the C++ loadResultsFrom
         // restoring m_lastScanMode / m_lastValueType).
@@ -1801,6 +1847,85 @@ mod tests {
         assert!(err.starts_with("Pattern error:"), "got {err}");
     }
 
+    #[test]
+    fn apply_change_all_results_updates_ordered_rows_directly() {
+        let mut results = vec![
+            ScanResult {
+                address: 0x1000,
+                scan_value: vec![1].into(),
+                previous_value: vec![9].into(),
+                ..ScanResult::default()
+            },
+            ScanResult {
+                address: 0x2000,
+                scan_value: vec![2].into(),
+                previous_value: vec![8].into(),
+                ..ScanResult::default()
+            },
+        ];
+
+        let wrote = apply_change_all_results(
+            &mut results,
+            vec![(0x1000, Some(vec![0xAA])), (0x2000, Some(vec![0xBB]))],
+        );
+
+        assert_eq!(wrote, 2);
+        assert_eq!(&results[0].scan_value[..], &[0xAA]);
+        assert_eq!(&results[1].scan_value[..], &[0xBB]);
+        assert_eq!(&results[0].previous_value[..], &[9]);
+    }
+
+    #[test]
+    fn apply_change_all_results_indexes_out_of_order_rows_and_counts_successes() {
+        let mut results = vec![
+            ScanResult {
+                address: 0x1000,
+                scan_value: vec![1].into(),
+                ..ScanResult::default()
+            },
+            ScanResult {
+                address: 0x2000,
+                scan_value: vec![2].into(),
+                ..ScanResult::default()
+            },
+        ];
+
+        let wrote = apply_change_all_results(
+            &mut results,
+            vec![
+                (0x2000, Some(vec![0xCC])),
+                (0xDEAD, Some(vec![0xDD])),
+                (0x1000, None),
+            ],
+        );
+
+        assert_eq!(wrote, 2);
+        assert_eq!(&results[0].scan_value[..], &[1]);
+        assert_eq!(&results[1].scan_value[..], &[0xCC]);
+    }
+
+    #[test]
+    fn apply_change_all_results_duplicate_addresses_update_first_result() {
+        let mut results = vec![
+            ScanResult {
+                address: 0x1000,
+                scan_value: vec![1].into(),
+                ..ScanResult::default()
+            },
+            ScanResult {
+                address: 0x1000,
+                scan_value: vec![2].into(),
+                ..ScanResult::default()
+            },
+        ];
+
+        let wrote = apply_change_all_results(&mut results, vec![(0x1000, Some(vec![0xEE]))]);
+
+        assert_eq!(wrote, 1);
+        assert_eq!(&results[0].scan_value[..], &[0xEE]);
+        assert_eq!(&results[1].scan_value[..], &[2]);
+    }
+
     // ── formatValue ──
 
     #[test]
@@ -1871,7 +1996,7 @@ mod tests {
         f.build_request(8, None).expect("ok");
         let r = ScanResult {
             address: 0x0000_7FF6_1234_0000,
-            scan_value: 1i32.to_le_bytes().to_vec(),
+            scan_value: 1i32.to_le_bytes().to_vec().into(),
             ..ScanResult::default()
         };
         let row = ScanRow::from_result(&f, &r);

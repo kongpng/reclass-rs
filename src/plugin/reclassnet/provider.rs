@@ -27,7 +27,7 @@ use crate::plugin::reclassnet::ffi::{
     decode_utf16_fixed, EnumerateRemoteModuleData, EnumerateRemoteSectionData, ProcessAccess,
     RcPointer, SectionProtection, SectionType,
 };
-use crate::provider::{MemoryRegion, Provider, RegionType};
+use crate::provider::{MemoryRegion, ModuleEntry, ModuleLookup, Provider, RegionType};
 
 // ── thread_local collectors for the no-context ReClass.NET callbacks ──────────
 //
@@ -132,6 +132,7 @@ pub struct RcNetProvider {
     process_name: String,
     /// Cached modules for symbol resolution + base (the C++ `m_modules`).
     modules: Vec<ModuleInfo>,
+    module_lookup: ModuleLookup,
     /// Cached regions for [`enumerate_regions`](Provider::enumerate_regions)
     /// (design §7.A [fix] (2); the C++ discarded these).
     regions: Vec<MemoryRegion>,
@@ -173,6 +174,7 @@ impl RcNetProvider {
             handle,
             process_name: process_name.into(),
             modules: Vec::new(),
+            module_lookup: ModuleLookup::default(),
             regions: Vec::new(),
             base: 0,
             pointer_size: if is_32bit_hint { 4 } else { 8 },
@@ -223,6 +225,17 @@ impl RcNetProvider {
             self.pointer_size = 8;
         }
 
+        self.module_lookup = ModuleLookup::new(
+            modules
+                .iter()
+                .map(|m| ModuleEntry {
+                    name: m.name.clone(),
+                    full_path: String::new(),
+                    base: m.base,
+                    size: m.size,
+                })
+                .collect(),
+        );
         self.modules = modules;
         self.regions = regions;
     }
@@ -344,28 +357,24 @@ impl Provider for RcNetProvider {
     }
 
     fn get_symbol(&self, addr: u64) -> String {
-        // The C++ linear module scan → "mod+0xHEX" (reference §8).
-        for m in &self.modules {
-            if addr >= m.base && addr < m.base.saturating_add(m.size) {
-                return format!("{}+0x{:x}", m.name, addr - m.base);
-            }
-        }
-        String::new()
+        // Same snapshot as the C++ module cache, indexed for repeated per-row lookups.
+        self.module_lookup
+            .find_by_addr(addr)
+            .map(|m| format!("{}+0x{:x}", m.name, addr - m.base))
+            .unwrap_or_default()
     }
 
     fn symbol_to_address(&self, name: &str) -> u64 {
-        // The C++ case-insensitive module-name match → base (reference §8).
-        for m in &self.modules {
-            if m.name.eq_ignore_ascii_case(name) {
-                return m.base;
-            }
-        }
-        0
+        self.module_lookup.symbol_to_address(name)
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         // [fix] (2): real regions from the section callback (C++ returned empty).
         self.regions.clone()
+    }
+
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        true
     }
 }
 

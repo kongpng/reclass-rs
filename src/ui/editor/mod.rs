@@ -27,12 +27,21 @@ pub mod element;
 pub mod geometry;
 pub mod hit_test;
 mod hover_popup;
+#[doc(hidden)]
+pub use hover_popup::{
+    bench_memory_preview_lookup_orders, bench_memory_preview_rows_with_cached_lookup,
+    bench_memory_preview_rows_with_maps, bench_pointer_memory_preview_with_cached_lookup,
+    bench_pointer_memory_preview_with_maps, bench_struct_preview_preflight_reenumerate,
+    bench_struct_preview_preflight_with_regions,
+};
 pub mod inline_edit;
 pub mod minimap;
 pub mod palette;
 pub mod selection;
 pub mod tab_cycle;
-use hover_popup::{HoverPopupKind, HoverPopupState, HoverProbe, MEMORY_PREVIEW_MIN_ROWS};
+use hover_popup::{
+    HoverMemoryMaps, HoverPopupKind, HoverPopupState, HoverProbe, MEMORY_PREVIEW_MIN_ROWS,
+};
 mod context_menu;
 mod debug_view;
 mod popups;
@@ -43,15 +52,19 @@ mod mouse;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{ActiveTheme, IconName};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::compose::EditTarget;
 use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
-use crate::core::linemeta::K_COMMAND_ROW_ID;
+use crate::core::linemeta::{sel_id_for_line, K_COMMAND_ROW_ID};
 use crate::core::{is_hex_preview, ComposeResult, LineKind, LineMeta, NodeKind};
 use crate::ui::design::color::with_alpha;
-use crate::ui::overlays::findbar::{FindBar, FindEvent};
+use crate::ui::overlays::findbar::{FindBar, FindEvent, FindMatch};
 use crate::ui::pickers::sourcechooser::{SourceChooserEvent, SourceChooserPopup};
 use crate::ui::{design, overlays::tooltip};
+use ahash::AHashMap;
 
 use element::{RowElement, RowPaint};
 use geometry::CellMetrics;
@@ -508,6 +521,10 @@ pub struct RcxEditor {
     /// Last row/value hit-test used to rebuild an open hover popup from timer
     /// refreshes while the mouse stays still or is over the popup itself.
     hover_probe: Option<HoverProbe>,
+    /// Region/module snapshot for the currently-open memory-preview hover. This
+    /// is intentionally scoped to one hover probe/provider so live target maps are
+    /// re-read when the pointer moves, the popup closes, or the source changes.
+    hover_memory_maps: Option<HoverMemoryMaps>,
     /// The moving end of a keyboard range-selection (Shift+arrows/page/home/end).
     /// The C++ tracks the Scintilla caret line; here we mirror it so Shift-nav
     /// extends from the last caret position rather than from `first_selected_line`
@@ -572,6 +589,19 @@ pub struct RcxEditor {
     /// minimap / the C++ purple overview block, data_options.png). Purely-visual
     /// editor state, defaults off; the View menu's "Minimap" item flips it.
     minimap: bool,
+    /// Cached minimap bars keyed by controller result revision + row-affecting
+    /// palette colors. Prevents scroll/paint frames from reducing every composed
+    /// line again while still rebuilding after live-provider refreshes.
+    minimap_rows_cache: Option<MinimapRowsCache>,
+    /// Cached hex-row byte intervals keyed by the composed result revision. Byte
+    /// selection drags update on every mouse move, so this prevents each drag
+    /// tick from rescanning all composed rows just to mirror covered hex rows into
+    /// the controller selection.
+    byte_row_index_cache: Option<ByteRowIndexCache>,
+    /// Static row paint cache keyed by composed result revision. It stores row
+    /// text, semantic style spans, and pill columns; dynamic overlays remain
+    /// frame-local so selection, hover, find, and byte selection never go stale.
+    static_row_paint_cache: RefCell<StaticRowPaintCache>,
     /// Measured monospace cell metrics (re-measured each frame in `render` from
     /// the real shaped glyph advance so column math matches the painted grid).
     metrics: CellMetrics,
@@ -602,7 +632,10 @@ pub struct RcxEditor {
     /// Item 31: the FULL match set, cached for the paint path (which has no `cx` to
     /// read the find-bar entity). Refreshed on Navigate and on every recompose
     /// (`sync_find_bar_lines`) so the painted IND_FIND bands track the layout.
-    find_matches: Vec<crate::ui::overlays::findbar::FindMatch>,
+    find_matches: Vec<FindMatch>,
+    /// Per-line ranges into `find_matches`; rebuilt whenever `find_matches`
+    /// changes so row paint does not rescan every match for every visible line.
+    find_match_line_ranges: Vec<std::ops::Range<usize>>,
     _find_bar_sub: Option<Subscription>,
     /// Item 33: the last find query, persisted across hide/show so re-opening the
     /// bar (Ctrl+F) resumes the prior search rather than starting blank (the C++
@@ -772,6 +805,320 @@ struct EditingField {
     _subscription: Subscription,
 }
 
+fn find_match_line_ranges(line_count: usize, matches: &[FindMatch]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = vec![0..0; line_count];
+    let mut cursor = 0usize;
+    for (line, slot) in ranges.iter_mut().enumerate() {
+        while matches.get(cursor).is_some_and(|m| m.line < line) {
+            cursor += 1;
+        }
+        let start = cursor;
+        while matches.get(cursor).is_some_and(|m| m.line == line) {
+            cursor += 1;
+        }
+        *slot = start..cursor;
+    }
+    ranges
+}
+
+fn find_highlight_count_for_ranges(
+    matches: &[FindMatch],
+    ranges: &[std::ops::Range<usize>],
+    current: Option<FindMatch>,
+    start: usize,
+    end: usize,
+) -> usize {
+    let mut total = 0usize;
+    for line in start..end {
+        let Some(range) = ranges.get(line).cloned() else {
+            continue;
+        };
+        for m in matches[range].iter().filter(|m| m.end > m.start) {
+            total = total.wrapping_add(m.end - m.start);
+            if current.is_some_and(|c| c.line == m.line && c.start == m.start && c.end == m.end) {
+                total = total.wrapping_add(1);
+            }
+        }
+    }
+    total
+}
+
+#[doc(hidden)]
+pub fn bench_find_match_line_ranges(
+    line_count: usize,
+    matches: &[FindMatch],
+) -> Vec<std::ops::Range<usize>> {
+    find_match_line_ranges(line_count, matches)
+}
+
+#[doc(hidden)]
+pub fn bench_find_highlight_indexed_count(
+    matches: &[FindMatch],
+    line_count: usize,
+    current: Option<FindMatch>,
+    start: usize,
+    end: usize,
+) -> usize {
+    let ranges = find_match_line_ranges(line_count, matches);
+    find_highlight_count_for_ranges(matches, &ranges, current, start, end)
+}
+
+#[doc(hidden)]
+pub fn bench_find_highlight_indexed_count_with_ranges(
+    matches: &[FindMatch],
+    ranges: &[std::ops::Range<usize>],
+    current: Option<FindMatch>,
+    start: usize,
+    end: usize,
+) -> usize {
+    find_highlight_count_for_ranges(matches, ranges, current, start, end)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MinimapPaletteKey {
+    class_name: [u32; 4],
+    type_fg: [u32; 4],
+    dim: [u32; 4],
+    keyword: [u32; 4],
+    fnptr_fg: [u32; 4],
+    value_fg: [u32; 4],
+}
+
+impl MinimapPaletteKey {
+    fn new(palette: EditorPalette) -> Self {
+        Self {
+            class_name: hsla_key(palette.class_name),
+            type_fg: hsla_key(palette.type_fg),
+            dim: hsla_key(palette.dim),
+            keyword: hsla_key(palette.keyword),
+            fnptr_fg: hsla_key(palette.fnptr_fg),
+            value_fg: hsla_key(palette.value_fg),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MinimapRowsCacheKey {
+    result_revision: u64,
+    palette: MinimapPaletteKey,
+}
+
+#[derive(Clone, Debug)]
+struct MinimapRowsCache {
+    key: MinimapRowsCacheKey,
+    rows: Arc<[minimap::MinimapRow]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteRowInterval {
+    start: u64,
+    end: u64,
+    sel_id: u64,
+    line: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ByteRowIndexCache {
+    result_revision: u64,
+    rows: Vec<ByteRowInterval>,
+    non_overlapping: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StaticRowPaint {
+    text: SharedString,
+    runs: Arc<[geometry::SpanStyle]>,
+    pill_spans: Arc<[(i32, i32)]>,
+}
+
+const STATIC_ROW_PAINT_SPARSE_THRESHOLD: usize = 20_000;
+
+#[derive(Clone, Debug)]
+enum StaticRowPaintRows {
+    Dense(Vec<Option<StaticRowPaint>>),
+    Sparse(AHashMap<usize, StaticRowPaint>),
+}
+
+impl Default for StaticRowPaintRows {
+    fn default() -> Self {
+        Self::Dense(Vec::new())
+    }
+}
+
+impl StaticRowPaintRows {
+    fn get(&self, idx: usize) -> Option<&StaticRowPaint> {
+        match self {
+            StaticRowPaintRows::Dense(rows) => rows.get(idx).and_then(|row| row.as_ref()),
+            StaticRowPaintRows::Sparse(rows) => rows.get(&idx),
+        }
+    }
+
+    fn reset_for_line_count(&mut self, line_count: usize) {
+        if line_count >= STATIC_ROW_PAINT_SPARSE_THRESHOLD {
+            match self {
+                StaticRowPaintRows::Sparse(rows) => rows.clear(),
+                _ => *self = StaticRowPaintRows::Sparse(AHashMap::with_capacity(512)),
+            }
+        } else {
+            match self {
+                StaticRowPaintRows::Dense(rows) => {
+                    rows.clear();
+                    rows.resize_with(line_count, || None);
+                }
+                _ => {
+                    let mut rows = Vec::new();
+                    rows.resize_with(line_count, || None);
+                    *self = StaticRowPaintRows::Dense(rows);
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, idx: usize, row: StaticRowPaint) {
+        match self {
+            StaticRowPaintRows::Dense(rows) => {
+                if idx >= rows.len() {
+                    rows.resize_with(idx + 1, || None);
+                }
+                rows[idx] = Some(row);
+            }
+            StaticRowPaintRows::Sparse(rows) => {
+                rows.insert(idx, row);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StaticRowPaintCache {
+    result_revision: u64,
+    rows: StaticRowPaintRows,
+}
+
+fn hsla_key(color: Hsla) -> [u32; 4] {
+    [
+        color.h.to_bits(),
+        color.s.to_bits(),
+        color.l.to_bits(),
+        color.a.to_bits(),
+    ]
+}
+
+fn minimap_rows_for_meta(meta: &[LineMeta], palette: EditorPalette) -> Arc<[minimap::MinimapRow]> {
+    meta.iter()
+        .map(|lm| minimap::minimap_row_for(lm, &palette))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn row_selected_by_set(selected: &HashSet<u64>, lm: &LineMeta) -> bool {
+    if lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
+        return false;
+    }
+    selected.contains(&sel_id_for_line(lm))
+}
+
+fn first_selected_line_from_meta(meta: &[LineMeta], selected: &HashSet<u64>) -> Option<usize> {
+    if selected.is_empty() {
+        return (meta.len() > 1).then_some(1);
+    }
+    let selected_bare: HashSet<u64> = selected
+        .iter()
+        .map(|&id| crate::controller::strip_sel_pub(id))
+        .collect();
+    meta.iter()
+        .enumerate()
+        .find_map(|(i, lm)| (lm.node_id != 0 && selected_bare.contains(&lm.node_id)).then_some(i))
+}
+
+fn byte_row_count(lm: &LineMeta) -> i32 {
+    if lm.line_byte_count > 0 {
+        lm.line_byte_count
+    } else {
+        crate::core::size_for_kind(lm.node_kind)
+    }
+}
+
+fn build_byte_row_index(meta: &[LineMeta]) -> (Vec<ByteRowInterval>, bool) {
+    let mut rows = Vec::new();
+    let mut in_order = true;
+    let mut non_overlapping = true;
+    let mut previous: Option<(u64, u64)> = None;
+    for (line, lm) in meta.iter().enumerate() {
+        if !is_hex_preview(lm.node_kind) || lm.line_kind != LineKind::Field {
+            continue;
+        }
+        let count = byte_row_count(lm);
+        if count <= 0 {
+            continue;
+        }
+        let start = lm.offset_addr;
+        let end = start.saturating_add(count as u64);
+        if end > start {
+            if let Some((prev_start, prev_end)) = previous {
+                if prev_start > start || (prev_start == start && prev_end > end) {
+                    in_order = false;
+                }
+                if prev_end > start {
+                    non_overlapping = false;
+                }
+            }
+            previous = Some((start, end));
+            rows.push(ByteRowInterval {
+                start,
+                end,
+                sel_id: sel_id_for_line(lm),
+                line,
+            });
+        }
+    }
+    if !in_order {
+        rows.sort_unstable_by_key(|row| (row.start, row.end));
+        non_overlapping = rows.windows(2).all(|pair| pair[0].end <= pair[1].start);
+    }
+    (rows, non_overlapping)
+}
+
+fn covered_byte_rows_full_scan(meta: &[LineMeta], sel: (u64, u64)) -> HashSet<u64> {
+    let mut covered = HashSet::new();
+    for lm in meta {
+        if !is_hex_preview(lm.node_kind) || lm.line_kind != LineKind::Field {
+            continue;
+        }
+        if selection::row_byte_overlap(lm.offset_addr, byte_row_count(lm), sel).is_some() {
+            covered.insert(sel_id_for_line(lm));
+        }
+    }
+    covered
+}
+
+fn covered_byte_rows_from_index(rows: &[ByteRowInterval], sel: (u64, u64)) -> HashSet<u64> {
+    let (lo, hi) = sel;
+    let start = rows.partition_point(|row| row.end <= lo);
+    let mut covered = HashSet::new();
+    for row in &rows[start..] {
+        if row.start >= hi {
+            break;
+        }
+        covered.insert(row.sel_id);
+    }
+    covered
+}
+
+fn byte_row_line_from_index(rows: &[ByteRowInterval], addr: u64) -> Option<usize> {
+    let idx = rows.partition_point(|row| row.end <= addr);
+    let row = rows.get(idx)?;
+    (addr >= row.start && addr < row.end).then_some(row.line)
+}
+
+#[doc(hidden)]
+pub fn bench_minimap_rows_for_meta(
+    meta: &[LineMeta],
+    palette: EditorPalette,
+) -> Arc<[minimap::MinimapRow]> {
+    minimap_rows_for_meta(meta, palette)
+}
+
 impl RcxEditor {
     /// Build an editor over a fresh document (empty tree). The app replaces the
     /// document via [`set_document`] when opening a project.
@@ -788,6 +1135,7 @@ impl RcxEditor {
             hovered_node_id: 0,
             hover_popup: None,
             hover_probe: None,
+            hover_memory_maps: None,
             caret_line: None,
             drag_anchor_line: None,
             drag_on_byte_grid: false,
@@ -803,6 +1151,9 @@ impl RcxEditor {
             compact_columns: false,
             hover_effects: true,
             minimap: false,
+            minimap_rows_cache: None,
+            byte_row_index_cache: None,
+            static_row_paint_cache: RefCell::new(StaticRowPaintCache::default()),
             metrics: CellMetrics::new(8.0, 16.0),
             context_menu: None,
             context_menu_pos: Point::default(),
@@ -813,6 +1164,7 @@ impl RcxEditor {
             find_bar: None,
             find_match: None,
             find_matches: Vec::new(),
+            find_match_line_ranges: Vec::new(),
             last_find_query: String::new(),
             _find_bar_sub: None,
             _enum_picker_sub: None,
@@ -878,13 +1230,12 @@ impl RcxEditor {
     /// struct, in which case the view falls back to the all-roots default.
     fn default_view_root_id(&self) -> Option<u64> {
         let tree = self.controller.tree();
-        for &idx in tree.children_of(0).iter() {
-            let n = &tree.nodes[idx];
-            if n.kind == crate::core::NodeKind::Struct {
-                return Some(n.id);
-            }
-        }
-        None
+        tree.with_children(0, |children| {
+            children.iter().find_map(|&idx| {
+                let n = &tree.nodes[idx];
+                (n.kind == crate::core::NodeKind::Struct).then_some(n.id)
+            })
+        })
     }
 
     /// Read access to the engine (status bar / tests).
@@ -902,9 +1253,17 @@ impl RcxEditor {
         self.controller.last_result()
     }
 
-    /// `applyDocument` analogue — force a recompose + repaint.
+    fn set_find_matches(&mut self, matches: Vec<FindMatch>) {
+        let line_count = self.controller.last_result().meta.len();
+        self.find_match_line_ranges = find_match_line_ranges(line_count, &matches);
+        self.find_matches = matches;
+    }
+
+    /// `applyDocument` analogue — recompose if the controller has not already
+    /// composed the current tree/view state, then repaint.
     pub fn apply_document(&mut self, cx: &mut Context<Self>) {
-        self.controller.refresh();
+        self.sync_controller_visible_line_range();
+        self.controller.refresh_if_stale();
         cx.emit(RcxEditorEvent::DocumentEdited);
         cx.notify();
     }
@@ -916,7 +1275,8 @@ impl RcxEditor {
     /// would snap the expanded tree shut. (Structural edits still use
     /// `apply_document`; this is the no-edit recompose.)
     pub fn recompose_view(&mut self, cx: &mut Context<Self>) {
-        self.controller.refresh();
+        self.sync_controller_visible_line_range();
+        self.controller.refresh_if_stale();
         cx.notify();
     }
 
@@ -967,6 +1327,7 @@ impl RcxEditor {
         if self.editing.is_some() {
             return;
         }
+        self.sync_controller_visible_line_range();
         if self.controller.pump_refresh() {
             // A read landed and the snapshot/heat changed — recompose + repaint so
             // the live values + changed-byte heat appear without user input.
@@ -992,25 +1353,49 @@ impl RcxEditor {
     /// what a click would store (`applyByteSelectionOverlay`'s `covered` set). An
     /// empty set when there is no byte selection. Reuses the same per-row overlap
     /// geometry as `build_row_paint`.
-    fn covered_byte_rows(&self) -> std::collections::HashSet<u64> {
-        let mut covered = std::collections::HashSet::new();
+    fn covered_byte_rows(&mut self) -> std::collections::HashSet<u64> {
         let Some(sel) = self.byte_sel.range() else {
-            return covered;
+            return std::collections::HashSet::new();
         };
-        for lm in &self.controller.last_result().meta {
-            if !is_hex_preview(lm.node_kind) || lm.line_kind != LineKind::Field {
-                continue;
-            }
-            let count = if lm.line_byte_count > 0 {
-                lm.line_byte_count
-            } else {
-                crate::core::size_for_kind(lm.node_kind)
-            };
-            if selection::row_byte_overlap(lm.offset_addr, count, sel).is_some() {
-                covered.insert(crate::core::sel_id_for_line(lm));
+        self.ensure_byte_row_index_cache();
+        if let Some(cache) = &self.byte_row_index_cache {
+            if cache.non_overlapping {
+                return covered_byte_rows_from_index(&cache.rows, sel);
             }
         }
-        covered
+        covered_byte_rows_full_scan(&self.controller.last_result().meta, sel)
+    }
+
+    fn ensure_byte_row_index_cache(&mut self) {
+        let revision = self.controller.result_revision();
+        if self
+            .byte_row_index_cache
+            .as_ref()
+            .is_none_or(|cache| cache.result_revision != revision)
+        {
+            let (rows, non_overlapping) = build_byte_row_index(&self.controller.last_result().meta);
+            self.byte_row_index_cache = Some(ByteRowIndexCache {
+                result_revision: revision,
+                rows,
+                non_overlapping,
+            });
+        }
+    }
+
+    fn byte_row_line_for_addr(&mut self, addr: u64) -> Option<usize> {
+        self.ensure_byte_row_index_cache();
+        if let Some(cache) = &self.byte_row_index_cache {
+            if cache.non_overlapping {
+                return byte_row_line_from_index(&cache.rows, addr);
+            }
+        }
+        self.controller.last_result().meta.iter().position(|lm| {
+            let count = byte_row_count(lm);
+            is_hex_preview(lm.node_kind)
+                && lm.line_kind == LineKind::Field
+                && addr >= lm.offset_addr
+                && addr < lm.offset_addr + count.max(0) as u64
+        })
     }
 
     /// Mirror the byte selection into the controller's row selection: recompute
@@ -1148,7 +1533,8 @@ impl RcxEditor {
     /// `\n` is stripped.
     fn line_text(&self, idx: usize) -> &str {
         let result = self.controller.last_result();
-        let r = geometry::line_byte_range(&result.text, &result.line_starts, idx);
+        let r =
+            geometry::line_byte_range_from_byte_starts(&result.text, &result.line_byte_starts, idx);
         result.text[r].trim_end_matches('\n')
     }
 
@@ -1770,22 +2156,10 @@ impl RcxEditor {
     }
 
     fn first_selected_line(&self) -> Option<usize> {
-        let result = self.controller.last_result();
-        let sel = self.controller.selected_ids();
-        if sel.is_empty() {
-            // First data line.
-            return (result.meta.len() > 1).then_some(1);
-        }
-        for (i, lm) in result.meta.iter().enumerate() {
-            if lm.node_id != 0
-                && sel
-                    .iter()
-                    .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
-            {
-                return Some(i);
-            }
-        }
-        None
+        first_selected_line_from_meta(
+            &self.controller.last_result().meta,
+            self.controller.selected_ids(),
+        )
     }
 
     /// After any controller mutation: drain events (status hints etc. are read by
@@ -1826,7 +2200,7 @@ impl RcxEditor {
                 // bar so the painted bands track the new layout (previously only
                 // updated on Navigate).
                 let st = bar.read(cx).state();
-                self.find_matches = st.matches().to_vec();
+                self.set_find_matches(st.matches().to_vec());
                 self.find_match = st.current_match();
             }
         }
@@ -1916,7 +2290,7 @@ impl RcxEditor {
             let q = self.last_find_query.clone();
             bar.update(cx, |b, cx| b.set_query(&q, window, cx));
             let st = bar.read(cx).state();
-            self.find_matches = st.matches().to_vec();
+            self.set_find_matches(st.matches().to_vec());
             self.find_match = st.current_match();
         }
         let focus = bar.read(cx).focus_handle(cx);
@@ -1928,7 +2302,7 @@ impl RcxEditor {
                     this.find_match = Some(*m);
                     // Item 31: refresh the cached full match set so every hit paints.
                     if let Some(bar) = this.find_bar.as_ref() {
-                        this.find_matches = bar.read(cx).state().matches().to_vec();
+                        this.set_find_matches(bar.read(cx).state().matches().to_vec());
                     }
                     // Scroll the matched line into view + repaint the highlight.
                     this.scroll.scroll_to_item(m.line, ScrollStrategy::Center);
@@ -2340,7 +2714,7 @@ impl RcxEditor {
                         n.id,
                     )
                 };
-                if is_container && parent != 0 && !tree.children_of(node_id).is_empty() {
+                if is_container && parent != 0 && tree.has_children(node_id) {
                     target = parent;
                 }
             }
@@ -2354,16 +2728,9 @@ impl RcxEditor {
             -1
         };
         if let Some(new_id) = self.controller.append_single_field(target) {
-            self.apply_document(cx);
             // Scroll to the freshly-selected new field's line so the cursor chases
             // the new tail (the next Down grows again).
-            if let Some(line) = self
-                .controller
-                .last_result()
-                .meta
-                .iter()
-                .position(|lm| lm.node_id == new_id && !lm.is_continuation)
-            {
+            if let Some(line) = self.controller.last_result().line_for_node(new_id) {
                 // Park the caret on the freshly-appended field so the NEXT Down
                 // (plain or modifier) sees the caret at the new last row and grows
                 // again — otherwise a stale caret on the old tail makes the second
@@ -2379,8 +2746,7 @@ impl RcxEditor {
                 }
                 self.scroll.scroll_to_item(line, ScrollStrategy::Center);
             }
-        } else {
-            self.apply_document(cx);
+            self.after_mutation(cx);
         }
     }
 
@@ -2520,6 +2886,15 @@ impl RcxEditor {
         (first, first + rows.saturating_sub(1))
     }
 
+    fn sync_controller_visible_line_range(&mut self) {
+        let (first, last) = self.visible_line_range();
+        if last > first {
+            self.controller.set_visible_line_range(first, last);
+        } else {
+            self.controller.clear_visible_line_range();
+        }
+    }
+
     /// Item 9: clear the hover band + node id and dismiss any open hover popup
     /// (called on keyboard nav and when the pointer leaves the viewport). The C++
     /// caret-move / mouse-leave path runs `dismissAllPopups` + drops the hover line.
@@ -2539,6 +2914,10 @@ impl RcxEditor {
         }
         if self.hover_probe.is_some() {
             self.hover_probe = None;
+            changed = true;
+        }
+        if self.hover_memory_maps.is_some() {
+            self.hover_memory_maps = None;
             changed = true;
         }
         self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
@@ -2788,6 +3167,13 @@ impl RcxEditor {
     fn selected_node_indices_ordered(&self) -> Vec<usize> {
         let result = self.controller.last_result();
         let sel = self.controller.selected_ids();
+        if sel.is_empty() {
+            return Vec::new();
+        }
+        let selected_bare: std::collections::HashSet<u64> = sel
+            .iter()
+            .map(|&id| crate::controller::strip_sel_pub(id))
+            .collect();
         let mut out = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for lm in result.meta.iter() {
@@ -2797,10 +3183,7 @@ impl RcxEditor {
             if !seen.insert(lm.node_id) {
                 continue;
             }
-            if sel
-                .iter()
-                .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
-            {
+            if selected_bare.contains(&lm.node_id) {
                 out.push(lm.node_idx as usize);
             }
         }
@@ -2813,6 +3196,13 @@ impl RcxEditor {
     fn selected_root_ids(&self) -> Vec<u64> {
         let result = self.controller.last_result();
         let sel = self.controller.selected_ids();
+        if sel.is_empty() {
+            return Vec::new();
+        }
+        let selected_bare: std::collections::HashSet<u64> = sel
+            .iter()
+            .map(|&id| crate::controller::strip_sel_pub(id))
+            .collect();
         let mut out = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for lm in result.meta.iter() {
@@ -2822,10 +3212,7 @@ impl RcxEditor {
             if !seen.insert(lm.node_id) {
                 continue;
             }
-            if sel
-                .iter()
-                .any(|&id| crate::controller::strip_sel_pub(id) == lm.node_id)
-            {
+            if selected_bare.contains(&lm.node_id) {
                 out.push(lm.node_id);
             }
         }
@@ -3716,12 +4103,7 @@ impl RcxEditor {
     /// (the C++ `m_nodeLineIndex` first entry, used by scroll-to-node). `None` when
     /// the node is not currently composed (collapsed away / filtered).
     fn line_for_node(&self, node_id: u64) -> Option<usize> {
-        if node_id == 0 {
-            return None;
-        }
-        self.controller.last_result().meta.iter().position(|lm| {
-            lm.node_id == node_id && lm.line_kind != LineKind::Footer && !lm.is_continuation
-        })
+        self.controller.last_result().line_for_node(node_id)
     }
 
     // ── Debug view (item 75, `VM_Debug`) ──
@@ -3747,12 +4129,57 @@ impl RcxEditor {
 
     // ── Row rendering ──
 
-    /// Build the `RowPaint` for line `idx`: text + colored runs + overlays.
-    fn build_row_paint(&self, idx: usize, palette: EditorPalette) -> RowPaint {
+    fn build_static_row_paint(&self, idx: usize) -> StaticRowPaint {
         let lm = self.line_meta(idx).cloned().unwrap_or_default();
         let text = self.line_text_owned(idx);
         let (type_w, name_w) = geometry::effective_widths(&lm);
         let runs = geometry::style_runs(&lm, &text, type_w, name_w);
+        let pill_spans = match lm.line_kind {
+            LineKind::Footer => geometry::footer_pill_spans(&text)
+                .into_iter()
+                .map(|span| (span.start, span.end))
+                .collect(),
+            LineKind::CommandRow => geometry::command_row_pill_spans(&text)
+                .into_iter()
+                .map(|span| (span.start, span.end))
+                .collect(),
+            _ => Vec::new(),
+        };
+        StaticRowPaint {
+            text: text.into(),
+            runs: runs.into(),
+            pill_spans: pill_spans.into(),
+        }
+    }
+
+    fn static_row_paint(&self, idx: usize) -> StaticRowPaint {
+        let revision = self.controller.result_revision();
+        {
+            let cache = self.static_row_paint_cache.borrow();
+            if cache.result_revision == revision {
+                if let Some(row) = cache.rows.get(idx) {
+                    return row.clone();
+                }
+            }
+        }
+
+        let row = self.build_static_row_paint(idx);
+        let mut cache = self.static_row_paint_cache.borrow_mut();
+        if cache.result_revision != revision {
+            cache.result_revision = revision;
+            cache
+                .rows
+                .reset_for_line_count(self.controller.last_result().meta.len());
+        }
+        cache.rows.insert(idx, row.clone());
+        row
+    }
+
+    /// Build the `RowPaint` for line `idx`: text + colored runs + overlays.
+    fn build_row_paint(&self, idx: usize, palette: EditorPalette) -> RowPaint {
+        let lm = self.line_meta(idx).cloned().unwrap_or_default();
+        let static_paint = self.static_row_paint(idx);
+        let (type_w, name_w) = geometry::effective_widths(&lm);
 
         let mut overlays: Vec<(i32, i32, Hsla)> = Vec::new();
 
@@ -3787,8 +4214,8 @@ impl RcxEditor {
         // straight onto the overlay column space. The match set is cached in
         // `find_matches` (refreshed on Navigate / recompose) so this paint path
         // needs no `cx`.
-        for m in &self.find_matches {
-            if m.line == idx && m.end > m.start {
+        if let Some(range) = self.find_match_line_ranges.get(idx).cloned() {
+            for m in self.find_matches[range].iter().filter(|m| m.end > m.start) {
                 let is_current = self
                     .find_match
                     .is_some_and(|c| c.line == m.line && c.start == m.start && c.end == m.end);
@@ -3804,34 +4231,20 @@ impl RcxEditor {
         // Rounded chip backgrounds: footer add-bytes/Trim pills and the
         // command-row chevron/source chips (editor-surface.md §5 step 14;
         // PIC4/PIC5). Drawn as subtle Zed buttons (soft fill + 1px border).
-        let mut pills: Vec<element::PillPaint> = Vec::new();
-        match lm.line_kind {
-            LineKind::Footer => {
-                for s in geometry::footer_pill_spans(&text) {
-                    pills.push(element::PillPaint {
-                        start: s.start,
-                        end: s.end,
-                        fill: palette.pill_bg,
-                        border: with_alpha(palette.border, 0.6),
-                    });
-                }
-            }
-            LineKind::CommandRow => {
-                for s in geometry::command_row_pill_spans(&text) {
-                    pills.push(element::PillPaint {
-                        start: s.start,
-                        end: s.end,
-                        fill: palette.pill_bg,
-                        border: with_alpha(palette.border, 0.6),
-                    });
-                }
-            }
-            _ => {}
-        }
+        let pills: Vec<element::PillPaint> = static_paint
+            .pill_spans
+            .iter()
+            .map(|&(start, end)| element::PillPaint {
+                start,
+                end,
+                fill: palette.pill_bg,
+                border: with_alpha(palette.border, 0.6),
+            })
+            .collect();
 
         RowPaint {
-            text: text.into(),
-            runs,
+            text: static_paint.text,
+            runs: static_paint.runs,
             overlays,
             pills,
             palette,
@@ -3862,15 +4275,25 @@ impl RcxEditor {
 
     /// Build the [`minimap::Minimap`] element from the current compose result: one
     /// proportional bar per composed line, colored by node kind / line role, plus
-    /// the viewport indicator from the live scroll offset (item 4). Cheap — it only
-    /// reads the existing `LineMeta`s and the scroll handle; no re-layout.
-    fn build_minimap(&self, palette: EditorPalette, cx: &App) -> minimap::Minimap {
-        let result = self.controller.last_result();
-        let rows: Vec<minimap::MinimapRow> = result
-            .meta
-            .iter()
-            .map(|lm| minimap::minimap_row_for(lm, &palette))
-            .collect();
+    /// the viewport indicator from the live scroll offset (item 4). Row reduction
+    /// is cached across paint frames and rebuilt only when the controller result
+    /// revision or row-affecting palette colors change.
+    fn build_minimap(&mut self, palette: EditorPalette, cx: &App) -> minimap::Minimap {
+        let key = MinimapRowsCacheKey {
+            result_revision: self.controller.result_revision(),
+            palette: MinimapPaletteKey::new(palette),
+        };
+        let rows = match self.minimap_rows_cache.as_ref() {
+            Some(cache) if cache.key == key => Arc::clone(&cache.rows),
+            _ => {
+                let rows = minimap_rows_for_meta(&self.controller.last_result().meta, palette);
+                self.minimap_rows_cache = Some(MinimapRowsCache {
+                    key,
+                    rows: Arc::clone(&rows),
+                });
+                rows
+            }
+        };
         let total = rows.len();
         let (visible_start, visible_end) = self.minimap_visible_range(total);
         let t = cx.theme();
@@ -3914,17 +4337,11 @@ impl RcxEditor {
         (start, end)
     }
 
-    /// Whether row `idx` is selected (any selection-id maps to its node, matching
-    /// the line type for footer/array-elem/member rows; §7 `applySelectionOverlay`).
-    /// Delegates the precise per-id match to [`sel_id_matches_row`].
+    /// Whether row `idx` is selected (selection ids already use the same
+    /// footer/array/member encoding as `sel_id_for_line`; §7
+    /// `applySelectionOverlay`).
     fn is_row_selected(&self, lm: &LineMeta) -> bool {
-        if lm.node_id == 0 || lm.node_id == K_COMMAND_ROW_ID {
-            return false;
-        }
-        self.controller
-            .selected_ids()
-            .iter()
-            .any(|&id| sel_id_matches_row(id, lm))
+        row_selected_by_set(self.controller.selected_ids(), lm)
     }
 
     /// Pixel `(left, width)` of the char span `[start, end)` within `text`,
@@ -5220,17 +5637,7 @@ impl RcxEditor {
         let Some((lo, _)) = self.byte_sel_lo_n() else {
             return;
         };
-        let line = self.controller.last_result().meta.iter().position(|lm| {
-            let count = if lm.line_byte_count > 0 {
-                lm.line_byte_count
-            } else {
-                crate::core::size_for_kind(lm.node_kind)
-            };
-            is_hex_preview(lm.node_kind)
-                && lm.line_kind == LineKind::Field
-                && lo >= lm.offset_addr
-                && lo < lm.offset_addr + count.max(0) as u64
-        });
+        let line = self.byte_row_line_for_addr(lo);
         if let Some(line) = line {
             self.begin_inline_edit(line, EditTarget::Value, window, cx);
         }
@@ -5899,6 +6306,7 @@ fn hex_kind_for_size(bytes: i32) -> NodeKind {
 /// footer rows, an array-elem-sel only the row with the matching element index, a
 /// member-sel only the row with the matching sub-line. Without this, selecting one
 /// array element (or one member row) greyed EVERY row of that node.
+#[cfg(test)]
 fn sel_id_matches_row(sel_id: u64, lm: &LineMeta) -> bool {
     use crate::core::linemeta::{
         array_elem_idx_from_sel_id, member_sub_from_sel_id, sel_kind, SelKind,
@@ -6489,7 +6897,8 @@ mod tests {
     // controller and need no gpui types.
     use crate::controller::{Modifiers as CtrlMods, RcxController, RcxDocument};
     use crate::core::linemeta::K_COMMAND_ROW_ID;
-    use crate::core::LineKind;
+    use crate::core::{LineKind, LineMeta, NodeKind};
+    use crate::ui::overlays::findbar::FindMatch;
 
     // The view-side logic is unit-tested in the sibling modules (geometry,
     // hit_test, selection, tab_cycle, inline_edit). Here we cover the small glue
@@ -6527,6 +6936,98 @@ mod tests {
         c.set_view_root_id(s_id);
         c.refresh();
         c
+    }
+
+    #[test]
+    fn find_match_line_ranges_index_matches_by_line() {
+        let matches = vec![
+            FindMatch {
+                line: 0,
+                start: 1,
+                end: 3,
+            },
+            FindMatch {
+                line: 2,
+                start: 4,
+                end: 6,
+            },
+            FindMatch {
+                line: 2,
+                start: 8,
+                end: 12,
+            },
+            FindMatch {
+                line: 4,
+                start: 0,
+                end: 1,
+            },
+        ];
+        let ranges = super::find_match_line_ranges(5, &matches);
+
+        assert_eq!(ranges, vec![0..1, 1..1, 1..3, 3..3, 3..4]);
+        assert_eq!(
+            super::find_highlight_count_for_ranges(&matches, &ranges, Some(matches[2]), 0, 5),
+            10
+        );
+        assert_eq!(
+            super::find_highlight_count_for_ranges(&matches, &ranges, None, 1, 4),
+            6
+        );
+    }
+
+    fn hex_line(node_id: u64, node_idx: i32, offset_addr: u64, byte_count: i32) -> LineMeta {
+        LineMeta {
+            node_id,
+            node_idx,
+            node_kind: NodeKind::Hex64,
+            line_kind: LineKind::Field,
+            offset_addr,
+            line_byte_count: byte_count,
+            ..LineMeta::default()
+        }
+    }
+
+    #[test]
+    fn byte_row_index_queries_non_overlapping_rows() {
+        let meta = vec![
+            hex_line(10, 0, 0, 8),
+            hex_line(20, 1, 8, 8),
+            hex_line(30, 2, 16, 8),
+        ];
+        let (rows, non_overlapping) = super::build_byte_row_index(&meta);
+
+        assert!(non_overlapping);
+        let covered = super::covered_byte_rows_from_index(&rows, (9, 17));
+        assert!(covered.contains(&crate::core::linemeta::sel_id_for_line(&meta[1])));
+        assert!(covered.contains(&crate::core::linemeta::sel_id_for_line(&meta[2])));
+        assert_eq!(covered.len(), 2);
+        assert_eq!(super::byte_row_line_from_index(&rows, 16), Some(2));
+        assert_eq!(super::byte_row_line_from_index(&rows, 24), None);
+    }
+
+    #[test]
+    fn byte_row_index_detects_overlaps_for_full_scan_fallback() {
+        let meta = vec![hex_line(10, 0, 0, 8), hex_line(20, 1, 4, 8)];
+        let (_, non_overlapping) = super::build_byte_row_index(&meta);
+
+        assert!(!non_overlapping);
+        let covered = super::covered_byte_rows_full_scan(&meta, (5, 6));
+        assert_eq!(covered.len(), 2);
+    }
+
+    #[test]
+    fn byte_row_index_sorts_out_of_order_non_overlapping_rows() {
+        let meta = vec![
+            hex_line(30, 2, 16, 8),
+            hex_line(10, 0, 0, 8),
+            hex_line(20, 1, 8, 8),
+        ];
+        let (rows, non_overlapping) = super::build_byte_row_index(&meta);
+
+        assert!(non_overlapping);
+        assert_eq!(super::byte_row_line_from_index(&rows, 0), Some(1));
+        assert_eq!(super::byte_row_line_from_index(&rows, 8), Some(2));
+        assert_eq!(super::byte_row_line_from_index(&rows, 16), Some(0));
     }
 
     fn editor_with_primitive_array() -> RcxController {
@@ -6654,6 +7155,89 @@ mod tests {
             greyed_by_bare, 0,
             "a bare node id must not match array-element rows (they carry the elem encoding)"
         );
+    }
+
+    #[test]
+    fn row_selected_by_set_matches_legacy_selection_matcher() {
+        use super::{row_selected_by_set, sel_id_matches_row};
+        use crate::core::linemeta::{sel_id_for_line, K_COMMAND_ROW_ID};
+        use crate::core::LineMeta;
+        use std::collections::HashSet;
+
+        let rows = [
+            LineMeta {
+                node_id: 42,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: 42,
+                line_kind: LineKind::Footer,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: 42,
+                is_array_element: true,
+                array_element_idx: 0x80000,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: 42,
+                is_member_line: true,
+                sub_line: 7,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: 0,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: K_COMMAND_ROW_ID,
+                ..LineMeta::default()
+            },
+        ];
+
+        for selected_row in &rows {
+            let selected = HashSet::from([sel_id_for_line(selected_row)]);
+            for row in &rows {
+                let legacy = if row.node_id == 0 || row.node_id == K_COMMAND_ROW_ID {
+                    false
+                } else {
+                    selected.iter().any(|&id| sel_id_matches_row(id, row))
+                };
+                assert_eq!(row_selected_by_set(&selected, row), legacy);
+            }
+        }
+    }
+
+    #[test]
+    fn first_selected_line_uses_stripped_selection_ids() {
+        use super::first_selected_line_from_meta;
+        use crate::core::linemeta::{make_member_sel_id, K_COMMAND_ROW_ID};
+        use crate::core::LineMeta;
+        use std::collections::HashSet;
+
+        let meta = vec![
+            LineMeta {
+                node_id: K_COMMAND_ROW_ID,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: 11,
+                ..LineMeta::default()
+            },
+            LineMeta {
+                node_id: 22,
+                ..LineMeta::default()
+            },
+        ];
+
+        assert_eq!(
+            first_selected_line_from_meta(&meta, &HashSet::new()),
+            Some(1)
+        );
+
+        let selected = HashSet::from([make_member_sel_id(22, 3)]);
+        assert_eq!(first_selected_line_from_meta(&meta, &selected), Some(2));
     }
 
     #[test]

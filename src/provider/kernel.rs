@@ -8,7 +8,9 @@
 
 use crate::plugin::contract::ProcessInfo;
 
-use super::{MemoryRegion, ModuleEntry, Provider, ThreadInfo, VtopResult};
+use super::{
+    read_pages_in_runs, MemoryRegion, ModuleEntry, PageMap, Provider, ThreadInfo, VtopResult,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelTarget {
@@ -98,6 +100,10 @@ impl Provider for KernelMemoryProvider {
         self.inner.read(addr, buf)
     }
 
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        read_pages_in_runs(pages, |addr, buf| self.inner.read(addr, buf))
+    }
+
     fn size(&self) -> i32 {
         self.inner.size()
     }
@@ -115,6 +121,10 @@ impl Provider for KernelMemoryProvider {
     }
 
     fn is_live(&self) -> bool {
+        true
+    }
+
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
         true
     }
 
@@ -185,7 +195,9 @@ mod platform {
     use std::sync::Mutex;
 
     use crate::plugin::contract::ProcessInfo;
-    use crate::provider::{MemoryRegion, ModuleEntry, RegionType, ThreadInfo, VtopResult};
+    use crate::provider::{
+        MemoryRegion, ModuleEntry, ModuleLookup, RegionType, ThreadInfo, VtopResult,
+    };
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_SERVICE_ALREADY_RUNNING, GENERIC_READ, GENERIC_WRITE,
         HANDLE, INVALID_HANDLE_VALUE,
@@ -405,6 +417,7 @@ mod platform {
                         peb: 0,
                         cr3_cache: Mutex::new(0),
                         modules: Vec::new(),
+                        module_lookup: ModuleLookup::default(),
                     };
                     inner.query_peb();
                     inner.cache_modules();
@@ -655,6 +668,7 @@ mod platform {
         peb: u64,
         cr3_cache: Mutex<u64>,
         modules: Vec<ModuleEntry>,
+        module_lookup: ModuleLookup,
     }
 
     unsafe impl Send for KernelProcessInner {}
@@ -736,19 +750,11 @@ mod platform {
         }
 
         fn get_symbol(&self, addr: u64) -> String {
-            self.modules
-                .iter()
-                .find(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
-                .map(|m| format!("{}+0x{:x}", m.name, addr - m.base))
-                .unwrap_or_default()
+            self.module_lookup.symbol_for_addr_lower(addr)
         }
 
         fn symbol_to_address(&self, name: &str) -> u64 {
-            self.modules
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(name))
-                .map(|m| m.base)
-                .unwrap_or(0)
+            self.module_lookup.symbol_to_address(name)
         }
 
         fn enumerate_regions(&self) -> Vec<MemoryRegion> {
@@ -852,18 +858,20 @@ mod platform {
                 return;
             };
             let count = (br as usize / size_of::<RcxDrvModuleEntry>()).min(entries.len());
-            self.modules.reserve(count);
+            let mut modules = Vec::with_capacity(count);
             for (i, entry) in entries.into_iter().take(count).enumerate() {
                 if i == 0 {
                     self.base = entry.base;
                 }
-                self.modules.push(ModuleEntry {
+                modules.push(ModuleEntry {
                     name: wide_to_string(&entry.name),
                     full_path: String::new(),
                     base: entry.base,
                     size: entry.size,
                 });
             }
+            self.module_lookup = ModuleLookup::new(modules.clone());
+            self.modules = modules;
         }
 
         fn get_cr3(&self) -> u64 {

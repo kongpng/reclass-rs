@@ -53,6 +53,10 @@ required-features = ["mcp"]
 name = "reclass"
 path = "src/lib.rs"
 
+[[bench]]
+name = "perf_workloads"
+harness = false
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Features (ARCHITECTURE.md §8). Off `ui` ⇒ headless engine build (logic-only).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,12 +140,29 @@ serde_json = "1"
 # bookkeeping that has no `abi_stable`/`libloading` ties.
 toml = "0.8"
 ahash = "0.8"
+# Live process readability checks are a read-mostly range-cache workload. This
+# crate is already present transitively through the UI stack; using it directly
+# avoids taking an `RwLock` on every hot `Provider::is_readable` query while
+# keeping region refreshes as explicit atomic cache replacement.
+arc-swap = "1"
+# `CachedPageProvider` is hit once per visible live row during compose/refresh.
+# Its page map is short-lived and uncontended, so `parking_lot::Mutex` removes
+# std mutex poisoning overhead on the live-provider hot path.
+parking_lot = "0.12"
 indexmap = { version = "2", features = ["serde"] }
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 half = "2"
+# Scanner exact byte-pattern search. `memchr` is a small, mature crate already
+# present transitively; making it direct lets the scanner use its optimized
+# `memmem::Finder` instead of the local BMH loop for unmasked alignment-1 scans.
+memchr = "2"
+# Type inference produces a tiny candidate set per previewed value; `SmallVec`
+# keeps that hot-loop scratch storage inline while reusing a mature crate already
+# present transitively through the UI stack.
+smallvec = "1"
 
 # CLI + logging for the bin.
 clap = { version = "4", features = ["derive"] }
@@ -231,6 +252,9 @@ windows-sys = { version = "0.61", optional = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+criterion = "0.8.2"
 
 # ── UI (gpui) — unpinned git, SAME source form as gpui-component (§7). ──
 # Do NOT add `rev=` to gpui/gpui_platform; reproducibility = committed Cargo.lock.

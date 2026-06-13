@@ -696,7 +696,6 @@ fn emit_struct_body(
     if !is_union && cursor < struct_size {
         emit_pad_run_c(ctx, &ind, base_offset, cursor, struct_size - cursor);
     }
-
 }
 
 /// The `emitPadRun` lambda inside `emitStructBody` (`generator.cpp:237-243`).
@@ -1025,7 +1024,6 @@ fn emit_rust_struct_body(
     if !is_union && cursor < struct_size {
         emit_pad_run_rust(ctx, &ind, base_offset, cursor, struct_size - cursor);
     }
-
 }
 
 /// Join `name:bits` for the bitfield comment (`generator.cpp:660-662`).
@@ -1317,7 +1315,6 @@ fn emit_csharp_struct_body(
             }
         }
     }
-
 }
 
 /// `emitCSharpStruct(GenContext&, uint64_t)` (`generator.cpp:1035-1085`).

@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::provider::{MemoryRegion, NullProvider, Provider, RegionType};
+use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -101,6 +102,93 @@ impl Provider for MutableProvider {
     }
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         self.regions.clone()
+    }
+}
+
+struct SparseIslandProvider {
+    read_calls: Cell<usize>,
+}
+
+impl SparseIslandProvider {
+    fn island(addr: u64) -> Option<[u8; 4]> {
+        match addr {
+            0 => Some([0x13, 0x37, 0x42, 0x99]),
+            0x1000 => Some([0x13, 0x37, 0x42, 0x99]),
+            _ => None,
+        }
+    }
+}
+
+impl Provider for SparseIslandProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.read_calls.set(self.read_calls.get() + 1);
+        let Some(bytes) = Self::island(addr) else {
+            return false;
+        };
+        if buf.len() > bytes.len() {
+            return false;
+        }
+        buf.copy_from_slice(&bytes[..buf.len()]);
+        true
+    }
+
+    fn size(&self) -> i32 {
+        i32::MAX
+    }
+
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        len >= 0 && Self::island(addr).is_some_and(|bytes| (len as usize) <= bytes.len())
+    }
+
+    fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+        vec![
+            region(0, 4, true, true, false, "a"),
+            region(0x1000, 4, true, true, false, "b"),
+        ]
+    }
+}
+
+struct LiveSparseSpanProvider {
+    data: Vec<u8>,
+    read_calls: Cell<usize>,
+}
+
+impl LiveSparseSpanProvider {
+    fn new() -> Self {
+        let mut data = vec![0u8; 0x1004];
+        data[0..4].copy_from_slice(&[0x13, 0x37, 0x42, 0x99]);
+        data[0x1000..0x1004].copy_from_slice(&[0x13, 0x37, 0x42, 0x99]);
+        Self {
+            data,
+            read_calls: Cell::new(0),
+        }
+    }
+}
+
+impl Provider for LiveSparseSpanProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.read_calls.set(self.read_calls.get() + 1);
+        let start = addr as usize;
+        let Some(end) = start.checked_add(buf.len()) else {
+            return false;
+        };
+        if end > self.data.len() {
+            return false;
+        }
+        buf.copy_from_slice(&self.data[start..end]);
+        true
+    }
+
+    fn size(&self) -> i32 {
+        self.data.len() as i32
+    }
+
+    fn is_live(&self) -> bool {
+        true
+    }
+
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
+        true
     }
 }
 
@@ -547,6 +635,20 @@ fn scan_wildcard_match() {
     assert_eq!(r.len(), 2);
     assert_eq!(r[0].address, 0);
     assert_eq!(r[1].address, 8);
+}
+
+#[test]
+fn scan_wildcard_overlapping_matches() {
+    let prov = buffer(vec![0xAA, 0xAA, 0xAA, 0xAA]);
+    let req = ScanRequest {
+        pattern: vec![0xAA, 0x00, 0xAA],
+        mask: vec![0xFF, 0x00, 0xFF],
+        ..Default::default()
+    };
+    let r = sync_scan(&prov, &req);
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].address, 0);
+    assert_eq!(r[1].address, 1);
 }
 
 #[test]
@@ -1412,6 +1514,40 @@ fn scan_constrain_regions_overlapping_constraints() {
     assert_eq!(sync_scan(&prov, &req).len(), 3);
 }
 
+#[test]
+fn intersect_constraints_skips_non_overlapping_prefixes() {
+    let regions: Vec<_> = (0..512u64)
+        .map(|i| region(i * 0x1000, 0x100, true, false, false, ""))
+        .collect();
+    let mut unsorted_regions = regions.clone();
+    unsorted_regions.swap(0, 511);
+    let constraints: Vec<_> = (0..512u64)
+        .step_by(64)
+        .map(|i| AddressRange {
+            start: i * 0x1000 + 0x20,
+            end: i * 0x1000 + 0x40,
+        })
+        .collect();
+
+    let clipped = intersect_constraints(regions, &constraints);
+    let mut unsorted_clipped = intersect_constraints(unsorted_regions, &constraints);
+    unsorted_clipped.sort_by_key(|r| r.base);
+
+    assert_eq!(clipped.len(), constraints.len());
+    assert_eq!(unsorted_clipped.len(), clipped.len());
+    assert_eq!(
+        unsorted_clipped
+            .iter()
+            .map(|r| (r.base, r.size))
+            .collect::<Vec<_>>(),
+        clipped.iter().map(|r| (r.base, r.size)).collect::<Vec<_>>()
+    );
+    for (sub, constraint) in clipped.iter().zip(constraints.iter()) {
+        assert_eq!(sub.base, constraint.start);
+        assert_eq!(sub.size, constraint.end - constraint.start);
+    }
+}
+
 /// Regression: a region whose `base + size` overflows u64 (e.g. a corrupt or
 /// hostile ReClass.NET plugin section reporting an absurd size) must not panic
 /// the clip. `intersect_constraints` clamps the region end to `u64::MAX` via
@@ -1998,6 +2134,42 @@ fn skip_system_combines_with_private_only() {
     assert_eq!(r[0].address, 32);
 }
 
+#[test]
+fn filtered_scan_reports_prepared_region_totals() {
+    let mut data = vec![0u8; 96];
+    let needle = 0x12345678i32.to_le_bytes();
+    data[0..4].copy_from_slice(&needle);
+    data[44..48].copy_from_slice(&needle);
+    data[68..72].copy_from_slice(&needle);
+    let regs = vec![
+        region_ty(0, 16, true, false, true, "kernel32.dll", RegionType::Image),
+        region_ty(32, 16, true, true, false, "game.exe", RegionType::Private),
+        region_ty(64, 16, true, true, false, "game.exe", RegionType::Private),
+    ];
+    let prov = TestRegionProvider::new(data, regs.clone());
+    let obs = TestObserver::default();
+    let (pat, mask) = serialize_value(ValueType::Int32, "305419896").unwrap();
+    let req = ScanRequest {
+        pattern: pat,
+        mask,
+        alignment: 4,
+        skip_system_modules: true,
+        start_address: 40,
+        end_address: 72,
+        ..Default::default()
+    };
+    let r = run_scan_in_regions(&prov, regs, &req, &AtomicBool::new(false), &obs);
+    assert_eq!(
+        r.iter().map(|r| r.address).collect::<Vec<_>>(),
+        vec![44, 68]
+    );
+    assert_eq!(*obs.regions_resolved.lock().unwrap(), Some((2, 16)));
+    let stats = obs.stats.lock().unwrap().expect("stats");
+    assert_eq!(stats.regions_scanned, 2);
+    assert_eq!(stats.bytes_scanned, 16);
+    assert_eq!(stats.bytes_failed, 0);
+}
+
 // ── Address upper cap ──
 
 #[test]
@@ -2388,6 +2560,265 @@ fn rescan_empty_seed() {
     assert_eq!(out.len(), 0);
 }
 
+#[test]
+fn rescan_exact_value_keeps_masked_wildcard_semantics() {
+    let prov = crate::provider::BufferProvider::new(vec![0xAA, 0x11, 0xAB, 0x11], "x");
+    let seed = vec![
+        ScanResult {
+            address: 0,
+            region_module: String::new(),
+            scan_value: vec![0; 2].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 2,
+            region_module: String::new(),
+            scan_value: vec![0; 2].into(),
+            previous_value: Default::default(),
+        },
+    ];
+
+    let out = sync_rescan(
+        &prov,
+        seed,
+        2,
+        ScanCondition::ExactValue,
+        ValueType::HexBytes,
+        &[0xAA, 0x00],
+        &[0xFF, 0x00],
+        &[],
+    );
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].address, 0);
+    assert_eq!(&out[0].scan_value[..], &[0xAA, 0x11]);
+}
+
+#[test]
+fn rescan_sparse_unreadable_gap_reads_hits_individually() {
+    let prov = SparseIslandProvider {
+        read_calls: Cell::new(0),
+    };
+    let seed = vec![
+        ScanResult {
+            address: 0,
+            region_module: String::new(),
+            scan_value: vec![0; 4].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 0x1000,
+            region_module: String::new(),
+            scan_value: vec![0; 4].into(),
+            previous_value: Default::default(),
+        },
+    ];
+
+    let out = sync_rescan(
+        &prov,
+        seed,
+        4,
+        ScanCondition::ExactValue,
+        ValueType::Int32,
+        &[0x13, 0x37, 0x42, 0x99],
+        &[0xFF; 4],
+        &[],
+    );
+
+    assert_eq!(
+        out.iter().map(|result| result.address).collect::<Vec<_>>(),
+        vec![0, 0x1000]
+    );
+    assert_eq!(prov.read_calls.get(), 2);
+}
+
+#[test]
+fn rescan_live_sparse_hits_keep_coalesced_span_read() {
+    let prov = LiveSparseSpanProvider::new();
+    let seed = vec![
+        ScanResult {
+            address: 0,
+            region_module: String::new(),
+            scan_value: vec![0; 4].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 0x1000,
+            region_module: String::new(),
+            scan_value: vec![0; 4].into(),
+            previous_value: Default::default(),
+        },
+    ];
+
+    let out = sync_rescan(
+        &prov,
+        seed,
+        4,
+        ScanCondition::ExactValue,
+        ValueType::Int32,
+        &[0x13, 0x37, 0x42, 0x99],
+        &[0xFF; 4],
+        &[],
+    );
+
+    assert_eq!(
+        out.iter().map(|result| result.address).collect::<Vec<_>>(),
+        vec![0, 0x1000]
+    );
+    assert_eq!(prov.read_calls.get(), 1);
+}
+
+#[test]
+fn rescan_moves_old_scan_value_to_previous_value() {
+    let prov = crate::provider::BufferProvider::new(vec![5, 6, 7, 8], "x");
+    let seed = vec![ScanResult {
+        address: 0,
+        region_module: String::new(),
+        scan_value: vec![1, 2, 3, 4].into(),
+        previous_value: vec![9, 9, 9, 9].into(),
+    }];
+
+    let out = sync_rescan(
+        &prov,
+        seed,
+        4,
+        ScanCondition::UnknownValue,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(&out[0].previous_value[..], &[1, 2, 3, 4]);
+    assert_eq!(&out[0].scan_value[..], &[5, 6, 7, 8]);
+}
+
+#[test]
+fn rescan_unsorted_seed_preserves_result_order_after_chunked_reads() {
+    let prov = crate::provider::BufferProvider::new((0u8..12).collect(), "x");
+    let seed = vec![
+        ScanResult {
+            address: 8,
+            region_module: "third".into(),
+            scan_value: vec![0xAA; 4].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 0,
+            region_module: "first".into(),
+            scan_value: vec![0xBB; 4].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 4,
+            region_module: "second".into(),
+            scan_value: vec![0xCC; 4].into(),
+            previous_value: Default::default(),
+        },
+    ];
+
+    let out = sync_rescan(
+        &prov,
+        seed,
+        4,
+        ScanCondition::UnknownValue,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+    );
+
+    assert_eq!(
+        out.iter()
+            .map(|result| result.region_module.as_str())
+            .collect::<Vec<_>>(),
+        vec!["third", "first", "second"]
+    );
+    assert_eq!(&out[0].scan_value[..], &[8, 9, 10, 11]);
+    assert_eq!(&out[1].scan_value[..], &[0, 1, 2, 3]);
+    assert_eq!(&out[2].scan_value[..], &[4, 5, 6, 7]);
+}
+
+#[test]
+fn rescan_filtered_unsorted_seed_preserves_original_result_order() {
+    let prov = crate::provider::BufferProvider::new(
+        [
+            1u32.to_le_bytes(),
+            0x1234_5678u32.to_le_bytes(),
+            0x1234_5678u32.to_le_bytes(),
+        ]
+        .concat(),
+        "x",
+    );
+    let seed = vec![
+        ScanResult {
+            address: 8,
+            region_module: "third".into(),
+            scan_value: vec![0xAA; 4].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 0,
+            region_module: "first".into(),
+            scan_value: vec![0xBB; 4].into(),
+            previous_value: Default::default(),
+        },
+        ScanResult {
+            address: 4,
+            region_module: "second".into(),
+            scan_value: vec![0xCC; 4].into(),
+            previous_value: Default::default(),
+        },
+    ];
+    let pattern = 0x1234_5678u32.to_le_bytes();
+
+    let out = sync_rescan(
+        &prov,
+        seed,
+        4,
+        ScanCondition::ExactValue,
+        ValueType::UInt32,
+        &pattern,
+        &[0xFF; 4],
+        &[],
+    );
+
+    assert_eq!(
+        out.iter()
+            .map(|result| result.region_module.as_str())
+            .collect::<Vec<_>>(),
+        vec!["third", "second"]
+    );
+}
+
+#[test]
+fn rescan_abort_before_no_filter_preserves_scan_value() {
+    let prov = crate::provider::BufferProvider::new(vec![5, 6, 7, 8], "x");
+    let abort = AtomicBool::new(true);
+    let out = run_rescan(
+        &prov,
+        vec![ScanResult {
+            address: 0,
+            region_module: String::new(),
+            scan_value: vec![1, 2, 3, 4].into(),
+            previous_value: Default::default(),
+        }],
+        4,
+        ScanCondition::UnknownValue,
+        ValueType::Int32,
+        &[],
+        &[],
+        &[],
+        &abort,
+        &NullObserver,
+    );
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(&out[0].previous_value[..], &[1, 2, 3, 4]);
+    assert_eq!(&out[0].scan_value[..], &[1, 2, 3, 4]);
+}
+
 /// Regression: a saved-scan results file can carry an attacker-controlled
 /// address parsed via `from_str_radix(..).unwrap_or(0)` (scannerpanel parsing),
 /// so `address` may be `u64::MAX` ("ffffffffffffffff"). `run_rescan`'s span math
@@ -2403,15 +2834,15 @@ fn rescan_address_overflow_does_not_panic() {
     let seed = vec![
         ScanResult {
             address: u64::MAX - 8,
-            scan_value: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            scan_value: vec![0xAA, 0xBB, 0xCC, 0xDD].into(),
             region_module: String::new(),
-            previous_value: Vec::new(),
+            previous_value: Default::default(),
         },
         ScanResult {
             address: u64::MAX,
-            scan_value: vec![0x11, 0x22, 0x33, 0x44],
+            scan_value: vec![0x11, 0x22, 0x33, 0x44].into(),
             region_module: String::new(),
-            previous_value: Vec::new(),
+            previous_value: Default::default(),
         },
     ];
     // UnknownValue applies no filter, so both seeds are carried through; the
@@ -2440,9 +2871,9 @@ fn rescan_address_overflow_does_not_panic() {
 fn scan_result_json_shape() {
     let r = ScanResult {
         address: 0xDEADBEEFCAFEBABE,
-        scan_value: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        scan_value: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
         region_module: "game.exe".to_string(),
-        previous_value: Vec::new(),
+        previous_value: Default::default(),
     };
     let addr_hex = format!("{:x}", r.address);
     let value_hex: String = r.scan_value.iter().map(|b| format!("{b:02x}")).collect();

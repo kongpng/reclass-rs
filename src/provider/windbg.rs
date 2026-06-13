@@ -6,7 +6,7 @@
 //! - `"pid:1234"`
 //! - `"dump:C:/path/to/file.dmp"`
 
-use super::{MemoryRegion, ModuleEntry, Provider};
+use super::{read_pages_in_runs, MemoryRegion, ModuleEntry, PageMap, Provider};
 
 pub struct WinDbgMemoryProvider {
     inner: platform::Inner,
@@ -31,6 +31,10 @@ impl Provider for WinDbgMemoryProvider {
         self.inner.read(addr, buf)
     }
 
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        read_pages_in_runs(pages, |addr, buf| self.inner.read(addr, buf))
+    }
+
     fn size(&self) -> i32 {
         self.inner.size()
     }
@@ -48,6 +52,10 @@ impl Provider for WinDbgMemoryProvider {
     }
 
     fn is_live(&self) -> bool {
+        self.inner.is_live()
+    }
+
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
         self.inner.is_live()
     }
 

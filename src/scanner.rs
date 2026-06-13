@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::provider::{MemoryRegion, Provider, RegionType};
+use smallvec::SmallVec;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Value / condition vocabulary
@@ -150,9 +151,15 @@ pub struct ScanResult {
     pub address: u64,
     pub region_module: String,
     /// cached bytes at scan/update time.
-    pub scan_value: Vec<u8>,
+    pub scan_value: ScanBytes,
     /// value before last update.
-    pub previous_value: Vec<u8>,
+    pub previous_value: ScanBytes,
+}
+
+pub type ScanBytes = SmallVec<[u8; 16]>;
+
+fn scan_bytes(bytes: &[u8]) -> ScanBytes {
+    ScanBytes::from_slice(bytes)
 }
 
 /// `struct ScanStats` (`scanner.h:85-90`) — surfaced in the status line.
@@ -632,6 +639,35 @@ pub fn is_system_module(module_name: &str) -> bool {
 /// ties the *last* occurrence among those wins. The shift is keyed on the text
 /// tail byte `data[i+last]`.
 pub fn bmh_find(data: &[u8], pat: &[u8]) -> Option<usize> {
+    BmhNeedle::new(pat).and_then(|needle| needle.find(data))
+}
+
+struct BmhNeedle<'a> {
+    pat: &'a [u8],
+    shift: [usize; 256],
+}
+
+impl<'a> BmhNeedle<'a> {
+    fn new(pat: &'a [u8]) -> Option<Self> {
+        let plen = pat.len();
+        if plen == 0 {
+            return None;
+        }
+        let mut shift = [plen; 256];
+        if plen > 1 {
+            for i in 0..plen - 1 {
+                shift[pat[i] as usize] = plen - 1 - i;
+            }
+        }
+        Some(BmhNeedle { pat, shift })
+    }
+
+    fn find(&self, data: &[u8]) -> Option<usize> {
+        bmh_find_with_shift(data, self.pat, &self.shift)
+    }
+}
+
+fn bmh_find_with_shift(data: &[u8], pat: &[u8], shift: &[usize; 256]) -> Option<usize> {
     let len = data.len();
     let plen = pat.len();
     if plen == 0 || plen > len {
@@ -639,10 +675,6 @@ pub fn bmh_find(data: &[u8], pat: &[u8]) -> Option<usize> {
     }
     if plen == 1 {
         return data.iter().position(|&b| b == pat[0]);
-    }
-    let mut shift = [plen; 256];
-    for i in 0..plen - 1 {
-        shift[pat[i] as usize] = plen - 1 - i;
     }
     let last = plen - 1;
     let mut i = 0usize;
@@ -663,6 +695,46 @@ pub fn bmh_find(data: &[u8], pat: &[u8]) -> Option<usize> {
     None
 }
 
+struct MaskedAnchor<'a> {
+    offset: usize,
+    finder: memchr::memmem::Finder<'a>,
+}
+
+fn masked_anchor<'a>(pat: &'a [u8], mask: &[u8]) -> Option<MaskedAnchor<'a>> {
+    if pat.is_empty() || mask.len() < pat.len() {
+        return None;
+    }
+
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+
+    for (i, &m) in mask[..pat.len()].iter().enumerate() {
+        if m == 0xFF {
+            if run_len == 0 {
+                run_start = i;
+            }
+            run_len += 1;
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+
+    if best_len == 0 {
+        return None;
+    }
+
+    Some(MaskedAnchor {
+        offset: best_start,
+        finder: memchr::memmem::Finder::new(&pat[best_start..best_start + best_len]),
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers — region context + typed comparison
 // ─────────────────────────────────────────────────────────────────────────────
@@ -670,14 +742,44 @@ pub fn bmh_find(data: &[u8], pat: &[u8]) -> Option<usize> {
 /// `static QString formatRegionContext(const MemoryRegion&, uint64_t)`
 /// (`scanner.cpp:22-28`).
 ///
-/// Empty module name → empty string. Else `"name+0xOFFSET"` with lowercase hex,
+/// Empty module name -> empty string. Else `"name+0xOFFSET"` with lowercase hex,
 /// no leading zeros, no `0x` padding (e.g. `"code+0x0"`, `"region0+0x4"`).
 fn format_region_context(region: &MemoryRegion, address: u64) -> String {
     if region.module_name.is_empty() {
         return String::new();
     }
     let off = address.saturating_sub(region.base);
-    format!("{}+0x{:x}", region.module_name, off)
+    let mut out = String::with_capacity(region.module_name.len() + 3 + 16);
+    out.push_str(&region.module_name);
+    out.push_str("+0x");
+    push_hex_lower(&mut out, off);
+    out
+}
+
+fn push_scan_result(results: &mut Vec<ScanResult>, max_results: i32, result: ScanResult) -> bool {
+    if results.is_empty() {
+        results.reserve(max_results.max(0) as usize);
+    }
+    results.push(result);
+    results.len() as i32 >= max_results
+}
+
+fn push_hex_lower(out: &mut String, mut value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if value == 0 {
+        out.push('0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut idx = buf.len();
+    while value != 0 {
+        idx -= 1;
+        buf[idx] = HEX[(value & 0xF) as usize];
+        value >>= 4;
+    }
+    for &b in &buf[idx..] {
+        out.push(char::from(b));
+    }
 }
 
 /// `static int compareTyped(const QByteArray&, const QByteArray&, ValueType)`
@@ -751,6 +853,8 @@ impl ScanObserver for NullObserver {}
 const K_CHUNK_BIG: u64 = 2 * 1024 * 1024;
 const K_CHUNK_MIN: u64 = 64 * 1024;
 const K_ABORT_STRIDE: i32 = 4096;
+const K_EXACT_DENSE_PROBE_BYTES: i32 = 4096;
+const K_EXACT_DENSE_PROBE_HITS: usize = 4;
 
 /// Resolve the region list for a scan, applying the "no regions → one synthetic
 /// region covering [0, size)" fallback (`scanner.cpp:612-620`).
@@ -768,6 +872,57 @@ fn resolve_regions(prov: &dyn Provider, regions: Vec<MemoryRegion>) -> Vec<Memor
     } else {
         regions
     }
+}
+
+struct PreparedScanRegion {
+    region: MemoryRegion,
+    start: u64,
+    end: u64,
+}
+
+fn scan_region_accepted(req: &ScanRequest, r: &MemoryRegion) -> bool {
+    if req.filter_executable && !r.executable {
+        return false;
+    }
+    if req.filter_writable && !r.writable {
+        return false;
+    }
+    if req.private_only && r.region_type != RegionType::Private {
+        return false;
+    }
+    if req.skip_system_modules && is_system_module(&r.module_name) {
+        return false;
+    }
+    true
+}
+
+fn prepare_scan_regions(
+    regions: Vec<MemoryRegion>,
+    req: &ScanRequest,
+    has_range: bool,
+) -> (Vec<PreparedScanRegion>, u64) {
+    let mut prepared = Vec::with_capacity(regions.len());
+    let mut total_bytes = 0u64;
+    for region in regions {
+        if !scan_region_accepted(req, &region) {
+            continue;
+        }
+        let mut start = region.base;
+        let mut end = region.base.saturating_add(region.size);
+        if has_range {
+            if end <= req.start_address || start >= req.end_address {
+                continue;
+            }
+            start = start.max(req.start_address);
+            end = end.min(req.end_address);
+        }
+        if end <= start {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(end - start);
+        prepared.push(PreparedScanRegion { region, start, end });
+    }
+    (prepared, total_bytes)
 }
 
 /// `QVector<ScanResult> ScanEngine::runScan(...)` (`scanner.cpp:562-917`).
@@ -853,49 +1008,43 @@ pub fn run_scan_in_regions(
             }
         }
     }
+    let memmem_finder = if bmh_eligible {
+        Some(memchr::memmem::Finder::new(&pat[..pattern_len as usize]))
+    } else {
+        None
+    };
+    let bmh_needle = if bmh_eligible {
+        BmhNeedle::new(&pat[..pattern_len as usize])
+    } else {
+        None
+    };
+    let masked_anchor = if !is_capture && !is_typed_const && !bmh_eligible {
+        masked_anchor(&pat[..pattern_len as usize], msk)
+    } else {
+        None
+    };
 
     // If constrainRegions specified, intersect with provider regions.
     if !req.constrain_regions.is_empty() {
         regions = intersect_constraints(regions, &req.constrain_regions);
     }
 
-    // Per-region acceptance — keeps the pre-compute pass and the inner scan loop
-    // in lockstep so totalBytes matches scannedBytes.
-    let region_accepted = |r: &MemoryRegion| -> bool {
-        if req.filter_executable && !r.executable {
-            return false;
-        }
-        if req.filter_writable && !r.writable {
-            return false;
-        }
-        if req.private_only && r.region_type != RegionType::Private {
-            return false;
-        }
-        if req.skip_system_modules && is_system_module(&r.module_name) {
-            return false;
-        }
-        true
+    let needs_prepared_regions = has_range
+        || req.filter_executable
+        || req.filter_writable
+        || req.private_only
+        || req.skip_system_modules;
+    let mut prepared_regions = Vec::new();
+    let (total_bytes, accepted_regions) = if needs_prepared_regions {
+        let (prepared, total_bytes) =
+            prepare_scan_regions(std::mem::take(&mut regions), req, has_range);
+        let accepted_regions = prepared.len() as i32;
+        prepared_regions = prepared;
+        (total_bytes, accepted_regions)
+    } else {
+        let total_bytes = regions.iter().map(|region| region.size).sum();
+        (total_bytes, regions.len() as i32)
     };
-
-    // Pre-compute total bytes for progress + emit a resolved-regions count.
-    let mut total_bytes: u64 = 0;
-    let mut accepted_regions: i32 = 0;
-    for r in &regions {
-        if !region_accepted(r) {
-            continue;
-        }
-        let mut r_start = r.base;
-        let mut r_end = r.base.saturating_add(r.size);
-        if has_range {
-            if r_end <= req.start_address || r_start >= req.end_address {
-                continue;
-            }
-            r_start = r_start.max(req.start_address);
-            r_end = r_end.min(req.end_address);
-        }
-        total_bytes += r_end - r_start;
-        accepted_regions += 1;
-    }
     obs.regions_resolved(accepted_regions, total_bytes);
 
     if total_bytes == 0 {
@@ -905,29 +1054,18 @@ pub fn run_scan_in_regions(
     let mut scanned_bytes: u64 = 0;
     let mut failed_bytes: u64 = 0;
     let mut last_pct: i32 = -1;
+    let mut chunk: Vec<u8> = Vec::new();
 
-    'scan: for region in &regions {
+    'scan: {
+        macro_rules! scan_region {
+            ($region:expr, $reg_start:expr, $reg_end:expr) => {{
         if abort.load(Ordering::Relaxed) {
-            break;
+            break 'scan;
         }
-        if !region_accepted(region) {
-            continue;
-        }
-
-        // Clip region to requested address range.
-        let mut reg_start = region.base;
-        let mut reg_end = region.base.saturating_add(region.size);
-        if has_range {
-            if reg_end <= req.start_address || reg_start >= req.end_address {
-                continue;
-            }
-            reg_start = reg_start.max(req.start_address);
-            reg_end = reg_end.min(req.end_address);
-        }
+        let region = $region;
+        let reg_start = $reg_start;
+        let reg_end = $reg_end;
         let reg_size = reg_end - reg_start;
-        if reg_size == 0 {
-            continue;
-        }
         if pattern_len as u64 > reg_size {
             scanned_bytes += reg_size;
             continue;
@@ -938,7 +1076,7 @@ pub fn run_scan_in_regions(
         if reg_size < K_CHUNK_MIN {
             target_chunk = reg_size;
         }
-        let mut chunk = vec![0u8; target_chunk as usize];
+        chunk.resize(target_chunk as usize, 0);
 
         let mut off: u64 = 0;
         while off < reg_size {
@@ -968,13 +1106,16 @@ pub fn run_scan_in_regions(
                     }
                     let addr = reg_start + off + i as u64;
                     let iu = i as usize;
-                    results.push(ScanResult {
-                        address: addr,
-                        region_module: format_region_context(region, addr),
-                        scan_value: data[iu..iu + val_size as usize].to_vec(),
-                        previous_value: Vec::new(),
-                    });
-                    if results.len() as i32 >= req.max_results {
+                    if push_scan_result(
+                        &mut results,
+                        req.max_results,
+                        ScanResult {
+                            address: addr,
+                            region_module: format_region_context(region, addr),
+                            scan_value: scan_bytes(&data[iu..iu + val_size as usize]),
+                            previous_value: ScanBytes::new(),
+                        },
+                    ) {
                         break 'scan;
                     }
                     i += alignment;
@@ -1000,49 +1141,123 @@ pub fn run_scan_in_regions(
                     };
                     if ok {
                         let addr = reg_start + off + i as u64;
-                        results.push(ScanResult {
-                            address: addr,
-                            region_module: format_region_context(region, addr),
-                            scan_value: val.to_vec(),
-                            previous_value: Vec::new(),
-                        });
-                        if results.len() as i32 >= req.max_results {
+                        if push_scan_result(
+                            &mut results,
+                            req.max_results,
+                            ScanResult {
+                                address: addr,
+                                region_module: format_region_context(region, addr),
+                                scan_value: scan_bytes(val),
+                                previous_value: ScanBytes::new(),
+                            },
+                        ) {
                             break 'scan;
                         }
                     }
                     i += alignment;
                 }
             } else if bmh_eligible {
+                let finder = memmem_finder
+                    .as_ref()
+                    .expect("BMH eligibility requires a non-empty pattern");
+                let bmh_needle = bmh_needle
+                    .as_ref()
+                    .expect("BMH eligibility requires a non-empty pattern");
                 let mut search_from: i32 = 0;
+                let mut dense_probe_hits = 0usize;
+                let mut use_bmh = false;
                 while search_from <= scan_end {
                     if abort.load(Ordering::Relaxed) {
                         break 'scan;
                     }
                     let slice = &data[search_from as usize..read_len as usize];
-                    match bmh_find(slice, &pat[..pattern_len as usize]) {
+                    let found = if use_bmh {
+                        bmh_needle.find(slice)
+                    } else {
+                        finder.find(slice)
+                    };
+                    match found {
                         None => break,
                         Some(hit) => {
                             let abs_i = search_from + hit as i32;
                             if abs_i > scan_end {
                                 break;
                             }
+                            if !use_bmh && abs_i <= K_EXACT_DENSE_PROBE_BYTES {
+                                dense_probe_hits += 1;
+                                if dense_probe_hits >= K_EXACT_DENSE_PROBE_HITS {
+                                    use_bmh = true;
+                                }
+                            }
                             let n = 16.min(read_len - abs_i) as usize;
                             let addr = reg_start + off + abs_i as u64;
-                            results.push(ScanResult {
-                                address: addr,
-                                region_module: format_region_context(region, addr),
-                                scan_value: data[abs_i as usize..abs_i as usize + n].to_vec(),
-                                previous_value: Vec::new(),
-                            });
-                            if results.len() as i32 >= req.max_results {
+                            if push_scan_result(
+                                &mut results,
+                                req.max_results,
+                                ScanResult {
+                                    address: addr,
+                                    region_module: format_region_context(region, addr),
+                                    scan_value: scan_bytes(
+                                        &data[abs_i as usize..abs_i as usize + n],
+                                    ),
+                                    previous_value: ScanBytes::new(),
+                                },
+                            ) {
                                 break 'scan;
                             }
                             search_from = abs_i + 1; // overlapping matches
                         }
                     }
                 }
+            } else if let Some(anchor) = masked_anchor.as_ref() {
+                // Masked signatures can skip directly between fixed-byte anchors,
+                // then verify the full mask only at candidate starts.
+                let alignment = alignment as usize;
+                let mut anchor_from = anchor.offset;
+                while anchor_from < read_len as usize {
+                    if abort.load(Ordering::Relaxed) {
+                        break 'scan;
+                    }
+                    let Some(hit) = anchor.finder.find(&data[anchor_from..read_len as usize])
+                    else {
+                        break;
+                    };
+                    let anchor_i = anchor_from + hit;
+                    let i = anchor_i - anchor.offset;
+                    if i as i32 > scan_end {
+                        break;
+                    }
+                    anchor_from = anchor_i + 1;
+                    if i % alignment != 0 {
+                        continue;
+                    }
+
+                    let mut matched = true;
+                    for j in 0..pattern_len as usize {
+                        if (data[i + j] & msk[j]) != (pat[j] & msk[j]) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        let n = 16.min(read_len - i as i32) as usize;
+                        let addr = reg_start + off + i as u64;
+                        if push_scan_result(
+                            &mut results,
+                            req.max_results,
+                            ScanResult {
+                                address: addr,
+                                region_module: format_region_context(region, addr),
+                                scan_value: scan_bytes(&data[i..i + n]),
+                                previous_value: ScanBytes::new(),
+                            },
+                        ) {
+                            break 'scan;
+                        }
+                    }
+                }
             } else {
-                // Naive aligned matcher (handles wildcards + alignment > 1).
+                // Naive aligned matcher (handles all-wildcard masks).
                 let mut i: i32 = 0;
                 while i <= scan_end {
                     if (i & (K_ABORT_STRIDE - 1)) == 0 && abort.load(Ordering::Relaxed) {
@@ -1059,13 +1274,16 @@ pub fn run_scan_in_regions(
                     if matched {
                         let n = 16.min(read_len - i) as usize;
                         let addr = reg_start + off + i as u64;
-                        results.push(ScanResult {
-                            address: addr,
-                            region_module: format_region_context(region, addr),
-                            scan_value: data[iu..iu + n].to_vec(),
-                            previous_value: Vec::new(),
-                        });
-                        if results.len() as i32 >= req.max_results {
+                        if push_scan_result(
+                            &mut results,
+                            req.max_results,
+                            ScanResult {
+                                address: addr,
+                                region_module: format_region_context(region, addr),
+                                scan_value: scan_bytes(&data[iu..iu + n]),
+                                previous_value: ScanBytes::new(),
+                            },
+                        ) {
                             break 'scan;
                         }
                     }
@@ -1099,6 +1317,18 @@ pub fn run_scan_in_regions(
             if pct != last_pct {
                 last_pct = pct;
                 obs.progress(pct);
+            }
+        }
+            }};
+        }
+
+        if needs_prepared_regions {
+            for prepared in &prepared_regions {
+                scan_region!(&prepared.region, prepared.start, prepared.end);
+            }
+        } else {
+            for region in &regions {
+                scan_region!(region, region.base, region.base.saturating_add(region.size));
             }
         }
     }
@@ -1138,12 +1368,53 @@ fn intersect_constraints(
         merged.push(c);
     }
 
+    if regions.windows(2).all(|pair| pair[0].base <= pair[1].base) {
+        return intersect_sorted_regions_with_constraints(&regions, &merged);
+    }
+
+    intersect_unsorted_regions_with_constraints(&regions, &merged)
+}
+
+fn intersect_sorted_regions_with_constraints(
+    regions: &[MemoryRegion],
+    merged: &[AddressRange],
+) -> Vec<MemoryRegion> {
     let mut clipped: Vec<MemoryRegion> = Vec::new();
-    for region in &regions {
+    let mut first_overlap = 0usize;
+    for region in regions {
         let r_end = region.base.saturating_add(region.size);
-        for c in &merged {
-            if c.end <= region.base || c.start >= r_end {
+        while first_overlap < merged.len() && merged[first_overlap].end <= region.base {
+            first_overlap += 1;
+        }
+        for c in &merged[first_overlap..] {
+            if c.start >= r_end {
+                break;
+            }
+            let i_start = region.base.max(c.start);
+            let i_end = r_end.min(c.end);
+            if i_end <= i_start {
                 continue;
+            }
+            let mut sub = region.clone();
+            sub.base = i_start;
+            sub.size = i_end - i_start;
+            clipped.push(sub);
+        }
+    }
+    clipped
+}
+
+fn intersect_unsorted_regions_with_constraints(
+    regions: &[MemoryRegion],
+    merged: &[AddressRange],
+) -> Vec<MemoryRegion> {
+    let mut clipped: Vec<MemoryRegion> = Vec::new();
+    for region in regions {
+        let r_end = region.base.saturating_add(region.size);
+        let first_overlap = merged.partition_point(|c| c.end <= region.base);
+        for c in &merged[first_overlap..] {
+            if c.start >= r_end {
+                break;
             }
             let i_start = region.base.max(c.start);
             let i_end = r_end.min(c.end);
@@ -1164,6 +1435,7 @@ fn intersect_constraints(
 // ─────────────────────────────────────────────────────────────────────────────
 
 const K_RESCAN_CHUNK: u64 = 256 * 1024;
+const K_RESCAN_SPARSE_SPAN_FACTOR: u64 = 64;
 
 /// `QVector<ScanResult> ScanEngine::runRescan(...)` (`scanner.cpp:949-1136`).
 ///
@@ -1206,101 +1478,141 @@ pub fn run_rescan(
         ScanCondition::IncreasedBy | ScanCondition::DecreasedBy
     );
     let needs_filter = has_exact_filter || has_comparison || has_typed_const || has_delta;
+    let exact_filter_unmasked = has_exact_filter
+        && filter_mask.len() >= filter_pattern.len()
+        && filter_mask[..filter_pattern.len()]
+            .iter()
+            .all(|&mask| mask == 0xFF);
 
-    // Save previous values.
+    // Save previous values while keeping the spare buffer available for the
+    // freshly read bytes.
     for r in &mut results {
-        r.previous_value = r.scan_value.clone();
+        r.previous_value.clear();
+        std::mem::swap(&mut r.previous_value, &mut r.scan_value);
     }
 
-    // Sort indices by address for sequential chunked reads (stable).
-    let mut order: Vec<usize> = (0..total).collect();
-    order.sort_by(|&a, &b| results[a].address.cmp(&results[b].address));
+    // Most UI result sets are already produced in address order by first scan.
+    // Avoid allocating and sorting an index vector on that common path; keep the
+    // stable sorted-index fallback for imported/restored unsorted result sets.
+    let results_sorted = results
+        .windows(2)
+        .all(|pair| pair[0].address <= pair[1].address);
+    let mut order: Vec<usize> = Vec::new();
+    if !results_sorted {
+        order = (0..total).collect();
+        order.sort_by(|&a, &b| results[a].address.cmp(&results[b].address));
+    }
 
-    // Track which results matched (by original index). If no filter, all match.
-    let mut matched = vec![!needs_filter; total];
+    // Positive-width filtered rescans can use the freshly populated scan_value as
+    // match state: non-matches keep the empty buffer left by the previous-value
+    // swap above. Keep the explicit bitmap only for unusual zero-width filters.
+    let filter_by_scan_value = needs_filter && read_size > 0;
+    let mut matched = if needs_filter && !filter_by_scan_value {
+        vec![false; total]
+    } else {
+        Vec::new()
+    };
 
     let mut updated: i32 = 0;
     let mut last_pct: i32 = -1;
     let mut i: usize = 0;
+    let mut chunk: Vec<u8> = Vec::new();
 
     while i < total && !abort.load(Ordering::Relaxed) {
-        let span_base = results[order[i]].address;
+        let span_base_idx = if results_sorted { i } else { order[i] };
+        let span_base = results[span_base_idx].address;
         let mut span_end = i;
 
         // Extend span while next result fits in the same chunk.
         while span_end + 1 < total {
-            let end_addr = results[order[span_end + 1]]
-                .address
-                .saturating_add(read_size as u64);
+            let next_idx = if results_sorted {
+                span_end + 1
+            } else {
+                order[span_end + 1]
+            };
+            let end_addr = results[next_idx].address.saturating_add(read_size as u64);
             if end_addr - span_base > K_RESCAN_CHUNK {
                 break;
             }
             span_end += 1;
         }
 
-        let span_last = results[order[span_end]].address;
-        let chunk_len = span_last
+        let span_last_idx = if results_sorted {
+            span_end
+        } else {
+            order[span_end]
+        };
+        let span_last = results[span_last_idx].address;
+        let mut chunk_len = span_last
             .saturating_add(read_size as u64)
             .saturating_sub(span_base) as usize;
-        let mut chunk = vec![0u8; chunk_len];
-        // Read return value ignored — failed reads leave zeros.
-        let _ = prov.read(span_base, &mut chunk[..]);
+        let span_count = (span_end - i + 1) as u64;
+        let useful_bytes = span_count.saturating_mul(read_size.max(0) as u64);
+        let sparse_span = !prov.prefers_coalesced_rescan_reads()
+            && useful_bytes > 0
+            && (chunk_len as u64) > useful_bytes.saturating_mul(K_RESCAN_SPARSE_SPAN_FACTOR);
+        if sparse_span {
+            span_end = i;
+            chunk_len = read_size.max(0) as usize;
+        }
+        chunk.resize(chunk_len, 0);
+        if !prov.read(span_base, &mut chunk[..chunk_len]) {
+            // Read return value ignored semantically: failed reads leave zeros.
+            chunk[..chunk_len].fill(0);
+        }
 
         for j in i..=span_end {
-            let idx = order[j];
+            let idx = if results_sorted { j } else { order[j] };
             let off = (results[idx].address - span_base) as usize;
             // chunk.mid(off, readSize): clamps at chunk end if truncated.
             let sv = if off <= chunk_len {
                 let end = (off + read_size as usize).min(chunk_len);
-                chunk[off..end].to_vec()
+                &chunk[off..end]
             } else {
-                Vec::new()
+                &[][..]
             };
-            results[idx].scan_value = sv;
 
             // Apply exact-value filter.
+            let mut ok = !needs_filter;
             if has_exact_filter {
                 let pat_len = filter_pattern.len();
-                let sv = &results[idx].scan_value;
                 if sv.len() >= pat_len {
-                    let mut ok = true;
-                    for k in 0..pat_len {
-                        if (sv[k] & filter_mask[k]) != (filter_pattern[k] & filter_mask[k]) {
-                            ok = false;
-                            break;
+                    if exact_filter_unmasked {
+                        ok = &sv[..pat_len] == filter_pattern;
+                    } else {
+                        ok = true;
+                        for k in 0..pat_len {
+                            if (sv[k] & filter_mask[k]) != (filter_pattern[k] & filter_mask[k]) {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    matched[idx] = ok;
                 }
             }
 
             // Apply comparison-based filter.
             if has_comparison && !results[idx].previous_value.is_empty() {
-                let cmp = compare_typed(
-                    &results[idx].scan_value,
-                    &results[idx].previous_value,
-                    value_type,
-                );
-                matched[idx] = match condition {
+                let cmp = compare_typed(sv, &results[idx].previous_value, value_type);
+                ok = match condition {
                     ScanCondition::Changed => cmp != 0,
                     ScanCondition::Unchanged => cmp == 0,
                     ScanCondition::Increased => cmp > 0,
                     ScanCondition::Decreased => cmp < 0,
-                    _ => matched[idx],
+                    _ => ok,
                 };
             }
 
             // Typed const compare (BiggerThan / SmallerThan / Between).
             if has_typed_const && !filter_pattern.is_empty() {
-                let sv = &results[idx].scan_value;
                 let cmp_lo = compare_typed(sv, filter_pattern, value_type);
-                matched[idx] = match condition {
+                ok = match condition {
                     ScanCondition::BiggerThan => cmp_lo > 0,
                     ScanCondition::SmallerThan => cmp_lo < 0,
                     ScanCondition::Between if !filter_pattern2.is_empty() => {
                         cmp_lo >= 0 && compare_typed(sv, filter_pattern2, value_type) <= 0
                     }
-                    _ => matched[idx],
+                    _ => ok,
                 };
             }
 
@@ -1308,16 +1620,17 @@ pub fn run_rescan(
             if has_delta && !results[idx].previous_value.is_empty() && !filter_pattern.is_empty() {
                 let prev = &results[idx].previous_value;
                 let sz = prev.len().min(filter_pattern.len());
-                if results[idx].scan_value.len() >= sz {
-                    matched[idx] = delta_check(
-                        value_type,
-                        condition,
-                        prev,
-                        filter_pattern,
-                        &results[idx].scan_value,
-                        sz,
-                    );
+                if sv.len() >= sz {
+                    ok = delta_check(value_type, condition, prev, filter_pattern, sv, sz);
                 }
+            }
+
+            if ok {
+                if needs_filter && !filter_by_scan_value {
+                    matched[idx] = true;
+                }
+                results[idx].scan_value.clear();
+                results[idx].scan_value.extend_from_slice(sv);
             }
         }
 
@@ -1331,7 +1644,20 @@ pub fn run_rescan(
         }
     }
 
+    if !needs_filter && i < total {
+        for j in i..total {
+            let idx = if results_sorted { j } else { order[j] };
+            let result = &mut results[idx];
+            result.scan_value.clear();
+            result.scan_value.extend_from_slice(&result.previous_value);
+        }
+    }
+
     if needs_filter {
+        if filter_by_scan_value {
+            results.retain(|r| !r.scan_value.is_empty());
+            return results;
+        }
         let mut filtered: Vec<ScanResult> = Vec::with_capacity(total);
         for (k, r) in results.into_iter().enumerate() {
             if matched[k] {

@@ -9,7 +9,7 @@
 //! The walkers do NOT use `Result`: they mirror C++ exactly, returning an
 //! [`RttiInfo`] with `ok=false` and a load-bearing `error` string on failure.
 
-use crate::provider::Provider;
+use crate::provider::{ModuleEntry, Provider};
 use crate::rtti::demangle::{demangle_itanium_name, demangle_rtti_name};
 use crate::rtti::symbol_store::SymbolStore;
 
@@ -141,7 +141,13 @@ fn read_cstring(p: &dyn Provider, addr: u64, max_len: usize) -> String {
 /// invalid [`OwningModule`].
 pub fn find_owning_module(prov: &dyn Provider, addr: u64) -> OwningModule {
     let mods = prov.enumerate_modules();
-    for m in &mods {
+    find_owning_module_in(&mods, addr)
+}
+
+/// Module-snapshot variant of [`find_owning_module`]. Callers that already have
+/// a module list should use this to avoid live-provider re-enumeration.
+pub(crate) fn find_owning_module_in(mods: &[ModuleEntry], addr: u64) -> OwningModule {
+    for m in mods {
         // C++ wraps in uint64_t; use wrapping_add to match on a pathological size.
         if addr >= m.base && addr < m.base.wrapping_add(m.size) {
             return OwningModule {
@@ -160,6 +166,19 @@ pub fn find_owning_module(prov: &dyn Provider, addr: u64) -> OwningModule {
 /// MSVC RTTI walker.
 pub fn walk_rtti(
     prov: &dyn Provider,
+    vtable_addr: u64,
+    pointer_size: i32,
+    max_vtable_slots: i32,
+) -> RttiInfo {
+    let modules = prov.enumerate_modules();
+    walk_rtti_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots)
+}
+
+/// Module-snapshot variant of [`walk_rtti`] for callers that already enumerated
+/// live target modules for the current compose/refresh pass.
+pub(crate) fn walk_rtti_with_modules(
+    prov: &dyn Provider,
+    modules: &[ModuleEntry],
     vtable_addr: u64,
     pointer_size: i32,
     max_vtable_slots: i32,
@@ -189,7 +208,7 @@ pub fn walk_rtti(
     info.complete_locator = col_addr;
 
     // 2. image base — owning module, else (x64) the COL.pSelf @ +0x14 fallback.
-    let owner = find_owning_module(prov, col_addr);
+    let owner = find_owning_module_in(modules, col_addr);
     let mut image_base: u64 = 0;
     if owner.valid {
         info.module_name = owner.name.clone();
@@ -293,7 +312,7 @@ pub fn walk_rtti(
         let in_some_module = if !owner.valid {
             true // synthetic: trust the input
         } else {
-            find_owning_module(prov, target).valid
+            find_owning_module_in(modules, target).valid
         };
         if !in_some_module {
             break;
@@ -324,6 +343,18 @@ pub fn walk_rtti_itanium(
     pointer_size: i32,
     max_vtable_slots: i32,
 ) -> RttiInfo {
+    let modules = prov.enumerate_modules();
+    walk_rtti_itanium_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots)
+}
+
+/// Module-snapshot variant of [`walk_rtti_itanium`] for compose-time RTTI scans.
+pub(crate) fn walk_rtti_itanium_with_modules(
+    prov: &dyn Provider,
+    modules: &[ModuleEntry],
+    vtable_addr: u64,
+    pointer_size: i32,
+    max_vtable_slots: i32,
+) -> RttiInfo {
     let mut info = RttiInfo {
         vtable_address: vtable_addr,
         ..Default::default()
@@ -348,7 +379,7 @@ pub fn walk_rtti_itanium(
     }
 
     // 2. type_info must be in a module.
-    let ti_owner = find_owning_module(prov, ti_addr);
+    let ti_owner = find_owning_module_in(modules, ti_addr);
     if !ti_owner.valid {
         info.error = "type_info pointer outside any module".to_owned();
         return info;
@@ -391,7 +422,7 @@ pub fn walk_rtti_itanium(
         info.error = "could not read type_info vtable ptr".to_owned();
         return info;
     }
-    if ti_vtable == 0 || !find_owning_module(prov, ti_vtable).valid {
+    if ti_vtable == 0 || !find_owning_module_in(modules, ti_vtable).valid {
         info.error = "type_info vtable not in any module".to_owned();
         return info;
     }
@@ -408,7 +439,7 @@ pub fn walk_rtti_itanium(
         info.error = "could not read __name pointer".to_owned();
         return info;
     }
-    if name_ptr == 0 || !find_owning_module(prov, name_ptr).valid {
+    if name_ptr == 0 || !find_owning_module_in(modules, name_ptr).valid {
         info.error = "__name pointer not in any module".to_owned();
         return info;
     }
@@ -470,7 +501,7 @@ pub fn walk_rtti_itanium(
         if target == 0 {
             break;
         }
-        if !find_owning_module(prov, target).valid {
+        if !find_owning_module_in(modules, target).valid {
             break;
         }
         let symbol = SymbolStore::global()

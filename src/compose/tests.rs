@@ -10,9 +10,11 @@
 //! those tests run normally.)
 
 use super::{
-    array_elem_count_span_for, array_elem_type_span_for, command_row_root_name_span,
-    command_row_src_span, compose, compose_default, format_preview, pointer_kind_span_for,
-    pointer_target_span_for, ComposeResult, LineGeometry, K_FOLD_COL, K_TREE_INDENT,
+    array_elem_count_span_for, array_elem_type_span_for, children_strictly_increasing_by_abs,
+    command_row_root_name_span, command_row_src_span, compose, compose_default,
+    compose_preview_with_symbols_at_base, compose_with_symbols_at_base, format_preview,
+    pointer_kind_span_for, pointer_target_span_for, ComposeResult, LineGeometry, K_FOLD_COL,
+    K_TREE_INDENT,
 };
 use crate::core::linemeta::{find_chip, K_COMMAND_ROW_ID};
 use crate::core::{ChipKind, LineKind, LineMeta, Node, NodeKind, NodeTree};
@@ -30,6 +32,17 @@ fn child(parent: u64, kind: NodeKind, offset: i32, name: &str) -> Node {
         name: name.to_string(),
         ..Node::default()
     }
+}
+
+#[test]
+fn sorted_child_fast_path_requires_strictly_increasing_offsets() {
+    let abs = [0, 8, 16, 16, 24];
+    assert!(children_strictly_increasing_by_abs(&[0, 1, 2, 4], &abs));
+    assert!(!children_strictly_increasing_by_abs(&[0, 2, 1, 4], &abs));
+    assert!(
+        !children_strictly_increasing_by_abs(&[2, 3, 4], &abs),
+        "equal-offset siblings must keep using the C++-parity unstable sort"
+    );
 }
 
 fn lines(r: &ComposeResult) -> Vec<String> {
@@ -57,19 +70,90 @@ fn count_chips(r: &ComposeResult, k: ChipKind) -> i32 {
     n
 }
 
+#[test]
+fn line_byte_starts_match_utf16_line_starts() {
+    let mut t = NodeTree::new();
+    let root = t.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "PlayerΔ".into(),
+        struct_type_name: "PlayerΔ".into(),
+        comment: "héader".into(),
+        ..Node::default()
+    });
+    let root_id = t.nodes[root].id;
+    t.add_node(Node {
+        name: "héalth".into(),
+        comment: "→ hot".into(),
+        ..child(root_id, NodeKind::UInt32, 0, "health")
+    });
+    t.add_node(Node {
+        name: "mana✓".into(),
+        ..child(root_id, NodeKind::UInt32, 4, "mana")
+    });
+
+    let r = compose_default(&t, &BufferProvider::new(vec![0u8; 16], "unicode.bin"));
+
+    assert_eq!(r.line_byte_starts.len(), r.line_starts.len());
+    let text_utf16_len = r.text.encode_utf16().count() as i32;
+    for i in 0..r.line_starts.len() {
+        let byte_start = r.line_byte_starts[i];
+        let byte_end = r
+            .line_byte_starts
+            .get(i + 1)
+            .copied()
+            .unwrap_or(r.text.len());
+        let utf16_start = r.line_starts[i];
+        let utf16_end = r.line_starts.get(i + 1).copied().unwrap_or(text_utf16_len);
+
+        assert_eq!(
+            &r.text[byte_start..byte_end],
+            mid(&r.text, utf16_start, utf16_end)
+        );
+    }
+}
+
 struct HighBaseProvider {
     base: u64,
     data: Vec<u8>,
+    read_calls: std::cell::Cell<usize>,
+    readable_calls: std::cell::Cell<usize>,
+    region_calls: std::cell::Cell<usize>,
+    module_calls: std::cell::Cell<usize>,
+    report_modules: bool,
+    trust_regions: bool,
 }
 
 impl HighBaseProvider {
     fn new(base: u64, data: Vec<u8>) -> Self {
-        Self { base, data }
+        Self::with_modules(base, data, true)
+    }
+
+    fn without_modules(base: u64, data: Vec<u8>) -> Self {
+        Self::with_modules(base, data, false)
+    }
+
+    fn with_modules(base: u64, data: Vec<u8>, report_modules: bool) -> Self {
+        Self {
+            base,
+            data,
+            read_calls: std::cell::Cell::new(0),
+            readable_calls: std::cell::Cell::new(0),
+            region_calls: std::cell::Cell::new(0),
+            module_calls: std::cell::Cell::new(0),
+            report_modules,
+            trust_regions: false,
+        }
+    }
+
+    fn with_trusted_regions(mut self) -> Self {
+        self.trust_regions = true;
+        self
     }
 }
 
 impl Provider for HighBaseProvider {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.read_calls.set(self.read_calls.get() + 1);
         let Some(start) = addr.checked_sub(self.base).map(|v| v as usize) else {
             return false;
         };
@@ -85,6 +169,7 @@ impl Provider for HighBaseProvider {
     }
 
     fn is_readable(&self, addr: u64, len: i32) -> bool {
+        self.readable_calls.set(self.readable_calls.get() + 1);
         if len <= 0 {
             return len == 0;
         }
@@ -97,6 +182,7 @@ impl Provider for HighBaseProvider {
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+        self.region_calls.set(self.region_calls.get() + 1);
         vec![MemoryRegion {
             base: self.base,
             size: self.data.len() as u64,
@@ -108,7 +194,15 @@ impl Provider for HighBaseProvider {
         }]
     }
 
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        self.trust_regions
+    }
+
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+        self.module_calls.set(self.module_calls.get() + 1);
+        if !self.report_modules {
+            return Vec::new();
+        }
         vec![ModuleEntry {
             name: "synthetic.dll".into(),
             full_path: "synthetic.dll".into(),
@@ -370,6 +464,57 @@ fn pointer_deref_expansion() {
 }
 
 #[test]
+fn pointer_deref_expansion_uses_cached_regions_without_readability_preflight() {
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let mi = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Main".into(),
+        ..Node::default()
+    });
+    let main_id = tree.nodes[mi].id;
+    let ti = tree.add_node(Node {
+        collapsed: false,
+        kind: NodeKind::Struct,
+        name: "Target".into(),
+        ..Node::default()
+    });
+    let target_id = tree.nodes[ti].id;
+    tree.add_node(child(target_id, NodeKind::UInt32, 0, "field"));
+    tree.add_node(Node {
+        ref_id: target_id,
+        collapsed: false,
+        ..child(main_id, NodeKind::Pointer64, 0, "ptr")
+    });
+
+    let mut data = vec![0u8; 0x80];
+    data[0..8].copy_from_slice(&(BASE + 0x40).to_le_bytes());
+    data[0x40..0x44].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    let prov = HighBaseProvider::new(BASE, data);
+
+    let r = compose_default(&tree, &prov);
+
+    assert!(
+        r.meta
+            .iter()
+            .any(|lm| lm.node_kind == NodeKind::UInt32 && lm.depth == 2),
+        "expanded pointer should still compose target children"
+    );
+    assert_eq!(
+        prov.readable_calls.get(),
+        0,
+        "expanded pointer compose should not ask live providers to enumerate readability"
+    );
+    assert_eq!(
+        prov.region_calls.get(),
+        1,
+        "expanded pointer compose should snapshot regions once for target readability"
+    );
+}
+
+#[test]
 fn pointer_deref_null() {
     let mut tree = NodeTree::new();
     tree.base_address = 0;
@@ -531,6 +676,36 @@ fn line_meta_has_node_id() {
         assert!(ni >= 0 && (ni as usize) < tree.nodes.len());
         assert_eq!(lm.node_id, tree.nodes[ni as usize].id);
     }
+}
+
+#[test]
+fn compose_result_indexes_first_navigable_line_by_node_id() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Root".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    let mat_i = tree.add_node(child(root_id, NodeKind::Mat4x4, 0, "matrix"));
+    let mat_id = tree.nodes[mat_i].id;
+
+    let prov = NullProvider;
+    let r = compose_default(&tree, &prov);
+
+    assert_eq!(
+        r.line_for_node(root_id),
+        r.meta.iter().position(|lm| {
+            lm.node_id == root_id && lm.line_kind != LineKind::Footer && !lm.is_continuation
+        })
+    );
+    let mat_line = r.line_for_node(mat_id).expect("mat4x4 line indexed");
+    assert_eq!(r.meta[mat_line].node_id, mat_id);
+    assert!(!r.meta[mat_line].is_continuation);
+    assert_ne!(r.meta[mat_line].line_kind, LineKind::Footer);
+    assert!(r.line_for_node(0).is_none());
+    assert!(r.line_for_node(K_COMMAND_ROW_ID).is_none());
 }
 
 // ── arrays ──────────────────────────────────────────────────────────────────
@@ -1012,6 +1187,74 @@ fn top_level_rva_pointer_resolves_against_tree_base_address() {
         found_header,
         "expanded e_lfanew header line ending with '{{' not found"
     );
+}
+
+#[test]
+fn compose_with_explicit_base_does_not_clone_or_mutate_tree_base() {
+    let prov = BufferProvider::new(vec![0u8; 0x80], "");
+    let mut tree = NodeTree::new();
+    tree.base_address = 0x1000;
+    let root_idx = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Root".into(),
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root_idx].id;
+    tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "value".into(),
+        parent_id: root_id,
+        offset: 0x20,
+        ..Node::default()
+    });
+
+    let result = compose_with_symbols_at_base(
+        &tree, &prov, root_id, 0x5000, false, false, false, false, true, None, true, true,
+    );
+
+    assert_eq!(tree.base_address, 0x1000);
+    assert_eq!(result.layout.base_address, 0x5000);
+    let value_line = result
+        .meta
+        .iter()
+        .find(|line| line.node_idx >= 0 && tree.nodes[line.node_idx as usize].name == "value")
+        .expect("value row should render");
+    assert_eq!(value_line.offset_addr, 0x5020);
+}
+
+#[test]
+fn compose_preview_limited_matches_full_prefix() {
+    let prov = BufferProvider::new(vec![0u8; 0x4000], "");
+    let mut tree = NodeTree::new();
+    let root_idx = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "Root".into(),
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root_idx].id;
+    for i in 0..128 {
+        tree.add_node(Node {
+            kind: NodeKind::Hex64,
+            name: format!("field_{i}"),
+            parent_id: root_id,
+            offset: i * 8,
+            ..Node::default()
+        });
+    }
+
+    let full = compose_with_symbols_at_base(
+        &tree, &prov, root_id, 0x5000, false, false, true, false, true, None, true, true,
+    );
+    let preview = compose_preview_with_symbols_at_base(
+        &tree, &prov, root_id, 0x5000, false, false, true, false, true, None, true, true, 6,
+    );
+
+    assert_eq!(preview.meta.len(), 6);
+    assert_eq!(&lines(&preview), &lines(&full)[..6]);
+    assert_eq!(preview.meta[0].line_kind, full.meta[0].line_kind);
+    assert_eq!(preview.meta[5].offset_addr, full.meta[5].offset_addr);
 }
 
 /// Regression: the non-RVA case of the same rendering change. Expanded absolute
@@ -1882,6 +2125,86 @@ fn enum_chip_fires_and_can_be_suppressed() {
 }
 
 #[test]
+fn enum_chip_reads_without_readability_preflight() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ei = tree.add_node(Node {
+        class_keyword: "enum".into(),
+        struct_type_name: "Status".into(),
+        name: "Status".into(),
+        enum_members: vec![
+            ("READY".into(), 0),
+            ("RUNNING".into(), 1),
+            ("DONE".into(), 2),
+        ],
+        kind: NodeKind::Struct,
+        ..Node::default()
+    });
+    let enum_id = tree.nodes[ei].id;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(Node {
+        ref_id: enum_id,
+        ..child(root_id, NodeKind::UInt32, 0, "status")
+    });
+
+    let mut data = vec![0u8; 16];
+    data[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let prov = HighBaseProvider::new(K_STRUCT_BASE, data);
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, true, true,
+    );
+
+    let c = first_chip(&r, ChipKind::Enum).expect("enum chip should fire");
+    assert!(c.text.contains("RUNNING"), "{}", c.text);
+    assert_eq!(prov.readable_calls.get(), 0);
+}
+
+#[test]
+fn enum_chip_duplicate_values_keep_first_member() {
+    let mut tree = NodeTree::new();
+    tree.base_address = K_STRUCT_BASE;
+    let ei = tree.add_node(Node {
+        class_keyword: "enum".into(),
+        struct_type_name: "Status".into(),
+        name: "Status".into(),
+        enum_members: vec![("FIRST".into(), 7), ("SECOND".into(), 7)],
+        kind: NodeKind::Struct,
+        ..Node::default()
+    });
+    let enum_id = tree.nodes[ei].id;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(Node {
+        ref_id: enum_id,
+        ..child(root_id, NodeKind::UInt32, 0, "status")
+    });
+
+    let mut data = vec![0u8; 16];
+    data[0..4].copy_from_slice(&7u32.to_le_bytes());
+    let prov = HighBaseProvider::new(K_STRUCT_BASE, data);
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, false, true, false, true,
+    );
+
+    let c = first_chip(&r, ChipKind::Enum).expect("enum chip should fire");
+    assert!(c.text.contains("FIRST"), "{}", c.text);
+    assert!(!c.text.contains("SECOND"), "{}", c.text);
+}
+
+#[test]
 fn comment_chip_fires_and_can_be_suppressed() {
     let mut tree = NodeTree::new();
     tree.base_address = K_STRUCT_BASE;
@@ -2205,7 +2528,7 @@ fn type_hint_chip_fires_as_overlay() {
     // type_hints=true (7th arg) — the TypeHint chip is gated on it
     // (`compose.cpp:441`, `test_rtti_hint.cpp:313`).
     let r = compose(
-        &tree, &prov, root_id, false, false, false, true, true, true, true,
+        &tree, &prov, root_id, false, false, false, true, true, false, true,
     );
     let c = first_chip(&r, ChipKind::TypeHint).expect("typehint chip");
     assert!(c.start_col >= 0);
@@ -2229,6 +2552,45 @@ fn type_hint_chip_fires_as_overlay() {
         c.text
     );
     assert!(!c.type_hint_kinds.is_empty());
+}
+
+#[test]
+fn type_hint_hex_rows_read_without_readability_preflight() {
+    const BASE: u64 = K_STRUCT_BASE;
+
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
+
+    let mut data = vec![0u8; 16];
+    data[0..4].copy_from_slice(&1.5f32.to_le_bytes());
+    data[4..8].copy_from_slice(&2.25f32.to_le_bytes());
+    let prov = HighBaseProvider::new(BASE, data);
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, false, true,
+    );
+
+    assert!(
+        first_chip(&r, ChipKind::TypeHint).is_some(),
+        "sanity check: type hint path should run"
+    );
+    assert_eq!(
+        prov.readable_calls.get(),
+        0,
+        "type-hint hex rows should not ask live providers to enumerate readability per row"
+    );
+    assert_eq!(
+        prov.read_calls.get(),
+        2,
+        "formatting and type inference should reuse row bytes; RTTI detection still reads the candidate separately"
+    );
 }
 
 #[test]
@@ -2359,6 +2721,237 @@ fn readable_pointer_type_hint_names_target() {
         c.text
     );
     assert_eq!(c.type_hint_kinds, vec![NodeKind::Pointer64]);
+    assert_eq!(
+        prov.readable_calls.get(),
+        0,
+        "pointer type-hint promotion should use the compose-pass region snapshot"
+    );
+    assert_eq!(
+        prov.region_calls.get(),
+        1,
+        "pointer type-hint promotion should enumerate regions once per compose pass"
+    );
+}
+
+#[test]
+fn pointer_type_hints_reuse_region_and_module_snapshots() {
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+    const FIELD_COUNT: usize = 32;
+
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    for i in 0..FIELD_COUNT {
+        tree.add_node(child(
+            root_id,
+            NodeKind::Hex64,
+            (i * 8) as i32,
+            &format!("payload_{i}"),
+        ));
+    }
+
+    let mut data = vec![0u8; 0x400];
+    for i in 0..FIELD_COUNT {
+        let target = BASE + 0x200 + i as u64;
+        data[i * 8..i * 8 + 8].copy_from_slice(&target.to_le_bytes());
+        data[0x200 + i] = 0xAA;
+    }
+    let prov = HighBaseProvider::without_modules(BASE, data);
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, false, true,
+    );
+
+    let pointer_chips = r
+        .meta
+        .iter()
+        .flat_map(|lm| lm.chips.iter())
+        .filter(|chip| {
+            chip.kind == ChipKind::TypeHint && chip.type_hint_kinds == vec![NodeKind::Pointer64]
+        })
+        .count();
+    assert_eq!(pointer_chips, FIELD_COUNT);
+    assert_eq!(
+        prov.readable_calls.get(),
+        0,
+        "pointer type-hint promotion should not call live readability per row"
+    );
+    assert_eq!(
+        prov.region_calls.get(),
+        1,
+        "pointer type-hint promotion should enumerate regions once per compose pass"
+    );
+    assert_eq!(
+        prov.module_calls.get(),
+        1,
+        "pointer type-hint naming should enumerate modules once per compose pass"
+    );
+}
+
+#[test]
+fn trusted_region_pointer_type_hints_skip_target_probe_reads() {
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+    const FIELD_COUNT: usize = 16;
+
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    for i in 0..FIELD_COUNT {
+        tree.add_node(child(
+            root_id,
+            NodeKind::Hex64,
+            (i * 8) as i32,
+            &format!("payload_{i}"),
+        ));
+    }
+
+    let mut data = vec![0u8; 0x400];
+    for i in 0..FIELD_COUNT {
+        let target = BASE + 0x200 + i as u64;
+        data[i * 8..i * 8 + 8].copy_from_slice(&target.to_le_bytes());
+        data[0x200 + i] = 0xAA;
+    }
+    let baseline = HighBaseProvider::without_modules(BASE, data.clone());
+    let trusted = HighBaseProvider::without_modules(BASE, data).with_trusted_regions();
+
+    let baseline_result = compose(
+        &tree, &baseline, root_id, false, false, false, true, true, false, true,
+    );
+    let trusted_result = compose(
+        &tree, &trusted, root_id, false, false, false, true, true, false, true,
+    );
+
+    let pointer_chips = trusted_result
+        .meta
+        .iter()
+        .flat_map(|lm| lm.chips.iter())
+        .filter(|chip| {
+            chip.kind == ChipKind::TypeHint && chip.type_hint_kinds == vec![NodeKind::Pointer64]
+        })
+        .count();
+    assert_eq!(pointer_chips, FIELD_COUNT);
+    assert_eq!(
+        pointer_chips,
+        baseline_result
+            .meta
+            .iter()
+            .flat_map(|lm| lm.chips.iter())
+            .filter(|chip| {
+                chip.kind == ChipKind::TypeHint && chip.type_hint_kinds == vec![NodeKind::Pointer64]
+            })
+            .count()
+    );
+    assert_eq!(
+        baseline.read_calls.get(),
+        trusted.read_calls.get() + FIELD_COUNT,
+        "trusted region providers should skip one target probe read per pointer"
+    );
+    assert_eq!(
+        trusted.region_calls.get(),
+        1,
+        "trusted region providers should still build one compose-pass region snapshot"
+    );
+}
+
+#[test]
+fn pointer_type_hint_lookup_handles_unsorted_region_and_module_maps() {
+    struct UnsortedProvider {
+        base: u64,
+        data: Vec<u8>,
+    }
+
+    impl Provider for UnsortedProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            let Some(start) = addr.checked_sub(self.base).map(|v| v as usize) else {
+                return false;
+            };
+            if start.saturating_add(buf.len()) > self.data.len() {
+                return false;
+            }
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            self.data.len() as i32
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            vec![
+                MemoryRegion {
+                    base: self.base + 0x200,
+                    size: 0x20,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                    module_name: "later".into(),
+                    region_type: RegionType::Image,
+                },
+                MemoryRegion {
+                    base: self.base + 0x20,
+                    size: 0x20,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                    module_name: "target".into(),
+                    region_type: RegionType::Image,
+                },
+            ]
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            vec![
+                ModuleEntry {
+                    name: "later.dll".into(),
+                    full_path: String::new(),
+                    base: self.base + 0x200,
+                    size: 0x20,
+                },
+                ModuleEntry {
+                    name: "target.dll".into(),
+                    full_path: String::new(),
+                    base: self.base + 0x20,
+                    size: 0x20,
+                },
+            ]
+        }
+    }
+
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "payload"));
+    let mut data = vec![0u8; 0x240];
+    data[0..8].copy_from_slice(&(BASE + 0x20).to_le_bytes());
+    data[0x20] = 0xAA;
+    let prov = UnsortedProvider { base: BASE, data };
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, false, true,
+    );
+
+    let chip = first_chip(&r, ChipKind::TypeHint).expect("readable pointer chip");
+    assert!(
+        chip.text.contains("target.dll+0x0"),
+        "unsorted module fallback should name the target module: {}",
+        chip.text
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2625,23 +3218,29 @@ fn build_address_space_with_rtti() -> Vec<u8> {
 struct FakeModuleProvider {
     inner: BufferProvider,
     enum_calls: std::cell::Cell<u32>,
+    read_calls: std::cell::Cell<u32>,
+    readable_calls: std::cell::Cell<u32>,
 }
 impl FakeModuleProvider {
     fn new(data: Vec<u8>) -> Self {
         FakeModuleProvider {
             inner: BufferProvider::new(data, "synthetic"),
             enum_calls: std::cell::Cell::new(0),
+            read_calls: std::cell::Cell::new(0),
+            readable_calls: std::cell::Cell::new(0),
         }
     }
 }
 impl crate::provider::Provider for FakeModuleProvider {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.read_calls.set(self.read_calls.get() + 1);
         self.inner.read(addr, buf)
     }
     fn size(&self) -> i32 {
         self.inner.size()
     }
     fn is_readable(&self, addr: u64, len: i32) -> bool {
+        self.readable_calls.set(self.readable_calls.get() + 1);
         self.inner.is_readable(addr, len)
     }
     fn enumerate_modules(&self) -> Vec<crate::provider::ModuleEntry> {
@@ -2738,10 +3337,9 @@ fn rtti_no_hint_when_value_outside_any_module() {
 fn rtti_modules_enumerated_few_times_not_per_line() {
     // 32 fields all pointing at the same vtable. Without caching,
     // `enumerate_modules` would fire once per candidate (32×) plus once inside
-    // each `walk_rtti` success path (>= 64). With the per-pass module cache +
-    // rtti_cache it stays O(1): one call from compose's own cache, plus one
-    // inside `walk_rtti`'s `find_owning_module` for the single unique walk
-    // (whose RttiInfo is then memoized). (`test_rtti_hint.cpp:213-240`.)
+    // each `walk_rtti` success path (>= 64). With the per-pass module cache,
+    // module-snapshot walker, and rtti_cache, it stays O(1).
+    // (`test_rtti_hint.cpp:213-240`.)
     const FIELD_COUNT: i32 = 32;
     let mut data = build_address_space_with_rtti();
     let vtable_va = RTTI_IMAGE_BASE + 0x1000;
@@ -2764,6 +3362,55 @@ fn rtti_modules_enumerated_few_times_not_per_line() {
         count_chips(&r, ChipKind::Rtti),
         FIELD_COUNT,
         "every vtable field gets an RTTI chip"
+    );
+}
+
+#[cfg(feature = "symbols")]
+#[test]
+fn rtti_unique_candidates_reuse_module_snapshot() {
+    const FIELD_COUNT: i32 = 32;
+    let mut data = build_address_space_with_rtti();
+    for i in 0..FIELD_COUNT as usize {
+        let candidate = RTTI_IMAGE_BASE + 0x2000 + i as u64 * 0x20;
+        let col = RTTI_IMAGE_BASE + 0x6000 + i as u64 * 0x10;
+        let field_off = RTTI_STRUCT_BASE as usize + i * 8;
+        let meta_off = candidate as usize - 8;
+        let col_off = col as usize;
+        data[field_off..field_off + 8].copy_from_slice(&candidate.to_le_bytes());
+        data[meta_off..meta_off + 8].copy_from_slice(&col.to_le_bytes());
+        data[col_off..col_off + 4].copy_from_slice(&0xDEADu32.to_le_bytes());
+    }
+
+    let prov = FakeModuleProvider::new(data);
+    let tree = tree_with_hex64_fields(RTTI_STRUCT_BASE, FIELD_COUNT);
+    let r = compose(
+        &tree, &prov, 0, false, false, false, false, true, true, true,
+    );
+
+    assert_eq!(count_chips(&r, ChipKind::Rtti), 0);
+    assert_eq!(
+        prov.enum_calls.get(),
+        1,
+        "unique RTTI candidates should reuse compose's module snapshot"
+    );
+}
+
+#[test]
+fn rtti_probe_reads_without_readability_preflight() {
+    const FIELD_COUNT: i32 = 32;
+    let data = vec![0u8; FIELD_COUNT as usize * 8 + 8];
+    let prov = FakeModuleProvider::new(data);
+    let tree = tree_with_hex64_fields(0, FIELD_COUNT);
+    let _ = compose_default(&tree, &prov);
+
+    assert_eq!(
+        prov.readable_calls.get(),
+        0,
+        "RTTI probing should not ask live providers to enumerate readability per field"
+    );
+    assert!(
+        prov.read_calls.get() >= FIELD_COUNT as u32,
+        "each Hex64 RTTI candidate is still read once"
     );
 }
 

@@ -968,7 +968,10 @@ mod tests {
             zw.finish().unwrap();
         }
         let path = rcnet_tmp("ok");
-        std::fs::File::create(&path).unwrap().write_all(&buf).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
         let zipped = import_reclass_xml(&path, 8).expect("rcnet imports");
         let _ = std::fs::remove_file(&path);
 
@@ -990,7 +993,10 @@ mod tests {
             zw.finish().unwrap();
         }
         let path = rcnet_tmp("noxml");
-        std::fs::File::create(&path).unwrap().write_all(&buf).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
         let r = import_reclass_xml(&path, 8);
         let _ = std::fs::remove_file(&path);
         assert!(matches!(r, Err(ImportError::RcnetNoXml)), "got {r:?}");

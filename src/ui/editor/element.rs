@@ -13,6 +13,7 @@
 //! viewport-local coordinates (editor-surface.md §8 `hitTest`).
 
 use gpui::*;
+use std::sync::Arc;
 
 use super::geometry::{self, CellMetrics, SpanStyle};
 use super::hit_test::{self, CursorKind};
@@ -25,7 +26,7 @@ use super::RcxEditor;
 pub struct RowPaint {
     pub text: SharedString,
     /// Colored spans in char-column coordinates.
-    pub runs: Vec<SpanStyle>,
+    pub runs: Arc<[SpanStyle]>,
     /// Inline background overlays as `(char_start, char_end, color)` — heat byte
     /// runs and byte-selection digit highlights (drawn behind the glyphs).
     pub overlays: Vec<(i32, i32, Hsla)>,

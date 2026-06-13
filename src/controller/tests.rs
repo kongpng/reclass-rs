@@ -6,6 +6,7 @@
 //! [`RcxController::pump_refresh`] (policy/transport split — PORTING §0) and a
 //! mock [`EditorView`], so there is no sleeping/timer flakiness.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::*;
@@ -14,6 +15,20 @@ use crate::core::{Node, NodeKind, NodeTree, OffsetAdj, ValueHistory};
 use crate::provider::{BufferProvider, MemoryRegion, Provider, RegionType};
 
 // ── Shared fixtures (port of buildSmallTree + makeSmallBuffer) ──
+
+#[test]
+fn changed_byte_indices_for_line_intersects_sorted_ranges_once() {
+    let ranges = vec![(0x1002, 0x1004), (0x1006, 0x1009), (0x1010, 0x1020)];
+    assert_eq!(
+        changed_byte_indices_for_line(&ranges, 0x1000, 8).as_slice(),
+        &[2, 3, 6, 7]
+    );
+    assert!(changed_byte_indices_for_line(&ranges, 0x1009, 4).is_empty());
+    assert_eq!(
+        changed_byte_indices_for_line(&ranges, 0x1008, 8).as_slice(),
+        &[0]
+    );
+}
 
 fn build_small_tree(tree: &mut NodeTree) {
     tree.base_address = 0;
@@ -101,6 +116,59 @@ impl Provider for BaseAwareProvider {
     }
 }
 
+struct CountingLiveProvider {
+    data: Vec<u8>,
+    reads: AtomicUsize,
+}
+
+impl CountingLiveProvider {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    fn reset_reads(&self) {
+        self.reads.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Provider for CountingLiveProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let start = addr as usize;
+        let Some(end) = start.checked_add(buf.len()) else {
+            return false;
+        };
+        if end > self.data.len() {
+            return false;
+        }
+        buf.copy_from_slice(&self.data[start..end]);
+        true
+    }
+
+    fn size(&self) -> i32 {
+        self.data.len() as i32
+    }
+
+    fn is_live(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> String {
+        "counting-live".into()
+    }
+
+    fn kind(&self) -> String {
+        "CountingLive".into()
+    }
+}
+
 fn make_ctrl() -> RcxController {
     let mut doc = RcxDocument::new();
     build_small_tree(&mut doc.tree);
@@ -143,6 +211,36 @@ fn find_id(c: &RcxController, name: &str) -> u64 {
 fn read_u32(c: &RcxController, addr: u64) -> u32 {
     let b = c.document().provider.read_bytes(addr, 4);
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[test]
+fn refresh_if_stale_skips_current_compose_and_runs_after_tree_generation_change() {
+    let mut c = make_ctrl_zero();
+    let initial_revision = c.result_revision();
+    assert!(c.refresh_if_stale());
+    let initial_lines = c.last_result().meta.len();
+    let composed_revision = c.result_revision();
+    assert_eq!(composed_revision, initial_revision + 1);
+
+    assert!(!c.refresh_if_stale());
+    assert_eq!(c.last_result().meta.len(), initial_lines);
+    assert_eq!(c.result_revision(), composed_revision);
+
+    let root_id = c.tree().nodes[0].id;
+    c.tree_mut().add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "fresh_tail".into(),
+        parent_id: root_id,
+        offset: 32,
+        ..Node::default()
+    });
+
+    assert!(c.refresh_if_stale());
+    assert!(c.last_result().meta.len() > initial_lines);
+    let recomposed_revision = c.result_revision();
+    assert_eq!(recomposed_revision, composed_revision + 1);
+    assert!(!c.refresh_if_stale());
+    assert_eq!(c.result_revision(), recomposed_revision);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -665,6 +763,116 @@ fn clear_value_history_resets_heat() {
     assert_eq!(c.value_history()[&target_id].unique_count(), 1);
 }
 
+#[test]
+fn structural_command_refresh_reuses_heat_without_value_resampling() {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let root_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[root_idx].id;
+    let field_idx = doc.tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "field".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let field_id = doc.tree.nodes[field_idx].id;
+    let provider = Arc::new(CountingLiveProvider::new(vec![0x11, 0x22, 0x33, 0x44]));
+    doc.provider = provider.clone();
+
+    let mut c = RcxController::new(doc);
+    c.set_track_values(true);
+    let history = c.value_history_mut().entry(field_id).or_default();
+    history.record("one");
+    history.record("two");
+    history.record("three");
+
+    provider.reset_reads();
+    c.push_command(Command::Rename {
+        node_id: field_id,
+        old_name: "field".into(),
+        new_name: "renamed".into(),
+    });
+    let structural_reads = provider.reads();
+    let heat_after_command = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_id)
+        .map(|lm| lm.heat_level)
+        .unwrap_or_default();
+    assert!(heat_after_command > 0);
+
+    provider.reset_reads();
+    c.refresh();
+    assert!(
+        provider.reads() > structural_reads,
+        "normal refresh should still sample live values; structural={structural_reads}, normal={}",
+        provider.reads()
+    );
+}
+
+#[test]
+fn visible_line_range_bounds_live_value_tracking() {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let root_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[root_idx].id;
+    let mut field_ids = Vec::new();
+    for i in 0..16 {
+        let idx = doc.tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: format!("field_{i}"),
+            parent_id: root_id,
+            offset: i * 4,
+            ..Node::default()
+        });
+        field_ids.push(doc.tree.nodes[idx].id);
+    }
+    doc.provider = Arc::new(CountingLiveProvider::new(vec![0xA5; 16 * 4]));
+
+    let mut c = RcxController::new(doc);
+    c.set_track_values(false);
+    let first_field_line = c
+        .last_result()
+        .line_for_node(field_ids[0])
+        .expect("first field should compose");
+    let fourth_field_line = c
+        .last_result()
+        .line_for_node(field_ids[3])
+        .expect("fourth field should compose");
+    c.set_track_values(true);
+    c.set_visible_line_range(first_field_line, fourth_field_line);
+    c.refresh();
+
+    assert!(
+        c.value_history().contains_key(&field_ids[0]),
+        "first visible field should be tracked"
+    );
+    assert!(
+        c.value_history().contains_key(&field_ids[3]),
+        "last visible field should be tracked"
+    );
+    assert!(
+        !c.value_history().contains_key(&field_ids[8]),
+        "offscreen field should not be sampled by viewport-bounded tracking"
+    );
+}
+
 // Regression: a type change that only REFORMATS identical bytes must not
 // register as a value change. Hex64 "0x0" -> Pointer64 "nullptr" is the user's
 // exact complaint — the previous-values popup fired and the heatmap lit up even
@@ -1050,6 +1258,21 @@ fn append_single_field_grows_struct_at_tail() {
 }
 
 #[test]
+fn append_single_field_repeated_tail_appends_are_contiguous() {
+    let mut c = make_ctrl();
+    let mut last_id = find_id(&c, "field_hex");
+    let mut offsets = Vec::new();
+
+    for _ in 0..3 {
+        last_id = c.append_single_field(last_id).expect("appended");
+        let idx = c.tree().index_of_id(last_id) as usize;
+        offsets.push(c.tree().nodes[idx].offset);
+    }
+
+    assert_eq!(offsets, vec![16, 24, 32]);
+}
+
+#[test]
 fn append_single_field_walks_up_leaf_to_struct() {
     // Passing a mid-struct leaf id (field_u8) still resolves the enclosing
     // struct and appends at the struct tail.
@@ -1343,6 +1566,22 @@ fn append_hex_fields_to_struct_large_run_does_not_flood_undo_stack() {
 
     c.undo();
     assert_eq!(c.tree().nodes.len(), before_nodes);
+}
+
+#[test]
+fn append_hex_fields_to_struct_repeated_bulk_appends_are_contiguous() {
+    let mut c = make_ctrl();
+    let root_id = c.tree().nodes[0].id;
+
+    let first = c.append_hex_fields_to_struct(root_id, 0x10);
+    let second = c.append_hex_fields_to_struct(root_id, 0x10);
+    let offsets: Vec<i32> = first
+        .iter()
+        .chain(second.iter())
+        .map(|id| c.tree().nodes[c.tree().index_of_id(*id) as usize].offset)
+        .collect();
+
+    assert_eq!(offsets, vec![16, 24, 32, 40]);
 }
 
 #[test]
@@ -2376,7 +2615,7 @@ fn attach_data_file_missing_path_keeps_provider() {
 // test_refresh_speedups.cpp ports
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
 use std::sync::Mutex;
 
 const MODULE_BASE: u64 = 0;
@@ -2391,6 +2630,7 @@ struct CountingProvider {
     reads_per_page: Mutex<std::collections::HashMap<u64, i32>>,
     total_reads: AtomicI32,
     data: Mutex<Vec<u8>>,
+    unsorted_regions: bool,
 }
 impl CountingProvider {
     fn new() -> Self {
@@ -2398,6 +2638,13 @@ impl CountingProvider {
             reads_per_page: Mutex::new(std::collections::HashMap::new()),
             total_reads: AtomicI32::new(0),
             data: Mutex::new(vec![0u8; TOTAL_SIZE as usize]),
+            unsorted_regions: false,
+        }
+    }
+    fn new_unsorted_regions() -> Self {
+        CountingProvider {
+            unsorted_regions: true,
+            ..CountingProvider::new()
         }
     }
     fn reads_for(&self, page: u64) -> i32 {
@@ -2447,7 +2694,7 @@ impl Provider for CountingProvider {
         "Process".into()
     }
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
-        vec![
+        let mut regions = vec![
             MemoryRegion {
                 base: MODULE_BASE,
                 size: MODULE_SIZE,
@@ -2466,7 +2713,11 @@ impl Provider for CountingProvider {
                 module_name: String::new(),
                 region_type: RegionType::Private,
             },
-        ]
+        ];
+        if self.unsorted_regions {
+            regions.reverse();
+        }
+        regions
     }
 }
 
@@ -2567,6 +2818,22 @@ fn permanent_pages_marked_after_module_read() {
 }
 
 #[test]
+fn permanent_page_classification_handles_unsorted_regions() {
+    let mut doc = RcxDocument::new();
+    build_speedup_tree(&mut doc.tree, false, true);
+    let prov = Arc::new(CountingProvider::new_unsorted_regions());
+    doc.provider = prov;
+    let mut c = RcxController::new(doc);
+
+    let module_page = MODULE_BASE + 4096;
+    let mut pages = PageMap::new();
+    pages.insert(module_page, vec![0u8; 4096]);
+    c.on_read_complete(pages);
+
+    assert!(c.snapshot_prov().unwrap().is_permanent(module_page));
+}
+
+#[test]
 fn collapsed_pointer_skips_target() {
     let ptr_target = MODULE_BASE + 4096;
     let (mut c, prov) = setup_speedup(true, true, ptr_target);
@@ -2585,6 +2852,81 @@ fn page_stability_climbs_when_idle() {
         c.pump_refresh();
     }
     assert!(c.page_stability(heap_page) >= 1);
+}
+
+#[test]
+fn refresh_extent_cache_invalidates_after_tree_growth() {
+    let (mut c, _prov) = setup_speedup(false, true, 0);
+    assert!(c.pump_refresh());
+
+    let root_id = c.document().tree.nodes[0].id;
+    c.document_mut().tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "later_page".into(),
+        parent_id: root_id,
+        offset: 4096,
+        ..Node::default()
+    });
+
+    let plan = c.on_refresh_tick();
+    let new_page = HEAP_BASE + 4096;
+    match plan {
+        RefreshPlan::Read { pages, .. } => assert!(
+            pages.contains(&new_page),
+            "refresh plan must include page added after extent cache population"
+        ),
+        RefreshPlan::None => panic!("expected refresh read after tree growth"),
+    }
+}
+
+#[test]
+fn changed_page_refresh_marks_changed_hex_byte_indices() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0x4000;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let field = tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "bytes".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let field_id = tree.nodes[field].id;
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(BufferProvider::new(vec![0; 0x5000], "changed.bin"));
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(0x4000, vec![0u8; 4096]);
+    c.on_read_complete(initial);
+
+    let mut bytes = vec![0u8; 4096];
+    bytes[2] = 1;
+    bytes[3] = 1;
+    bytes[4] = 1;
+    let mut changed = PageMap::new();
+    changed.insert(0x4000, bytes);
+    c.on_read_complete(changed);
+
+    let lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_id)
+        .expect("hex field line");
+    assert!(lm.data_changed);
+    assert_eq!(lm.changed_byte_indices, vec![2, 3, 4]);
 }
 
 /// Mock editor whose viewport covers only the first few document lines (the
@@ -2616,6 +2958,19 @@ fn viewport_bounds_re_reads() {
     // Subsequent tick: far-end heap pages skipped.
     prov.reset_counters();
     c.pump_refresh();
+    let last_heap_page = HEAP_BASE + HEAP_SIZE - 4096;
+    assert_eq!(prov.reads_for(last_heap_page), 0);
+}
+
+#[test]
+fn explicit_visible_line_range_bounds_re_reads() {
+    let (mut c, prov) = setup_speedup(false, true, 0);
+    assert!(c.pump_refresh());
+    c.set_visible_line_range(0, 2);
+
+    prov.reset_counters();
+    c.pump_refresh();
+
     let last_heap_page = HEAP_BASE + HEAP_SIZE - 4096;
     assert_eq!(prov.reads_for(last_heap_page), 0);
 }
@@ -4259,4 +4614,100 @@ fn on_byte_selection_rows_replaces_selection_and_clears() {
         .take_events()
         .iter()
         .any(|e| *e == crate::controller::ControllerEvent::SelectionChanged(0)));
+}
+
+#[test]
+fn data_extent_handles_deep_nested_tree_without_losing_tail_extent() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let mut parent_id = tree.nodes[root].id;
+    for i in 0..2048 {
+        let idx = tree.add_node(Node {
+            kind: if i == 2047 {
+                NodeKind::Hex64
+            } else {
+                NodeKind::Struct
+            },
+            name: format!("nested_{i}"),
+            parent_id,
+            offset: 8,
+            collapsed: false,
+            ..Node::default()
+        });
+        parent_id = tree.nodes[idx].id;
+    }
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(BufferProvider::new(vec![0; 32], "deep.bin"));
+    let controller = RcxController::new(doc);
+
+    assert_eq!(controller.data_extent(), 2048 * 8 + 8);
+}
+
+#[test]
+fn data_extent_counts_empty_embedded_ref_span() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+
+    let target_idx = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Target".into(),
+        name: "target".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let target_id = tree.nodes[target_idx].id;
+    tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "a".into(),
+        parent_id: target_id,
+        offset: 0,
+        ..Node::default()
+    });
+    tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "b".into(),
+        parent_id: target_id,
+        offset: 8,
+        ..Node::default()
+    });
+
+    let root_idx = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root_idx].id;
+    tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "embedded".into(),
+        parent_id: root_id,
+        offset: 32,
+        ref_id: target_id,
+        collapsed: false,
+        ..Node::default()
+    });
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(BufferProvider::new(vec![0; 32], "embedded.bin"));
+    let controller = RcxController::new(doc);
+
+    assert_eq!(controller.data_extent(), 48);
 }

@@ -12,9 +12,8 @@
 //!   pure + unit-tested.
 //! - [`ModuleRow`] — one module's display strings (name, base, size), built from
 //!   a [`ModuleEntry`](crate::provider::ModuleEntry); pure + unit-tested.
-//! - [`build_module_rows`] — map the active provider's
-//!   [`enumerate_modules`](crate::provider::Provider::enumerate_modules) into the
-//!   display rows (sorted by base address), pure + unit-tested.
+//! - [`build_module_rows`] — map a provider module snapshot into display rows
+//!   (sorted by base address), pure + unit-tested.
 //! - [`ModulesPanel`] (gated on `ui`) — the Zed-styled gpui-component
 //!   [`Panel`](gpui_component::dock::Panel): a header with the tab strip + the
 //!   Download All button, over the (virtualization-free, list-sized) module
@@ -246,13 +245,15 @@ mod view {
     ///
     /// Owns the selected [`ModulesTab`] and the currently-attached
     /// [`Provider`] (the active tab's source — set via
-    /// [`set_provider`](ModulesPanel::set_provider)); the module rows are derived
-    /// from the provider on render. Mirrors [`WorkspacePanel`] /
-    /// [`ScannerPanel`]'s `view(window, cx) -> Entity<Self>` + `impl Panel`
-    /// structure.
+    /// [`set_provider`](ModulesPanel::set_provider)); the module rows are refreshed
+    /// explicitly on provider attach or from the header refresh action so rendering
+    /// does not walk a live process's module list every paint. Mirrors
+    /// [`WorkspacePanel`] / [`ScannerPanel`]'s `view(window, cx) -> Entity<Self>` +
+    /// `impl Panel` structure.
     pub struct ModulesPanel {
         tab: ModulesTab,
         provider: Option<Arc<dyn Provider + Send + Sync>>,
+        module_rows: Vec<ModuleRow>,
         focus_handle: FocusHandle,
     }
 
@@ -262,6 +263,7 @@ mod view {
             ModulesPanel {
                 tab: ModulesTab::Modules,
                 provider: None,
+                module_rows: Vec::new(),
                 focus_handle: cx.focus_handle(),
             }
         }
@@ -277,6 +279,7 @@ mod view {
         /// the module list reads from this source.
         pub fn set_provider(&mut self, provider: Option<Arc<dyn Provider + Send + Sync>>) {
             self.provider = provider;
+            self.refresh_module_rows();
         }
 
         /// The currently-selected tab (for tests / external wiring).
@@ -290,30 +293,37 @@ mod view {
             cx.notify();
         }
 
+        fn refresh_module_rows(&mut self) {
+            self.module_rows = match &self.provider {
+                Some(provider) => build_module_rows(&provider.enumerate_modules()),
+                None => Vec::new(),
+            };
+        }
+
+        fn refresh_module_rows_notify(&mut self, cx: &mut Context<Self>) {
+            self.refresh_module_rows();
+            cx.notify();
+        }
+
         /// The module rows for the active source (empty without a provider).
         /// Each row carries a symbol-loaded indicator computed from the global
         /// [`SymbolStore`] (the C++ "✓ N syms" badge).
+        #[cfg(not(feature = "symbols"))]
+        fn rows(&self) -> &[ModuleRow] {
+            &self.module_rows
+        }
+
+        #[cfg(feature = "symbols")]
         fn rows(&self) -> Vec<ModuleRow> {
-            let rows = match &self.provider {
-                Some(p) => build_module_rows(&p.enumerate_modules()),
-                None => Vec::new(),
-            };
-            #[cfg(feature = "symbols")]
-            {
-                let mut rows = rows;
-                if let Ok(store) = SymbolStore::global().lock() {
-                    for r in &mut rows {
-                        if let Some(set) = store.module_data(&r.name) {
-                            r.symbol_count = set.name_to_rva.len();
-                        }
+            let mut rows = self.module_rows.clone();
+            if let Ok(store) = SymbolStore::global().lock() {
+                for r in &mut rows {
+                    if let Some(set) = store.module_data(&r.name) {
+                        r.symbol_count = set.name_to_rva.len();
                     }
                 }
-                rows
             }
-            #[cfg(not(feature = "symbols"))]
-            {
-                rows
-            }
+            rows
         }
 
         /// The resolved-symbol rows for the Symbols tab — every `(name, rva)` of
@@ -412,6 +422,7 @@ mod view {
             let body: AnyElement = match cur {
                 ModulesTab::Modules => {
                     let rows = self.rows();
+                    let rows: &[ModuleRow] = rows.as_ref();
                     if rows.is_empty() {
                         empty_state(cur.empty_caption(), cx).into_any_element()
                     } else {
@@ -470,6 +481,12 @@ mod view {
                 // ── Download All action ──
                 .child({
                     let view = cx.entity();
+                    refresh_modules_button(cx).on_click(move |_e, _w, cx| {
+                        view.update(cx, |this, cx| this.refresh_module_rows_notify(cx));
+                    })
+                })
+                .child({
+                    let view = cx.entity();
                     download_all_button(cx).on_click(move |_e, _w, cx| {
                         view.update(cx, |_this, cx| cx.emit(ModuleAction::DownloadAll));
                     })
@@ -521,20 +538,32 @@ mod view {
             .child("Download All")
     }
 
+    fn refresh_modules_button(cx: &App) -> Stateful<Div> {
+        div()
+            .id("rcx-modules-refresh")
+            .flex_none()
+            .size(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(tokens::radius::MD))
+            .text_color(color::text_muted(cx))
+            .hover(|s| s.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
+            .tooltip(|window, cx| Tooltip::new("Refresh modules").build(window, cx))
+            .child(icon::refresh().with_size(px(12.0)))
+    }
+
     /// The module list — one row per loaded module (name + size + base +
     /// symbol-loaded indicator). Not virtualized: a source's module count is
     /// small enough to render directly. Each row double-clicks to activate
     /// (set base + load PDB).
-    fn module_list(
-        view: &Entity<ModulesPanel>,
-        rows: Vec<ModuleRow>,
-        cx: &App,
-    ) -> impl IntoElement {
-        crate::ui::design::panel_list("rcx-modules-list").children(
-            rows.into_iter()
-                .enumerate()
-                .map(|(ix, row)| module_row(view, ix, row, cx)),
-        )
+    fn module_list(view: &Entity<ModulesPanel>, rows: &[ModuleRow], cx: &App) -> impl IntoElement {
+        let children: Vec<AnyElement> = rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| module_row(view, ix, row, cx).into_any_element())
+            .collect();
+        crate::ui::design::panel_list("rcx-modules-list").children(children)
     }
 
     /// One module row: a leading source glyph, the truncating module name, a
@@ -544,7 +573,7 @@ mod view {
     fn module_row(
         view: &Entity<ModulesPanel>,
         ix: usize,
-        row: ModuleRow,
+        row: &ModuleRow,
         cx: &App,
     ) -> impl IntoElement {
         use gpui_component::ActiveTheme as _;
@@ -587,7 +616,7 @@ mod view {
                     .truncate()
                     .text_size(px(tokens::font::UI_MD))
                     .text_color(color::text(cx))
-                    .child(SharedString::from(row.name)),
+                    .child(SharedString::from(row.name.clone())),
             )
             // ✓ N syms indicator (the C++ symbol-loaded badge).
             .when(row.symbol_count > 0, |r| {
@@ -607,7 +636,7 @@ mod view {
                         .font_family(tokens::font::mono_family())
                         .text_size(px(tokens::font::UI_XS))
                         .text_color(color::text_muted(cx))
-                        .child(SharedString::from(row.size_text)),
+                        .child(SharedString::from(row.size_text.clone())),
                 )
             })
             .child(
@@ -616,7 +645,7 @@ mod view {
                     .font_family(tokens::font::mono_family())
                     .text_size(px(tokens::font::UI_XS))
                     .text_color(color::syntax_address(cx))
-                    .child(SharedString::from(row.base_text)),
+                    .child(SharedString::from(row.base_text.clone())),
             )
     }
 

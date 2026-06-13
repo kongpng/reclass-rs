@@ -256,7 +256,7 @@ impl StatusInfo {
         };
 
         // Direct members (the C++ "N fields" count) + total footprint.
-        let fields = tree.children_of(node.id).len();
+        let fields = tree.child_count(node.id);
         let size = tree.total_byte_size(node);
         let plural = if fields == 1 { "field" } else { "fields" };
         let info = format!("{fields} {plural} \u{00B7} 0x{size:X} bytes");

@@ -11,7 +11,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::plugin::contract::ProcessInfo;
-use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
+use crate::provider::{
+    read_pages_in_runs, MemoryRegion, ModuleEntry, ModuleLookup, PageMap, Provider, RegionType,
+};
 
 use memflow::cglue::CTup3;
 use memflow::prelude::v1::*;
@@ -239,6 +241,7 @@ pub struct MemflowProvider {
     process_name: String,
     pointer_size: i32,
     base: u64,
+    module_lookup: ModuleLookup,
 }
 
 impl MemflowProvider {
@@ -257,6 +260,7 @@ impl MemflowProvider {
             .ok()
             .map(|module| address_to_u64(module.base))
             .unwrap_or(0);
+        let module_lookup = ModuleLookup::new(enumerate_memflow_modules(&mut process));
 
         Ok(Self {
             config,
@@ -265,6 +269,7 @@ impl MemflowProvider {
             process_name,
             pointer_size,
             base,
+            module_lookup,
         })
     }
 
@@ -290,6 +295,17 @@ impl Provider for MemflowProvider {
                 .read_raw_into(Address::from(addr), buf)
                 .data_part()
                 .is_ok()
+        })
+    }
+
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        self.with_process(PageMap::new(), |process| {
+            read_pages_in_runs(pages, |addr, buf| {
+                process
+                    .read_raw_into(Address::from(addr), buf)
+                    .data_part()
+                    .is_ok()
+            })
         })
     }
 
@@ -328,6 +344,10 @@ impl Provider for MemflowProvider {
         true
     }
 
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> String {
         "Process".to_string()
     }
@@ -341,30 +361,11 @@ impl Provider for MemflowProvider {
     }
 
     fn get_symbol(&self, addr: u64) -> String {
-        self.enumerate_modules()
-            .into_iter()
-            .find(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
-            .map(|m| format!("{}+0x{:X}", m.name, addr.saturating_sub(m.base)))
-            .unwrap_or_default()
+        self.module_lookup.symbol_for_addr_upper(addr)
     }
 
     fn symbol_to_address(&self, name: &str) -> u64 {
-        let wanted = name.trim().trim_matches('<').trim_matches('>');
-        if wanted.is_empty() {
-            return 0;
-        }
-        self.enumerate_modules()
-            .into_iter()
-            .find(|m| {
-                m.name.eq_ignore_ascii_case(wanted)
-                    || m.full_path.eq_ignore_ascii_case(wanted)
-                    || Path::new(&m.full_path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|file| file.eq_ignore_ascii_case(wanted))
-            })
-            .map(|m| m.base)
-            .unwrap_or(0)
+        self.module_lookup.symbol_to_address(name)
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
@@ -385,25 +386,31 @@ impl Provider for MemflowProvider {
         })
     }
 
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        true
+    }
+
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
-        self.with_process(Vec::new(), |process| {
-            process
-                .module_list()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|module| ModuleEntry {
-                    name: module.name.as_ref().to_string(),
-                    full_path: module.path.as_ref().to_string(),
-                    base: address_to_u64(module.base),
-                    size: module.size as u64,
-                })
-                .collect()
-        })
+        self.module_lookup.clone_modules()
     }
 
     fn is_readable(&self, _addr: u64, len: i32) -> bool {
         len >= 0
     }
+}
+
+fn enumerate_memflow_modules(process: &mut IntoProcessInstanceArcBox<'static>) -> Vec<ModuleEntry> {
+    process
+        .module_list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|module| ModuleEntry {
+            name: module.name.as_ref().to_string(),
+            full_path: module.path.as_ref().to_string(),
+            base: address_to_u64(module.base),
+            size: module.size as u64,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -456,5 +463,31 @@ mod tests {
         let (connectors, os_layers) = cfg.os_chain_steps();
         assert_eq!(connectors, ["qemu:vm:memmap=map"]);
         assert_eq!(os_layers, ["win32::dtb=0x1234"]);
+    }
+
+    #[test]
+    fn module_lookup_indexes_address_name_path_and_file_name() {
+        let modules = vec![
+            ModuleEntry {
+                name: "Second.dll".to_string(),
+                full_path: r"C:\Game\Second.dll".to_string(),
+                base: 0x3000,
+                size: 0x1000,
+            },
+            ModuleEntry {
+                name: "FirstModule".to_string(),
+                full_path: r"C:\Game\Bin\First.dll".to_string(),
+                base: 0x1000,
+                size: 0x1000,
+            },
+        ];
+        let lookup = ModuleLookup::new(modules);
+
+        assert_eq!(lookup.find_by_addr(0x1004).unwrap().name, "FirstModule");
+        assert!(lookup.find_by_addr(0x2000).is_none());
+        assert_eq!(lookup.symbol_to_address("firstmodule"), 0x1000);
+        assert_eq!(lookup.symbol_to_address("first.dll"), 0x1000);
+        assert_eq!(lookup.symbol_to_address(r"c:\game\bin\first.dll"), 0x1000);
+        assert_eq!(lookup.symbol_to_address("second.dll"), 0x3000);
     }
 }

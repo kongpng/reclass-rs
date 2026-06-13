@@ -3,12 +3,14 @@
 //!
 //! Faithful port of `src/core.h:408-863` plus the two out-of-line normalizers
 //! from `src/compose.cpp:1747-1784`. The `mutable` C++ id/child caches become
-//! `RefCell<HashMap<…>>` (interior mutability inside `&self` methods); the
+//! `RefCell<AHashMap<…>>` (interior mutability inside `&self` methods); the
 //! invalidation timing is preserved because tests mutate `parent_id` directly
 //! then call `invalidate_id_cache()`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use ahash::{AHashMap, AHashSet};
 
 use serde_json::{json, Map, Value};
 
@@ -67,9 +69,16 @@ pub struct NodeTree {
     next_evidence_event_id: u64,
     next_evidence_hypothesis_id: u64,
     next_evidence_proposal_id: u64,
-    id_cache: RefCell<HashMap<u64, i32>>,
-    child_cache: RefCell<HashMap<u64, Vec<usize>>>,
+    id_cache: RefCell<AHashMap<u64, i32>>,
+    child_cache: RefCell<AHashMap<u64, Vec<usize>>>,
+    span_cache: RefCell<SpanCache>,
     generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct SpanCache {
+    generation: u64,
+    spans: AHashMap<u64, i32>,
 }
 
 impl Default for NodeTree {
@@ -88,8 +97,9 @@ impl Default for NodeTree {
             next_evidence_event_id: 1,
             next_evidence_hypothesis_id: 1,
             next_evidence_proposal_id: 1,
-            id_cache: RefCell::new(HashMap::new()),
-            child_cache: RefCell::new(HashMap::new()),
+            id_cache: RefCell::new(AHashMap::new()),
+            child_cache: RefCell::new(AHashMap::new()),
+            span_cache: RefCell::new(SpanCache::default()),
             generation: 1,
         }
     }
@@ -112,8 +122,9 @@ impl Clone for NodeTree {
             next_evidence_hypothesis_id: self.next_evidence_hypothesis_id,
             next_evidence_proposal_id: self.next_evidence_proposal_id,
             // caches are an optimization, not semantics — clone empty.
-            id_cache: RefCell::new(HashMap::new()),
-            child_cache: RefCell::new(HashMap::new()),
+            id_cache: RefCell::new(AHashMap::new()),
+            child_cache: RefCell::new(AHashMap::new()),
+            span_cache: RefCell::new(SpanCache::default()),
             generation: self.generation,
         }
     }
@@ -281,30 +292,31 @@ impl NodeTree {
     pub fn invalidate_id_cache(&self) {
         self.id_cache.borrow_mut().clear();
         self.child_cache.borrow_mut().clear();
+        self.span_cache.borrow_mut().spans.clear();
     }
 
-    fn ensure_id_cache(&self) {
+    fn ensure_child_cache(&self) {
+        if self.nodes.is_empty() || !self.child_cache.borrow().is_empty() {
+            return;
+        }
+        let mut cc = self.child_cache.borrow_mut();
+        if !cc.is_empty() {
+            return;
+        }
+        for (i, n) in self.nodes.iter().enumerate() {
+            cc.entry(n.parent_id).or_default().push(i);
+        }
+    }
+
+    /// `int indexOfId(uint64_t) const` (`core.h:594-600`) — **-1 on miss**.
+    pub fn index_of_id(&self, id: u64) -> i32 {
         let mut idc = self.id_cache.borrow_mut();
         if idc.is_empty() && !self.nodes.is_empty() {
             for (i, n) in self.nodes.iter().enumerate() {
                 idc.insert(n.id, i as i32);
             }
         }
-    }
-
-    fn ensure_child_cache(&self) {
-        let mut cc = self.child_cache.borrow_mut();
-        if cc.is_empty() && !self.nodes.is_empty() {
-            for (i, n) in self.nodes.iter().enumerate() {
-                cc.entry(n.parent_id).or_default().push(i);
-            }
-        }
-    }
-
-    /// `int indexOfId(uint64_t) const` (`core.h:594-600`) — **-1 on miss**.
-    pub fn index_of_id(&self, id: u64) -> i32 {
-        self.ensure_id_cache();
-        *self.id_cache.borrow().get(&id).unwrap_or(&-1)
+        *idc.get(&id).unwrap_or(&-1)
     }
 
     /// `QVector<int> childrenOf(uint64_t) const` (`core.h:602-608`).
@@ -317,6 +329,31 @@ impl NodeTree {
             .unwrap_or_default()
     }
 
+    pub fn with_children<R>(&self, parent_id: u64, f: impl FnOnce(&[usize]) -> R) -> R {
+        self.ensure_child_cache();
+        let child_cache = self.child_cache.borrow();
+        match child_cache.get(&parent_id) {
+            Some(children) => f(children),
+            None => f(&[]),
+        }
+    }
+
+    pub fn child_count(&self, parent_id: u64) -> usize {
+        self.ensure_child_cache();
+        self.child_cache
+            .borrow()
+            .get(&parent_id)
+            .map_or(0, Vec::len)
+    }
+
+    pub fn has_children(&self, parent_id: u64) -> bool {
+        self.ensure_child_cache();
+        self.child_cache
+            .borrow()
+            .get(&parent_id)
+            .is_some_and(|children| !children.is_empty())
+    }
+
     /// `ValidateReport validate(bool repair)` (`core.h:468-516`).
     pub fn validate(&mut self, repair: bool) -> ValidateReport {
         let mut r = ValidateReport::default();
@@ -326,7 +363,7 @@ impl NodeTree {
 
         // Pass 1 — dedup ids.
         {
-            let mut seen: HashMap<u64, usize> = HashMap::new();
+            let mut seen: AHashMap<u64, usize> = AHashMap::new();
             for i in 0..self.nodes.len() {
                 if self.nodes[i].id == 0 || seen.contains_key(&self.nodes[i].id) {
                     r.duplicates += 1;
@@ -357,7 +394,7 @@ impl NodeTree {
 
         // Pass 3 — cycles.
         for i in 0..self.nodes.len() {
-            let mut visited: HashSet<u64> = HashSet::new();
+            let mut visited: AHashSet<u64> = AHashSet::new();
             let mut cur = i as i32;
             while cur >= 0 && (cur as usize) < self.nodes.len() {
                 let nid = self.nodes[cur as usize].id;
@@ -387,7 +424,7 @@ impl NodeTree {
         }
 
         // Local child map (this is a `const` method — no cache side effect).
-        let mut child_map: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut child_map: AHashMap<u64, Vec<usize>> = AHashMap::new();
         for (i, n) in self.nodes.iter().enumerate() {
             child_map.entry(n.parent_id).or_default().push(i);
         }
@@ -480,7 +517,7 @@ impl NodeTree {
     /// `QString fieldPath(id, sep)` (`core.h:653-668`).
     pub fn field_path(&self, id: u64, sep: char) -> String {
         let mut parts: Vec<String> = Vec::new();
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: AHashSet<u64> = AHashSet::new();
         let mut cur = id;
         while cur != 0 && !seen.contains(&cur) {
             seen.insert(cur);
@@ -514,7 +551,7 @@ impl NodeTree {
         self.ensure_child_cache();
         let child_map = self.child_cache.borrow();
         let mut result = vec![idx as usize];
-        let mut visited: HashSet<u64> = HashSet::new();
+        let mut visited: AHashSet<u64> = AHashSet::new();
         visited.insert(node_id);
         let mut stack = vec![node_id];
         while let Some(pid) = stack.pop() {
@@ -535,7 +572,7 @@ impl NodeTree {
     /// `int depthOf(int idx) const` (`core.h:701-714`).
     pub fn depth_of(&self, idx: i32) -> i32 {
         let mut d = 0;
-        let mut visited: HashSet<u64> = HashSet::new();
+        let mut visited: AHashSet<u64> = AHashSet::new();
         let mut cur = idx;
         while cur >= 0
             && (cur as usize) < self.nodes.len()
@@ -558,7 +595,7 @@ impl NodeTree {
     /// `int64_t computeOffset(int idx) const` (`core.h:723-736`) — can be negative.
     pub fn compute_offset(&self, idx: i32) -> i64 {
         let mut total: i64 = 0;
-        let mut visited: HashSet<u64> = HashSet::new();
+        let mut visited: AHashSet<u64> = AHashSet::new();
         let mut cur = idx;
         while cur >= 0 && (cur as usize) < self.nodes.len() {
             let nid = self.nodes[cur as usize].id;
@@ -588,11 +625,21 @@ impl NodeTree {
 
     /// `int structSpan(...)` (`core.h:752-787`) — recursive, cycle-safe.
     pub fn struct_span(&self, struct_id: u64) -> i32 {
-        let mut visited: HashSet<u64> = HashSet::new();
+        {
+            let mut cache = self.span_cache.borrow_mut();
+            if cache.generation != self.generation {
+                cache.generation = self.generation;
+                cache.spans.clear();
+            } else if let Some(span) = cache.spans.get(&struct_id) {
+                return *span;
+            }
+        }
+
+        let mut visited: AHashSet<u64> = AHashSet::new();
         self.struct_span_inner(struct_id, &mut visited, 0)
     }
 
-    fn struct_span_inner(&self, struct_id: u64, visited: &mut HashSet<u64>, depth: i32) -> i32 {
+    fn struct_span_inner(&self, struct_id: u64, visited: &mut AHashSet<u64>, depth: i32) -> i32 {
         // `visited` stops true cycles; the depth bound stops a crafted document's
         // deep *distinct* nesting (a flat node array forming a thousands-deep
         // parent/ref chain) from overflowing the stack here — the same class of
@@ -600,6 +647,9 @@ impl NodeTree {
         const MAX_STRUCT_SPAN_DEPTH: i32 = 256;
         if depth > MAX_STRUCT_SPAN_DEPTH || visited.contains(&struct_id) {
             return 0; // cycle or pathological depth.
+        }
+        if let Some(span) = self.span_cache.borrow().spans.get(&struct_id) {
+            return *span;
         }
         visited.insert(struct_id);
 
@@ -612,6 +662,10 @@ impl NodeTree {
 
         // Short-circuit: leaf with no children to walk.
         if !is_container_kind(node.kind) && node.ref_id == 0 {
+            self.span_cache
+                .borrow_mut()
+                .spans
+                .insert(struct_id, declared_size);
             return declared_size;
         }
 
@@ -636,7 +690,9 @@ impl NodeTree {
             max_end = max_end.max(self.struct_span_inner(node.ref_id, visited, depth + 1));
         }
 
-        declared_size.max(max_end)
+        let span = declared_size.max(max_end);
+        self.span_cache.borrow_mut().spans.insert(struct_id, span);
+        span
     }
 
     /// Container-aware footprint (`Node::totalByteSize`, `core.h:841-845`).
@@ -654,7 +710,7 @@ impl NodeTree {
         let mut out = HashSet::new();
         for &id in ids {
             let mut has_selected_ancestor = false;
-            let mut visited: HashSet<u64> = HashSet::new();
+            let mut visited: AHashSet<u64> = AHashSet::new();
             let idx = self.index_of_id(id);
             if idx < 0 {
                 continue;
@@ -937,6 +993,30 @@ mod tests {
     }
 
     #[test]
+    fn has_children_uses_incremental_child_cache() {
+        let mut t = NodeTree::new();
+        let parent_idx = t.add_node(Node {
+            kind: NodeKind::Struct,
+            ..Node::default()
+        });
+        let parent_id = t.nodes[parent_idx].id;
+
+        assert!(!t.has_children(parent_id));
+        assert!(t.children_of(parent_id).is_empty());
+        assert_eq!(t.child_count(parent_id), 0);
+        assert_eq!(t.with_children(parent_id, |children| children.len()), 0);
+
+        let child_idx = t.add_node(child(parent_id, NodeKind::UInt32, 0));
+        assert!(t.has_children(parent_id));
+        assert_eq!(t.child_count(parent_id), 1);
+        assert_eq!(
+            t.with_children(parent_id, |children| children.to_vec()),
+            vec![child_idx]
+        );
+        assert_eq!(t.children_of(parent_id), vec![child_idx]);
+    }
+
+    #[test]
     fn struct_span_nested() {
         let mut t = NodeTree::new();
         let s = t.add_node(Node {
@@ -947,6 +1027,26 @@ mod tests {
         t.add_node(child(sid, NodeKind::UInt32, 0));
         t.add_node(child(sid, NodeKind::UInt64, 4));
         assert_eq!(t.struct_span(sid), 12);
+    }
+
+    #[test]
+    fn struct_span_cache_tracks_generation_and_manual_invalidation() {
+        let mut t = NodeTree::new();
+        let s = t.add_node(Node {
+            kind: NodeKind::Struct,
+            ..Node::default()
+        });
+        let sid = t.nodes[s].id;
+        let first = t.add_node(child(sid, NodeKind::UInt32, 0));
+        assert_eq!(t.struct_span(sid), 4);
+        assert_eq!(t.struct_span(sid), 4);
+
+        t.add_node(child(sid, NodeKind::UInt64, 8));
+        assert_eq!(t.struct_span(sid), 16);
+
+        t.nodes[first].offset = 32;
+        t.invalidate_id_cache();
+        assert_eq!(t.struct_span(sid), 36);
     }
 
     #[test]

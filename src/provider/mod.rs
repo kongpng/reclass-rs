@@ -9,6 +9,9 @@
 //! [`SnapshotProvider`], first-party live providers behind `native-providers`,
 //! and the connector-backed memflow provider.
 
+use ahash::AHashMap;
+use std::fmt::Write as _;
+
 mod buffer;
 mod file;
 #[cfg(feature = "kernel-provider")]
@@ -19,6 +22,7 @@ pub mod native;
 mod null;
 #[cfg(feature = "process-provider")]
 mod process;
+mod read_cache;
 mod registry;
 #[cfg(feature = "remote-process-provider")]
 mod remote;
@@ -34,13 +38,121 @@ pub use kernel::{KernelMemoryProvider, KernelTarget};
 pub use memflow::{MemflowAttachConfig, MemflowProvider};
 pub use null::NullProvider;
 #[cfg(feature = "process-provider")]
-pub use process::{LocalProcessProvider, ProcessTarget};
+pub use process::{bench_readable_ranges_from_regions, LocalProcessProvider, ProcessTarget};
+pub use read_cache::CachedPageProvider;
 pub use registry::{ProviderInfo, ProviderRegistry, SavedSourceDisplay};
 #[cfg(feature = "remote-process-provider")]
 pub use remote::{RemoteProcessProvider, RemoteProcessTarget};
 pub use snapshot::{PageMap, SnapshotProvider, K_PAGE_SIZE};
 #[cfg(feature = "windbg-provider")]
 pub use windbg::WinDbgMemoryProvider;
+
+pub(crate) const K_MAX_BULK_READ_PAGES: usize = 64;
+
+pub(crate) enum NormalizedPages<'a> {
+    Borrowed(&'a [u64]),
+    Owned(Vec<u64>),
+}
+
+impl<'a> NormalizedPages<'a> {
+    pub(crate) fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Borrowed(pages) => pages,
+            Self::Owned(pages) => pages,
+        }
+    }
+}
+
+pub(crate) fn normalize_page_list(pages: &[u64]) -> NormalizedPages<'_> {
+    let mut previous = None;
+    let already_normalized = pages.iter().copied().all(|page| {
+        if page & (K_PAGE_SIZE - 1) != 0 {
+            return false;
+        }
+        if previous.is_some_and(|prev| page <= prev) {
+            return false;
+        }
+        previous = Some(page);
+        true
+    });
+    if already_normalized {
+        return NormalizedPages::Borrowed(pages);
+    }
+
+    let mut sorted_pages: Vec<u64> = pages.iter().map(|page| page & !(K_PAGE_SIZE - 1)).collect();
+    sorted_pages.sort_unstable();
+    sorted_pages.dedup();
+    NormalizedPages::Owned(sorted_pages)
+}
+
+#[allow(dead_code)]
+pub(crate) fn read_pages_in_runs(
+    pages: &[u64],
+    mut read: impl FnMut(u64, &mut [u8]) -> bool,
+) -> PageMap {
+    let mut out = PageMap::new();
+    if pages.is_empty() {
+        return out;
+    }
+
+    let normalized_pages = normalize_page_list(pages);
+    let pages = normalized_pages.as_slice();
+    out.reserve(pages.len());
+
+    let mut run_start = 0usize;
+    while run_start < pages.len() {
+        let mut run_end = run_start + 1;
+        while run_end < pages.len()
+            && run_end - run_start < K_MAX_BULK_READ_PAGES
+            && pages[run_end - 1]
+                .checked_add(K_PAGE_SIZE)
+                .is_some_and(|next| next == pages[run_end])
+        {
+            run_end += 1;
+        }
+        read_page_run(&pages[run_start..run_end], &mut read, &mut out);
+        run_start = run_end;
+    }
+
+    out
+}
+
+#[allow(dead_code)]
+fn read_page_run(pages: &[u64], read: &mut impl FnMut(u64, &mut [u8]) -> bool, out: &mut PageMap) {
+    if pages.is_empty() {
+        return;
+    }
+    if pages.len() == 1 {
+        read_single_page(pages[0], read, out);
+        return;
+    }
+
+    let run_len = pages.len() * K_PAGE_SIZE as usize;
+    let mut bytes = vec![0u8; run_len];
+    if read(pages[0], &mut bytes) {
+        for (idx, &page_addr) in pages.iter().enumerate() {
+            let start = idx * K_PAGE_SIZE as usize;
+            let end = start + K_PAGE_SIZE as usize;
+            out.insert(page_addr, bytes[start..end].to_vec());
+        }
+        return;
+    }
+
+    for &page_addr in pages {
+        read_single_page(page_addr, read, out);
+    }
+}
+
+#[allow(dead_code)]
+fn read_single_page(
+    page_addr: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+    out: &mut PageMap,
+) {
+    let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+    let _ = read(page_addr, &mut bytes);
+    out.insert(page_addr, bytes);
+}
 
 /// `enum class RegionType : uint8_t` (`provider.h:13-17`).
 #[repr(u8)]
@@ -111,6 +223,172 @@ pub struct ModuleEntry {
     pub size: u64,
 }
 
+/// Indexed module snapshot for live providers.
+///
+/// Process providers usually snapshot modules once at attach time, then resolve
+/// many per-row addresses during compose/hover formatting. A sorted range index
+/// turns those point lookups from linear scans into binary searches while a small
+/// lowercase map handles reverse lookup by module name, path, or basename.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleLookup {
+    modules: Vec<ModuleEntry>,
+    range_order: ModuleLookupOrder,
+    name_to_base: AHashMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModuleRange {
+    base: u64,
+    end: u64,
+    module_idx: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+enum ModuleLookupOrder {
+    #[default]
+    Input,
+    Sorted(Vec<ModuleRange>),
+    Linear,
+}
+
+impl ModuleLookup {
+    pub fn new(modules: Vec<ModuleEntry>) -> Self {
+        let range_order = module_lookup_order(&modules);
+
+        let mut name_to_base = AHashMap::with_capacity(modules.len() * 3);
+        for module in &modules {
+            insert_module_lookup_key(&mut name_to_base, &module.name, module.base);
+            insert_module_lookup_key(&mut name_to_base, &module.full_path, module.base);
+            insert_module_lookup_key(
+                &mut name_to_base,
+                module_file_name(&module.full_path),
+                module.base,
+            );
+        }
+
+        Self {
+            modules,
+            range_order,
+            name_to_base,
+        }
+    }
+
+    pub fn modules(&self) -> &[ModuleEntry] {
+        &self.modules
+    }
+
+    pub fn clone_modules(&self) -> Vec<ModuleEntry> {
+        self.modules.clone()
+    }
+
+    pub fn find_by_addr(&self, addr: u64) -> Option<&ModuleEntry> {
+        match &self.range_order {
+            ModuleLookupOrder::Input => {
+                let idx = self.modules.partition_point(|module| module.base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| self.modules.get(i))
+                    .filter(|module| module_contains_addr(module, addr))
+            }
+            ModuleLookupOrder::Sorted(sorted_ranges) => {
+                let idx = sorted_ranges.partition_point(|range| range.base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| sorted_ranges.get(i))
+                    .filter(|range| addr < range.end)
+                    .and_then(|range| self.modules.get(range.module_idx))
+            }
+            ModuleLookupOrder::Linear => self
+                .modules
+                .iter()
+                .find(|module| module_contains_addr(module, addr)),
+        }
+    }
+
+    pub fn symbol_for_addr_lower(&self, addr: u64) -> String {
+        self.symbol_for_addr(addr, false)
+    }
+
+    pub fn symbol_for_addr_upper(&self, addr: u64) -> String {
+        self.symbol_for_addr(addr, true)
+    }
+
+    fn symbol_for_addr(&self, addr: u64, uppercase: bool) -> String {
+        let Some(module) = self.find_by_addr(addr) else {
+            return String::new();
+        };
+        let rel = addr.saturating_sub(module.base);
+        let mut out = String::with_capacity(module.name.len() + 3 + 16);
+        out.push_str(&module.name);
+        out.push_str("+0x");
+        if uppercase {
+            let _ = write!(out, "{rel:X}");
+        } else {
+            let _ = write!(out, "{rel:x}");
+        }
+        out
+    }
+
+    pub fn symbol_to_address(&self, name: &str) -> u64 {
+        let wanted = name.trim().trim_matches('<').trim_matches('>');
+        if wanted.is_empty() {
+            return 0;
+        }
+        self.name_to_base
+            .get(&wanted.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+fn module_lookup_order(modules: &[ModuleEntry]) -> ModuleLookupOrder {
+    if modules_non_overlapping_in_order(modules) {
+        return ModuleLookupOrder::Input;
+    }
+
+    let mut sorted_ranges: Vec<_> = modules
+        .iter()
+        .enumerate()
+        .map(|(idx, module)| ModuleRange {
+            base: module.base,
+            end: module.base.saturating_add(module.size),
+            module_idx: idx,
+        })
+        .collect();
+    sorted_ranges.sort_unstable_by_key(|range| range.base);
+    if sorted_ranges
+        .windows(2)
+        .all(|pair| pair[0].end <= pair[1].base)
+    {
+        ModuleLookupOrder::Sorted(sorted_ranges)
+    } else {
+        ModuleLookupOrder::Linear
+    }
+}
+
+fn modules_non_overlapping_in_order(modules: &[ModuleEntry]) -> bool {
+    modules.windows(2).all(|pair| {
+        let left_end = pair[0].base.saturating_add(pair[0].size);
+        left_end <= pair[1].base
+    })
+}
+
+fn insert_module_lookup_key(name_to_base: &mut AHashMap<String, u64>, key: &str, base: u64) {
+    let key = key.trim();
+    if !key.is_empty() {
+        name_to_base.entry(key.to_ascii_lowercase()).or_insert(base);
+    }
+}
+
+fn module_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn module_contains_addr(module: &ModuleEntry, addr: u64) -> bool {
+    addr >= module.base
+        && addr
+            .checked_sub(module.base)
+            .is_some_and(|rel| rel < module.size)
+}
+
 /// `class Provider` (`provider.h:38-153`) — the abstract data source.
 ///
 /// Implementors MUST provide [`read`](Provider::read) and
@@ -145,6 +423,12 @@ pub trait Provider {
     fn is_live(&self) -> bool {
         false
     }
+    /// Scanner rescans can either read page-spaced hits individually or coalesce
+    /// them into larger spans. High-call-overhead live providers override this;
+    /// cheap in-memory/file providers keep the sparse tiny-read path.
+    fn prefers_coalesced_rescan_reads(&self) -> bool {
+        false
+    }
     /// Category tag for the command-row Source span ("File" / "Process" / …).
     fn kind(&self) -> String {
         "File".to_string()
@@ -168,6 +452,12 @@ pub trait Provider {
     /// Enumerate committed/readable memory regions.
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         Vec::new()
+    }
+    /// True when a readable entry from `enumerate_regions()` is authoritative
+    /// enough for UI preview/link decisions. Live process providers can avoid
+    /// an extra one-byte target probe per visible pointer hint.
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        false
     }
     /// Process Environment Block address (live process only). 0 if unavailable.
     fn peb(&self) -> u64 {
@@ -243,15 +533,156 @@ pub trait Provider {
             return Vec::new();
         }
         let mut buf = vec![0u8; len as usize];
-        if !self.read(addr, &mut buf) {
-            buf.iter_mut().for_each(|b| *b = 0);
-        }
+        let _ = self.read(addr, &mut buf);
         buf
+    }
+
+    /// Read page-aligned 4 KiB chunks for refresh snapshots. Providers with
+    /// expensive per-call I/O can override this to coalesce contiguous pages.
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        let mut out = PageMap::new();
+        out.reserve(pages.len());
+        for &page_addr in pages {
+            let page_addr = page_addr & !(K_PAGE_SIZE - 1);
+            let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
+            let _ = self.read(page_addr, &mut bytes);
+            out.insert(page_addr, bytes);
+        }
+        out
     }
 
     /// `writeBytes(addr, d)` (`provider.h:150-152`). Non-const in C++; `&self`
     /// here (interior mutability — see [`write`](Provider::write)).
     fn write_bytes(&self, addr: u64, data: &[u8]) -> bool {
         self.write(addr, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_page_list, read_pages_in_runs, ModuleEntry, ModuleLookup, NormalizedPages,
+        K_PAGE_SIZE,
+    };
+
+    #[test]
+    fn module_lookup_indexes_address_name_path_and_file_name() {
+        let lookup = ModuleLookup::new(vec![
+            ModuleEntry {
+                name: "Second.dll".to_string(),
+                full_path: r"C:\Game\Second.dll".to_string(),
+                base: 0x3000,
+                size: 0x1000,
+            },
+            ModuleEntry {
+                name: "FirstModule".to_string(),
+                full_path: r"C:\Game\Bin\First.dll".to_string(),
+                base: 0x1000,
+                size: 0x1000,
+            },
+        ]);
+
+        assert_eq!(lookup.find_by_addr(0x1004).unwrap().name, "FirstModule");
+        assert_eq!(lookup.find_by_addr(0x3004).unwrap().name, "Second.dll");
+        assert!(lookup.find_by_addr(0x2000).is_none());
+        assert_eq!(lookup.symbol_to_address("firstmodule"), 0x1000);
+        assert_eq!(lookup.symbol_to_address("first.dll"), 0x1000);
+        assert_eq!(lookup.symbol_to_address(r"c:\game\bin\first.dll"), 0x1000);
+        assert_eq!(lookup.symbol_to_address("second.dll"), 0x3000);
+        assert_eq!(lookup.symbol_to_address("<Second.dll>"), 0x3000);
+    }
+
+    #[test]
+    fn module_lookup_preserves_original_order_for_overlapping_ranges() {
+        let lookup = ModuleLookup::new(vec![
+            ModuleEntry {
+                name: "first".to_string(),
+                base: 0x1000,
+                size: 0x2000,
+                ..ModuleEntry::default()
+            },
+            ModuleEntry {
+                name: "second".to_string(),
+                base: 0x1800,
+                size: 0x1000,
+                ..ModuleEntry::default()
+            },
+        ]);
+
+        assert_eq!(lookup.find_by_addr(0x1900).unwrap().name, "first");
+    }
+
+    #[test]
+    fn read_pages_in_runs_coalesces_sorted_contiguous_pages() {
+        let pages = [
+            K_PAGE_SIZE * 2,
+            0,
+            K_PAGE_SIZE,
+            K_PAGE_SIZE,
+            K_PAGE_SIZE * 3,
+        ];
+        let mut reads = Vec::new();
+
+        let result = read_pages_in_runs(&pages, |addr, buf| {
+            reads.push((addr, buf.len()));
+            for page_idx in 0..(buf.len() / K_PAGE_SIZE as usize) {
+                let start = page_idx * K_PAGE_SIZE as usize;
+                buf[start] = ((addr / K_PAGE_SIZE) as usize + page_idx) as u8;
+            }
+            true
+        });
+
+        assert_eq!(reads, vec![(0, (K_PAGE_SIZE as usize) * 4)]);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.get(&0).unwrap()[0], 0);
+        assert_eq!(result.get(&K_PAGE_SIZE).unwrap()[0], 1);
+        assert_eq!(result.get(&(K_PAGE_SIZE * 2)).unwrap()[0], 2);
+        assert_eq!(result.get(&(K_PAGE_SIZE * 3)).unwrap()[0], 3);
+    }
+
+    #[test]
+    fn normalize_page_list_borrows_sorted_aligned_unique_pages() {
+        let pages = [0, K_PAGE_SIZE, K_PAGE_SIZE * 2];
+
+        let normalized = normalize_page_list(&pages);
+
+        assert!(matches!(normalized, NormalizedPages::Borrowed(_)));
+        assert_eq!(normalized.as_slice(), pages);
+    }
+
+    #[test]
+    fn normalize_page_list_sorts_aligns_and_deduplicates_pages() {
+        let pages = [K_PAGE_SIZE + 7, 0, K_PAGE_SIZE, K_PAGE_SIZE * 3];
+
+        let normalized = normalize_page_list(&pages);
+
+        assert!(matches!(normalized, NormalizedPages::Owned(_)));
+        assert_eq!(normalized.as_slice(), [0, K_PAGE_SIZE, K_PAGE_SIZE * 3]);
+    }
+
+    #[test]
+    fn read_pages_in_runs_falls_back_when_bulk_read_fails() {
+        let pages = [0, K_PAGE_SIZE];
+        let mut reads = Vec::new();
+
+        let result = read_pages_in_runs(&pages, |addr, buf| {
+            reads.push((addr, buf.len()));
+            if buf.len() > K_PAGE_SIZE as usize {
+                return false;
+            }
+            buf[0] = (addr / K_PAGE_SIZE) as u8;
+            true
+        });
+
+        assert_eq!(
+            reads,
+            vec![
+                (0, (K_PAGE_SIZE as usize) * 2),
+                (0, K_PAGE_SIZE as usize),
+                (K_PAGE_SIZE, K_PAGE_SIZE as usize),
+            ]
+        );
+        assert_eq!(result.get(&0).unwrap()[0], 0);
+        assert_eq!(result.get(&K_PAGE_SIZE).unwrap()[0], 1);
     }
 }

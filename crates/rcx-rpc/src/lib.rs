@@ -22,6 +22,15 @@ pub const RPC_CMD_WRITE: u32 = 2;
 pub const RPC_CMD_ENUM_MODULES: u32 = 3;
 pub const RPC_CMD_PING: u32 = 4;
 pub const RPC_CMD_SHUTDOWN: u32 = 5;
+pub const RPC_CMD_ENUM_REGIONS: u32 = 6;
+
+pub const RCX_RPC_REGION_READABLE: u32 = 1 << 0;
+pub const RCX_RPC_REGION_WRITABLE: u32 = 1 << 1;
+pub const RCX_RPC_REGION_EXECUTABLE: u32 = 1 << 2;
+
+pub const RCX_RPC_REGION_IMAGE: u32 = 0;
+pub const RCX_RPC_REGION_MAPPED: u32 = 1;
+pub const RCX_RPC_REGION_PRIVATE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -38,6 +47,17 @@ pub struct RcxRpcModuleEntry {
     pub size: u64,
     pub name_offset: u32,
     pub name_length: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct RcxRpcRegionEntry {
+    pub base: u64,
+    pub size: u64,
+    pub name_offset: u32,
+    pub name_length: u32,
+    pub flags: u32,
+    pub region_type: u32,
 }
 
 #[repr(C)]
@@ -132,6 +152,7 @@ pub fn rsp_name(pid: u32) -> String {
 
 const _: () = assert!(core::mem::size_of::<RcxRpcReadEntry>() == 16);
 const _: () = assert!(core::mem::size_of::<RcxRpcModuleEntry>() == 24);
+const _: () = assert!(core::mem::size_of::<RcxRpcRegionEntry>() == 32);
 const _: () = assert!(core::mem::size_of::<RcxRpcHeader>() == RCX_RPC_HEADER_SIZE);
 const _: () = assert!(core::mem::offset_of!(RcxRpcHeader, version) == 0);
 const _: () = assert!(core::mem::offset_of!(RcxRpcHeader, payload_ready) == 4);
@@ -169,6 +190,7 @@ mod tests {
     fn wire_layout_matches_cpp_static_asserts() {
         assert_eq!(core::mem::size_of::<RcxRpcReadEntry>(), 16);
         assert_eq!(core::mem::size_of::<RcxRpcModuleEntry>(), 24);
+        assert_eq!(core::mem::size_of::<RcxRpcRegionEntry>(), 32);
         assert_eq!(core::mem::size_of::<RcxRpcHeader>(), 4096);
     }
 }

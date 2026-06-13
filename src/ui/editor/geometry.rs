@@ -767,6 +767,26 @@ pub fn line_byte_range(text: &str, line_starts: &[i32], idx: usize) -> std::ops:
     begin..end.max(begin)
 }
 
+/// The byte range of composed line `idx` using compose-precomputed UTF-8 byte
+/// starts. This is the render-path variant of [`line_byte_range`]: same output,
+/// but O(1) per row instead of rescanning from the start of the full document.
+pub fn line_byte_range_from_byte_starts(
+    text: &str,
+    line_byte_starts: &[usize],
+    idx: usize,
+) -> std::ops::Range<usize> {
+    if idx >= line_byte_starts.len() {
+        return 0..0;
+    }
+    let begin = line_byte_starts[idx].min(text.len());
+    let end = if idx + 1 < line_byte_starts.len() {
+        line_byte_starts[idx + 1].min(text.len())
+    } else {
+        text.len()
+    };
+    begin..end.max(begin)
+}
+
 /// The byte range of display span `[start, end)` in `text`. Command-row spans are
 /// UTF-16-unit scans (`utf16_to_byte`); every other line's span is a display
 /// column (`byte_for_col`). Shared by the inline-edit seed and keyword-hover.
