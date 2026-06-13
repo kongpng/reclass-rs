@@ -65,6 +65,12 @@ impl From<Vec<u8>> for PageBytes {
     }
 }
 
+impl From<Bytes> for PageBytes {
+    fn from(bytes: Bytes) -> Self {
+        Self::Shared(bytes)
+    }
+}
+
 impl From<Box<[u8]>> for PageBytes {
     fn from(bytes: Box<[u8]>) -> Self {
         Self::Shared(Bytes::from(bytes))

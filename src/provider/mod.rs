@@ -9,8 +9,10 @@
 //! [`SnapshotProvider`], first-party live providers behind `native-providers`,
 //! and the connector-backed memflow provider.
 
-use ahash::AHashMap;
 use std::fmt::Write as _;
+
+use ahash::AHashMap;
+use bytes::Bytes;
 
 mod buffer;
 mod file;
@@ -130,10 +132,11 @@ fn read_page_run(pages: &[u64], read: &mut impl FnMut(u64, &mut [u8]) -> bool, o
     let run_len = pages.len() * K_PAGE_SIZE as usize;
     let mut bytes = vec![0u8; run_len];
     if read(pages[0], &mut bytes) {
+        let bytes = Bytes::from(bytes);
         for (idx, &page_addr) in pages.iter().enumerate() {
             let start = idx * K_PAGE_SIZE as usize;
             let end = start + K_PAGE_SIZE as usize;
-            out.insert(page_addr, bytes[start..end].to_vec().into());
+            out.insert(page_addr, bytes.slice(start..end).into());
         }
         return;
     }
@@ -540,15 +543,7 @@ pub trait Provider {
     /// Read page-aligned 4 KiB chunks for refresh snapshots. Providers with
     /// expensive per-call I/O can override this to coalesce contiguous pages.
     fn read_pages(&self, pages: &[u64]) -> PageMap {
-        let mut out = PageMap::new();
-        out.reserve(pages.len());
-        for &page_addr in pages {
-            let page_addr = page_addr & !(K_PAGE_SIZE - 1);
-            let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
-            let _ = self.read(page_addr, &mut bytes);
-            out.insert(page_addr, bytes.into());
-        }
-        out
+        read_pages_in_runs(pages, |addr, buf| self.read(addr, buf))
     }
 
     /// `writeBytes(addr, d)` (`provider.h:150-152`). Non-const in C++; `&self`
@@ -570,8 +565,9 @@ pub trait Provider {
 mod tests {
     use super::{
         normalize_page_list, read_pages_in_runs, ModuleEntry, ModuleLookup, NormalizedPages,
-        K_PAGE_SIZE,
+        Provider, K_PAGE_SIZE,
     };
+    use std::sync::Mutex;
 
     #[test]
     fn module_lookup_indexes_address_name_path_and_file_name() {
@@ -645,6 +641,41 @@ mod tests {
         assert_eq!(result.get(&0).unwrap()[0], 0);
         assert_eq!(result.get(&K_PAGE_SIZE).unwrap()[0], 1);
         assert_eq!(result.get(&(K_PAGE_SIZE * 2)).unwrap()[0], 2);
+        assert_eq!(result.get(&(K_PAGE_SIZE * 3)).unwrap()[0], 3);
+    }
+
+    #[derive(Default)]
+    struct DefaultReadPagesProvider {
+        reads: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl Provider for DefaultReadPagesProvider {
+        fn size(&self) -> i32 {
+            (K_PAGE_SIZE as i32) * 4
+        }
+
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.reads.lock().unwrap().push((addr, buf.len()));
+            for page_idx in 0..(buf.len() / K_PAGE_SIZE as usize) {
+                let start = page_idx * K_PAGE_SIZE as usize;
+                buf[start] = ((addr / K_PAGE_SIZE) as usize + page_idx) as u8;
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn default_read_pages_coalesces_contiguous_pages() {
+        let provider = DefaultReadPagesProvider::default();
+        let pages = [0, K_PAGE_SIZE, K_PAGE_SIZE * 2, K_PAGE_SIZE * 3];
+
+        let result = provider.read_pages(&pages);
+
+        assert_eq!(
+            provider.reads.lock().unwrap().as_slice(),
+            &[(0, K_PAGE_SIZE as usize * 4)]
+        );
+        assert_eq!(result.len(), 4);
         assert_eq!(result.get(&(K_PAGE_SIZE * 3)).unwrap()[0], 3);
     }
 

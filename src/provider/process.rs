@@ -5,8 +5,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::plugin::contract::ProcessInfo;
 use arc_swap::ArcSwapOption;
+
+use crate::plugin::contract::ProcessInfo;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 use super::read_pages_in_runs;
@@ -435,6 +436,7 @@ mod platform {
     use std::os::unix::fs::FileExt;
     use std::sync::Mutex;
 
+    use bytes::Bytes;
     use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
     use nix::unistd::Pid;
 
@@ -614,10 +616,11 @@ mod platform {
                 process_vm_readv(Pid::from_raw(self.pid as i32), &mut local, &remote).unwrap_or(0);
             let full_pages = (read / K_PAGE_SIZE as usize).min(pages.len());
             if full_pages > 0 {
+                let bytes = Bytes::from(bytes);
                 for (idx, &page_addr) in pages.iter().take(full_pages).enumerate() {
                     let start = idx * K_PAGE_SIZE as usize;
                     let end = start + K_PAGE_SIZE as usize;
-                    out.insert(page_addr, bytes[start..end].to_vec().into());
+                    out.insert(page_addr, bytes.slice(start..end).into());
                 }
                 if full_pages == pages.len() {
                     return;
@@ -772,6 +775,7 @@ mod platform {
     use crate::provider::{
         MemoryRegion, ModuleEntry, ModuleLookup, PageMap, RegionType, ThreadInfo, K_PAGE_SIZE,
     };
+    use bytes::Bytes;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
     };
@@ -1026,10 +1030,11 @@ mod platform {
             let read = self.read_available(pages[0], &mut bytes);
             let full_pages = (read / K_PAGE_SIZE as usize).min(pages.len());
             if full_pages > 0 {
+                let bytes = Bytes::from(bytes);
                 for (idx, &page_addr) in pages.iter().take(full_pages).enumerate() {
                     let start = idx * K_PAGE_SIZE as usize;
                     let end = start + K_PAGE_SIZE as usize;
-                    out.insert(page_addr, bytes[start..end].to_vec().into());
+                    out.insert(page_addr, bytes.slice(start..end).into());
                 }
                 if full_pages == pages.len() {
                     return;
