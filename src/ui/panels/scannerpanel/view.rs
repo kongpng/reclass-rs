@@ -179,25 +179,40 @@ pub(super) struct DisplayRow {
 #[derive(Clone, Debug)]
 struct DisplayRowSearch {
     display: DisplayRow,
-    address_lower: String,
-    value_lower: String,
-    module_lower: String,
+    search_text: String,
 }
 
 impl DisplayRowSearch {
     fn new(display: DisplayRow) -> Self {
+        let mut search_text = String::with_capacity(
+            display.row.address_text.len()
+                + display.row.value_text.len()
+                + display.module.len()
+                + 2,
+        );
+        push_lowercase(&mut search_text, &display.row.address_text);
+        search_text.push('\n');
+        push_lowercase(&mut search_text, &display.row.value_text);
+        search_text.push('\n');
+        push_lowercase(&mut search_text, &display.module);
         Self {
-            address_lower: display.row.address_text.to_lowercase(),
-            value_lower: display.row.value_text.to_lowercase(),
-            module_lower: display.module.to_lowercase(),
+            search_text,
             display,
         }
     }
 
     fn matches(&self, query: &str) -> bool {
-        self.address_lower.contains(query)
-            || self.value_lower.contains(query)
-            || self.module_lower.contains(query)
+        self.search_text.contains(query)
+    }
+}
+
+fn push_lowercase(out: &mut String, text: &str) {
+    if text.is_ascii() {
+        out.extend(text.bytes().map(|b| b.to_ascii_lowercase() as char));
+        return;
+    }
+    for ch in text.chars() {
+        out.extend(ch.to_lowercase());
     }
 }
 
@@ -2313,7 +2328,7 @@ impl Render for ScannerPanel {
         // C++ syncScanEnabled greys out the Scan button when a value-requiring
         // condition has an empty value field (scannerpanel.cpp:732-756). Mirror it so
         // First Scan is disabled (not just an error-on-click) when input is missing.
-        let missing_input = vis.value_enabled && self.form.value_text.trim().is_empty();
+        let missing_input = self.form.required_value_missing();
         let progress = self.progress;
         let breadcrumb =
             stage_breadcrumb(self.generation, self.last_result_count, self.results.len());

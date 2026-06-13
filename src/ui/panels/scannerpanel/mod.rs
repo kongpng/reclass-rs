@@ -122,9 +122,9 @@ pub fn value_type_entries() -> &'static [(ValueType, &'static str)] {
         (ValueType::Vec2, "vec2"),
         (ValueType::Vec3, "vec3"),
         (ValueType::Vec4, "vec4"),
-        (ValueType::Utf8, "utf8"),
-        (ValueType::Utf16, "utf16"),
-        (ValueType::HexBytes, "hex bytes"),
+        (ValueType::Utf8, "text utf-8"),
+        (ValueType::Utf16, "text utf-16le"),
+        (ValueType::HexBytes, "bytes"),
     ]
 }
 
@@ -147,7 +147,8 @@ pub struct FieldVisibility {
     pub value2_visible: bool,
     /// Value-type combo applies (value mode only).
     pub type_enabled: bool,
-    /// The label for the (shared) value row: "Pattern:" vs "Value:".
+    /// The label for the (shared) value row: "Pattern:", "Value:", "Text:",
+    /// or "Bytes:".
     pub value_label: &'static str,
 }
 
@@ -272,7 +273,33 @@ impl ScannerForm {
             value_enabled: needs_value,
             value2_visible: needs_range,
             type_enabled: !is_sig,
-            value_label: if is_sig { "Pattern:" } else { "Value:" },
+            value_label: self.value_label(is_sig),
+        }
+    }
+
+    /// Whether the current form has an empty required input. Text searches use
+    /// the literal input; numeric, vector, byte, and signature scans ignore
+    /// surrounding whitespace when deciding emptiness.
+    pub fn required_value_missing(&self) -> bool {
+        let vis = self.field_visibility();
+        if !vis.value_enabled {
+            return false;
+        }
+        if self.mode() == ScanMode::Signature {
+            return self.value_text.trim().is_empty();
+        }
+        typed_value_input_empty(self.value_type, &self.value_text)
+            || (vis.value2_visible && typed_value_input_empty(self.value_type, &self.value2_text))
+    }
+
+    fn value_label(&self, is_sig: bool) -> &'static str {
+        if is_sig {
+            return "Pattern:";
+        }
+        match self.value_type {
+            ValueType::Utf8 | ValueType::Utf16 => "Text:",
+            ValueType::HexBytes => "Bytes:",
+            _ => "Value:",
         }
     }
 
@@ -525,6 +552,13 @@ fn bool_str(b: bool) -> &'static str {
 /// `DiskSettings::get_bool`.
 fn parse_bool(s: &str) -> bool {
     s == "true" || s == "1"
+}
+
+fn typed_value_input_empty(vt: ValueType, text: &str) -> bool {
+    match vt {
+        ValueType::Utf8 | ValueType::Utf16 => text.is_empty(),
+        _ => text.trim().is_empty(),
+    }
 }
 
 /// Map a `ValueType` discriminant back to the enum (the inverse of
@@ -1675,6 +1709,35 @@ mod tests {
     }
 
     #[test]
+    fn string_value_types_show_text_or_bytes_label() {
+        let mut f = ScannerForm::new();
+        f.condition = CondEntry::Value(ScanCondition::ExactValue);
+
+        f.value_type = ValueType::Utf8;
+        assert_eq!(f.field_visibility().value_label, "Text:");
+        f.value_type = ValueType::Utf16;
+        assert_eq!(f.field_visibility().value_label, "Text:");
+        f.value_type = ValueType::HexBytes;
+        assert_eq!(f.field_visibility().value_label, "Bytes:");
+    }
+
+    #[test]
+    fn required_value_missing_preserves_text_whitespace() {
+        let mut f = ScannerForm::new();
+        f.condition = CondEntry::Value(ScanCondition::ExactValue);
+
+        f.value_type = ValueType::Int32;
+        f.value_text = "   ".to_string();
+        assert!(f.required_value_missing());
+
+        f.value_type = ValueType::Utf8;
+        assert!(!f.required_value_missing());
+
+        f.value_text.clear();
+        assert!(f.required_value_missing());
+    }
+
+    #[test]
     fn unknown_value_disables_value_field() {
         let mut f = ScannerForm::new();
         f.condition = CondEntry::Value(ScanCondition::UnknownValue);
@@ -2048,7 +2111,9 @@ mod tests {
         // (raw gap 5): Vec2/3/4 then UTF8/UTF16/HexBytes.
         assert_eq!(entries[10].0, ValueType::Vec2);
         assert_eq!(entries.last().unwrap().0, ValueType::HexBytes);
-        assert_eq!(entries.last().unwrap().1, "hex bytes");
+        assert_eq!(entries[13].1, "text utf-8");
+        assert_eq!(entries[14].1, "text utf-16le");
+        assert_eq!(entries.last().unwrap().1, "bytes");
     }
 
     #[test]

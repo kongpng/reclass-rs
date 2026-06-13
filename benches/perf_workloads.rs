@@ -219,6 +219,7 @@ fn patterned_provider(bytes: usize) -> BufferProvider {
     BufferProvider::new(data, "bench.bin")
 }
 
+#[derive(Clone)]
 struct LiveLikeProvider {
     base: u64,
     data: Vec<u8>,
@@ -807,6 +808,84 @@ impl Provider for CountingProvider {
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         self.inner.enumerate_regions()
+    }
+
+    fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+        self.inner.enumerate_modules()
+    }
+
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        self.inner.is_readable(addr, len)
+    }
+}
+
+struct SymbolWorkProvider {
+    inner: LiveLikeProvider,
+    symbol_calls: AtomicUsize,
+    symbol_work: usize,
+}
+
+impl SymbolWorkProvider {
+    fn new(inner: LiveLikeProvider, symbol_work: usize) -> Self {
+        Self {
+            inner,
+            symbol_calls: AtomicUsize::new(0),
+            symbol_work,
+        }
+    }
+
+    fn symbol_calls(&self) -> usize {
+        self.symbol_calls.load(Ordering::Relaxed)
+    }
+}
+
+impl Provider for SymbolWorkProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.inner.read(addr, buf)
+    }
+
+    fn read_pages(&self, pages: &[u64]) -> PageMap {
+        self.inner.read_pages(pages)
+    }
+
+    fn size(&self) -> i32 {
+        self.inner.size()
+    }
+
+    fn kind(&self) -> String {
+        self.inner.kind()
+    }
+
+    fn is_live(&self) -> bool {
+        self.inner.is_live()
+    }
+
+    fn pointer_size(&self) -> i32 {
+        self.inner.pointer_size()
+    }
+
+    fn base(&self) -> u64 {
+        self.inner.base()
+    }
+
+    fn get_symbol(&self, addr: u64) -> String {
+        self.symbol_calls.fetch_add(1, Ordering::Relaxed);
+        let mut acc = addr;
+        for i in 0..self.symbol_work {
+            acc = acc
+                .rotate_left(7)
+                .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+        black_box(acc);
+        self.inner.get_symbol(addr)
+    }
+
+    fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+        self.inner.enumerate_regions()
+    }
+
+    fn trusts_enumerated_region_readability(&self) -> bool {
+        self.inner.trusts_enumerated_region_readability()
     }
 
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
@@ -3654,6 +3733,30 @@ fn hover_memory_preview_workloads(c: &mut Criterion) {
                         black_box(&unsorted_orders),
                     );
                     black_box(total);
+                });
+            },
+        );
+
+        let repeated_target = 4096u64;
+        let repeated_preview: Vec<u8> = (0..rows)
+            .flat_map(|_| repeated_target.to_le_bytes())
+            .collect();
+        let symbol_provider = SymbolWorkProvider::new(provider.clone(), 128);
+        group.bench_with_input(
+            BenchmarkId::new("pointer_rows_duplicate_symbol_targets", rows),
+            &rows,
+            |b, &rows| {
+                b.iter(|| {
+                    let total = reclass::ui::editor::bench_memory_preview_rows_with_cached_lookup(
+                        black_box(&symbol_provider),
+                        8,
+                        rows,
+                        black_box(&repeated_preview),
+                        black_box(&regions),
+                        black_box(&modules),
+                        black_box(&orders),
+                    );
+                    black_box((total, symbol_provider.symbol_calls()));
                 });
             },
         );

@@ -351,7 +351,7 @@ fn parse_u64_with_hex(trimmed: &str) -> Option<u64> {
 /// all-`0xFF` `mask`. On failure returns the exact upstream error message.
 pub fn serialize_value(ty: ValueType, input: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
     let trimmed = input.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && !matches!(ty, ValueType::Utf8 | ValueType::Utf16) {
         return Err("Empty value".to_string());
     }
 
@@ -410,7 +410,7 @@ pub fn serialize_value(ty: ValueType, input: &str) -> Result<(Vec<u8>, Vec<u8>),
         ValueType::Vec3 => serialize_vec(trimmed, 3, &mut pattern)?,
         ValueType::Vec4 => serialize_vec(trimmed, 4, &mut pattern)?,
         ValueType::Utf8 => {
-            let encoded = trimmed.as_bytes();
+            let encoded = input.as_bytes();
             if encoded.is_empty() {
                 return Err("Empty UTF-8 string".to_string());
             }
@@ -418,7 +418,7 @@ pub fn serialize_value(ty: ValueType, input: &str) -> Result<(Vec<u8>, Vec<u8>),
         }
         ValueType::Utf16 => {
             // UTF-16LE encoding: iterate code units (matches QString unicode()).
-            for u in trimmed.encode_utf16() {
+            for u in input.encode_utf16() {
                 pattern.extend_from_slice(&u.to_le_bytes());
             }
             if pattern.is_empty() {

@@ -1743,6 +1743,7 @@ fn memory_preview_rows_with_lookup(
 ) -> Vec<MemoryPreviewRow> {
     let stride = pointer_size.max(1) as usize;
     let kind = if pointer_size <= 4 { "hex32" } else { "hex64" };
+    let mut symbol_cache = LastSymbolName::default();
     (0..row_count)
         .map(|row| {
             let start = row.saturating_mul(stride);
@@ -1771,7 +1772,13 @@ fn memory_preview_rows_with_lookup(
                 }
             }
             let type_hint = memory_preview_type_hint(chunk, pointer_size);
-            let pointer_note = memory_preview_pointer_note(provider, lookup, chunk, pointer_size);
+            let pointer_note = memory_preview_pointer_note(
+                provider,
+                lookup,
+                chunk,
+                pointer_size,
+                &mut symbol_cache,
+            );
             MemoryPreviewRow {
                 offset: start as u64,
                 kind,
@@ -2051,6 +2058,7 @@ fn memory_preview_pointer_note(
     lookup: &MemoryPreviewLookup<'_>,
     chunk: &[u8],
     pointer_size: i32,
+    symbol_cache: &mut LastSymbolName,
 ) -> Option<String> {
     let target = match pointer_size {
         4 if chunk.len() >= 4 => {
@@ -2067,7 +2075,12 @@ fn memory_preview_pointer_note(
     if !lookup.is_readable(target, 1) {
         return None;
     }
-    Some(memory_preview_named_address(provider, lookup, target))
+    Some(memory_preview_named_address(
+        provider,
+        lookup,
+        target,
+        symbol_cache,
+    ))
 }
 
 fn region_contains_readable(region: &MemoryRegion, addr: u64, len: i32) -> bool {
@@ -2083,10 +2096,11 @@ fn memory_preview_named_address(
     provider: &dyn Provider,
     lookup: &MemoryPreviewLookup<'_>,
     addr: u64,
+    symbol_cache: &mut LastSymbolName,
 ) -> String {
-    let symbol = provider.get_symbol(addr);
+    let symbol = symbol_cache.get(provider, addr);
     if !symbol.is_empty() {
-        return prefixed_pointer_note(&symbol);
+        return prefixed_pointer_note(symbol);
     }
     if let Some(module) = lookup.find_module(addr) {
         let name = if module.name.is_empty() {
@@ -2114,6 +2128,25 @@ fn memory_preview_named_address(
         return format!("-> {tag}{}.0x{addr:X}", region.module_name);
     }
     format!("-> 0x{addr:X}")
+}
+
+#[derive(Default)]
+struct LastSymbolName {
+    addr: u64,
+    symbol: String,
+    valid: bool,
+}
+
+impl LastSymbolName {
+    fn get(&mut self, provider: &dyn Provider, addr: u64) -> &str {
+        if self.valid && self.addr == addr {
+            return &self.symbol;
+        }
+        self.addr = addr;
+        self.symbol = provider.get_symbol(addr);
+        self.valid = true;
+        &self.symbol
+    }
 }
 
 fn prefixed_pointer_note(label: &str) -> String {
@@ -2493,6 +2526,56 @@ mod tests {
         }
     }
 
+    struct SymbolCountingProvider {
+        inner: TestProvider,
+        symbol_calls: Cell<usize>,
+    }
+
+    impl SymbolCountingProvider {
+        fn new(base: u64, data: Vec<u8>) -> Self {
+            Self {
+                inner: TestProvider {
+                    base,
+                    data,
+                    fail_reads: false,
+                },
+                symbol_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl Provider for SymbolCountingProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.inner.read(addr, buf)
+        }
+
+        fn size(&self) -> i32 {
+            self.inner.size()
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.inner.enumerate_regions()
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            vec![ModuleEntry {
+                name: "symmod".into(),
+                full_path: String::new(),
+                base: self.inner.base,
+                size: self.inner.data.len() as u64,
+            }]
+        }
+
+        fn get_symbol(&self, addr: u64) -> String {
+            self.symbol_calls.set(self.symbol_calls.get() + 1);
+            format!("sym_{:X}", addr.saturating_sub(self.inner.base))
+        }
+
+        fn is_readable(&self, _addr: u64, _len: i32) -> bool {
+            false
+        }
+    }
+
     impl Provider for CountingProvider {
         fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
             self.read_calls.set(self.read_calls.get() + 1);
@@ -2740,6 +2823,29 @@ mod tests {
             provider.read_calls.get(),
             0,
             "pointer-note labels should use the fresh region/module maps, not per-row target reads"
+        );
+    }
+
+    #[test]
+    fn memory_preview_pointer_notes_memoize_duplicate_symbol_names() {
+        let provider = SymbolCountingProvider::new(0x2000, vec![0xAA]);
+        let regions = provider.enumerate_regions();
+        let modules = provider.enumerate_modules();
+        let mut bytes = Vec::new();
+        for _ in 0..4 {
+            bytes.extend_from_slice(&0x2000u64.to_le_bytes());
+        }
+
+        let rows = memory_preview_rows_with_maps(&provider, 8, 4, &bytes, &regions, &modules);
+
+        assert_eq!(rows.len(), 4);
+        assert!(rows
+            .iter()
+            .all(|row| row.pointer_note.as_deref() == Some("-> sym_0")));
+        assert_eq!(
+            provider.symbol_calls.get(),
+            1,
+            "duplicate pointer targets in one hover preview should share one symbol lookup"
         );
     }
 

@@ -519,11 +519,27 @@ fn serialize_utf8() {
 }
 
 #[test]
+fn serialize_utf8_preserves_edge_spaces() {
+    let (pat, _) = serialize_value(ValueType::Utf8, "  Hello  ").unwrap();
+    assert_eq!(pat, b"  Hello  ".to_vec());
+}
+
+#[test]
 fn serialize_utf16() {
     let (pat, _) = serialize_value(ValueType::Utf16, "Hi").unwrap();
     assert_eq!(pat.len(), 4);
     assert_eq!(u16::from_le_bytes([pat[0], pat[1]]), b'H' as u16);
     assert_eq!(u16::from_le_bytes([pat[2], pat[3]]), b'i' as u16);
+}
+
+#[test]
+fn serialize_utf16_preserves_edge_spaces() {
+    let (pat, _) = serialize_value(ValueType::Utf16, " Hi ").unwrap();
+    let want: Vec<u8> = " Hi "
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    assert_eq!(pat, want);
 }
 
 #[test]
@@ -966,6 +982,23 @@ fn scan_find_float_value() {
     let r = sync_scan(&prov, &req);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].address, 8);
+}
+
+#[test]
+fn scan_find_utf8_string_with_edge_spaces() {
+    let mut data = vec![0u8; 128];
+    data[40..49].copy_from_slice(b"--  key  ");
+    let prov = buffer(data);
+    let (pat, mask) = serialize_value(ValueType::Utf8, "  key  ").unwrap();
+    let req = ScanRequest {
+        pattern: pat,
+        mask,
+        alignment: 1,
+        ..Default::default()
+    };
+    let r = sync_scan(&prov, &req);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].address, 42);
 }
 
 #[test]
