@@ -133,7 +133,7 @@ fn read_page_run(pages: &[u64], read: &mut impl FnMut(u64, &mut [u8]) -> bool, o
         for (idx, &page_addr) in pages.iter().enumerate() {
             let start = idx * K_PAGE_SIZE as usize;
             let end = start + K_PAGE_SIZE as usize;
-            out.insert(page_addr, bytes[start..end].to_vec());
+            out.insert(page_addr, bytes[start..end].to_vec().into());
         }
         return;
     }
@@ -151,7 +151,7 @@ fn read_single_page(
 ) {
     let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
     let _ = read(page_addr, &mut bytes);
-    out.insert(page_addr, bytes);
+    out.insert(page_addr, bytes.into());
 }
 
 /// `enum class RegionType : uint8_t` (`provider.h:13-17`).
@@ -546,7 +546,7 @@ pub trait Provider {
             let page_addr = page_addr & !(K_PAGE_SIZE - 1);
             let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
             let _ = self.read(page_addr, &mut bytes);
-            out.insert(page_addr, bytes);
+            out.insert(page_addr, bytes.into());
         }
         out
     }

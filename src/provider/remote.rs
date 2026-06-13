@@ -427,7 +427,7 @@ mod platform {
                             K_PAGE_SIZE as usize,
                         );
                     }
-                    out.insert(page_addr, bytes);
+                    out.insert(page_addr, bytes.into());
                 }
             }
         }
@@ -548,7 +548,7 @@ mod platform {
 
     fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
         for &page_addr in pages {
-            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize]);
+            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize].into());
         }
     }
 
@@ -1129,7 +1129,7 @@ mod platform {
                             K_PAGE_SIZE as usize,
                         );
                     }
-                    out.insert(page_addr, bytes);
+                    out.insert(page_addr, bytes.into());
                 }
             }
         }
@@ -1250,7 +1250,7 @@ mod platform {
 
     fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
         for &page_addr in pages {
-            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize]);
+            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize].into());
         }
     }
 

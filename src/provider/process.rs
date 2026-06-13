@@ -115,7 +115,7 @@ impl LocalProcessProvider {
             if readable {
                 readable_pages.push(page_addr);
             } else {
-                out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize]);
+                out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize].into());
             }
         }
         Some((readable_pages, out))
@@ -561,7 +561,7 @@ mod platform {
             if pages.len() == 1 {
                 let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
                 let _ = self.read(pages[0], &mut bytes);
-                out.insert(pages[0], bytes);
+                out.insert(pages[0], bytes.into());
                 return;
             }
 
@@ -588,7 +588,7 @@ mod platform {
                         .take(full_pages)
                         .zip(page_bytes.drain(..full_pages))
                     {
-                        out.insert(page_addr, bytes);
+                        out.insert(page_addr, bytes.into());
                     }
                     if full_pages == pages.len() {
                         return;
@@ -598,7 +598,7 @@ mod platform {
                 for &page_addr in &pages[full_pages..] {
                     let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
                     let _ = self.read(page_addr, &mut bytes);
-                    out.insert(page_addr, bytes);
+                    out.insert(page_addr, bytes.into());
                 }
                 return;
             }
@@ -617,7 +617,7 @@ mod platform {
                 for (idx, &page_addr) in pages.iter().take(full_pages).enumerate() {
                     let start = idx * K_PAGE_SIZE as usize;
                     let end = start + K_PAGE_SIZE as usize;
-                    out.insert(page_addr, bytes[start..end].to_vec());
+                    out.insert(page_addr, bytes[start..end].to_vec().into());
                 }
                 if full_pages == pages.len() {
                     return;
@@ -627,7 +627,7 @@ mod platform {
             for &page_addr in &pages[full_pages..] {
                 let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
                 let _ = self.read(page_addr, &mut bytes);
-                out.insert(page_addr, bytes);
+                out.insert(page_addr, bytes.into());
             }
         }
 
@@ -1017,7 +1017,7 @@ mod platform {
             if pages.len() == 1 {
                 let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
                 let _ = self.read_full(pages[0], &mut bytes);
-                out.insert(pages[0], bytes);
+                out.insert(pages[0], bytes.into());
                 return;
             }
 
@@ -1029,7 +1029,7 @@ mod platform {
                 for (idx, &page_addr) in pages.iter().take(full_pages).enumerate() {
                     let start = idx * K_PAGE_SIZE as usize;
                     let end = start + K_PAGE_SIZE as usize;
-                    out.insert(page_addr, bytes[start..end].to_vec());
+                    out.insert(page_addr, bytes[start..end].to_vec().into());
                 }
                 if full_pages == pages.len() {
                     return;
@@ -1039,7 +1039,7 @@ mod platform {
             for &page_addr in &pages[full_pages..] {
                 let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
                 let _ = self.read_full(page_addr, &mut bytes);
-                out.insert(page_addr, bytes);
+                out.insert(page_addr, bytes.into());
             }
         }
 
@@ -1664,7 +1664,7 @@ mod tests {
             let mut expected = vec![0u8; K_PAGE_SIZE as usize];
             assert!(provider.read(page_addr, &mut expected));
             assert_eq!(
-                page_map.get(&page_addr).map(Vec::as_slice),
+                page_map.get(&page_addr).map(|bytes| bytes.as_slice()),
                 Some(expected.as_slice())
             );
         }
@@ -1695,7 +1695,7 @@ mod tests {
         let mut expected = vec![0u8; K_PAGE_SIZE as usize];
         assert!(provider.read(region.base, &mut expected));
         assert_eq!(
-            page_map.get(&region.base).map(Vec::as_slice),
+            page_map.get(&region.base).map(|bytes| bytes.as_slice()),
             Some(expected.as_slice())
         );
     }

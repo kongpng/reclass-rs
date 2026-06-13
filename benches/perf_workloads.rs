@@ -1302,6 +1302,7 @@ fn changed_pages_from_next_live_tick_for_addrs(
                 let bytes = changed
                     .get_mut(&page)
                     .expect("visible changed page should be present in read result");
+                let bytes = bytes.make_mut();
                 bytes[(addr - page) as usize] = bytes[(addr - page) as usize].wrapping_add(1);
             }
             changed
@@ -1325,6 +1326,7 @@ fn changed_pages_from_next_live_tick_at(
             let bytes = changed
                 .get_mut(&page)
                 .expect("requested page should be present in read result");
+            let bytes = bytes.make_mut();
             bytes[0] = bytes[0].wrapping_add(1);
             changed
         }
@@ -2946,11 +2948,11 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
                         let mut controller =
                             controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
                         let mut initial = PageMap::new();
-                        initial.insert(0, vec![0u8; 4096]);
+                        initial.insert(0, vec![0u8; 4096].into());
                         controller.on_read_complete(initial);
 
                         let mut changed = PageMap::new();
-                        changed.insert(0, vec![0x5Au8; 4096]);
+                        changed.insert(0, vec![0x5Au8; 4096].into());
                         (controller, changed)
                     },
                     |(mut controller, changed)| {
@@ -3175,7 +3177,7 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
                         for page in 0..pages {
                             initial.insert(
                                 (page as u64) * K_PAGE_SIZE,
-                                vec![0x11; K_PAGE_SIZE as usize],
+                                vec![0x11; K_PAGE_SIZE as usize].into(),
                             );
                         }
                         controller.on_read_complete(initial);
@@ -3184,7 +3186,7 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
                         for page in 0..pages {
                             changed.insert(
                                 (page as u64) * K_PAGE_SIZE,
-                                vec![0x22; K_PAGE_SIZE as usize],
+                                vec![0x22; K_PAGE_SIZE as usize].into(),
                             );
                         }
                         (controller, changed)
@@ -3211,7 +3213,7 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
                         for page in 0..pages {
                             initial.insert(
                                 (page as u64) * K_PAGE_SIZE,
-                                vec![0x33; K_PAGE_SIZE as usize],
+                                vec![0x33; K_PAGE_SIZE as usize].into(),
                             );
                         }
                         controller.on_read_complete(initial);
@@ -3220,7 +3222,7 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
                         for page in 0..pages {
                             unchanged.insert(
                                 (page as u64) * K_PAGE_SIZE,
-                                vec![0x33; K_PAGE_SIZE as usize],
+                                vec![0x33; K_PAGE_SIZE as usize].into(),
                             );
                         }
                         (controller, unchanged)
@@ -3453,7 +3455,7 @@ fn read_pages_per_page(provider: &Arc<dyn Provider + Send + Sync>, pages: &[u64]
     for &page_addr in pages {
         let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
         let _ = provider.read(page_addr, &mut bytes);
-        out.insert(page_addr, bytes);
+        out.insert(page_addr, bytes.into());
     }
     out
 }
@@ -3629,7 +3631,7 @@ fn permanent_page_workloads(c: &mut Criterion) {
                         let controller = controller_for(flat_tree(1, NodeKind::Hex64), provider);
                         let mut fresh = PageMap::new();
                         for page in 0..pages {
-                            fresh.insert((page * 4096) as u64, vec![0u8; 4096]);
+                            fresh.insert((page * 4096) as u64, vec![0u8; 4096].into());
                         }
                         (controller, fresh)
                     },
@@ -3657,7 +3659,7 @@ fn permanent_page_workloads(c: &mut Criterion) {
                         let controller = controller_for(flat_tree(1, NodeKind::Hex64), provider);
                         let mut fresh = PageMap::new();
                         for page in 0..pages {
-                            fresh.insert((page * 4096) as u64, vec![0u8; 4096]);
+                            fresh.insert((page * 4096) as u64, vec![0u8; 4096].into());
                         }
                         (controller, fresh)
                     },
@@ -3708,7 +3710,7 @@ fn snapshot_readability_workloads(c: &mut Criterion) {
             Arc::new(LiveLikeProvider::new_compose_pointer_hint_regions(regions));
         let snapshot = SnapshotProvider::new(Some(real), PageMap::new(), 0);
         let mut fresh = PageMap::new();
-        fresh.insert(0, vec![0x5Au8; 4096]);
+        fresh.insert(0, vec![0x5Au8; 4096].into());
         merge_group.throughput(Throughput::Elements(regions as u64));
         merge_group.bench_with_input(
             BenchmarkId::new("single_page_many_live_mappings", regions),

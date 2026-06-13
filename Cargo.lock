@@ -5929,6 +5929,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "bytemuck",
+ "bytes",
  "clap",
  "cpp_demangle",
  "criterion",

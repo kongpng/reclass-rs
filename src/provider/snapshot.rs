@@ -8,9 +8,11 @@
 //! zeros.
 
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use ahash::AHashMap;
+use bytes::Bytes;
 
 use super::{MemoryRegion, ModuleEntry, Provider, ThreadInfo};
 
@@ -19,7 +21,63 @@ pub const K_PAGE_SIZE: u64 = 4096;
 const K_PAGE_MASK: u64 = !(K_PAGE_SIZE - 1);
 
 /// `using PageMap = QHash<uint64_t, QByteArray>` (`snapshot_provider.h:33`).
-pub type PageMap = AHashMap<u64, Vec<u8>>;
+pub type PageMap = AHashMap<u64, PageBytes>;
+
+/// Shared immutable page bytes.
+///
+/// Refresh keeps the same fresh page in both the snapshot provider and the
+/// previous-read baseline. `Bytes` makes that split a cheap refcount bump;
+/// snapshot write-through uses copy-on-write before patching cached bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageBytes {
+    Shared(Bytes),
+    Mutable(Vec<u8>),
+}
+
+impl Default for PageBytes {
+    fn default() -> Self {
+        Self::Shared(Bytes::new())
+    }
+}
+
+impl PageBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Shared(bytes) => bytes.as_ref(),
+            Self::Mutable(bytes) => bytes.as_slice(),
+        }
+    }
+
+    pub fn make_mut(&mut self) -> &mut [u8] {
+        if let Self::Shared(bytes) = self {
+            *self = Self::Mutable(bytes.to_vec());
+        }
+        match self {
+            Self::Shared(_) => unreachable!("shared page was converted to mutable storage"),
+            Self::Mutable(bytes) => bytes.as_mut_slice(),
+        }
+    }
+}
+
+impl From<Vec<u8>> for PageBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Shared(Bytes::from(bytes))
+    }
+}
+
+impl From<Box<[u8]>> for PageBytes {
+    fn from(bytes: Box<[u8]>) -> Self {
+        Self::Shared(Bytes::from(bytes))
+    }
+}
+
+impl Deref for PageBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
 
 /// Page table + logical extent — mutated by `update_pages`/`merge_pages`/
 /// `patch_pages` (and `write`) through `&self`, so it lives behind a lock
@@ -104,6 +162,7 @@ impl SnapshotProvider {
             let chunk = (data.len() - off).min((K_PAGE_SIZE as usize) - page_off);
             if let Some(page) = inner.pages.get_mut(&page_addr) {
                 if page_off + chunk <= page.len() {
+                    let page = page.make_mut();
                     page[page_off..page_off + chunk].copy_from_slice(&data[off..off + chunk]);
                 }
             }
@@ -356,7 +415,7 @@ mod tests {
             let mut v = vec![0u8; 4096];
             v[0] = 0xAB;
             v[1] = 0xCD;
-            v
+            v.into()
         });
         let snap = SnapshotProvider::new(None, pages, 4096);
         let mut buf = [0u8; 2];
@@ -376,7 +435,7 @@ mod tests {
             Arc::new(BufferProvider::new(vec![0u8; 8], "real"));
         // Snapshot caches page 0 as a copy of the real bytes (all zero).
         let mut pages = PageMap::new();
-        pages.insert(0, vec![0u8; 4096]);
+        pages.insert(0, vec![0u8; 4096].into());
         let snap = SnapshotProvider::new(Some(real.clone()), pages, 8);
 
         assert!(snap.is_writable());
@@ -391,6 +450,22 @@ mod tests {
         let mut buf = [0u8; 2];
         assert!(snap.read(2, &mut buf));
         assert_eq!(buf, [0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn patch_pages_copies_shared_page_before_mutating() {
+        let page = PageBytes::from(vec![0u8; 4096]);
+        let previous_read_baseline = page.clone();
+        let mut pages = PageMap::new();
+        pages.insert(0, page);
+        let snap = SnapshotProvider::new(None, pages, 4096);
+
+        snap.patch_pages(0, &[0xCC]);
+
+        assert_eq!(previous_read_baseline[0], 0);
+        let mut one = [0u8; 1];
+        assert!(snap.read(0, &mut one));
+        assert_eq!(one[0], 0xCC);
     }
 
     #[test]

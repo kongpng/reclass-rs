@@ -169,6 +169,10 @@ memchr = "2"
 # keeps that hot-loop scratch storage inline while reusing a mature crate already
 # present transitively through the UI stack.
 smallvec = "1"
+# Refresh snapshots keep each live-read page in both the visible snapshot and
+# the previous-read baseline. `Bytes` owns provider read buffers without copying
+# and clones cheaply; mutated snapshot pages fall back to copy-on-write.
+bytes = "1"
 
 # CLI + logging for the bin.
 clap = { version = "4", features = ["derive"] }

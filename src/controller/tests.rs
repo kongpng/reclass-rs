@@ -2868,7 +2868,7 @@ fn permanent_page_classification_handles_unsorted_regions() {
 
     let module_page = MODULE_BASE + 4096;
     let mut pages = PageMap::new();
-    pages.insert(module_page, vec![0u8; 4096]);
+    pages.insert(module_page, vec![0u8; 4096].into());
     c.on_read_complete(pages);
 
     assert!(c.snapshot_prov().unwrap().is_permanent(module_page));
@@ -3086,7 +3086,7 @@ fn changed_page_refresh_marks_changed_hex_byte_indices() {
     let mut c = RcxController::new(doc);
 
     let mut initial = PageMap::new();
-    initial.insert(0x4000, vec![0u8; 4096]);
+    initial.insert(0x4000, vec![0u8; 4096].into());
     assert!(c.on_read_complete(initial));
 
     let mut bytes = vec![0u8; 4096];
@@ -3094,7 +3094,7 @@ fn changed_page_refresh_marks_changed_hex_byte_indices() {
     bytes[3] = 1;
     bytes[4] = 1;
     let mut changed = PageMap::new();
-    changed.insert(0x4000, bytes);
+    changed.insert(0x4000, bytes.into());
     c.on_read_complete(changed);
 
     let lm = c
@@ -3139,8 +3139,8 @@ fn offscreen_changed_page_defers_refresh_until_visible() {
     let mut c = RcxController::new(doc);
 
     let mut initial = PageMap::new();
-    initial.insert(0, vec![0u8; 4096]);
-    initial.insert(4096, vec![0u8; 4096]);
+    initial.insert(0, vec![0u8; 4096].into());
+    initial.insert(4096, vec![0u8; 4096].into());
     assert!(c.on_read_complete(initial));
 
     let first_visible = c.last_result().line_for_node(field_ids[0]).unwrap();
@@ -3151,7 +3151,7 @@ fn offscreen_changed_page_defers_refresh_until_visible() {
     let mut offscreen = vec![0u8; 4096];
     offscreen[0] = 1;
     let mut changed = PageMap::new();
-    changed.insert(4096, offscreen);
+    changed.insert(4096, offscreen.into());
     assert!(
         !c.on_read_complete(changed),
         "offscreen live changes should not report visible output changes"
@@ -3211,8 +3211,8 @@ fn visible_changed_page_refreshes_immediately_with_visible_range() {
     let mut c = RcxController::new(doc);
 
     let mut initial = PageMap::new();
-    initial.insert(0, vec![0u8; 4096]);
-    initial.insert(4096, vec![0u8; 4096]);
+    initial.insert(0, vec![0u8; 4096].into());
+    initial.insert(4096, vec![0u8; 4096].into());
     assert!(c.on_read_complete(initial));
 
     let line = c.last_result().line_for_node(field_ids[0]).unwrap();
@@ -3223,7 +3223,7 @@ fn visible_changed_page_refreshes_immediately_with_visible_range() {
     let mut bytes = vec![0u8; 4096];
     bytes[0] = 1;
     let mut changed = PageMap::new();
-    changed.insert(0, bytes);
+    changed.insert(0, bytes.into());
     assert!(
         c.on_read_complete(changed),
         "visible live changes should report output changes"
@@ -3299,8 +3299,8 @@ fn middle_visible_changed_page_updates_row_text_without_rebuilding_structure() {
     let mut c = RcxController::new(doc);
 
     let mut initial = PageMap::new();
-    initial.insert(0, vec![0u8; 4096]);
-    initial.insert(4096, vec![0u8; 4096]);
+    initial.insert(0, vec![0u8; 4096].into());
+    initial.insert(4096, vec![0u8; 4096].into());
     c.on_read_complete(initial);
 
     let target_idx = 700usize;
@@ -3316,7 +3316,7 @@ fn middle_visible_changed_page_updates_row_text_without_rebuilding_structure() {
     let mut bytes = vec![0u8; 4096];
     bytes[target_idx * 4] = 1;
     let mut changed = PageMap::new();
-    changed.insert(0, bytes);
+    changed.insert(0, bytes.into());
     c.on_read_complete(changed);
 
     assert_eq!(c.result_revision(), composed_revision + 1);
@@ -3372,7 +3372,7 @@ fn visible_row_refresh_clears_previous_incremental_change_marks() {
     let mut c = RcxController::new(doc);
 
     let mut initial = PageMap::new();
-    initial.insert(0, vec![0u8; 4096]);
+    initial.insert(0, vec![0u8; 4096].into());
     c.on_read_complete(initial);
 
     let first_line = c.last_result().line_for_node(first_id).unwrap();
@@ -3382,7 +3382,7 @@ fn visible_row_refresh_clears_previous_incremental_change_marks() {
     let mut first_change = vec![0u8; 4096];
     first_change[0] = 1;
     let mut changed = PageMap::new();
-    changed.insert(0, first_change);
+    changed.insert(0, first_change.into());
     c.on_read_complete(changed);
     assert!(
         c.last_result()
@@ -3397,7 +3397,7 @@ fn visible_row_refresh_clears_previous_incremental_change_marks() {
     second_change[0] = 1;
     second_change[4] = 1;
     let mut changed = PageMap::new();
-    changed.insert(0, second_change);
+    changed.insert(0, second_change.into());
     c.on_read_complete(changed);
 
     let first_lm = c
@@ -3534,7 +3534,7 @@ fn all_zero_page0_discarded() {
     // Simpler: directly exercise on_read_complete with a synthetic all-zero
     // page-0 after prev_pages is non-empty.
     let mut zero_pages = PageMap::new();
-    zero_pages.insert(0, vec![0u8; 4096]);
+    zero_pages.insert(0, vec![0u8; 4096].into());
     let snap_before = c.snapshot_prov().unwrap().pages().len();
     // refresh_gen/read_gen must match for the guard to be reached.
     c.on_read_complete(zero_pages);
@@ -3559,11 +3559,11 @@ fn snapshot_provider_permanent_set() {
 #[test]
 fn snapshot_provider_merge_keeps_existing() {
     let mut initial = super::PageMap::new();
-    initial.insert(0x0000, vec![0xAA; 4096]);
-    initial.insert(0x1000, vec![0xBB; 4096]);
+    initial.insert(0x0000, vec![0xAA; 4096].into());
+    initial.insert(0x1000, vec![0xBB; 4096].into());
     let sp = SnapshotProvider::new(None, initial, 8192);
     let mut fresh = super::PageMap::new();
-    fresh.insert(0x1000, vec![0xCC; 4096]);
+    fresh.insert(0x1000, vec![0xCC; 4096].into());
     sp.merge_pages(&fresh, 8192);
     let mut buf = [0u8; 4];
     assert!(sp.read(0x0000, &mut buf));
