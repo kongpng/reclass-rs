@@ -7,7 +7,7 @@ use ahash::AHashMap;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use gpui::SharedString;
 use reclass::compose;
-use reclass::controller::{PageMap, RcxController, RcxDocument};
+use reclass::controller::{PageMap, RcxController, RcxDocument, RefreshPlan};
 use reclass::core::{
     infer_strong_types, infer_types, InferHints, LineKind, LineMeta, Node, NodeKind, NodeTree,
 };
@@ -58,6 +58,12 @@ fn flat_tree(nodes: usize, kind: NodeKind) -> NodeTree {
             ..Node::default()
         });
     }
+    tree
+}
+
+fn flat_tree_at_base(nodes: usize, kind: NodeKind, base_address: u64) -> NodeTree {
+    let mut tree = flat_tree(nodes, kind);
+    tree.base_address = base_address;
     tree
 }
 
@@ -228,6 +234,18 @@ struct LiveLikeProvider {
 }
 
 impl LiveLikeProvider {
+    fn with_dummy_modules(mut self, count: usize) -> Self {
+        self.modules = (0..count)
+            .map(|i| ModuleEntry {
+                name: format!("module_{i}.dll"),
+                full_path: format!(r"C:\dummy\module_{i}.dll"),
+                base: 0xFFFF_0000_0000_0000u64.saturating_add((i as u64) << 20),
+                size: 0x10000,
+            })
+            .collect();
+        self
+    }
+
     fn new_float_pairs(nodes: usize) -> Self {
         let mut data = vec![0u8; (nodes + 8) * 8];
         for i in 0..nodes {
@@ -1162,6 +1180,156 @@ fn controller_for(tree: NodeTree, provider: Arc<dyn Provider + Send + Sync>) -> 
     doc.tree = tree;
     doc.provider = provider;
     RcxController::new(doc)
+}
+
+fn apply_initial_live_snapshot(controller: &mut RcxController) {
+    match controller.on_refresh_tick() {
+        RefreshPlan::Read { pages, provider } => {
+            assert!(
+                !pages.is_empty(),
+                "initial live refresh should request pages"
+            );
+            let initial = RcxController::read_pages(&provider, &pages);
+            controller.on_read_complete(initial);
+        }
+        RefreshPlan::None => panic!("initial live refresh should request pages"),
+    }
+}
+
+fn set_first_visible_field_window(controller: &mut RcxController, lines: usize) {
+    let _ = set_visible_field_window_at(controller, 0, lines);
+}
+
+fn set_visible_field_window_at(
+    controller: &mut RcxController,
+    first_field_idx: usize,
+    lines: usize,
+) -> u64 {
+    let mut field_idx = 0usize;
+    let mut first_line = None;
+    let mut first_addr = 0u64;
+    let mut last_line = None;
+    let target_last = first_field_idx.saturating_add(lines.saturating_sub(1));
+
+    for (line, lm) in controller.last_result().meta.iter().enumerate() {
+        if lm.line_kind != LineKind::Field || lm.is_continuation {
+            continue;
+        }
+        if field_idx == first_field_idx {
+            first_line = Some(line);
+            first_addr = lm.offset_addr;
+        }
+        if field_idx == target_last {
+            last_line = Some(line);
+            break;
+        }
+        field_idx = field_idx.saturating_add(1);
+    }
+
+    let first = first_line.expect("composed tree should contain the requested first field line");
+    let last = last_line.unwrap_or_else(|| controller.last_result().meta.len().saturating_sub(1));
+    controller.set_visible_line_range(first, last);
+    first_addr
+}
+
+fn field_addrs_at(controller: &RcxController, first_field_idx: usize, lines: usize) -> Vec<u64> {
+    let mut field_idx = 0usize;
+    let mut addrs = Vec::with_capacity(lines);
+    let end_field_idx = first_field_idx.saturating_add(lines);
+
+    for lm in &controller.last_result().meta {
+        if lm.line_kind != LineKind::Field || lm.is_continuation {
+            continue;
+        }
+        if field_idx >= first_field_idx && field_idx < end_field_idx {
+            addrs.push(lm.offset_addr);
+            if addrs.len() == lines {
+                break;
+            }
+        }
+        field_idx = field_idx.saturating_add(1);
+    }
+    assert!(
+        !addrs.is_empty(),
+        "composed tree should contain the requested visible field addresses"
+    );
+    addrs
+}
+
+fn first_visible_field_addr(controller: &RcxController) -> u64 {
+    controller
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.line_kind == LineKind::Field && !lm.is_continuation)
+        .map(|lm| lm.offset_addr)
+        .expect("composed tree should contain a field line")
+}
+
+fn changed_pages_from_next_live_tick(controller: &mut RcxController) -> PageMap {
+    let addr = first_visible_field_addr(controller);
+    changed_pages_from_next_live_tick_for_addr(controller, addr)
+}
+
+fn offscreen_changed_pages_from_next_live_tick(controller: &mut RcxController) -> PageMap {
+    changed_pages_from_next_live_tick_at(controller, usize::MAX)
+}
+
+fn changed_pages_from_next_live_tick_for_addr(
+    controller: &mut RcxController,
+    addr: u64,
+) -> PageMap {
+    changed_pages_from_next_live_tick_for_addrs(controller, &[addr])
+}
+
+fn changed_pages_from_next_live_tick_for_addrs(
+    controller: &mut RcxController,
+    addrs: &[u64],
+) -> PageMap {
+    assert!(
+        !addrs.is_empty(),
+        "changed-page benchmark should mutate at least one address"
+    );
+    match controller.on_refresh_tick() {
+        RefreshPlan::Read { pages, provider } => {
+            let mut changed = RcxController::read_pages(&provider, &pages);
+            for &addr in addrs {
+                let page = addr & !(K_PAGE_SIZE - 1);
+                assert!(
+                    pages.contains(&page),
+                    "visible changed page should be part of the next live refresh"
+                );
+                let bytes = changed
+                    .get_mut(&page)
+                    .expect("visible changed page should be present in read result");
+                bytes[(addr - page) as usize] = bytes[(addr - page) as usize].wrapping_add(1);
+            }
+            changed
+        }
+        RefreshPlan::None => panic!("second live refresh should request pages"),
+    }
+}
+
+fn changed_pages_from_next_live_tick_at(
+    controller: &mut RcxController,
+    page_index: usize,
+) -> PageMap {
+    match controller.on_refresh_tick() {
+        RefreshPlan::Read { pages, provider } => {
+            assert!(
+                !pages.is_empty(),
+                "second live refresh should request pages"
+            );
+            let mut changed = RcxController::read_pages(&provider, &pages);
+            let page = pages[page_index.min(pages.len() - 1)];
+            let bytes = changed
+                .get_mut(&page)
+                .expect("requested page should be present in read result");
+            bytes[0] = bytes[0].wrapping_add(1);
+            changed
+        }
+        RefreshPlan::None => panic!("second live refresh should request pages"),
+    }
 }
 
 fn compose_workloads(c: &mut Criterion) {
@@ -2648,13 +2816,186 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
                     || {
                         let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
                         let mut controller =
-                            controller_for(flat_tree(nodes, NodeKind::Hex64), provider);
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
                         let mut initial = PageMap::new();
                         initial.insert(0, vec![0u8; 4096]);
                         controller.on_read_complete(initial);
 
                         let mut changed = PageMap::new();
                         changed.insert(0, vec![0x5Au8; 4096]);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    for &nodes in &[10_000usize, 50_000] {
+        group.throughput(Throughput::Elements(nodes as u64));
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_changed_live_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        set_first_visible_field_window(&mut controller, 80);
+                        let changed = changed_pages_from_next_live_tick(&mut controller);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_middle_changed_live_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        let addr = set_visible_field_window_at(&mut controller, nodes / 2, 80);
+                        let changed =
+                            changed_pages_from_next_live_tick_for_addr(&mut controller, addr);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_middle_changed_editor_tick_extra_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        apply_initial_live_snapshot(&mut controller);
+                        let addr = set_visible_field_window_at(&mut controller, nodes / 2, 80);
+                        let changed =
+                            changed_pages_from_next_live_tick_for_addr(&mut controller, addr);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        controller.refresh();
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_middle_changed_editor_tick_stale_guard", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        apply_initial_live_snapshot(&mut controller);
+                        let addr = set_visible_field_window_at(&mut controller, nodes / 2, 80);
+                        let changed =
+                            changed_pages_from_next_live_tick_for_addr(&mut controller, addr);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        controller.refresh_if_stale();
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_middle_changed_modules_live_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(
+                            LiveLikeProvider::new_float_pairs(nodes + 2048).with_dummy_modules(64),
+                        );
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        let addr = set_visible_field_window_at(&mut controller, nodes / 2, 80);
+                        let changed =
+                            changed_pages_from_next_live_tick_for_addr(&mut controller, addr);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_middle_all_changed_live_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        let first_field_idx = nodes / 2;
+                        set_visible_field_window_at(&mut controller, first_field_idx, 80);
+                        let addrs = field_addrs_at(&controller, first_field_idx, 80);
+                        let changed =
+                            changed_pages_from_next_live_tick_for_addrs(&mut controller, &addrs);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("visible_80_offscreen_changed_live_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        set_first_visible_field_window(&mut controller, 80);
+                        let changed = offscreen_changed_pages_from_next_live_tick(&mut controller);
                         (controller, changed)
                     },
                     |(mut controller, changed)| {
@@ -3133,6 +3474,34 @@ fn permanent_page_workloads(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let provider = Arc::new(LiveLikeProvider::new_module_pages(pages));
+                        let controller = controller_for(flat_tree(1, NodeKind::Hex64), provider);
+                        let mut fresh = PageMap::new();
+                        for page in 0..pages {
+                            fresh.insert((page * 4096) as u64, vec![0u8; 4096]);
+                        }
+                        (controller, fresh)
+                    },
+                    |(mut controller, fresh)| {
+                        controller.on_read_complete(fresh);
+                        black_box(controller.snapshot_prov().is_some());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    for &pages in &[512usize, 2_048] {
+        group.throughput(Throughput::Elements(pages as u64));
+        group.bench_with_input(
+            BenchmarkId::new("classify_heap_pages_with_modules", pages),
+            &pages,
+            |b, &pages| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(
+                            LiveLikeProvider::new_float_pairs(pages * 512 + 2048)
+                                .with_dummy_modules(64),
+                        );
                         let controller = controller_for(flat_tree(1, NodeKind::Hex64), provider);
                         let mut fresh = PageMap::new();
                         for page in 0..pages {

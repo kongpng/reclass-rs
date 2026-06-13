@@ -1327,11 +1327,12 @@ impl RcxEditor {
         if self.editing.is_some() {
             return;
         }
-        self.sync_controller_visible_line_range();
-        if self.controller.pump_refresh() {
-            // A read landed and the snapshot/heat changed — recompose + repaint so
-            // the live values + changed-byte heat appear without user input.
-            self.controller.refresh();
+        let viewport_output_changed = self.sync_controller_visible_line_range();
+        if self.controller.pump_refresh_output_changed() || viewport_output_changed {
+            // `on_read_complete` refreshes when landed pages affect visible
+            // output. Keep the old safety net for stale view/options without
+            // forcing a second full compose after an incremental live refresh.
+            self.controller.refresh_if_stale();
             self.refresh_hover_popup_from_probe(cx);
             let _ = self.controller.take_events();
             cx.notify();
@@ -2886,12 +2887,13 @@ impl RcxEditor {
         (first, first + rows.saturating_sub(1))
     }
 
-    fn sync_controller_visible_line_range(&mut self) {
+    fn sync_controller_visible_line_range(&mut self) -> bool {
         let (first, last) = self.visible_line_range();
         if last > first {
-            self.controller.set_visible_line_range(first, last);
+            self.controller.set_visible_line_range(first, last)
         } else {
             self.controller.clear_visible_line_range();
+            false
         }
     }
 

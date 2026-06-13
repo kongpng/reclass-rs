@@ -3046,7 +3046,7 @@ fn changed_page_refresh_marks_changed_hex_byte_indices() {
 
     let mut initial = PageMap::new();
     initial.insert(0x4000, vec![0u8; 4096]);
-    c.on_read_complete(initial);
+    assert!(c.on_read_complete(initial));
 
     let mut bytes = vec![0u8; 4096];
     bytes[2] = 1;
@@ -3064,6 +3064,315 @@ fn changed_page_refresh_marks_changed_hex_byte_indices() {
         .expect("hex field line");
     assert!(lm.data_changed);
     assert_eq!(lm.changed_byte_indices, vec![2, 3, 4]);
+}
+
+#[test]
+fn offscreen_changed_page_defers_refresh_until_visible() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let mut field_ids = Vec::new();
+    for i in 0..1100 {
+        let field = tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: format!("field_{i}"),
+            parent_id: root_id,
+            offset: i * 4,
+            ..Node::default()
+        });
+        field_ids.push(tree.nodes[field].id);
+    }
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(CountingLiveProvider::new(vec![0; 8192]));
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(0, vec![0u8; 4096]);
+    initial.insert(4096, vec![0u8; 4096]);
+    assert!(c.on_read_complete(initial));
+
+    let first_visible = c.last_result().line_for_node(field_ids[0]).unwrap();
+    let last_visible = c.last_result().line_for_node(field_ids[3]).unwrap();
+    assert!(!c.set_visible_line_range(first_visible, last_visible));
+    let composed_revision = c.result_revision();
+
+    let mut offscreen = vec![0u8; 4096];
+    offscreen[0] = 1;
+    let mut changed = PageMap::new();
+    changed.insert(4096, offscreen);
+    assert!(
+        !c.on_read_complete(changed),
+        "offscreen live changes should not report visible output changes"
+    );
+
+    assert_eq!(
+        c.result_revision(),
+        composed_revision,
+        "offscreen live changes should update the snapshot without recomposing visible rows"
+    );
+
+    let offscreen_line = c.last_result().line_for_node(field_ids[1024]).unwrap();
+    assert!(
+        c.set_visible_line_range(offscreen_line, offscreen_line),
+        "moving the viewport onto a deferred live change should refresh visible output"
+    );
+
+    assert_eq!(c.result_revision(), composed_revision + 1);
+    let lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_ids[1024])
+        .expect("offscreen field line");
+    assert!(lm.data_changed);
+}
+
+#[test]
+fn visible_changed_page_refreshes_immediately_with_visible_range() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let mut field_ids = Vec::new();
+    for i in 0..1100 {
+        let field = tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: format!("field_{i}"),
+            parent_id: root_id,
+            offset: i * 4,
+            ..Node::default()
+        });
+        field_ids.push(tree.nodes[field].id);
+    }
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(CountingLiveProvider::new(vec![0; 8192]));
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(0, vec![0u8; 4096]);
+    initial.insert(4096, vec![0u8; 4096]);
+    assert!(c.on_read_complete(initial));
+
+    let line = c.last_result().line_for_node(field_ids[0]).unwrap();
+    c.set_visible_line_range(line, line);
+    let composed_revision = c.result_revision();
+    let composed_meta_len = c.last_result().meta.len();
+
+    let mut bytes = vec![0u8; 4096];
+    bytes[0] = 1;
+    let mut changed = PageMap::new();
+    changed.insert(0, bytes);
+    assert!(
+        c.on_read_complete(changed),
+        "visible live changes should report output changes"
+    );
+
+    assert_eq!(c.result_revision(), composed_revision + 1);
+    assert_eq!(c.last_result().meta.len(), composed_meta_len);
+    assert_eq!(c.last_result().line_starts.len(), composed_meta_len);
+    assert_eq!(c.last_result().line_byte_starts.len(), composed_meta_len);
+    assert!(c.last_result().line_for_node(field_ids[1024]).is_some());
+    let offscreen_line = c.last_result().line_for_node(field_ids[1024]).unwrap();
+    let offscreen_start = c.last_result().line_byte_starts[offscreen_line];
+    let offscreen_end = c
+        .last_result()
+        .line_byte_starts
+        .get(offscreen_line + 1)
+        .copied()
+        .unwrap_or_else(|| c.last_result().text.len());
+    assert!(offscreen_start <= offscreen_end && offscreen_end <= c.last_result().text.len());
+    let lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_ids[0])
+        .expect("visible field line");
+    assert!(lm.data_changed);
+}
+
+#[test]
+fn middle_visible_changed_page_updates_row_text_without_rebuilding_structure() {
+    fn line_text(result: &crate::core::ComposeResult, line: usize) -> &str {
+        let start = result.line_byte_starts[line];
+        let next = result
+            .line_byte_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(result.text.len());
+        let end = if next > start && result.text.as_bytes().get(next - 1) == Some(&b'\n') {
+            next - 1
+        } else {
+            next
+        };
+        &result.text[start..end]
+    }
+
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let mut field_ids = Vec::new();
+    for i in 0..1100 {
+        let field = tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: format!("field_{i}"),
+            parent_id: root_id,
+            offset: i * 4,
+            ..Node::default()
+        });
+        field_ids.push(tree.nodes[field].id);
+    }
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(CountingLiveProvider::new(vec![0; 8192]));
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(0, vec![0u8; 4096]);
+    initial.insert(4096, vec![0u8; 4096]);
+    c.on_read_complete(initial);
+
+    let target_idx = 700usize;
+    let line = c
+        .last_result()
+        .line_for_node(field_ids[target_idx])
+        .unwrap();
+    c.set_visible_line_range(line, line);
+    let composed_revision = c.result_revision();
+    let composed_meta_len = c.last_result().meta.len();
+    let before_text = line_text(c.last_result(), line).to_string();
+
+    let mut bytes = vec![0u8; 4096];
+    bytes[target_idx * 4] = 1;
+    let mut changed = PageMap::new();
+    changed.insert(0, bytes);
+    c.on_read_complete(changed);
+
+    assert_eq!(c.result_revision(), composed_revision + 1);
+    assert_eq!(c.last_result().meta.len(), composed_meta_len);
+    assert_eq!(c.last_result().line_starts.len(), composed_meta_len);
+    assert_eq!(c.last_result().line_byte_starts.len(), composed_meta_len);
+    assert_ne!(line_text(c.last_result(), line), before_text);
+    assert!(line_text(c.last_result(), line).contains('1'));
+
+    let lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_ids[target_idx])
+        .expect("middle visible field line");
+    assert!(lm.data_changed);
+}
+
+#[test]
+fn visible_row_refresh_clears_previous_incremental_change_marks() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let first = tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "first".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let second = tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "second".into(),
+        parent_id: root_id,
+        offset: 4,
+        ..Node::default()
+    });
+    let first_id = tree.nodes[first].id;
+    let second_id = tree.nodes[second].id;
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(CountingLiveProvider::new(vec![0; 4096]));
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(0, vec![0u8; 4096]);
+    c.on_read_complete(initial);
+
+    let first_line = c.last_result().line_for_node(first_id).unwrap();
+    let second_line = c.last_result().line_for_node(second_id).unwrap();
+    c.set_visible_line_range(first_line, second_line);
+
+    let mut first_change = vec![0u8; 4096];
+    first_change[0] = 1;
+    let mut changed = PageMap::new();
+    changed.insert(0, first_change);
+    c.on_read_complete(changed);
+    assert!(
+        c.last_result()
+            .meta
+            .iter()
+            .find(|lm| lm.node_id == first_id)
+            .unwrap()
+            .data_changed
+    );
+
+    let mut second_change = vec![0u8; 4096];
+    second_change[0] = 1;
+    second_change[4] = 1;
+    let mut changed = PageMap::new();
+    changed.insert(0, second_change);
+    c.on_read_complete(changed);
+
+    let first_lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == first_id)
+        .unwrap();
+    let second_lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == second_id)
+        .unwrap();
+    assert!(!first_lm.data_changed);
+    assert!(second_lm.data_changed);
 }
 
 /// Mock editor whose viewport covers only the first few document lines (the

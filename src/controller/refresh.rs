@@ -175,11 +175,11 @@ impl super::RcxController {
     }
 
     /// `onReadComplete()` (`controller.cpp:6698`).
-    pub fn on_read_complete(&mut self, new_pages: PageMap) {
+    pub fn on_read_complete(&mut self, new_pages: PageMap) -> bool {
         self.read_in_flight = false;
 
         if self.read_gen != self.refresh_gen {
-            return;
+            return false;
         }
 
         // All-zero page-0 guard.
@@ -187,7 +187,7 @@ impl super::RcxController {
             if let Some(p0) = new_pages.get(&0) {
                 if p0.iter().all(|&b| b == 0) {
                     tracing::debug!("[Refresh] discarding all-zero page-0, keeping stale snapshot");
-                    return;
+                    return false;
                 }
             }
         }
@@ -266,10 +266,27 @@ impl super::RcxController {
         self.classify_permanent_pages(&new_pages);
         self.prev_pages.extend(new_pages);
 
-        if any_changed || first_snapshot {
+        let mut output_changed = false;
+        if first_snapshot {
             self.refresh();
+            output_changed = true;
+        } else if any_changed {
+            if self.changed_ranges_touch_visible_lines(&self.changed_ranges) {
+                if !self.deferred_changed_ranges.is_empty() {
+                    self.changed_ranges
+                        .extend(self.deferred_changed_ranges.drain(..));
+                    normalize_changed_ranges(&mut self.changed_ranges);
+                }
+                self.refresh();
+                output_changed = true;
+            } else {
+                self.deferred_changed_ranges
+                    .extend(self.changed_ranges.iter().copied());
+                normalize_changed_ranges(&mut self.deferred_changed_ranges);
+            }
         }
         self.changed_ranges.clear();
+        output_changed
     }
 
     /// `collectPointerRanges(...)` (`controller.cpp:6532`).
@@ -696,8 +713,21 @@ impl super::RcxController {
             RefreshPlan::None => false,
             RefreshPlan::Read { pages, provider } => {
                 let result = RcxController::read_pages(&provider, &pages);
-                self.on_read_complete(result);
+                let _ = self.on_read_complete(result);
                 true
+            }
+        }
+    }
+
+    /// Drive one tick synchronously and report whether visible/composed output
+    /// changed. Unlike [`pump_refresh`](Self::pump_refresh), unchanged or deferred
+    /// offscreen reads return `false` so UI callers can skip repaint work.
+    pub fn pump_refresh_output_changed(&mut self) -> bool {
+        match self.on_refresh_tick() {
+            RefreshPlan::None => false,
+            RefreshPlan::Read { pages, provider } => {
+                let result = RcxController::read_pages(&provider, &pages);
+                self.on_read_complete(result)
             }
         }
     }

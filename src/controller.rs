@@ -30,13 +30,13 @@ use crate::core::linemeta::{
 use crate::core::{
     alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node, is_hex_preview,
     is_pointer_kind, is_valid_primitive_ptr_target, kind_from_string, kind_meta, kind_to_string,
-    size_for_kind, BitfieldMember, Command, ComposeResult, LineKind, Node, NodeKind, NodeTree,
-    OffsetAdj, ValueHistory, K_COMMON_TYPES,
+    lines_for_kind, size_for_kind, BitfieldMember, Command, ComposeResult, LineKind, Node,
+    NodeKind, NodeTree, OffsetAdj, ValueHistory, K_COMMON_TYPES,
 };
 use crate::format;
 use crate::provider::{
-    BufferProvider, CachedPageProvider, MemoryRegion, NullProvider, Provider, SnapshotProvider,
-    K_PAGE_SIZE,
+    BufferProvider, CachedPageProvider, MemoryRegion, ModuleLookup, NullProvider, Provider,
+    SnapshotProvider, K_PAGE_SIZE,
 };
 
 /// Strip mask for selection ids (footer / array-element / member tag + sub bits).
@@ -86,6 +86,118 @@ fn changed_ranges_intersects(ranges: &[(i64, i64)], start: i64, end: i64) -> boo
         .is_some_and(|(range_start, _)| *range_start < end)
 }
 
+fn changed_ranges_covered_by_spans(ranges: &[(i64, i64)], spans: &[(i64, i64)]) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    if spans.is_empty() {
+        return false;
+    }
+
+    let mut spans = spans.to_vec();
+    spans.retain(|(start, end)| end > start);
+    spans.sort_unstable_by_key(|(start, _)| *start);
+
+    for &(range_start, range_end) in ranges {
+        if range_end <= range_start {
+            continue;
+        }
+        let mut covered_until = range_start;
+        for &(span_start, span_end) in &spans {
+            if span_end <= covered_until {
+                continue;
+            }
+            if span_start > covered_until {
+                break;
+            }
+            covered_until = covered_until.max(span_end);
+            if covered_until >= range_end {
+                break;
+            }
+        }
+        if covered_until < range_end {
+            return false;
+        }
+    }
+    true
+}
+
+fn trimmed_utf16_len(s: &str) -> i32 {
+    s.trim_end_matches(' ')
+        .encode_utf16()
+        .count()
+        .min(i32::MAX as usize) as i32
+}
+
+fn validate_compose_line_replacement(result: &ComposeResult, line: usize, new_line: &str) -> bool {
+    if line >= result.meta.len()
+        || result.line_starts.len() != result.meta.len()
+        || result.line_byte_starts.len() != result.meta.len()
+    {
+        return false;
+    }
+    let start = result.line_byte_starts[line];
+    let next = result
+        .line_byte_starts
+        .get(line + 1)
+        .copied()
+        .unwrap_or(result.text.len());
+    if start > next || next > result.text.len() {
+        return false;
+    }
+    let line_end = if next > start && result.text.as_bytes().get(next - 1) == Some(&b'\n') {
+        next - 1
+    } else {
+        next
+    };
+    if !result.text.is_char_boundary(start) || !result.text.is_char_boundary(line_end) {
+        return false;
+    }
+
+    let old_line = &result.text[start..line_end];
+    let old_len = trimmed_utf16_len(old_line);
+    let new_len = trimmed_utf16_len(new_line);
+    !(old_len >= result.max_line_len && new_len < old_len)
+}
+
+fn replace_compose_line_text(result: &mut ComposeResult, line: usize, new_line: &str) -> bool {
+    if !validate_compose_line_replacement(result, line, new_line) {
+        return false;
+    }
+    let start = result.line_byte_starts[line];
+    let next = result
+        .line_byte_starts
+        .get(line + 1)
+        .copied()
+        .unwrap_or(result.text.len());
+    let line_end = if next > start && result.text.as_bytes().get(next - 1) == Some(&b'\n') {
+        next - 1
+    } else {
+        next
+    };
+
+    let old_line = &result.text[start..line_end];
+    let old_units = old_line.encode_utf16().count().min(i32::MAX as usize) as i32;
+    let new_units = new_line.encode_utf16().count().min(i32::MAX as usize) as i32;
+    let byte_delta = new_line.len() as isize - (line_end - start) as isize;
+    let unit_delta = new_units - old_units;
+
+    result.text.replace_range(start..line_end, new_line);
+    if unit_delta != 0 {
+        for line_start in &mut result.line_starts[line + 1..] {
+            *line_start = line_start.saturating_add(unit_delta);
+        }
+    }
+    if byte_delta != 0 {
+        for byte_start in &mut result.line_byte_starts[line + 1..] {
+            *byte_start = byte_start.saturating_add_signed(byte_delta);
+        }
+    }
+    result.max_line_len = result.max_line_len.max(trimmed_utf16_len(new_line));
+    result.node_line_index = Default::default();
+    true
+}
+
 fn changed_byte_indices_for_line(
     ranges: &[(i64, i64)],
     offset: i64,
@@ -109,6 +221,80 @@ fn changed_byte_indices_for_line(
         idx += 1;
     }
     out
+}
+
+fn splice_compose_prefix(
+    result: &mut ComposeResult,
+    prefix: ComposeResult,
+    prefix_lines: usize,
+) -> bool {
+    if prefix_lines == 0 || prefix_lines > result.meta.len() || prefix.meta.len() != prefix_lines {
+        return false;
+    }
+    if result.line_starts.len() != result.meta.len()
+        || result.line_byte_starts.len() != result.meta.len()
+        || prefix.line_starts.len() != prefix_lines
+        || prefix.line_byte_starts.len() != prefix_lines
+    {
+        return false;
+    }
+    let suffix_start = result
+        .line_byte_starts
+        .get(prefix_lines)
+        .copied()
+        .unwrap_or(result.text.len())
+        .min(result.text.len());
+    if suffix_start == 0 {
+        return false;
+    }
+    let prefix_body_end = suffix_start - 1;
+    if result.text.as_bytes().get(prefix_body_end) != Some(&b'\n') {
+        return false;
+    }
+    let old_suffix_start_units = *result.line_starts.get(prefix_lines).unwrap_or(&0);
+    if old_suffix_start_units <= 0 {
+        return false;
+    }
+    let old_prefix_body_units = old_suffix_start_units - 1;
+    let new_prefix_units = prefix.text.encode_utf16().count().min(i32::MAX as usize) as i32;
+    let byte_delta = prefix.text.len() as isize - prefix_body_end as isize;
+    let unit_delta = new_prefix_units - old_prefix_body_units;
+
+    let old_prefix_max = (0..prefix_lines)
+        .map(|line| {
+            let start = result.line_byte_starts[line];
+            let end = result
+                .line_byte_starts
+                .get(line + 1)
+                .copied()
+                .unwrap_or(result.text.len())
+                .min(result.text.len());
+            let line = result.text[start..end].trim_end_matches('\n');
+            line.trim_end_matches(' ')
+                .encode_utf16()
+                .count()
+                .min(i32::MAX as usize) as i32
+        })
+        .max()
+        .unwrap_or(0);
+    if old_prefix_max >= result.max_line_len && prefix.max_line_len < old_prefix_max {
+        return false;
+    }
+
+    result.text.replace_range(0..prefix_body_end, &prefix.text);
+    result.meta.splice(0..prefix_lines, prefix.meta);
+    result.layout = prefix.layout;
+    result.max_line_len = result.max_line_len.max(prefix.max_line_len);
+    result.line_starts[..prefix_lines].copy_from_slice(&prefix.line_starts);
+    result.line_byte_starts[..prefix_lines].copy_from_slice(&prefix.line_byte_starts);
+    for start in &mut result.line_starts[prefix_lines..] {
+        *start = start.saturating_add(unit_delta);
+    }
+    for start in &mut result.line_byte_starts[prefix_lines..] {
+        *start = start.saturating_add_signed(byte_delta);
+    }
+    result.node_line_index = Default::default();
+    true
 }
 
 fn provider_read_cache_eligible(provider: &dyn Provider) -> bool {
@@ -757,6 +943,8 @@ pub struct RcxController {
     snapshot: Option<Box<SnapshotProvider>>,
     prev_pages: PageMap,
     changed_ranges: Vec<(i64, i64)>,
+    deferred_changed_ranges: Vec<(i64, i64)>,
+    transient_meta_lines: Vec<usize>,
     value_history: HashMap<u64, ValueHistory>,
     last_value_addr: AHashMap<u64, u64>,
     // nodeId -> raw bytes of the last sampled value. Change-detection keys on
@@ -824,6 +1012,7 @@ pub trait EditorView {
     fn is_editing(&self) -> bool {
         false
     }
+
     fn first_visible_line(&self) -> i64 {
         0
     }
@@ -868,6 +1057,8 @@ impl RcxController {
             snapshot: None,
             prev_pages: PageMap::new(),
             changed_ranges: Vec::new(),
+            deferred_changed_ranges: Vec::new(),
+            transient_meta_lines: Vec::new(),
             value_history: HashMap::new(),
             last_value_addr: AHashMap::new(),
             last_value_bytes: AHashMap::new(),
@@ -1008,14 +1199,65 @@ impl RcxController {
         self.editor = Some(editor);
     }
 
-    pub fn set_visible_line_range(&mut self, first: usize, last: usize) {
+    pub fn set_visible_line_range(&mut self, first: usize, last: usize) -> bool {
         if last >= first {
             self.visible_line_range = Some((first, last));
+            if self.changed_ranges_touch_visible_lines(&self.deferred_changed_ranges) {
+                self.changed_ranges = std::mem::take(&mut self.deferred_changed_ranges);
+                self.refresh();
+                self.changed_ranges.clear();
+                return true;
+            }
         }
+        false
     }
 
     pub fn clear_visible_line_range(&mut self) {
         self.visible_line_range = None;
+    }
+
+    fn changed_ranges_touch_visible_lines(&self, ranges: &[(i64, i64)]) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+        let Some((first, last)) = self.visible_line_range else {
+            return true;
+        };
+        let meta_len = self.last_result.meta.len();
+        if first >= meta_len {
+            return false;
+        }
+        let end = last.min(meta_len.saturating_sub(1));
+        for line in first..=end {
+            let Some(lm) = self.last_result.meta.get(line) else {
+                continue;
+            };
+            if lm.node_idx < 0 || lm.node_idx as usize >= self.doc.tree.nodes.len() {
+                continue;
+            }
+            let node = &self.doc.tree.nodes[lm.node_idx as usize];
+            if matches!(node.kind, NodeKind::Pointer32 | NodeKind::Pointer64)
+                && node.ptr_depth > 0
+                && node.ref_id == 0
+                && is_valid_primitive_ptr_target(node.element_kind)
+            {
+                // Primitive pointer rows can display the dereferenced target, so
+                // a target-page change may affect visible text without touching
+                // the pointer slot address recorded in LineMeta.
+                return true;
+            }
+            let byte_count = if lm.line_byte_count > 0 {
+                lm.line_byte_count
+            } else {
+                self.node_size(node)
+            };
+            let line_start = lm.offset_addr as i64;
+            let line_end = line_start.saturating_add(byte_count.max(1) as i64);
+            if changed_ranges_intersects(ranges, line_start, line_end) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Drain queued events (the UI dispatches them to GPUI; tests assert on them).
@@ -1221,6 +1463,8 @@ impl RcxController {
     /// `resetChangeTracking()` (`controller.cpp:1881`) — does NOT refresh.
     pub fn reset_change_tracking(&mut self) {
         self.changed_ranges.clear();
+        self.deferred_changed_ranges.clear();
+        self.clear_transient_meta_lines();
         self.value_history.clear();
         self.last_value_addr.clear();
         self.last_value_bytes.clear();
@@ -4964,6 +5208,214 @@ impl RcxController {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl RcxController {
+    fn clear_transient_meta_lines(&mut self) {
+        if self.transient_meta_lines.is_empty() {
+            return;
+        }
+        self.transient_meta_lines.sort_unstable();
+        self.transient_meta_lines.dedup();
+        for line in self.transient_meta_lines.drain(..) {
+            let Some(lm) = self.last_result.meta.get_mut(line) else {
+                continue;
+            };
+            lm.data_changed = false;
+            lm.changed_byte_indices.clear();
+            lm.heat_level = 0;
+        }
+    }
+
+    fn patchable_visible_value_row(&self, line: usize) -> Option<(i64, i64)> {
+        if self.tree_lines || self.compact_columns || self.type_hints || self.show_comments {
+            return None;
+        }
+        let lm = self.last_result.meta.get(line)?;
+        if lm.line_kind != LineKind::Field
+            || lm.is_continuation
+            || lm.fold_head
+            || !lm.chips.is_empty()
+            || lm.node_idx < 0
+        {
+            return None;
+        }
+        let node_idx = lm.node_idx as usize;
+        let node = self.doc.tree.nodes.get(node_idx)?;
+        if is_container_kind(node.kind)
+            || is_pointer_kind(node.kind)
+            || is_func_ptr(node.kind)
+            || lines_for_kind(node.kind) != 1
+        {
+            return None;
+        }
+        if self.show_enum_chips && node.ref_id != 0 {
+            return None;
+        }
+
+        let byte_count = if lm.line_byte_count > 0 {
+            lm.line_byte_count
+        } else {
+            node.byte_size()
+        };
+        if byte_count <= 0 {
+            return None;
+        }
+        let start = lm.offset_addr as i64;
+        Some((start, start.saturating_add(byte_count as i64)))
+    }
+
+    fn patchable_visible_row_rtti_safe(
+        &self,
+        line: usize,
+        provider: &dyn Provider,
+        rtti_modules: &mut Option<ModuleLookup>,
+    ) -> bool {
+        let Some(lm) = self.last_result.meta.get(line) else {
+            return false;
+        };
+        if !self.show_rtti || !matches!(lm.node_kind, NodeKind::Hex64) {
+            return true;
+        }
+        let modules =
+            rtti_modules.get_or_insert_with(|| ModuleLookup::new(provider.enumerate_modules()));
+        if modules.modules().is_empty() {
+            return true;
+        }
+        let mut bytes = [0u8; 8];
+        if !provider.read(lm.offset_addr, &mut bytes) {
+            return true;
+        }
+        let candidate = u64::from_le_bytes(bytes);
+        candidate == 0 || candidate == u64::MAX || modules.find_by_addr(candidate).is_none()
+    }
+
+    fn try_refresh_visible_rows(&mut self, value_refresh_mode: ValueRefreshMode) -> bool {
+        if value_refresh_mode != ValueRefreshMode::SampleLiveValues
+            || self.changed_ranges.is_empty()
+        {
+            return false;
+        }
+        let Some((first, last)) = self.visible_line_range else {
+            return false;
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let meta_len = self.last_result.meta.len();
+        if first >= meta_len {
+            return false;
+        }
+        let end = last.min(meta_len.saturating_sub(1));
+        let provider: &dyn Provider = snapshot.as_ref();
+        let mut rtti_modules = None;
+        let mut patch_lines = Vec::new();
+        let mut covered_spans = Vec::new();
+
+        for line in first..=end {
+            let Some((span_start, span_end)) = self.patchable_visible_value_row(line) else {
+                continue;
+            };
+            if !changed_ranges_intersects(&self.changed_ranges, span_start, span_end) {
+                continue;
+            }
+            if !self.patchable_visible_row_rtti_safe(line, provider, &mut rtti_modules) {
+                continue;
+            }
+            patch_lines.push(line);
+            covered_spans.push((span_start, span_end));
+        }
+        if patch_lines.is_empty()
+            || !changed_ranges_covered_by_spans(&self.changed_ranges, &covered_spans)
+        {
+            return false;
+        }
+
+        let mut replacements = Vec::with_capacity(patch_lines.len());
+        for &line in &patch_lines {
+            let lm = &self.last_result.meta[line];
+            let node = self.doc.tree.nodes[lm.node_idx as usize].clone();
+            let body = format::fmt_node_line(
+                &node,
+                provider,
+                lm.offset_addr,
+                lm.depth,
+                lm.sub_line,
+                "",
+                lm.effective_type_w,
+                lm.effective_name_w,
+                "",
+                self.compact_columns,
+            );
+            let new_line = format!("   {body}");
+            if !validate_compose_line_replacement(&self.last_result, line, &new_line) {
+                return false;
+            }
+            replacements.push((line, new_line));
+        }
+
+        for (line, new_line) in replacements {
+            if !replace_compose_line_text(&mut self.last_result, line, &new_line) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn try_refresh_visible_prefix(&mut self, value_refresh_mode: ValueRefreshMode) -> bool {
+        if value_refresh_mode != ValueRefreshMode::SampleLiveValues {
+            return false;
+        }
+        if self.changed_ranges.is_empty() {
+            return false;
+        }
+        let Some((_first, last)) = self.visible_line_range else {
+            return false;
+        };
+        let old_line_count = self.last_result.meta.len();
+        let prefix_lines = last.saturating_add(1).min(old_line_count);
+        if prefix_lines == 0 || prefix_lines >= old_line_count {
+            return false;
+        }
+        if prefix_lines.saturating_mul(4) > old_line_count.saturating_mul(3) {
+            return false;
+        }
+        let Some(preview) = self.snapshot.as_ref().map(|snap| {
+            compose::compose_preview_with_symbols_at_base(
+                &self.doc.tree,
+                snap.as_ref(),
+                self.view_root_id,
+                self.doc.tree.base_address,
+                self.compact_columns,
+                self.tree_lines,
+                self.brace_wrap,
+                self.type_hints,
+                self.show_comments,
+                None,
+                self.show_rtti,
+                self.show_enum_chips,
+                prefix_lines,
+            )
+        }) else {
+            return false;
+        };
+        if preview.meta.len() != prefix_lines {
+            return false;
+        }
+        if self.last_result.meta.len() < prefix_lines
+            || !self.last_result.meta[..prefix_lines]
+                .iter()
+                .zip(&preview.meta)
+                .all(|(old, new)| {
+                    old.node_idx == new.node_idx
+                        && old.node_id == new.node_id
+                        && old.sub_line == new.sub_line
+                        && old.line_kind == new.line_kind
+                })
+        {
+            return false;
+        }
+
+        splice_compose_prefix(&mut self.last_result, preview, prefix_lines)
+    }
+
     fn current_compose_stamp(&self) -> ComposeStamp {
         ComposeStamp {
             tree_generation: self.doc.tree.generation(),
@@ -5045,52 +5497,77 @@ impl RcxController {
         #[cfg(not(feature = "symbols"))]
         let sym: compose::SymbolLookupFn<'_> = None;
 
-        // Compose against snapshot if active, else real provider.
-        self.last_result = if let Some(snap) = &self.snapshot {
-            compose::compose_with_symbols(
-                &self.doc.tree,
-                snap.as_ref(),
-                self.view_root_id,
-                self.compact_columns,
-                self.tree_lines,
-                self.brace_wrap,
-                self.type_hints,
-                self.show_comments,
-                sym,
-                self.show_rtti,
-                self.show_enum_chips,
-            )
-        } else if let Some(cache) = &live_read_cache {
-            compose::compose_with_symbols(
-                &self.doc.tree,
-                cache,
-                self.view_root_id,
-                self.compact_columns,
-                self.tree_lines,
-                self.brace_wrap,
-                self.type_hints,
-                self.show_comments,
-                sym,
-                self.show_rtti,
-                self.show_enum_chips,
-            )
+        // Compose against snapshot if active, else real provider. For live
+        // changed-page refreshes where the viewport is a strict prefix, first
+        // try a bounded preview compose and splice that prefix into the existing
+        // full result. If line identity changes, fall back to full compose.
+        let used_visible_rows = sym.is_none() && self.try_refresh_visible_rows(value_refresh_mode);
+        let used_visible_prefix = !used_visible_rows
+            && sym.is_none()
+            && self.try_refresh_visible_prefix(value_refresh_mode);
+        if !used_visible_rows && !used_visible_prefix {
+            self.last_result = if let Some(snap) = &self.snapshot {
+                compose::compose_with_symbols(
+                    &self.doc.tree,
+                    snap.as_ref(),
+                    self.view_root_id,
+                    self.compact_columns,
+                    self.tree_lines,
+                    self.brace_wrap,
+                    self.type_hints,
+                    self.show_comments,
+                    sym,
+                    self.show_rtti,
+                    self.show_enum_chips,
+                )
+            } else if let Some(cache) = &live_read_cache {
+                compose::compose_with_symbols(
+                    &self.doc.tree,
+                    cache,
+                    self.view_root_id,
+                    self.compact_columns,
+                    self.tree_lines,
+                    self.brace_wrap,
+                    self.type_hints,
+                    self.show_comments,
+                    sym,
+                    self.show_rtti,
+                    self.show_enum_chips,
+                )
+            } else {
+                self.doc.compose(
+                    self.view_root_id,
+                    self.compact_columns,
+                    self.tree_lines,
+                    self.brace_wrap,
+                    self.type_hints,
+                    self.show_comments,
+                    sym,
+                )
+            };
+        }
+        if used_visible_rows || used_visible_prefix {
+            self.clear_transient_meta_lines();
         } else {
-            self.doc.compose(
-                self.view_root_id,
-                self.compact_columns,
-                self.tree_lines,
-                self.brace_wrap,
-                self.type_hints,
-                self.show_comments,
-                sym,
-            )
-        };
+            self.transient_meta_lines.clear();
+        }
 
         // Change-highlight pass.
         if !self.changed_ranges.is_empty() {
             // Snapshot the per-line node info we need (avoid borrow conflicts).
             let meta_len = self.last_result.meta.len();
-            for i in 0..meta_len {
+            let change_line_range = if used_visible_rows {
+                if let Some((first, last)) = self.visible_line_range {
+                    let start = first.min(meta_len);
+                    let end = last.saturating_add(1).min(meta_len);
+                    start..end
+                } else {
+                    0..meta_len
+                }
+            } else {
+                0..meta_len
+            };
+            for i in change_line_range {
                 let (node_idx, offset_addr, line_byte_count) = {
                     let lm = &self.last_result.meta[i];
                     (lm.node_idx, lm.offset_addr, lm.line_byte_count)
@@ -5110,6 +5587,7 @@ impl RcxController {
                         let lm = &mut self.last_result.meta[i];
                         lm.changed_byte_indices.extend(changed_idx);
                         lm.data_changed = true;
+                        self.transient_meta_lines.push(i);
                     }
                 } else {
                     let sz = self.node_size(node);
@@ -5117,6 +5595,7 @@ impl RcxController {
                         changed_ranges_intersects(&self.changed_ranges, offset, offset + sz as i64);
                     if data_changed {
                         self.last_result.meta[i].data_changed = true;
+                        self.transient_meta_lines.push(i);
                     }
                 }
             }
@@ -5160,11 +5639,14 @@ impl RcxController {
             return;
         }
 
-        for lm in &mut self.last_result.meta {
+        for (i, lm) in self.last_result.meta.iter_mut().enumerate() {
             lm.heat_level = self
                 .value_history
                 .get(&lm.node_id)
                 .map_or(0, |history| history.heat_level());
+            if lm.heat_level != 0 {
+                self.transient_meta_lines.push(i);
+            }
         }
     }
 
@@ -5334,6 +5816,9 @@ impl RcxController {
             }
             let heat = vh.heat_level();
             self.last_result.meta[i].heat_level = heat;
+            if heat != 0 {
+                self.transient_meta_lines.push(i);
+            }
         }
     }
 

@@ -192,7 +192,9 @@ impl Provider for LocalProcessProvider {
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
-        let regions = self.inner.enumerate_regions();
+        let regions = self
+            .inner
+            .enumerate_regions_with_lookup(&self.module_lookup);
         self.refresh_readable_ranges(&regions);
         regions
     }
@@ -211,7 +213,9 @@ impl Provider for LocalProcessProvider {
             None => {}
         }
 
-        let regions = self.inner.enumerate_regions();
+        let regions = self
+            .inner
+            .enumerate_regions_with_lookup(&self.module_lookup);
         let ranges = readable_ranges_from_regions(&regions);
         let readable = readable_ranges_contains(&ranges, addr, len);
         self.readable_ranges.store(Some(Arc::new(ranges)));
@@ -404,7 +408,9 @@ mod platform {
     use nix::unistd::Pid;
 
     use crate::plugin::contract::ProcessInfo;
-    use crate::provider::{MemoryRegion, ModuleEntry, PageMap, ThreadInfo, K_PAGE_SIZE};
+    use crate::provider::{
+        MemoryRegion, ModuleEntry, ModuleLookup, PageMap, ThreadInfo, K_PAGE_SIZE,
+    };
 
     use super::{
         module_entries_from_maps, parse_maps_text, regions_from_maps, MapEntry, ProcessTarget,
@@ -639,6 +645,13 @@ mod platform {
 
         pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
             regions_from_maps(&read_maps(self.pid))
+        }
+
+        pub fn enumerate_regions_with_lookup(
+            &self,
+            _module_lookup: &ModuleLookup,
+        ) -> Vec<MemoryRegion> {
+            self.enumerate_regions()
         }
 
         pub fn peb(&self) -> u64 {
@@ -1059,8 +1072,11 @@ mod platform {
         pub fn base(&self) -> u64 {
             self.base
         }
-        pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
-            unsafe { enumerate_regions_for(self.handle, &self.modules) }
+        pub fn enumerate_regions_with_lookup(
+            &self,
+            module_lookup: &ModuleLookup,
+        ) -> Vec<MemoryRegion> {
+            unsafe { enumerate_regions_for(self.handle, module_lookup) }
         }
         pub fn peb(&self) -> u64 {
             self.peb
@@ -1302,9 +1318,11 @@ mod platform {
         out
     }
 
-    unsafe fn enumerate_regions_for(handle: HANDLE, modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
+    unsafe fn enumerate_regions_for(
+        handle: HANDLE,
+        module_lookup: &ModuleLookup,
+    ) -> Vec<MemoryRegion> {
         let mut regions = Vec::new();
-        let module_lookup = ModuleLookup::new(modules.to_vec());
         let mut addr = 0usize;
         loop {
             let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
@@ -1382,7 +1400,7 @@ mod platform {
 #[cfg(not(any(target_os = "linux", windows)))]
 mod platform {
     use crate::plugin::contract::ProcessInfo;
-    use crate::provider::{MemoryRegion, ModuleEntry, ThreadInfo};
+    use crate::provider::{MemoryRegion, ModuleEntry, ModuleLookup, ThreadInfo};
 
     use super::ProcessTarget;
 
@@ -1420,6 +1438,12 @@ mod platform {
         }
         pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
             Vec::new()
+        }
+        pub fn enumerate_regions_with_lookup(
+            &self,
+            _module_lookup: &ModuleLookup,
+        ) -> Vec<MemoryRegion> {
+            self.enumerate_regions()
         }
         pub fn peb(&self) -> u64 {
             0
