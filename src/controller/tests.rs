@@ -2879,6 +2879,143 @@ fn refresh_extent_cache_invalidates_after_tree_growth() {
     }
 }
 
+struct PointerBudgetProvider {
+    main_base: u64,
+    target_bases: [u64; 3],
+    span: u64,
+}
+
+impl Provider for PointerBudgetProvider {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        for (idx, &target) in self.target_bases.iter().enumerate() {
+            if addr == self.main_base + (idx as u64) * 8 && buf.len() == 8 {
+                buf.copy_from_slice(&target.to_le_bytes());
+                return true;
+            }
+        }
+        buf.fill(0);
+        true
+    }
+
+    fn size(&self) -> i32 {
+        self.span as i32
+    }
+
+    fn is_live(&self) -> bool {
+        true
+    }
+
+    fn kind(&self) -> String {
+        "Process".into()
+    }
+
+    fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+        let mut regions = Vec::with_capacity(1 + self.target_bases.len());
+        regions.push(MemoryRegion {
+            base: self.main_base,
+            size: self.span,
+            readable: true,
+            writable: true,
+            executable: false,
+            module_name: String::new(),
+            region_type: RegionType::Private,
+        });
+        for &base in &self.target_bases {
+            regions.push(MemoryRegion {
+                base,
+                size: self.span,
+                readable: true,
+                writable: true,
+                executable: false,
+                module_name: String::new(),
+                region_type: RegionType::Private,
+            });
+        }
+        regions
+    }
+}
+
+#[test]
+fn pointer_snapshot_budget_charges_main_range_once() {
+    let main_base = 0x1000_0000u64;
+    let span = K_MAX_MAIN_EXTENT as u64;
+    let target_bases = [0x2000_0000u64, 0x3000_0000u64, 0x4000_0000u64];
+    let mut tree = NodeTree::new();
+    tree.base_address = main_base;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    tree.add_node(Node {
+        kind: NodeKind::Array,
+        name: "main".into(),
+        parent_id: root_id,
+        offset: 0,
+        element_kind: NodeKind::Hex64,
+        array_len: (span / 8) as i32,
+        ..Node::default()
+    });
+
+    for (idx, _) in target_bases.iter().enumerate() {
+        let target = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            struct_type_name: format!("Target{idx}"),
+            name: format!("target_{idx}"),
+            parent_id: 0,
+            ..Node::default()
+        });
+        let target_id = tree.nodes[target].id;
+        tree.add_node(Node {
+            kind: NodeKind::Array,
+            name: format!("target_bytes_{idx}"),
+            parent_id: target_id,
+            element_kind: NodeKind::Hex64,
+            array_len: (span / 8) as i32,
+            ..Node::default()
+        });
+        tree.add_node(Node {
+            kind: NodeKind::Pointer64,
+            name: format!("ptr_{idx}"),
+            parent_id: root_id,
+            offset: (idx as i32) * 8,
+            ref_id: target_id,
+            collapsed: false,
+            ..Node::default()
+        });
+    }
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(PointerBudgetProvider {
+        main_base,
+        target_bases,
+        span,
+    });
+    let mut c = RcxController::new(doc);
+    c.on_read_complete(PageMap::new());
+
+    let plan = c.on_refresh_tick();
+    let target_page = target_bases[2] & !(K_PAGE_SIZE - 1);
+    match plan {
+        RefreshPlan::Read { pages, .. } => {
+            let target_hits: Vec<bool> = target_bases
+                .iter()
+                .map(|base| pages.contains(&(base & !(K_PAGE_SIZE - 1))))
+                .collect();
+            assert!(
+                pages.contains(&target_page),
+                "pointer target after the main range budget should still be planned; len={}, hits={target_hits:?}",
+                pages.len()
+            );
+        }
+        RefreshPlan::None => panic!("expected refresh read plan"),
+    }
+}
+
 #[test]
 fn changed_page_refresh_marks_changed_hex_byte_indices() {
     let mut tree = NodeTree::new();

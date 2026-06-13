@@ -462,11 +462,6 @@ fn compose_with_symbols_at_base_inner(
 
     // Column widths (`compose.cpp:1601-1688`).
     {
-        let type_name_len = |n: &Node| -> i32 { node_type_name(tree, n).len() as i32 };
-
-        // Pre-compute type-name lengths.
-        let type_name_lens: Vec<i32> = tree.nodes.iter().map(type_name_len).collect();
-
         let type_cap = if state.compact_columns {
             K_COMPACT_TYPE_W
         } else {
@@ -474,8 +469,8 @@ fn compose_with_symbols_at_base_inner(
         };
         let mut max_type_len = K_MIN_TYPE_W;
         let mut max_name_len = K_MIN_NAME_W;
-        for (i, node) in tree.nodes.iter().enumerate() {
-            max_type_len = max_type_len.max(type_name_lens[i]);
+        for node in &tree.nodes {
+            max_type_len = max_type_len.max(node_type_name_len(tree, node));
             max_name_len = max_name_len.max(u16_len(&node.name));
         }
         state.type_w = max_type_len.clamp(K_MIN_TYPE_W, type_cap);
@@ -495,7 +490,7 @@ fn compose_with_symbols_at_base_inner(
                 if child.kind == NodeKind::Struct {
                     continue; // pointer headers shouldn't inflate sibling widths
                 }
-                scope_max_type = scope_max_type.max(type_name_lens[child_idx as usize]);
+                scope_max_type = scope_max_type.max(node_type_name_len(tree, child));
                 scope_max_name = scope_max_name.max(u16_len(&child.name));
             }
             // Primitive arrays with no tree children: account for synthesized
@@ -534,7 +529,7 @@ fn compose_with_symbols_at_base_inner(
                 if child.kind == NodeKind::Struct {
                     continue;
                 }
-                root_max_type = root_max_type.max(type_name_lens[child_idx as usize]);
+                root_max_type = root_max_type.max(node_type_name_len(tree, child));
                 root_max_name = root_max_name.max(u16_len(&child.name));
             }
             state
@@ -1216,21 +1211,62 @@ fn rtti_for_vtable(state: &mut ComposeState, prov: &dyn Provider, candidate_addr
 }
 
 /// `node`-display type string (the `nodeTypeName` lambda, `compose.cpp:1602-1613`).
-fn node_type_name(tree: &NodeTree, n: &Node) -> String {
+fn node_type_name_len(tree: &NodeTree, n: &Node) -> i32 {
     match n.kind {
         NodeKind::Array => {
-            let sn = if n.element_kind == NodeKind::Struct {
-                resolve_pointer_target(tree, n.ref_id)
+            let elem_len = if n.element_kind == NodeKind::Struct {
+                let target_len = resolve_pointer_target_len(tree, n.ref_id);
+                if target_len > 0 {
+                    target_len
+                } else {
+                    render::type_name_raw_len(n.element_kind)
+                }
             } else {
-                String::new()
+                render::type_name_raw_len(n.element_kind)
             };
-            render::array_type_name(n.element_kind, n.array_len, &sn)
+            (elem_len + 2 + i32_decimal_len(n.array_len)) as i32
         }
-        NodeKind::Struct => render::struct_type_name(n),
+        NodeKind::Struct => {
+            if !n.struct_type_name.is_empty() {
+                n.struct_type_name.len() as i32
+            } else {
+                n.resolved_class_keyword().len() as i32
+            }
+        }
         NodeKind::Pointer32 | NodeKind::Pointer64 => {
-            render::pointer_type_name(resolve_pointer_target(tree, n.ref_id))
+            let target_len = resolve_pointer_target_len(tree, n.ref_id);
+            (if target_len == 0 {
+                "void".len()
+            } else {
+                target_len
+            } + 1) as i32
         }
-        _ => render::type_name_raw(n.kind),
+        _ => render::type_name_raw_len(n.kind) as i32,
+    }
+}
+
+fn resolve_pointer_target_len(tree: &NodeTree, ref_id: u64) -> usize {
+    let ref_idx = tree.index_of_id(ref_id);
+    if ref_idx < 0 {
+        return 0;
+    }
+    let r = &tree.nodes[ref_idx as usize];
+    if r.struct_type_name.is_empty() {
+        r.name.len()
+    } else {
+        r.struct_type_name.len()
+    }
+}
+
+fn i32_decimal_len(v: i32) -> usize {
+    let mut n = if v < 0 { -(v as i64) } else { v as i64 } as u64;
+    let mut len = usize::from(v < 0);
+    loop {
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            return len;
+        }
     }
 }
 
@@ -3433,18 +3469,13 @@ pub fn array_next_span_for(lm: &LineMeta, line_text: &str) -> ColumnSpan {
 /// untouched.
 mod render {
     use super::U16Str;
-    use crate::core::{Node, NodeKind};
+    use crate::core::Node;
     use crate::provider::Provider;
 
     pub use crate::format::{
         array_type_name, extract_bits, fmt_offset_margin, indent, struct_type_name, type_name_raw,
+        type_name_raw_len,
     };
-
-    /// `pointerTypeName(kind, targetName)` (`format.cpp:117-121`) — for width.
-    /// The C++ `kind` arg is unused; pass `Pointer64` to match the facade.
-    pub fn pointer_type_name(target_name: String) -> String {
-        crate::format::pointer_type_name(NodeKind::Pointer64, &target_name)
-    }
 
     /// `fmtStructHeader(...)` (`format.cpp:248-259`).
     pub fn fmt_struct_header(

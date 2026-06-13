@@ -1743,6 +1743,7 @@ fn memory_preview_rows_with_lookup(
 ) -> Vec<MemoryPreviewRow> {
     let stride = pointer_size.max(1) as usize;
     let kind = if pointer_size <= 4 { "hex32" } else { "hex64" };
+    let mut type_hint_cache = LastTypeHint::default();
     let mut symbol_cache = LastSymbolName::default();
     (0..row_count)
         .map(|row| {
@@ -1771,7 +1772,7 @@ fn memory_preview_rows_with_lookup(
                     ascii.push(' ');
                 }
             }
-            let type_hint = memory_preview_type_hint(chunk, pointer_size);
+            let type_hint = type_hint_cache.get(chunk, pointer_size);
             let pointer_note = memory_preview_pointer_note(
                 provider,
                 lookup,
@@ -2051,6 +2052,68 @@ fn memory_preview_type_hint(chunk: &[u8], pointer_size: i32) -> Option<String> {
         emitted += 1;
     }
     (emitted > 0).then_some(out)
+}
+
+#[derive(Default)]
+struct LastTypeHint {
+    pointer_size: i32,
+    len: usize,
+    key: u128,
+    value: Option<String>,
+    valid: bool,
+    cached: bool,
+}
+
+impl LastTypeHint {
+    fn get(&mut self, chunk: &[u8], pointer_size: i32) -> Option<String> {
+        let key = Self::key(chunk);
+        if self.valid
+            && self.pointer_size == pointer_size
+            && self.len == chunk.len()
+            && key.is_some_and(|key| self.key == key)
+        {
+            if self.cached {
+                return self.value.clone();
+            }
+
+            let value = memory_preview_type_hint(chunk, pointer_size);
+            self.value = value.clone();
+            self.cached = true;
+            return value;
+        }
+
+        let value = memory_preview_type_hint(chunk, pointer_size);
+        if let Some(key) = key {
+            self.pointer_size = pointer_size;
+            self.len = chunk.len();
+            self.key = key;
+            self.value = None;
+            self.valid = true;
+            self.cached = false;
+        } else {
+            self.valid = false;
+            self.value = None;
+            self.cached = false;
+        }
+        value
+    }
+
+    fn key(chunk: &[u8]) -> Option<u128> {
+        match chunk.len() {
+            0 => Some(0),
+            1..=8 => {
+                let mut bytes = [0u8; 8];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                Some(u64::from_le_bytes(bytes) as u128)
+            }
+            9..=16 => {
+                let mut bytes = [0u8; 16];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                Some(u128::from_le_bytes(bytes))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn memory_preview_pointer_note(
@@ -2447,7 +2510,7 @@ mod tests {
         hover_kind_eq, memory_preview_rows, memory_preview_rows_with_maps,
         memory_preview_type_hint, read_provider_bytes, read_provider_bytes_best_effort,
         read_provider_bytes_best_effort_cached, recency_tier, target_is_readable,
-        target_is_readable_cached, try_parse_int, HoverMemoryMaps, HoverPopupKind,
+        target_is_readable_cached, try_parse_int, HoverMemoryMaps, HoverPopupKind, LastTypeHint,
         MemoryPreviewRow,
     };
     use crate::compose::ColumnSpan;
@@ -2769,6 +2832,23 @@ mod tests {
                 && hint.as_deref().unwrap_or_default().contains("uint32_t×2"),
             "memory preview should render top-2 split-int predictions: {hint:?}"
         );
+    }
+
+    #[test]
+    fn memory_preview_type_hint_cache_reuses_identical_chunks() {
+        let data = 0x0000_7FF6_A0B0_1000u64.to_le_bytes();
+        let mut cache = LastTypeHint::default();
+
+        let first = cache.get(&data, 8);
+        assert!(
+            first.as_deref().unwrap_or_default().contains("ptr64"),
+            "sanity check the cached value is a real pointer hint: {first:?}"
+        );
+
+        cache.value = Some("cached hint".to_string());
+        cache.cached = true;
+        assert_eq!(cache.get(&data, 8).as_deref(), Some("cached hint"));
+        assert_ne!(cache.get(&data, 4).as_deref(), Some("cached hint"));
     }
 
     #[test]

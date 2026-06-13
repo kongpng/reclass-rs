@@ -85,14 +85,14 @@ impl super::RcxController {
 
         // Ranges: main struct + pointer targets.
         let base = self.doc.tree.base_address;
-        let mut ranges: Vec<(u64, i32)> = vec![(base, extent)];
+        let mut ranges: Vec<(u64, i32)> = Vec::new();
         if self.snapshot.is_some() {
             let mut root_id = self.view_root_id;
             if root_id == 0 && !self.doc.tree.nodes.is_empty() {
                 root_id = self.doc.tree.nodes[0].id;
             }
             let mut visited: HashSet<(u64, u64)> = HashSet::new();
-            let mut budget = K_POINTER_SNAPSHOT_BYTE_BUDGET - extent as i64;
+            let mut budget = K_POINTER_SNAPSHOT_BYTE_BUDGET;
             self.collect_pointer_ranges(
                 root_id,
                 base,
@@ -102,6 +102,9 @@ impl super::RcxController {
                 &mut ranges,
                 &mut budget,
             );
+        }
+        if ranges.is_empty() {
+            ranges.push((base, extent));
         }
 
         let first_snapshot = self.snapshot.is_none() || self.prev_pages.is_empty();
@@ -152,8 +155,10 @@ impl super::RcxController {
             self.apply_adaptive_interval();
             return RefreshPlan::None;
         }
-        request_pages.sort_unstable();
-        request_pages.dedup();
+        if ranges.len() > 1 {
+            request_pages.sort_unstable();
+            request_pages.dedup();
+        }
 
         self.read_in_flight = true;
         self.read_gen = self.refresh_gen;

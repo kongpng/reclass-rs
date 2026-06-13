@@ -233,6 +233,16 @@ pub fn type_name_raw(kind: NodeKind) -> String {
     kind_meta(kind).map_or_else(|| "???".to_string(), |m| m.type_name.to_string())
 }
 
+/// Byte length of [`type_name_raw`] without allocating on the built-in type-name
+/// path. The compose width pass uses byte counts for parity with its existing
+/// `String::len()` calculation.
+pub fn type_name_raw_len(kind: NodeKind) -> usize {
+    if let Some(f) = current_type_name_fn() {
+        return f(kind).len();
+    }
+    kind_meta(kind).map_or(3, |m| m.type_name.len())
+}
+
 /// `fmt::typeName(NodeKind, int colType=14)` (`format.cpp:98-102`) — fixed-width
 /// (fitted) display name. Use [`type_name_fitted`] to override the column width.
 pub fn type_name(kind: NodeKind) -> String {
@@ -2976,8 +2986,16 @@ mod tests {
         }
         set_type_name_provider(Some(over));
         assert_eq!(type_name_raw(NodeKind::Float), "X");
+        assert_eq!(
+            type_name_raw_len(NodeKind::Float),
+            type_name_raw(NodeKind::Float).len()
+        );
         set_type_name_provider(None);
         assert_eq!(type_name_raw(NodeKind::Float), "float");
+        assert_eq!(
+            type_name_raw_len(NodeKind::Float),
+            type_name_raw(NodeKind::Float).len()
+        );
     }
 
     // A provider whose 8 bytes at addr 0 hold a fixed pointer value, and which
