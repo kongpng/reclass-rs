@@ -18,7 +18,9 @@ const K_PAGE_MASK: u64 = !(K_PAGE_SIZE - 1);
 pub struct CachedPageProvider {
     inner: Arc<dyn Provider + Send + Sync>,
     pages: Mutex<PageCache>,
-    regions: OnceLock<ReadableRegionLookup>,
+    region_snapshot: OnceLock<Arc<Vec<MemoryRegion>>>,
+    module_snapshot: OnceLock<Arc<Vec<ModuleEntry>>>,
+    readable_regions: OnceLock<ReadableRegionLookup>,
 }
 
 impl CachedPageProvider {
@@ -26,8 +28,24 @@ impl CachedPageProvider {
         Self {
             inner,
             pages: Mutex::new(PageCache::default()),
-            regions: OnceLock::new(),
+            region_snapshot: OnceLock::new(),
+            module_snapshot: OnceLock::new(),
+            readable_regions: OnceLock::new(),
         }
+    }
+
+    fn region_snapshot(&self) -> Arc<Vec<MemoryRegion>> {
+        Arc::clone(
+            self.region_snapshot
+                .get_or_init(|| Arc::new(self.inner.enumerate_regions())),
+        )
+    }
+
+    fn module_snapshot(&self) -> Arc<Vec<ModuleEntry>> {
+        Arc::clone(
+            self.module_snapshot
+                .get_or_init(|| Arc::new(self.inner.enumerate_modules())),
+        )
     }
 
     fn read_cached_chunk(&self, page_addr: u64, page_off: usize, out: &mut [u8]) -> bool {
@@ -128,7 +146,7 @@ impl Provider for CachedPageProvider {
     }
 
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
-        self.inner.enumerate_regions()
+        self.region_snapshot().as_ref().clone()
     }
 
     fn trusts_enumerated_region_readability(&self) -> bool {
@@ -144,7 +162,7 @@ impl Provider for CachedPageProvider {
     }
 
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
-        self.inner.enumerate_modules()
+        self.module_snapshot().as_ref().clone()
     }
 
     fn has_kernel_paging(&self) -> bool {
@@ -168,8 +186,8 @@ impl Provider for CachedPageProvider {
             return len == 0;
         }
         let regions = self
-            .regions
-            .get_or_init(|| ReadableRegionLookup::new(self.inner.enumerate_regions()));
+            .readable_regions
+            .get_or_init(|| ReadableRegionLookup::new(self.region_snapshot()));
         if regions.has_regions() {
             regions.contains(addr, len)
         } else {
@@ -240,7 +258,7 @@ impl PageCache {
 }
 
 struct ReadableRegionLookup {
-    regions: Vec<MemoryRegion>,
+    regions: Arc<Vec<MemoryRegion>>,
     order: RegionLookupOrder,
     last_region_index: AtomicUsize,
 }
@@ -252,7 +270,7 @@ enum RegionLookupOrder {
 }
 
 impl ReadableRegionLookup {
-    fn new(regions: Vec<MemoryRegion>) -> Self {
+    fn new(regions: Arc<Vec<MemoryRegion>>) -> Self {
         let order = region_lookup_order(&regions);
         Self {
             regions,
@@ -357,7 +375,9 @@ mod tests {
         regions: Vec<MemoryRegion>,
         reads: AtomicUsize,
         region_enumerations: AtomicUsize,
+        module_enumerations: AtomicUsize,
         readability_checks: AtomicUsize,
+        modules: Vec<ModuleEntry>,
     }
 
     impl CountingProvider {
@@ -376,7 +396,9 @@ mod tests {
                 regions,
                 reads: AtomicUsize::new(0),
                 region_enumerations: AtomicUsize::new(0),
+                module_enumerations: AtomicUsize::new(0),
                 readability_checks: AtomicUsize::new(0),
+                modules: Vec::new(),
             }
         }
 
@@ -386,8 +408,15 @@ mod tests {
                 regions: Vec::new(),
                 reads: AtomicUsize::new(0),
                 region_enumerations: AtomicUsize::new(0),
+                module_enumerations: AtomicUsize::new(0),
                 readability_checks: AtomicUsize::new(0),
+                modules: Vec::new(),
             }
+        }
+
+        fn with_modules(mut self, modules: Vec<ModuleEntry>) -> Self {
+            self.modules = modules;
+            self
         }
 
         fn reads(&self) -> usize {
@@ -396,6 +425,10 @@ mod tests {
 
         fn region_enumerations(&self) -> usize {
             self.region_enumerations.load(Ordering::Relaxed)
+        }
+
+        fn module_enumerations(&self) -> usize {
+            self.module_enumerations.load(Ordering::Relaxed)
         }
 
         fn readability_checks(&self) -> usize {
@@ -424,6 +457,11 @@ mod tests {
         fn enumerate_regions(&self) -> Vec<MemoryRegion> {
             self.region_enumerations.fetch_add(1, Ordering::Relaxed);
             self.regions.clone()
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.module_enumerations.fetch_add(1, Ordering::Relaxed);
+            self.modules.clone()
         }
 
         fn is_readable(&self, addr: u64, len: i32) -> bool {
@@ -498,7 +536,9 @@ mod tests {
             ],
             reads: AtomicUsize::new(0),
             region_enumerations: AtomicUsize::new(0),
+            module_enumerations: AtomicUsize::new(0),
             readability_checks: AtomicUsize::new(0),
+            modules: Vec::new(),
         });
         let cache = CachedPageProvider::new(real.clone());
 
@@ -528,8 +568,41 @@ mod tests {
     }
 
     #[test]
+    fn cached_page_provider_shares_region_snapshot_with_readability_lookup() {
+        let real = Arc::new(CountingProvider::new(vec![0xA5; K_PAGE_SIZE as usize * 2]));
+        let cache = CachedPageProvider::new(real.clone());
+
+        assert_eq!(cache.enumerate_regions().len(), 1);
+        assert!(cache.is_readable(16, 8));
+        assert_eq!(cache.enumerate_regions().len(), 1);
+
+        assert_eq!(real.region_enumerations(), 1);
+        assert_eq!(real.readability_checks(), 0);
+    }
+
+    #[test]
+    fn cached_page_provider_reuses_module_snapshot() {
+        let real = Arc::new(
+            CountingProvider::new(vec![0xA5; K_PAGE_SIZE as usize]).with_modules(vec![
+                ModuleEntry {
+                    name: "demo.dll".into(),
+                    full_path: "demo.dll".into(),
+                    base: 0,
+                    size: K_PAGE_SIZE,
+                },
+            ]),
+        );
+        let cache = CachedPageProvider::new(real.clone());
+
+        assert_eq!(cache.enumerate_modules().len(), 1);
+        assert_eq!(cache.enumerate_modules().len(), 1);
+
+        assert_eq!(real.module_enumerations(), 1);
+    }
+
+    #[test]
     fn readable_region_lookup_keeps_linear_overlap_semantics() {
-        let lookup = ReadableRegionLookup::new(vec![
+        let lookup = ReadableRegionLookup::new(Arc::new(vec![
             MemoryRegion {
                 base: 0,
                 size: K_PAGE_SIZE * 2,
@@ -548,7 +621,7 @@ mod tests {
                 module_name: String::new(),
                 region_type: crate::provider::RegionType::Private,
             },
-        ]);
+        ]));
 
         assert!(lookup.contains(K_PAGE_SIZE + 16, 8));
         assert!(!lookup.contains(16, 8));

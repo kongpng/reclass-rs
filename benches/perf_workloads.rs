@@ -20,6 +20,9 @@ use reclass::provider::{
     BufferProvider, CachedPageProvider, MemoryRegion, ModuleEntry, ModuleLookup, Provider,
     RegionType, SnapshotProvider, K_PAGE_SIZE,
 };
+use reclass::scanner::pointer::{
+    find_pointer_chains, PointerChainRequest, PointerMap, PointerMapStats, PointerRecord,
+};
 use reclass::scanner::{
     run_rescan, run_scan, AddressRange, NullObserver, ScanCondition, ScanRequest, ScanResult,
     ValueType,
@@ -979,6 +982,37 @@ fn compose_live_read_cache_workloads(c: &mut Criterion) {
     {
         if let Ok(provider) = LocalProcessProvider::attach(&std::process::id().to_string()) {
             let provider: Arc<dyn Provider + Send + Sync> = Arc::new(provider);
+            let sample_addr = provider.base();
+            group.bench_function("direct_current_process_map_snapshots", |b| {
+                b.iter(|| {
+                    let mut total = 0usize;
+                    for _ in 0..16 {
+                        total = total.wrapping_add(provider.enumerate_regions().len());
+                        total = total.wrapping_add(provider.enumerate_modules().len());
+                        total = total.wrapping_add(usize::from(
+                            provider.is_readable(black_box(sample_addr), 8),
+                        ));
+                    }
+                    black_box(total);
+                });
+            });
+            group.bench_function("cached_current_process_map_snapshots", |b| {
+                b.iter_batched(
+                    || CachedPageProvider::new(Arc::clone(&provider)),
+                    |cache| {
+                        let mut total = 0usize;
+                        for _ in 0..16 {
+                            total = total.wrapping_add(cache.enumerate_regions().len());
+                            total = total.wrapping_add(cache.enumerate_modules().len());
+                            total = total.wrapping_add(usize::from(
+                                cache.is_readable(black_box(sample_addr), 8),
+                            ));
+                        }
+                        black_box(total);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
             for &nodes in &[10_000usize, 50_000] {
                 let rows: Vec<u64> = (0..nodes)
                     .map(|i| 0x1111_0000_0000_0000u64.wrapping_add(i as u64))
@@ -4444,6 +4478,54 @@ fn scanner_workloads(c: &mut Criterion) {
     scanner_group.finish();
 }
 
+fn pointer_chain_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pointer_chain_lookup");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &records in &[10_000usize, 50_000] {
+        let target = 0x8000_0000u64;
+        let pointer_records: Vec<_> = (0..records)
+            .map(|i| PointerRecord {
+                address: 0x1000_0000 + (i as u64) * 8,
+                points_to: target.saturating_sub((i % 16) as u64),
+            })
+            .collect();
+        let map = PointerMap::from_records(
+            8,
+            vec![AddressRange {
+                start: 0x1000_0000,
+                end: target + 0x1000,
+            }],
+            pointer_records,
+            PointerMapStats::default(),
+        );
+        let request = PointerChainRequest {
+            targets: vec![target],
+            max_depth: 1,
+            max_offset: 0x10,
+            max_results: 10,
+        };
+        group.throughput(Throughput::Elements(records as u64));
+        group.bench_with_input(
+            BenchmarkId::new("many_direct_candidates_capped", records),
+            &records,
+            |b, _| {
+                b.iter(|| {
+                    let result = find_pointer_chains(
+                        black_box(&map),
+                        black_box(&request),
+                        &AtomicBool::new(false),
+                    );
+                    black_box((result.chains.len(), result.truncated));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn formatting_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("format_pointer_deref");
     group.sample_size(10);
@@ -4669,6 +4751,7 @@ criterion_group!(
     scanner_change_all_workloads,
     scanner_table_workloads,
     scanner_workloads,
+    pointer_chain_workloads,
     rtti_workloads,
     compose_live_read_cache_workloads,
     formatting_workloads

@@ -69,6 +69,7 @@ default = [
     "mcp",
     "native-providers",
     "memflow-provider",
+    "scanflow-provider",
     "plugins",
 ]
 
@@ -93,6 +94,11 @@ mcp = ["dep:interprocess"]
 
 # Live-process provider through memflow's runtime connector/OS plugin inventory.
 memflow-provider = ["dep:memflow"]
+
+# memflow-native advanced scan helpers. The generic pointer-map/chain scanner
+# works over any Provider; this enables the scanflow-backed backend only for
+# MemflowProvider targets.
+scanflow-provider = ["memflow-provider", "dep:scanflow"]
 
 # C++ provider parity set. Individual providers stay feature-addressable for
 # lean builds; platform-specific implementations are target-cfg gated inside the
@@ -180,6 +186,9 @@ directories = "6"
 # as qemu, kvm, pcileech, winio, and win32 are discovered at runtime from memflow
 # plugin directories. Default-on via `memflow-provider`, removable in lean builds.
 memflow = { version = "0.2.4", optional = true }
+# memflow-native pointer-map / global / sigmaker primitives. Only compiled when
+# `scanflow-provider` is enabled; UI calls stay capability-gated to memflow.
+scanflow = { version = "0.2.1", optional = true }
 rcx-rpc = { path = "crates/rcx-rpc", optional = true }
 rcx-payload = { path = "crates/rcx-payload", optional = true }
 

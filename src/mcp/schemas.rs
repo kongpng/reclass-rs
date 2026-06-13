@@ -663,17 +663,26 @@ fn tool_tree_export_header() -> Value {
 fn tool_analysis_pointer_chain() -> Value {
     json!({
         "name": "analysis.pointer_chain",
-        "description": "Follow a chain of pointers from a starting address, returning hex dump + type inference + vtable detection + symbol annotations at each level. Stops on null, unreadable, or maxDepth. Use this to explore what a pointer points to without multiple sequential hex.read calls.",
+        "description": "Build a provider pointer map and find reverse pointer chains to one or more target addresses. Works on any active Provider; memflow providers can use the scanflow-backed map when that feature is enabled. Defaults to writable regions for live-process usefulness.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "address": {"type": "string", "description": "Starting address (hex string, e.g. '0x7FF618570000'). Or use baseRelative:true with an offset from struct base."},
-                "baseRelative": {"type": "boolean", "description": "If true, address is relative to struct base address."},
-                "maxDepth": {"type": "integer", "description": "Maximum pointer levels to follow (default 3, max 8)."},
-                "readLength": {"type": "integer", "description": "Bytes to read and analyze at each level (default 64, max 512)."},
+                "target": {"type": "string", "description": "Target address to find pointers to. Hex string such as '0x7FF618570000'; plain hex and ReClass backtick form are accepted."},
+                "targets": {"type": "array", "items": {"type": "string"}, "description": "Optional multiple target addresses. If present, overrides target/address."},
+                "address": {"type": "string", "description": "Alias for target for compatibility."},
+                "baseRelative": {"type": "boolean", "description": "If true, target/targets/address are offsets from the struct base address."},
+                "maxDepth": {"type": "integer", "description": "Maximum reverse pointer-chain depth. Default 3, max 8."},
+                "maxOffset": {"type": "string", "description": "Maximum accepted pointer offset at each hop. Default 0x1000."},
+                "maxResults": {"type": "integer", "description": "Maximum chains to return. Default 100, max 1000."},
+                "maxPointers": {"type": "integer", "description": "Maximum pointer-map records before truncation. Default 2000000; 0 means unlimited."},
+                "filterExecutable": {"type": "boolean", "description": "Only scan executable regions. Default false."},
+                "filterWritable": {"type": "boolean", "description": "Only scan writable regions. Default true."},
+                "privateOnly": {"type": "boolean", "description": "Only scan private regions. Default false."},
+                "skipSystemModules": {"type": "boolean", "description": "Skip well-known system module regions. Default false."},
+                "userModeOnly": {"type": "boolean", "description": "Clamp scan ranges to user-mode virtual addresses. Default false."},
+                "regions": {"type": "array", "description": "Restrict pointer-map scanning to address ranges. Each item is [startHex, endHex].", "items": {"type": "array", "items": {"type": "string"}}},
                 "tabIndex": {"type": "integer", "description": "MDI tab index (0-based). Omit for active tab."}
-            },
-            "required": ["address"]
+            }
         }
     })
 }
@@ -925,6 +934,7 @@ Set dryRun:true to preview only. Set mode:'replace' to remove existing root type
             "evidence.proposal",
             "evidence.focus_packet",
             "tree.export_header",
+            "analysis.pointer_chain",
             "mcp.reconnect",
         ];
         for name in tool_names() {

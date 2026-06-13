@@ -5884,6 +5884,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayon-tlsctx"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaa2eb6ca3d673ee39c35792a4783151ecd9dba57e752d4af1143a5cec11ffbd"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "rcx-payload"
 version = "0.1.0"
 dependencies = [
@@ -5950,6 +5959,7 @@ dependencies = [
  "reclass-plugin-abi",
  "regex",
  "reqwest",
+ "scanflow",
  "serde",
  "serde_json",
  "smallvec",
@@ -6443,6 +6453,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scanflow"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3c1d3fc69b06ada5d63eb32c9432e60dbfd6d9eb8cc1205f67534615400200d"
+dependencies = [
+ "iced-x86",
+ "memflow",
+ "rayon",
+ "rayon-tlsctx",
 ]
 
 [[package]]

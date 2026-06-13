@@ -156,6 +156,7 @@ pub fn handle_tools_call(
         "evidence.proposal" => tools::tool_evidence_proposal(&args, host),
         "evidence.focus_packet" => tools::tool_evidence_focus_packet(&args, host),
         "tree.export_header" => tools::tool_tree_export_header(&args, host),
+        "analysis.pointer_chain" => tools::tool_analysis_pointer_chain(&args, host),
         "mcp.reconnect" => {
             // `toolReconnect` (`mcp_bridge.cpp:2432-2442`).
             if !has_current_sender {

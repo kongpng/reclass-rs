@@ -24,6 +24,8 @@ use std::time::Instant;
 use crate::provider::{MemoryRegion, Provider, RegionType};
 use smallvec::SmallVec;
 
+pub mod pointer;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Value / condition vocabulary
 // ─────────────────────────────────────────────────────────────────────────────

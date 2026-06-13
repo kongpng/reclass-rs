@@ -63,6 +63,10 @@ pub fn scanner_panel_key_bindings() -> Vec<KeyBinding> {
     ]
 }
 use crate::provider::Provider;
+use crate::scanner::pointer::{
+    build_pointer_map, find_pointer_chains, PointerChain, PointerChainRequest, PointerMap,
+    PointerMapRequest,
+};
 use crate::scanner::{
     run_rescan, run_scan, serialize_value, value_size_for_type, NullObserver, ScanCondition,
     ScanResult, ValueType,
@@ -312,7 +316,7 @@ impl TableDelegate for ScanResultsDelegate {
         // slot 2; resolve the logical column for the physical index.
         let module_ix = self.module_col_ix();
         if col_ix == module_ix && self.show_module {
-            return Column::new("module", "Module").width(px(140.)).sortable();
+            return Column::new("context", "Context").width(px(260.)).sortable();
         }
         match col_ix {
             COL_VALUE => Column::new("value", "Value").width(px(160.)).sortable(),
@@ -467,6 +471,9 @@ pub struct ScannerPanel {
     form: ScannerForm,
     value_input: Entity<InputState>,
     value2_input: Entity<InputState>,
+    pointer_target_input: Entity<InputState>,
+    pointer_offset_input: Entity<InputState>,
+    pointer_depth_input: Entity<InputState>,
     filter_input: Entity<InputState>,
     table: Entity<TableState<ScanResultsDelegate>>,
     /// The live result list (the C++ `m_results`) — the raw [`ScanResult`]s
@@ -491,6 +498,7 @@ pub struct ScannerPanel {
     /// `m_lastResultCount`).
     last_result_count: usize,
     provider: Option<Arc<dyn Provider + Send + Sync>>,
+    pointer_map: Option<Arc<PointerMap>>,
     /// The attached source's display name, for the floating dock title
     /// ("Memory Scanner — notepad.exe (Process)"); empty when none.
     source_title: Option<String>,
@@ -546,12 +554,18 @@ const RESET_CONFIRM_THRESHOLD: usize = 1000;
 
 /// Reset confirm cooldown in milliseconds (the C++ 4 s `QTimer::singleShot`).
 const RESET_CONFIRM_COOLDOWN_MS: u64 = 4000;
+const MAX_POINTER_CHAIN_TARGETS: usize = 256;
 
 impl ScannerPanel {
     /// Build an empty scanner panel.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let value_input = cx.new(|cx| InputState::new(window, cx).placeholder("value / pattern"));
         let value2_input = cx.new(|cx| InputState::new(window, cx).placeholder("upper bound"));
+        let pointer_target_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("target address"));
+        let pointer_offset_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("max offset"));
+        let pointer_depth_input = cx.new(|cx| InputState::new(window, cx).placeholder("depth"));
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter results..."));
         let table = cx
@@ -636,6 +650,9 @@ impl ScannerPanel {
             form: ScannerForm::new(),
             value_input,
             value2_input,
+            pointer_target_input,
+            pointer_offset_input,
+            pointer_depth_input,
             filter_input,
             table,
             results: Vec::new(),
@@ -646,6 +663,7 @@ impl ScannerPanel {
             generation: 0,
             last_result_count: 0,
             provider: None,
+            pointer_map: None,
             source_title: None,
             status: String::new(),
             selected_row: None,
@@ -685,6 +703,7 @@ impl ScannerPanel {
             }
         });
         self.provider = provider;
+        self.pointer_map = None;
     }
 
     /// Set the active editor's view-root span `(start, size)` for the
@@ -978,10 +997,14 @@ impl ScannerPanel {
 
     /// Mark the scan as running (progress bar + Cancel) and clear the abort.
     fn begin_scan(&mut self, cx: &mut Context<Self>) {
+        self.begin_task("Scanning…", cx);
+    }
+
+    fn begin_task(&mut self, status: impl Into<String>, cx: &mut Context<Self>) {
         self.abort = Arc::new(AtomicBool::new(false));
         self.scanning = true;
         self.progress = 0;
-        self.status = "Scanning…".to_string();
+        self.status = status.into();
         cx.notify();
     }
 
@@ -1256,6 +1279,216 @@ impl ScannerPanel {
         self.context_target = None;
         self.refresh_table(cx);
         cx.notify();
+    }
+
+    fn pointer_map_request(&self, provider: &dyn Provider) -> PointerMapRequest {
+        let pointer_size = provider_pointer_size(provider);
+        PointerMapRequest {
+            pointer_size,
+            alignment: pointer_size,
+            filter_executable: self.form.filter_executable,
+            filter_writable: self.form.filter_writable,
+            private_only: self.form.private_only,
+            skip_system_modules: self.form.skip_system_modules,
+            start_address: 0,
+            end_address: if self.form.user_mode_only {
+                if pointer_size == 8 {
+                    0x0000_7FFF_FFFF_FFFF
+                } else {
+                    0x7FFF_FFFF
+                }
+            } else {
+                0
+            },
+            constrain_regions: self
+                .form
+                .struct_only
+                .then_some(self.struct_bounds)
+                .flatten()
+                .map(|(start, size)| crate::scanner::AddressRange {
+                    start,
+                    end: start.saturating_add(size),
+                })
+                .into_iter()
+                .collect(),
+            ..PointerMapRequest::default()
+        }
+    }
+
+    fn build_pointer_map_index(&mut self, cx: &mut Context<Self>) {
+        if self.scanning {
+            return;
+        }
+        let Some(provider) = self.provider.clone() else {
+            self.status = "No data source — attach a process or file to map pointers".to_string();
+            cx.notify();
+            return;
+        };
+        let req = self.pointer_map_request(provider.as_ref());
+        self.begin_task("Building pointer map…", cx);
+        let abort = self.abort.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { build_pointer_map(provider.as_ref(), &req, &abort) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.scanning = false;
+                this.progress = 0;
+                match result {
+                    Ok(map) => {
+                        let stats = map.stats();
+                        let backend = match stats.source {
+                            crate::scanner::pointer::PointerMapSource::GenericProvider => {
+                                "provider"
+                            }
+                            crate::scanner::pointer::PointerMapSource::MemflowScanflow => {
+                                "scanflow"
+                            }
+                        };
+                        this.status = if stats.truncated {
+                            format!(
+                                "Pointer map ({backend}) truncated at {} pointers",
+                                stats.pointers_found
+                            )
+                        } else {
+                            format!(
+                                "Pointer map ({backend}): {} pointers across {} regions",
+                                stats.pointers_found, stats.regions_scanned
+                            )
+                        };
+                        this.pointer_map = Some(Arc::new(map));
+                    }
+                    Err(err) => {
+                        this.status = err;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn find_pointer_chains_for_results(&mut self, cx: &mut Context<Self>) {
+        if self.scanning {
+            return;
+        }
+        let Some(map) = self.pointer_map.clone() else {
+            self.status = "Build a pointer map first".to_string();
+            cx.notify();
+            return;
+        };
+        let Some(provider) = self.provider.clone() else {
+            self.status = "No source attached".to_string();
+            cx.notify();
+            return;
+        };
+        let targets = match self.pointer_chain_targets(cx) {
+            Ok(targets) => targets,
+            Err(err) => {
+                self.status = err;
+                cx.notify();
+                return;
+            }
+        };
+        let target_summary = pointer_target_summary(&targets);
+        let (max_offset, max_depth) = match self.pointer_chain_settings(cx) {
+            Ok(settings) => settings,
+            Err(err) => {
+                self.status = err;
+                cx.notify();
+                return;
+            }
+        };
+        self.begin_task("Finding pointer chains…", cx);
+        let abort = self.abort.clone();
+        cx.spawn(async move |this, cx| {
+            let pointer_size = map.pointer_size();
+            let result = cx
+                .background_spawn(async move {
+                    let chains = find_pointer_chains(
+                        &map,
+                        &PointerChainRequest {
+                            targets,
+                            max_depth,
+                            max_offset,
+                            max_results: 10_000,
+                        },
+                        &abort,
+                    );
+                    let rows = pointer_chains_to_scan_results(
+                        provider.as_ref(),
+                        pointer_size,
+                        &chains.chains,
+                    );
+                    (rows, chains.truncated)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let (rows, truncated) = result;
+                if !this.results.is_empty() {
+                    this.push_undo_snapshot();
+                }
+                let n = rows.len();
+                this.results = rows;
+                this.show_previous = false;
+                this.generation = if n > 0 { 1 } else { 0 };
+                this.last_result_count = 0;
+                this.selected_row = None;
+                this.scanning = false;
+                this.progress = 0;
+                let vt = if pointer_size == 4 {
+                    ValueType::UInt32
+                } else {
+                    ValueType::UInt64
+                };
+                this.form
+                    .set_last_scan(ScanMode::Value, vt, ScanCondition::ExactValue, &[]);
+                this.status = if truncated {
+                    format!("Found {n} pointer chains to {target_summary} (truncated)")
+                } else {
+                    format!("Found {n} pointer chains to {target_summary}")
+                };
+                this.refresh_table(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn pointer_chain_targets(&self, cx: &App) -> Result<Vec<u64>, String> {
+        let target_text = self.pointer_target_input.read(cx).value().to_string();
+        if !target_text.trim().is_empty() {
+            return Ok(vec![parse_address_control(&target_text, "pointer target")?]);
+        }
+        if let Some(addr) = self.selected_address(cx) {
+            return Ok(vec![addr]);
+        }
+        if let Some((start, _size)) = self.struct_bounds {
+            return Ok(vec![start]);
+        }
+        let targets: Vec<u64> = self
+            .displayed_addresses(cx)
+            .into_iter()
+            .take(MAX_POINTER_CHAIN_TARGETS)
+            .collect();
+        if targets.is_empty() {
+            Err("Type a target address, select a result, or focus a struct".to_string())
+        } else {
+            Ok(targets)
+        }
+    }
+
+    fn pointer_chain_settings(&self, cx: &App) -> Result<(u64, usize), String> {
+        let offset_text = self.pointer_offset_input.read(cx).value().to_string();
+        let depth_text = self.pointer_depth_input.read(cx).value().to_string();
+        let max_offset = parse_int_control(&offset_text, 0x1000, "pointer max offset")?;
+        let max_depth = parse_int_control(&depth_text, 3, "depth")?;
+        let max_depth = usize::try_from(max_depth)
+            .map_err(|_| "Invalid depth".to_string())?
+            .max(1);
+        Ok((max_offset, max_depth))
     }
 
     /// The address of the currently-selected result row, if any (drives the
@@ -1747,6 +1980,74 @@ impl ScannerPanel {
     }
 }
 
+fn provider_pointer_size(provider: &dyn Provider) -> usize {
+    match provider.pointer_size() {
+        4 => 4,
+        _ => 8,
+    }
+}
+
+fn parse_int_control(text: &str, default: u64, name: &str) -> Result<u64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).map_err(|_| format!("Invalid {name}"));
+    }
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid {name}"))
+}
+
+fn parse_address_control(text: &str, name: &str) -> Result<u64, String> {
+    let trimmed = text.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+        .chars()
+        .filter(|ch| *ch != '`' && *ch != '_')
+        .collect::<String>();
+    if hex.is_empty() || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("Invalid {name}"));
+    }
+    u64::from_str_radix(&hex, 16).map_err(|_| format!("Invalid {name}"))
+}
+
+fn pointer_target_summary(targets: &[u64]) -> String {
+    match targets {
+        [target] => format!("0x{target:X}"),
+        many => format!("{} targets", many.len()),
+    }
+}
+
+fn pointer_chains_to_scan_results(
+    provider: &dyn Provider,
+    pointer_size: usize,
+    chains: &[PointerChain],
+) -> Vec<ScanResult> {
+    chains
+        .iter()
+        .filter_map(|chain| {
+            let address = chain.base_address();
+            let mut bytes = vec![0u8; pointer_size];
+            if !provider.read(address, &mut bytes) {
+                bytes.clear();
+            }
+            (!chain.steps.is_empty()).then_some(ScanResult {
+                address,
+                region_module: chain.display(),
+                scan_value: bytes.into(),
+                previous_value: Default::default(),
+            })
+        })
+        .collect()
+}
+
 fn build_display_row(form: &ScannerForm, show_previous: bool, r: &ScanResult) -> DisplayRow {
     let mut row = ScanRow::from_result(form, r);
     let mut delta_dir = 0;
@@ -1828,7 +2129,7 @@ pub fn bench_scanner_table_filter_cached(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_display_cache, filter_display_cache};
+    use super::{build_display_cache, filter_display_cache, parse_address_control};
     use crate::scanner::ScanResult;
     use crate::ui::panels::scannerpanel::ScannerForm;
 
@@ -1859,6 +2160,20 @@ mod tests {
         assert_eq!(cache[matches[0]].display.row.address, results[0].address);
         let matches = filter_display_cache(&cache, "ENGINE");
         assert_eq!(cache[matches[0]].display.row.address, results[1].address);
+    }
+
+    #[test]
+    fn pointer_target_address_parser_accepts_reclass_hex_forms() {
+        assert_eq!(
+            parse_address_control("0x00007FF6`12340000", "target").unwrap(),
+            0x0000_7FF6_1234_0000
+        );
+        assert_eq!(
+            parse_address_control("0000_7ff6_1234_0000", "target").unwrap(),
+            0x0000_7FF6_1234_0000
+        );
+        assert_eq!(parse_address_control("1000", "target").unwrap(), 0x1000);
+        assert!(parse_address_control("module+0x10", "target").is_err());
     }
 }
 
@@ -2117,6 +2432,12 @@ impl Render for ScannerPanel {
         // scan" hint (live scanning needs a provider wired from the document,
         // out of scope here). ──
         let has_provider = self.provider.is_some();
+        let pointer_target_ready = !self.pointer_target_input.read(cx).value().trim().is_empty()
+            || has_selection
+            || self.struct_bounds.is_some()
+            || has_results;
+        let can_find_pointer_chains =
+            has_provider && self.pointer_map.is_some() && pointer_target_ready && !scanning;
         let status_text = if !self.status.is_empty() {
             self.status.clone()
         } else if !has_provider {
@@ -2357,6 +2678,42 @@ impl Render for ScannerPanel {
                                     })),
                             ),
                     )
+                    // Row 4: provider-appropriate pointer-map / chain actions.
+                    .child(
+                        gpui_component::h_flex()
+                            .gap(px(tokens::space::MD))
+                            .items_center()
+                            .flex_wrap()
+                            .child(
+                                div()
+                                    .w(px(56.))
+                                    .flex_none()
+                                    .text_size(px(tokens::font::UI_SM))
+                                    .text_color(color::text_muted(cx))
+                                    .child("Pointers:"),
+                            )
+                            .child(Input::new(&self.pointer_target_input).small().w(px(176.)))
+                            .child(Input::new(&self.pointer_offset_input).small().w(px(112.)))
+                            .child(Input::new(&self.pointer_depth_input).small().w(px(72.)))
+                            .child(
+                                Button::new("scanner-pointer-map")
+                                    .small()
+                                    .label("Build Map")
+                                    .disabled(!has_provider || scanning)
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.build_pointer_map_index(cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("scanner-pointer-chains")
+                                    .small()
+                                    .label("Find Chains")
+                                    .disabled(!can_find_pointer_chains)
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.find_pointer_chains_for_results(cx)
+                                    })),
+                            ),
+                    )
                     // ── Stage breadcrumb + progress bar (the C++ stage label
                     // + m_progressBar). ──
                     .when(!breadcrumb.is_empty() || scanning, |col| {
@@ -2438,6 +2795,9 @@ impl Render for ScannerPanel {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_h(px(96.))
+                    .w_full()
+                    .overflow_hidden()
                     // The DataTable's own table/head/row colors fall back to
                     // gpui-component's (light) defaults until the theme seeds
                     // them (theme_apply.rs). Paint the dark content bg behind

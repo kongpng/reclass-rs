@@ -556,6 +556,14 @@ pub trait Provider {
     fn write_bytes(&self, addr: u64, data: &[u8]) -> bool {
         self.write(addr, data)
     }
+
+    /// Provider-specific memflow downhook for optional memflow-native analysis
+    /// backends (for example scanflow). Kept as a narrow provider-layer escape
+    /// hatch instead of making every provider pretend to support those APIs.
+    #[cfg(feature = "memflow-provider")]
+    fn as_memflow_provider(&self) -> Option<&memflow::MemflowProvider> {
+        None
+    }
 }
 
 #[cfg(test)]

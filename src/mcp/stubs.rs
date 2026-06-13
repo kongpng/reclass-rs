@@ -26,7 +26,6 @@ pub const STUB_TOOLS: &[&str] = &[
     "node.read_value",
     "analysis.infer_types",
     "analysis.import_header",
-    "analysis.pointer_chain",
     "ui.inspect",
     "theme.get",
     "theme.set",
@@ -56,7 +55,7 @@ mod tests {
     #[test]
     fn stub_set_excludes_phantoms() {
         // Keep this pinned so adding/removing advertised stub handlers is explicit.
-        assert_eq!(STUB_TOOLS.len(), 19);
+        assert_eq!(STUB_TOOLS.len(), 18);
         for phantom in [
             "analysis.find_overlaps",
             "analysis.tree_summary",

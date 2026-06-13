@@ -6,10 +6,8 @@
 //! cases (clamps, the hex-dump format, the base-address case/0x asymmetry,
 //! placeholder forward refs, the atomic undo macro) are ported 1:1.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 
 use crate::core::command::OffsetAdj;
 use crate::core::kind::{alignment_for, kind_from_string, kind_to_string};
@@ -19,6 +17,11 @@ use crate::core::node::{
 use crate::core::value_history::now_ms;
 use crate::core::{Command, NodeKind, NodeTree};
 use crate::provider::Provider;
+use crate::scanner::pointer::{
+    build_pointer_map, find_pointer_chains, format_signed_offset, PointerChainRequest,
+    PointerMapRequest, PointerMapSource,
+};
+use crate::scanner::AddressRange;
 
 use super::host::{McpHost, TabState};
 use super::wire::{
@@ -46,6 +49,10 @@ fn arg_str_default(args: &Map<String, Value>, k: &str, default: &str) -> String 
 
 fn arg_bool(args: &Map<String, Value>, k: &str) -> bool {
     arg(args, k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn arg_bool_default(args: &Map<String, Value>, k: &str, default: bool) -> bool {
+    arg(args, k).and_then(Value::as_bool).unwrap_or(default)
 }
 
 #[cfg(feature = "memflow-provider")]
@@ -982,7 +989,7 @@ fn tool_source_switch_memflow(
         Err(err) => return make_text_result(&format!("memflow attach failed: {err}"), true),
     };
     let name = provider.name();
-    let provider = Arc::new(provider);
+    let provider = std::sync::Arc::new(provider);
     host.with_tab(idx, &mut |tab: &mut TabState| {
         tab.attach_provider_with_identifier(
             provider.clone(),
@@ -1017,7 +1024,7 @@ fn tool_source_switch_process(
         Err(err) => return make_text_result(&format!("process attach failed: {err}"), true),
     };
     let name = provider.name();
-    let provider = Arc::new(provider);
+    let provider = std::sync::Arc::new(provider);
     host.with_tab(idx, &mut |tab: &mut TabState| {
         tab.attach_provider_with_identifier(provider.clone(), "processmemory", target.clone());
     });
@@ -1047,7 +1054,7 @@ fn tool_source_switch_remote(
         Err(err) => return make_text_result(&format!("remote attach failed: {err}"), true),
     };
     let name = provider.name();
-    let provider = Arc::new(provider);
+    let provider = std::sync::Arc::new(provider);
     host.with_tab(idx, &mut |tab: &mut TabState| {
         tab.attach_provider_with_identifier(
             provider.clone(),
@@ -1095,7 +1102,7 @@ fn tool_source_switch_kernel(
         Err(err) => return make_text_result(&format!("kernel attach failed: {err}"), true),
     };
     let name = provider.name();
-    let provider = Arc::new(provider);
+    let provider = std::sync::Arc::new(provider);
     host.with_tab(idx, &mut |tab: &mut TabState| {
         tab.attach_provider_with_identifier(provider.clone(), "kernelmemory", target.clone());
     });
@@ -1127,7 +1134,7 @@ fn tool_source_switch_windbg(
         Err(err) => return make_text_result(&format!("WinDbg attach failed: {err}"), true),
     };
     let name = provider.name();
-    let provider = Arc::new(provider);
+    let provider = std::sync::Arc::new(provider);
     host.with_tab(idx, &mut |tab: &mut TabState| {
         tab.attach_provider_with_identifier(provider.clone(), "windbgmemory", target.clone());
     });
@@ -3016,6 +3023,231 @@ pub fn tool_tree_export_header(args: &Map<String, Value>, host: &mut dyn McpHost
     out
 }
 
+// ════════════════════════════════════════════════════════════════════
+// analysis.pointer_chain
+// ════════════════════════════════════════════════════════════════════
+
+pub fn tool_analysis_pointer_chain(args: &Map<String, Value>, host: &mut dyn McpHost) -> Value {
+    let Some(idx) = resolve_tab(args, host) else {
+        return make_text_result("No active tab", true);
+    };
+
+    let mut out = Value::Null;
+    host.with_tab_ref(idx, &mut |tab: &TabState| {
+        let provider = tab.data.provider.clone();
+        if provider.size() <= 0 && provider.enumerate_regions().is_empty() {
+            out = make_text_result("No provider attached", true);
+            return;
+        }
+
+        let base_relative = arg_bool(args, "baseRelative");
+        let targets = match pointer_chain_targets_from_args(args, tab.data.tree.base_address) {
+            Ok(targets) => targets
+                .into_iter()
+                .map(|target| {
+                    if base_relative {
+                        tab.data.tree.base_address.saturating_add(target)
+                    } else {
+                        target
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                out = make_text_result(&err, true);
+                return;
+            }
+        };
+
+        let pointer_size = match provider.pointer_size() {
+            4 => 4,
+            _ => 8,
+        };
+        let request = PointerMapRequest {
+            pointer_size,
+            alignment: pointer_size,
+            max_pointers: pointer_arg_usize(args, "maxPointers", 2_000_000, 0, 10_000_000),
+            filter_executable: arg_bool(args, "filterExecutable"),
+            filter_writable: arg_bool_default(args, "filterWritable", true),
+            private_only: arg_bool(args, "privateOnly"),
+            skip_system_modules: arg_bool(args, "skipSystemModules"),
+            start_address: 0,
+            end_address: if arg_bool(args, "userModeOnly") {
+                if pointer_size == 8 {
+                    0x0000_7FFF_FFFF_FFFF
+                } else {
+                    0x7FFF_FFFF
+                }
+            } else {
+                0
+            },
+            constrain_regions: pointer_regions_arg(args),
+            ..PointerMapRequest::default()
+        };
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let map = match build_pointer_map(provider.as_ref(), &request, &abort) {
+            Ok(map) => map,
+            Err(err) => {
+                out = make_text_result(&err, true);
+                return;
+            }
+        };
+        let chains = find_pointer_chains(
+            &map,
+            &PointerChainRequest {
+                targets: targets.clone(),
+                max_depth: pointer_arg_usize(args, "maxDepth", 3, 1, 8),
+                max_offset: pointer_arg_u64(args, "maxOffset", 0x1000),
+                max_results: pointer_arg_usize(args, "maxResults", 100, 1, 1000),
+            },
+            &abort,
+        );
+        let stats = map.stats();
+        let source = match stats.source {
+            PointerMapSource::GenericProvider => "provider",
+            PointerMapSource::MemflowScanflow => "scanflow",
+        };
+        let chain_json = chains
+            .chains
+            .iter()
+            .map(|chain| {
+                json!({
+                    "target": format!("0x{:X}", chain.target),
+                    "baseAddress": format!("0x{:X}", chain.base_address()),
+                    "display": chain.display(),
+                    "steps": chain.steps.iter().map(|step| {
+                        json!({
+                            "pointerAddress": format!("0x{:X}", step.pointer_address),
+                            "pointsTo": format!("0x{:X}", step.points_to),
+                            "offset": step.offset,
+                            "offsetHex": format_signed_offset(step.offset),
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = json!({
+            "targets": targets.iter().map(|target| format!("0x{target:X}")).collect::<Vec<_>>(),
+            "pointerMap": {
+                "source": source,
+                "pointersFound": stats.pointers_found,
+                "regionsScanned": stats.regions_scanned,
+                "truncated": stats.truncated,
+            },
+            "chains": chain_json,
+            "chainCount": chains.chains.len(),
+            "truncated": chains.truncated,
+        });
+        out = make_text_result(&qt_pretty(&result), false);
+    });
+
+    if out.is_null() {
+        return make_text_result("No active tab", true);
+    }
+    out
+}
+
+fn pointer_chain_targets_from_args(
+    args: &Map<String, Value>,
+    default_base: u64,
+) -> Result<Vec<u64>, String> {
+    if let Some(Value::Array(items)) = arg(args, "targets") {
+        let mut targets = Vec::new();
+        for item in items {
+            targets.push(parse_pointer_address_value(item).ok_or_else(|| {
+                "analysis.pointer_chain targets must be hex strings or integers".to_string()
+            })?);
+        }
+        if !targets.is_empty() {
+            return Ok(targets);
+        }
+    }
+    for key in ["target", "address"] {
+        if let Some(value) = arg(args, key) {
+            return parse_pointer_address_value(value)
+                .map(|target| vec![target])
+                .ok_or_else(|| format!("Invalid {key}"));
+        }
+    }
+    if default_base != 0 {
+        Ok(vec![default_base])
+    } else {
+        Err("analysis.pointer_chain requires target, targets, or address".to_string())
+    }
+}
+
+fn parse_pointer_address_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => parse_pointer_address_str(s),
+        _ => None,
+    }
+}
+
+fn parse_pointer_address_str(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+        .chars()
+        .filter(|ch| *ch != '`' && *ch != '_')
+        .collect::<String>();
+    if hex.is_empty() || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&hex, 16).ok()
+}
+
+fn pointer_arg_u64(args: &Map<String, Value>, key: &str, default: u64) -> u64 {
+    arg(args, key)
+        .and_then(parse_pointer_address_value)
+        .unwrap_or(default)
+}
+
+fn pointer_arg_usize(
+    args: &Map<String, Value>,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> usize {
+    let raw = match arg(args, key) {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+    .unwrap_or(default as u64) as usize;
+    raw.clamp(min, max)
+}
+
+fn pointer_regions_arg(args: &Map<String, Value>) -> Vec<AddressRange> {
+    let Some(Value::Array(regions)) = arg(args, "regions") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for region in regions {
+        let Value::Array(pair) = region else {
+            continue;
+        };
+        if pair.len() < 2 {
+            continue;
+        }
+        let Some(start) = parse_pointer_address_value(&pair[0]) else {
+            continue;
+        };
+        let Some(end) = parse_pointer_address_value(&pair[1]) else {
+            continue;
+        };
+        if end > start {
+            out.push(AddressRange { start, end });
+        }
+    }
+    out
+}
+
 // Keep OffsetAdj referenced (documents the command's helper POD).
 const _: fn() = || {
     let _ = std::mem::size_of::<OffsetAdj>();
@@ -3032,6 +3264,10 @@ mod tests {
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    fn write_u64(buf: &mut [u8], addr: usize, value: u64) {
+        buf[addr..addr + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     // ── resolve_tab ──
@@ -4014,6 +4250,43 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("nodeId not found"));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // analysis.pointer_chain
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn analysis_pointer_chain_uses_active_provider_pointer_map() {
+        let mut bytes = vec![0u8; 0x100];
+        write_u64(&mut bytes, 0x08, 0x20);
+        write_u64(&mut bytes, 0x20, 0x80);
+        let mut tab = TabState::new();
+        tab.data.provider = Arc::new(BufferProvider::new(bytes, "ptr.bin"));
+        let mut h = TestHost::with_tab(tab);
+
+        let r = tool_analysis_pointer_chain(
+            &map(json!({
+                "target": "0x80",
+                "maxDepth": 2,
+                "maxOffset": "0x0",
+                "filterWritable": false
+            })),
+            &mut h,
+        );
+
+        assert_ne!(r["isError"], json!(true));
+        let out = parse_text(&r);
+        assert_eq!(out["chainCount"], 2);
+        let bases: Vec<String> = out["chains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|chain| chain["baseAddress"].as_str().unwrap().to_string())
+            .collect();
+        assert!(bases.contains(&"0x8".to_string()));
+        assert!(bases.contains(&"0x20".to_string()));
+        assert_eq!(out["pointerMap"]["source"], "provider");
     }
 
     // ════════════════════════════════════════════════════════════════

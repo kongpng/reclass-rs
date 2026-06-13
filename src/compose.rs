@@ -1433,18 +1433,13 @@ fn provider_can_read_target(
     provider.read(addr, &mut probe)
 }
 
-fn named_address(
-    provider: &dyn Provider,
+fn named_address_from_maps(
     regions: &[MemoryRegion],
     regions_indexable: bool,
     modules: &[ModuleEntry],
     modules_indexable: bool,
     addr: u64,
 ) -> String {
-    let symbol = provider.get_symbol(addr);
-    if !symbol.is_empty() {
-        return symbol;
-    }
     if let Some(module) = find_module(modules, modules_indexable, addr) {
         let name = if module.name.is_empty() {
             "module"
@@ -1492,18 +1487,21 @@ fn pointer_type_hint_chip_text(
     ) {
         return None;
     }
-    ensure_hint_modules(state, prov);
-    let label = named_address(
-        prov,
-        &state.hint_regions,
-        state.hint_regions_indexable,
-        &state.rtti_modules,
-        state.rtti_modules_indexable,
-        target,
-    );
+    let symbol = prov.get_symbol(target);
+    let label = if symbol.is_empty() {
+        ensure_hint_modules(state, prov);
+        named_address_from_maps(
+            &state.hint_regions,
+            state.hint_regions_indexable,
+            &state.rtti_modules,
+            state.rtti_modules_indexable,
+            target,
+        )
+    } else {
+        symbol
+    };
     Some(format!("{type_name}\u{2713} -> {label}"))
 }
-
 // ───────────────────────────────────────────────────────────────────────────
 // Chip sanitize helper (`compose.cpp:394-404`).
 // ───────────────────────────────────────────────────────────────────────────
@@ -1879,14 +1877,15 @@ fn compose_leaf(
             //    rejects ~99% of values cheaply; surviving candidates run
             //    `walk_rtti` once and the result is cached for the rest of this
             //    compose pass (`rtti_for_vtable`). Independent of `type_hints`
-            //    and `show_comments` — RTTI is "real signal" worth showing on
-            //    its own (`compose.cpp:462-484`, `test_rtti_hint.cpp:312`).
+            //    and `show_comments`, but gated by `show_rtti`; with RTTI hidden
+            //    the editor should not enumerate modules or probe vtables.
             //    Appended LAST (after enum/comment/typeHint), matching C++
             //    `composeLeaf` order. The null-pointer CTA chip (port-specific)
             //    is gated on `show_rtti`; the PDB symbol annotation now rides in
             //    the value text via `read_value` (`format.cpp:425`), so no
             //    Symbol chip.
-            if node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64 {
+            if state.show_rtti && (node.kind == NodeKind::Hex64 || node.kind == NodeKind::Pointer64)
+            {
                 attach_rtti_chip(
                     state,
                     prov,

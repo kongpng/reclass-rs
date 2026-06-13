@@ -273,7 +273,7 @@ impl MemflowProvider {
         })
     }
 
-    fn with_process<T>(
+    pub(crate) fn with_process<T>(
         &self,
         fallback: T,
         f: impl FnOnce(&mut IntoProcessInstanceArcBox<'static>) -> T,
@@ -396,6 +396,10 @@ impl Provider for MemflowProvider {
 
     fn is_readable(&self, _addr: u64, len: i32) -> bool {
         len >= 0
+    }
+
+    fn as_memflow_provider(&self) -> Option<&MemflowProvider> {
+        Some(self)
     }
 }
 

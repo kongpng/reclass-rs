@@ -2588,8 +2588,8 @@ fn type_hint_hex_rows_read_without_readability_preflight() {
     );
     assert_eq!(
         prov.read_calls.get(),
-        2,
-        "formatting and type inference should reuse row bytes; RTTI detection still reads the candidate separately"
+        1,
+        "formatting and type inference should reuse row bytes; RTTI is disabled so no extra candidate read is needed"
     );
 }
 
@@ -2790,6 +2790,130 @@ fn pointer_type_hints_reuse_region_and_module_snapshots() {
         prov.module_calls.get(),
         1,
         "pointer type-hint naming should enumerate modules once per compose pass"
+    );
+}
+
+#[test]
+fn pointer_type_hint_symbol_hits_skip_module_snapshot() {
+    struct SymbolHitProvider {
+        base: u64,
+        data: Vec<u8>,
+        symbol_calls: std::cell::Cell<usize>,
+        module_calls: std::cell::Cell<usize>,
+    }
+
+    impl Provider for SymbolHitProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            let Some(start) = addr.checked_sub(self.base).map(|v| v as usize) else {
+                return false;
+            };
+            if start.saturating_add(buf.len()) > self.data.len() {
+                return false;
+            }
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            self.data.len() as i32
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            vec![MemoryRegion {
+                base: self.base,
+                size: self.data.len() as u64,
+                readable: true,
+                writable: true,
+                executable: false,
+                module_name: "fast.dll".into(),
+                region_type: RegionType::Image,
+            }]
+        }
+
+        fn trusts_enumerated_region_readability(&self) -> bool {
+            true
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.module_calls.set(self.module_calls.get() + 1);
+            vec![ModuleEntry {
+                name: "fast.dll".into(),
+                full_path: "fast.dll".into(),
+                base: self.base + 0x200,
+                size: 0x100,
+            }]
+        }
+
+        fn get_symbol(&self, addr: u64) -> String {
+            self.symbol_calls.set(self.symbol_calls.get() + 1);
+            if (self.base + 0x200..self.base + 0x300).contains(&addr) {
+                format!("fast.dll+0x{:x}", addr - (self.base + 0x200))
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    const BASE: u64 = 0x0000_7FF6_A0B0_0000;
+    const FIELD_COUNT: usize = 16;
+    let mut tree = NodeTree::new();
+    tree.base_address = BASE;
+    let ri = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[ri].id;
+    for i in 0..FIELD_COUNT {
+        tree.add_node(child(
+            root_id,
+            NodeKind::Hex64,
+            (i * 8) as i32,
+            &format!("payload_{i}"),
+        ));
+    }
+
+    let mut data = vec![0u8; 0x400];
+    for i in 0..FIELD_COUNT {
+        let target = BASE + 0x200 + i as u64;
+        data[i * 8..i * 8 + 8].copy_from_slice(&target.to_le_bytes());
+        data[0x200 + i] = 0xAA;
+    }
+    let prov = SymbolHitProvider {
+        base: BASE,
+        data,
+        symbol_calls: std::cell::Cell::new(0),
+        module_calls: std::cell::Cell::new(0),
+    };
+
+    let r = compose(
+        &tree, &prov, root_id, false, false, false, true, true, false, true,
+    );
+
+    let pointer_chips: Vec<_> = r
+        .meta
+        .iter()
+        .flat_map(|lm| lm.chips.iter())
+        .filter(|chip| {
+            chip.kind == ChipKind::TypeHint && chip.type_hint_kinds == vec![NodeKind::Pointer64]
+        })
+        .collect();
+    assert_eq!(pointer_chips.len(), FIELD_COUNT);
+    assert!(
+        pointer_chips
+            .iter()
+            .all(|chip| chip.text.contains("fast.dll+0x")),
+        "chips should still use provider symbol labels: {pointer_chips:?}"
+    );
+    assert_eq!(
+        prov.symbol_calls.get(),
+        FIELD_COUNT,
+        "provider symbols should be checked once for each readable pointer hint"
+    );
+    assert_eq!(
+        prov.module_calls.get(),
+        0,
+        "module snapshot should be lazy and skipped when symbols resolve every target"
     );
 }
 
