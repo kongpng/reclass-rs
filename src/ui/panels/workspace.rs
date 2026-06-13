@@ -360,6 +360,26 @@ fn member_type_name(m: &crate::core::Node) -> String {
     }
 }
 
+fn children_sorted_by_offset(tree: &NodeTree, children: &[usize]) -> bool {
+    children
+        .windows(2)
+        .all(|pair| tree.nodes[pair[0]].offset <= tree.nodes[pair[1]].offset)
+}
+
+fn push_field_child(tree: &NodeTree, children: &mut Vec<FieldChild>, node_idx: usize) {
+    let m = &tree.nodes[node_idx];
+    if is_hex_pad(m.kind) {
+        return;
+    }
+    children.push(FieldChild {
+        id: m.id,
+        type_name: member_type_name(m),
+        field_name: m.name.clone(),
+        offset: m.offset,
+        search_lower: OnceLock::new(),
+    });
+}
+
 /// The complete workspace tree model — the data the tree renders.
 ///
 /// Built by [`WorkspaceModel::build`] from the open documents; pure + testable.
@@ -480,25 +500,22 @@ impl WorkspaceModel {
     /// The field child rows of a struct (`buildStructChildren`): members sorted
     /// by offset, hex-padding members skipped.
     fn struct_children(tree: &NodeTree, struct_id: u64, _doc: DocId) -> (usize, Vec<FieldChild>) {
-        let mut members = tree.children_of(struct_id);
-        members.sort_by(|&a, &b| tree.nodes[a].offset.cmp(&tree.nodes[b].offset));
-
-        let mut children = Vec::new();
-        for mi in members {
-            let m = &tree.nodes[mi];
-            if is_hex_pad(m.kind) {
-                continue;
+        tree.with_children(struct_id, |members| {
+            let mut children = Vec::with_capacity(members.len());
+            if children_sorted_by_offset(tree, members) {
+                for &mi in members {
+                    push_field_child(tree, &mut children, mi);
+                }
+            } else {
+                let mut sorted_members = members.to_vec();
+                sorted_members.sort_by(|&a, &b| tree.nodes[a].offset.cmp(&tree.nodes[b].offset));
+                for mi in sorted_members {
+                    push_field_child(tree, &mut children, mi);
+                }
             }
-            children.push(FieldChild {
-                id: m.id,
-                type_name: member_type_name(m),
-                field_name: m.name.clone(),
-                offset: m.offset,
-                search_lower: OnceLock::new(),
-            });
-        }
-        let count = children.len();
-        (count, children)
+            let count = children.len();
+            (count, children)
+        })
     }
 
     /// The `"N structs · M enums"` count caption (empty when no types exist) —
@@ -1867,6 +1884,48 @@ mod tests {
         // in offset-sorted order: health@0, stamina@8, xp@12.
         let offsets: Vec<i32> = player.children.iter().map(|c| c.offset).collect();
         assert_eq!(offsets, vec![0, 8, 12]);
+    }
+
+    #[test]
+    fn struct_children_keep_offset_order_for_unsorted_tree_children() {
+        let mut tree = NodeTree::default();
+        let root = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Root".into(),
+            struct_type_name: "Root".into(),
+            parent_id: 0,
+            ..Node::default()
+        });
+        let root_id = tree.nodes[root].id;
+        tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: "late".into(),
+            parent_id: root_id,
+            offset: 8,
+            ..Node::default()
+        });
+        tree.add_node(Node {
+            kind: NodeKind::Float,
+            name: "early".into(),
+            parent_id: root_id,
+            offset: 0,
+            ..Node::default()
+        });
+
+        let d = doc_id(1);
+        let docs = vec![WorkspaceDoc {
+            doc: d,
+            tree: &tree,
+        }];
+        let model = WorkspaceModel::build(&docs, &[], &[]);
+        let root = model.type_entries().find(|t| t.name == "Root").unwrap();
+
+        let names: Vec<&str> = root
+            .children
+            .iter()
+            .map(|child| child.field_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["early", "late"]);
     }
 
     #[test]
