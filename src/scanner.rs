@@ -597,14 +597,25 @@ fn k_system() -> &'static HashSet<&'static str> {
 /// Lowercases + extension-strips the module name and checks both the stripped
 /// stem and the full lowercased name against [`k_system`].
 pub fn is_system_module(module_name: &str) -> bool {
-    if module_name.is_empty() {
+    let name = module_name.trim();
+    if name.is_empty() {
         return false;
     }
-    let name = module_name.trim().to_lowercase();
 
-    // Strip extension(s): "kernel32.dll" -> "kernel32", "libc.so.6" -> "libc.so"
-    let mut stem = name.clone();
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = name.to_ascii_lowercase();
+        return is_system_module_lowercase(&lower);
+    }
+
+    is_system_module_lowercase(name)
+}
+
+fn is_system_module_lowercase(name: &str) -> bool {
+    // Strip extension(s): "kernel32.dll" -> "kernel32". Keep the full name
+    // check too, so exact entries such as "libc.so.6" continue to match.
+    let mut stem_end = name.len();
     loop {
+        let stem = &name[..stem_end];
         let dot = stem.find('.');
         match dot {
             Some(d) if d > 0 => {
@@ -617,7 +628,7 @@ pub fn is_system_module(module_name: &str) -> bool {
                     || suffix == "so"
                     || numeric;
                 if strippable {
-                    stem = stem[..d].to_string();
+                    stem_end = d;
                     continue;
                 } else {
                     break;
@@ -627,7 +638,7 @@ pub fn is_system_module(module_name: &str) -> bool {
         }
     }
 
-    k_system().contains(stem.as_str()) || k_system().contains(name.as_str())
+    k_system().contains(&name[..stem_end]) || k_system().contains(name)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
