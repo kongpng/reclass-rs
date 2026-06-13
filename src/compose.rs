@@ -355,6 +355,7 @@ fn compose_with_symbols_at_base_inner(
         child_map: AHashMap::with_capacity(tree.nodes.len().saturating_add(1)),
         child_map_sorted: AHashSet::new(),
         abs_offsets: Vec::new(),
+        root_abs_offset_cache: AHashMap::new(),
         scope_widths: AHashMap::new(),
         enum_member_cache: AHashMap::new(),
         rtti_modules_cached: false,
@@ -891,6 +892,7 @@ struct ComposeState<'a> {
     child_map: AHashMap<u64, Vec<i32>>,
     child_map_sorted: AHashSet<u64>,
     abs_offsets: Vec<i64>,
+    root_abs_offset_cache: AHashMap<u64, Option<i64>>,
     scope_widths: AHashMap<u64, (i32, i32)>,
     enum_member_cache: AHashMap<u64, AHashMap<i64, usize>>,
 
@@ -1150,19 +1152,29 @@ fn rel_offset_from_root(tree: &NodeTree, idx: i32, root_id: u64) -> i64 {
 
 /// `resolveAddr` (`compose.cpp:235-242`).
 fn resolve_addr(
-    state: &ComposeState,
+    state: &mut ComposeState,
     tree: &NodeTree,
     node_idx: i32,
     base: u64,
     root_id: u64,
 ) -> u64 {
     if root_id != 0 {
-        let root_idx = tree.index_of_id(root_id);
-        if root_idx >= 0 {
+        let root_abs = if let Some(root_abs) = state.root_abs_offset_cache.get(&root_id).copied() {
+            root_abs
+        } else {
+            let root_idx = tree.index_of_id(root_id);
+            let root_abs = if root_idx >= 0 {
+                state.abs_offsets.get(root_idx as usize).copied()
+            } else {
+                None
+            };
+            state.root_abs_offset_cache.insert(root_id, root_abs);
+            root_abs
+        };
+        if let Some(root_abs) = root_abs {
             let node_idx = node_idx as usize;
-            let root_idx = root_idx as usize;
-            if node_idx < state.abs_offsets.len() && root_idx < state.abs_offsets.len() {
-                let rel = state.abs_offsets[node_idx].wrapping_sub(state.abs_offsets[root_idx]);
+            if node_idx < state.abs_offsets.len() {
+                let rel = state.abs_offsets[node_idx].wrapping_sub(root_abs);
                 return base.wrapping_add(rel as u64);
             }
         }
