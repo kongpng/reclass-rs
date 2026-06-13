@@ -72,6 +72,21 @@ use inline_edit::FieldInput;
 use palette::EditorPalette;
 use selection::ByteSelection;
 
+fn visible_line_range_from_metrics(
+    view_h: f32,
+    offset_y: f32,
+    line_height: f32,
+) -> Option<(usize, usize)> {
+    if line_height <= 0.0 || view_h <= 0.0 {
+        return None;
+    }
+    // The list scrolls content UP by a negative offset; first visible row is
+    // floor(-offset / line_height).
+    let first = ((-offset_y).max(0.0) / line_height).floor() as usize;
+    let rows = (view_h / line_height).floor().max(1.0) as usize;
+    Some((first, first + rows.saturating_sub(1)))
+}
+
 // Editor surface key actions (editor-surface.md §10 `handleNormalKey`). Bound in
 // the `RcxEditor` key context; the data-mutating ones route through the
 // controller. The full key vocabulary (type shortcuts, byte-selection nav, node
@@ -2877,19 +2892,17 @@ impl RcxEditor {
         let state = self.scroll.0.borrow();
         let view_h = f32::from(state.base_handle.bounds().size.height);
         let offset_y = f32::from(state.base_handle.offset().y);
-        if self.metrics.line_height <= 0.0 || view_h <= 0.0 {
-            return (0, 0);
-        }
-        // The list scrolls content UP by a negative offset; first visible row is
-        // floor(-offset / line_height).
-        let first = ((-offset_y).max(0.0) / self.metrics.line_height).floor() as usize;
-        let rows = (view_h / self.metrics.line_height).floor().max(1.0) as usize;
-        (first, first + rows.saturating_sub(1))
+        visible_line_range_from_metrics(view_h, offset_y, self.metrics.line_height)
+            .unwrap_or((0, 0))
     }
 
     fn sync_controller_visible_line_range(&mut self) -> bool {
-        let (first, last) = self.visible_line_range();
-        if last > first {
+        let state = self.scroll.0.borrow();
+        let view_h = f32::from(state.base_handle.bounds().size.height);
+        let offset_y = f32::from(state.base_handle.offset().y);
+        if let Some((first, last)) =
+            visible_line_range_from_metrics(view_h, offset_y, self.metrics.line_height)
+        {
             self.controller.set_visible_line_range(first, last)
         } else {
             self.controller.clear_visible_line_range();
@@ -6906,6 +6919,24 @@ mod tests {
     // hit_test, selection, tab_cycle, inline_edit). Here we cover the small glue
     // helpers that do not require a gpui Window: line slicing + selection-id
     // matching over a real ComposeResult from the controller.
+
+    #[test]
+    fn visible_line_range_math_preserves_single_row_viewports() {
+        assert_eq!(super::visible_line_range_from_metrics(0.0, 0.0, 16.0), None);
+        assert_eq!(super::visible_line_range_from_metrics(16.0, 0.0, 0.0), None);
+        assert_eq!(
+            super::visible_line_range_from_metrics(16.0, 0.0, 16.0),
+            Some((0, 0))
+        );
+        assert_eq!(
+            super::visible_line_range_from_metrics(16.0, -32.0, 16.0),
+            Some((2, 2))
+        );
+        assert_eq!(
+            super::visible_line_range_from_metrics(64.0, -32.0, 16.0),
+            Some((2, 5))
+        );
+    }
 
     fn editor_with_struct() -> RcxController {
         use crate::core::{Node, NodeKind};

@@ -3012,6 +3012,30 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
             },
         );
         group.bench_with_input(
+            BenchmarkId::new("visible_1_middle_changed_live_refresh", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        let addr = set_visible_field_window_at(&mut controller, nodes / 2, 1);
+                        let changed =
+                            changed_pages_from_next_live_tick_for_addr(&mut controller, addr);
+                        (controller, changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
             BenchmarkId::new("visible_80_middle_changed_editor_tick_extra_refresh", nodes),
             &nodes,
             |b, &nodes| {
