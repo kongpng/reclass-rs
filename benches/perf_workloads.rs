@@ -3303,6 +3303,45 @@ fn changed_page_refresh_workloads(c: &mut Criterion) {
             },
         );
         group.bench_with_input(
+            BenchmarkId::new(
+                "visible_80_middle_changed_with_deferred_offscreen_live_refresh",
+                nodes,
+            ),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree_at_base(nodes, NodeKind::Hex64, 0), provider);
+                        controller.set_track_values(true);
+                        apply_initial_live_snapshot(&mut controller);
+                        let visible_addr =
+                            set_visible_field_window_at(&mut controller, nodes / 2, 80);
+                        let offscreen_addr = field_addrs_at(&controller, 0, 1)
+                            .into_iter()
+                            .next()
+                            .expect("benchmark tree should have an offscreen field");
+                        let offscreen_changed = changed_pages_from_next_live_tick_for_addr(
+                            &mut controller,
+                            offscreen_addr,
+                        );
+                        let _ = controller.on_read_complete(offscreen_changed);
+                        let visible_changed = changed_pages_from_next_live_tick_for_addr(
+                            &mut controller,
+                            visible_addr,
+                        );
+                        (controller, visible_changed)
+                    },
+                    |(mut controller, changed)| {
+                        controller.on_read_complete(changed);
+                        black_box(controller.last_result().meta.len());
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
             BenchmarkId::new("visible_80_offscreen_changed_live_refresh", nodes),
             &nodes,
             |b, &nodes| {

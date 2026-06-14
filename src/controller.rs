@@ -92,40 +92,60 @@ fn changed_ranges_intersects(ranges: &[(i64, i64)], start: i64, end: i64) -> boo
         .is_some_and(|(range_start, _)| *range_start < end)
 }
 
-fn changed_ranges_covered_by_spans(ranges: &[(i64, i64)], spans: &[(i64, i64)]) -> bool {
-    if ranges.is_empty() {
-        return true;
-    }
-    if spans.is_empty() {
-        return false;
-    }
-
+fn split_changed_ranges_by_spans(
+    ranges: &[(i64, i64)],
+    spans: &[(i64, i64)],
+) -> (Vec<(i64, i64)>, Vec<(i64, i64)>) {
     let mut spans = spans.to_vec();
     spans.retain(|(start, end)| end > start);
     spans.sort_unstable_by_key(|(start, _)| *start);
+    normalize_changed_ranges(&mut spans);
 
+    let mut covered = Vec::new();
+    let mut uncovered = Vec::new();
     for &(range_start, range_end) in ranges {
         if range_end <= range_start {
             continue;
         }
-        let mut covered_until = range_start;
-        for &(span_start, span_end) in &spans {
-            if span_end <= covered_until {
+        if spans.is_empty() {
+            uncovered.push((range_start, range_end));
+            continue;
+        }
+
+        let mut cursor = range_start;
+        let mut span_idx = spans.partition_point(|(_, span_end)| *span_end <= cursor);
+        while cursor < range_end {
+            while span_idx < spans.len() && spans[span_idx].1 <= cursor {
+                span_idx += 1;
+            }
+            if span_idx >= spans.len() {
+                uncovered.push((cursor, range_end));
+                break;
+            }
+            let (span_start, span_end) = spans[span_idx];
+            if span_start >= range_end {
+                uncovered.push((cursor, range_end));
+                break;
+            }
+            if span_start > cursor {
+                let gap_end = span_start.min(range_end);
+                uncovered.push((cursor, gap_end));
+                cursor = gap_end;
                 continue;
             }
-            if span_start > covered_until {
-                break;
+
+            let covered_end = span_end.min(range_end);
+            if covered_end > cursor {
+                covered.push((cursor, covered_end));
+                cursor = covered_end;
+            } else {
+                span_idx += 1;
             }
-            covered_until = covered_until.max(span_end);
-            if covered_until >= range_end {
-                break;
-            }
-        }
-        if covered_until < range_end {
-            return false;
         }
     }
-    true
+    normalize_changed_ranges(&mut covered);
+    normalize_changed_ranges(&mut uncovered);
+    (covered, uncovered)
 }
 
 fn trimmed_utf16_len(s: &str) -> i32 {
@@ -5421,8 +5441,11 @@ impl RcxController {
             patch_lines.push(line);
             covered_spans.push((span_start, span_end));
         }
+        let (covered_ranges, uncovered_ranges) =
+            split_changed_ranges_by_spans(&self.changed_ranges, &covered_spans);
         if patch_lines.is_empty()
-            || !changed_ranges_covered_by_spans(&self.changed_ranges, &covered_spans)
+            || covered_ranges.is_empty()
+            || self.changed_ranges_touch_visible_lines(&uncovered_ranges)
         {
             return false;
         }
@@ -5455,6 +5478,11 @@ impl RcxController {
                 return false;
             }
         }
+        if !uncovered_ranges.is_empty() {
+            self.deferred_changed_ranges.extend(uncovered_ranges);
+            normalize_changed_ranges(&mut self.deferred_changed_ranges);
+        }
+        self.changed_ranges = covered_ranges;
         true
     }
 

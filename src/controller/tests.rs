@@ -3344,6 +3344,81 @@ fn visible_changed_page_refreshes_immediately_with_visible_range() {
 }
 
 #[test]
+fn visible_row_refresh_defers_unrelated_offscreen_changed_ranges() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Root".into(),
+        name: "root".into(),
+        parent_id: 0,
+        offset: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let mut field_ids = Vec::new();
+    for i in 0..1100 {
+        let field = tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: format!("field_{i}"),
+            parent_id: root_id,
+            offset: i * 4,
+            ..Node::default()
+        });
+        field_ids.push(tree.nodes[field].id);
+    }
+
+    let mut doc = RcxDocument::new();
+    doc.tree = tree;
+    doc.provider = Arc::new(CountingLiveProvider::new(vec![0; 8192]));
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(0, vec![0u8; 4096].into());
+    initial.insert(4096, vec![0u8; 4096].into());
+    assert!(c.on_read_complete(initial));
+
+    let visible_line = c.last_result().line_for_node(field_ids[1024]).unwrap();
+    assert!(!c.set_visible_line_range(visible_line, visible_line));
+    let composed_revision = c.result_revision();
+
+    let mut offscreen = vec![0u8; 4096];
+    offscreen[0] = 1;
+    let mut visible = vec![0u8; 4096];
+    visible[0] = 2;
+    let mut changed = PageMap::new();
+    changed.insert(0, offscreen.into());
+    changed.insert(4096, visible.into());
+
+    assert!(
+        c.on_read_complete(changed),
+        "visible live changes should still update immediately"
+    );
+    assert_eq!(c.result_revision(), composed_revision + 1);
+    let visible_lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_ids[1024])
+        .expect("visible field line");
+    assert!(visible_lm.data_changed);
+
+    let offscreen_line = c.last_result().line_for_node(field_ids[0]).unwrap();
+    assert!(
+        c.set_visible_line_range(offscreen_line, offscreen_line),
+        "unrelated offscreen changes should stay deferred after a visible row patch"
+    );
+    let offscreen_lm = c
+        .last_result()
+        .meta
+        .iter()
+        .find(|lm| lm.node_id == field_ids[0])
+        .expect("offscreen field line");
+    assert!(offscreen_lm.data_changed);
+}
+
+#[test]
 fn middle_visible_changed_page_updates_row_text_without_rebuilding_structure() {
     fn line_text(result: &crate::core::ComposeResult, line: usize) -> &str {
         let start = result.line_byte_starts[line];

@@ -351,11 +351,6 @@ impl super::RcxController {
             output_changed = true;
         } else if any_changed {
             if self.changed_ranges_touch_visible_lines(&self.changed_ranges) {
-                if !self.deferred_changed_ranges.is_empty() {
-                    self.changed_ranges
-                        .extend(self.deferred_changed_ranges.drain(..));
-                    normalize_changed_ranges(&mut self.changed_ranges);
-                }
                 self.refresh();
                 output_changed = true;
             } else {
