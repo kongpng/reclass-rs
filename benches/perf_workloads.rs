@@ -21,6 +21,8 @@ use reclass::provider::{
     BufferProvider, CachedPageProvider, MemoryRegion, ModuleEntry, ModuleLookup, Provider,
     RegionType, SnapshotProvider, K_PAGE_SIZE,
 };
+#[cfg(feature = "symbols")]
+use reclass::rtti::browser::resolve_rtti;
 use reclass::scanner::pointer::{
     bench_prepare_pointer_regions_from_regions, build_generic_pointer_map, find_pointer_chains,
     PointerChainRequest, PointerMap, PointerMapRequest, PointerMapStats, PointerRecord,
@@ -1012,6 +1014,25 @@ fn rtti_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("rtti_autodetect");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(2));
+    #[cfg(feature = "symbols")]
+    for &modules in &[1_000usize, 10_000] {
+        let provider = LiveLikeProvider::new_compose_pointer_hint_regions(modules);
+        let invalid_vtable = provider
+            .base()
+            .saturating_add(provider.size().max(0) as u64)
+            .saturating_add(0x1000);
+        group.throughput(Throughput::Elements(modules as u64));
+        group.bench_with_input(
+            BenchmarkId::new("browser_resolve_invalid_many_modules", modules),
+            &modules,
+            |b, _| {
+                b.iter(|| {
+                    let info = resolve_rtti(black_box(&provider), black_box(invalid_vtable), 8, 64);
+                    black_box(info.ok);
+                });
+            },
+        );
+    }
     for &nodes in &[1_000usize, 10_000] {
         let provider = LiveLikeProvider::new_rtti_candidates(nodes);
         let mut tree = flat_tree(nodes, NodeKind::Hex64);

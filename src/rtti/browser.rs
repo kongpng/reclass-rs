@@ -62,7 +62,7 @@
 use crate::core::kind::NodeKind;
 use crate::core::tree::NodeTree;
 use crate::provider::Provider;
-use crate::rtti::walk::{walk_rtti, walk_rtti_itanium, RttiInfo};
+use crate::rtti::walk::{walk_rtti_itanium_with_modules, walk_rtti_with_modules, RttiInfo};
 
 /// `RttiBrowserDialog::buildTextReport(info)` (`rttibrowser.h:139`). A plain-text
 /// dump used by "Copy as tree" and tests. Byte-for-byte field order/format as the
@@ -129,11 +129,13 @@ pub fn resolve_rtti(
     pointer_size: i32,
     max_vtable_slots: i32,
 ) -> RttiInfo {
-    let msvc = walk_rtti(prov, vtable_addr, pointer_size, max_vtable_slots);
+    let modules = prov.enumerate_modules();
+    let msvc = walk_rtti_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots);
     if msvc.ok {
         return msvc;
     }
-    let itanium = walk_rtti_itanium(prov, vtable_addr, pointer_size, max_vtable_slots);
+    let itanium =
+        walk_rtti_itanium_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots);
     if itanium.ok {
         return itanium;
     }
@@ -616,6 +618,8 @@ mod view {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
     use crate::core::node::Node;
     use crate::provider::{BufferProvider, ModuleEntry};
     use crate::rtti::walk::{RttiBaseClass, RttiVirtualMethod};
@@ -846,6 +850,7 @@ mod tests {
         inner: BufferProvider,
         base: u64,
         size: u64,
+        module_calls: Cell<usize>,
     }
     impl Provider for ModProv {
         fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
@@ -855,6 +860,7 @@ mod tests {
             self.inner.size()
         }
         fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.module_calls.set(self.module_calls.get() + 1);
             vec![ModuleEntry {
                 name: "m".to_owned(),
                 full_path: "m".to_owned(),
@@ -898,12 +904,18 @@ mod tests {
             inner: BufferProvider::new(itanium_image("3Foo"), "m"),
             base: 0x10000,
             size: 0x10000,
+            module_calls: Cell::new(0),
         };
         // MSVC walk fails on this image (COL signature bad); Itanium succeeds.
         let info = resolve_rtti(&prov, 0x10000 + 0x1000, 8, 64);
         assert!(info.ok, "{}", info.error);
         assert_eq!(info.abi, "Itanium");
         assert_eq!(info.demangled_name, "Foo");
+        assert_eq!(
+            prov.module_calls.get(),
+            1,
+            "resolver should share one module snapshot across MSVC and Itanium walkers"
+        );
     }
 
     #[test]
