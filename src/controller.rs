@@ -2557,6 +2557,19 @@ impl RcxController {
         }
     }
 
+    fn container_tail_offset(&self, parent_id: u64) -> i32 {
+        self.doc.tree.with_children(parent_id, |children| {
+            children
+                .iter()
+                .map(|&ci| {
+                    let child = &self.doc.tree.nodes[ci];
+                    child.offset + self.node_size(child)
+                })
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
     /// Offset adjustments for siblings at or past `from_offset` when the field at
     /// `skip_idx` grows/shrinks by `delta` — the shared insert/remove/duplicate/
     /// resize sibling-shift walk. Empty when `delta == 0`.
@@ -2571,19 +2584,21 @@ impl RcxController {
         if delta == 0 {
             return adjs;
         }
-        for si in self.doc.tree.children_of(parent_id) {
-            if Some(si) == skip_idx {
-                continue;
+        self.doc.tree.with_children(parent_id, |children| {
+            for &si in children {
+                if Some(si) == skip_idx {
+                    continue;
+                }
+                let sib = &self.doc.tree.nodes[si];
+                if sib.offset >= from_offset {
+                    adjs.push(OffsetAdj {
+                        node_id: sib.id,
+                        old_offset: sib.offset,
+                        new_offset: sib.offset + delta,
+                    });
+                }
             }
-            let sib = &self.doc.tree.nodes[si];
-            if sib.offset >= from_offset {
-                adjs.push(OffsetAdj {
-                    node_id: sib.id,
-                    old_offset: sib.offset,
-                    new_offset: sib.offset + delta,
-                });
-            }
-        }
+        });
         adjs
     }
 
@@ -2814,15 +2829,7 @@ impl RcxController {
             ..Node::default()
         };
         if offset < 0 {
-            let mut max_end = 0;
-            for si in self.doc.tree.children_of(parent_id) {
-                let sn = &self.doc.tree.nodes[si];
-                let sz = self.node_size(sn);
-                let end = sn.offset + sz;
-                if end > max_end {
-                    max_end = end;
-                }
-            }
+            let max_end = self.container_tail_offset(parent_id);
             let align = alignment_for(kind);
             n.offset = (max_end + align - 1) / align * align;
         } else {
@@ -2853,17 +2860,7 @@ impl RcxController {
 
         let tail = match self.append_tail_cache.filter(|(id, _)| *id == struct_id) {
             Some((_, tail)) => tail,
-            None => self
-                .doc
-                .tree
-                .children_of(struct_id)
-                .iter()
-                .map(|&ci| {
-                    let child = &self.doc.tree.nodes[ci];
-                    child.offset + self.node_size(child)
-                })
-                .max()
-                .unwrap_or(0),
+            None => self.container_tail_offset(struct_id),
         };
 
         let mut nodes = Vec::with_capacity(count as usize);
@@ -3033,14 +3030,7 @@ impl RcxController {
             .map(|(_, tail)| tail)
             .unwrap_or(0);
         if slot_offset == 0 {
-            for ci in self.doc.tree.children_of(target_id) {
-                let sib = &self.doc.tree.nodes[ci];
-                let sz = self.node_size(sib);
-                let end = sib.offset + sz;
-                if end > slot_offset {
-                    slot_offset = end;
-                }
-            }
+            slot_offset = self.container_tail_offset(target_id);
         }
         let align = alignment_for(NodeKind::Hex64);
         let offset = (slot_offset + align - 1) / align * align;
@@ -3116,14 +3106,7 @@ impl RcxController {
             .map(|(_, tail)| tail)
             .unwrap_or(0);
         if slot_offset == 0 {
-            for ci in self.doc.tree.children_of(target_id) {
-                let sib = &self.doc.tree.nodes[ci];
-                let sz = self.node_size(sib);
-                let end = sib.offset + sz;
-                if end > slot_offset {
-                    slot_offset = end;
-                }
-            }
+            slot_offset = self.container_tail_offset(target_id);
         }
 
         let align = alignment_for(NodeKind::Hex64);
@@ -4054,25 +4037,33 @@ impl RcxController {
                 let size_delta = new_effective - old_effective;
                 if size_delta != 0 && old_effective > 0 {
                     let old_end = node_offset + old_effective;
-                    let siblings = self.doc.tree.children_of(parent_id);
+                    let offset_adjs: Vec<OffsetAdj> =
+                        self.doc.tree.with_children(parent_id, |children| {
+                            children
+                                .iter()
+                                .filter_map(|&si| {
+                                    let s = &self.doc.tree.nodes[si];
+                                    if s.id == node_id || s.offset < old_end {
+                                        None
+                                    } else {
+                                        Some(OffsetAdj {
+                                            node_id: s.id,
+                                            old_offset: s.offset,
+                                            new_offset: s.offset + size_delta,
+                                        })
+                                    }
+                                })
+                                .collect()
+                        });
                     let was = self.suppress_refresh;
                     self.suppress_refresh = true;
                     self.begin_macro("Adjust sibling offsets");
-                    for si in siblings {
-                        let (sib_id, sib_off) = {
-                            let s = &self.doc.tree.nodes[si];
-                            (s.id, s.offset)
-                        };
-                        if sib_id == node_id {
-                            continue;
-                        }
-                        if sib_off >= old_end {
-                            self.push_command(Command::ChangeOffset {
-                                node_id: sib_id,
-                                old_offset: sib_off,
-                                new_offset: sib_off + size_delta,
-                            });
-                        }
+                    for adj in offset_adjs {
+                        self.push_command(Command::ChangeOffset {
+                            node_id: adj.node_id,
+                            old_offset: adj.old_offset,
+                            new_offset: adj.new_offset,
+                        });
                     }
                     self.end_macro();
                     self.suppress_refresh = was;

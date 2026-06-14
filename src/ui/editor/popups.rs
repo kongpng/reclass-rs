@@ -676,24 +676,25 @@ impl super::RcxEditor {
         let provider = &self.controller.document().provider;
         let data = provider.read_bytes(addr, size);
         // Adjacent same-parent hex siblings after this node (for join previews).
-        let siblings = tree.children_of(parent_id);
         let mut nexts: Vec<Adjacent> = Vec::new();
-        if let Some(pos) = siblings.iter().position(|&s| s == idx) {
-            for &sib in siblings.iter().skip(pos + 1).take(15) {
-                let sn = &tree.nodes[sib];
-                if !is_hex_preview(sn.kind) {
-                    break;
+        tree.with_children(parent_id, |siblings| {
+            if let Some(pos) = siblings.iter().position(|&s| s == idx) {
+                for &sib in siblings.iter().skip(pos + 1).take(15) {
+                    let sn = &tree.nodes[sib];
+                    if !is_hex_preview(sn.kind) {
+                        break;
+                    }
+                    let sz = crate::core::size_for_kind(sn.kind).max(0);
+                    let (saddr, _) = tree.absolute_address(sib as i32);
+                    let bytes = provider.read_bytes(saddr, sz);
+                    nexts.push(Adjacent {
+                        exists: true,
+                        kind: sn.kind,
+                        data: bytes,
+                    });
                 }
-                let sz = crate::core::size_for_kind(sn.kind).max(0);
-                let (saddr, _) = tree.absolute_address(sib as i32);
-                let bytes = provider.read_bytes(saddr, sz);
-                nexts.push(Adjacent {
-                    exists: true,
-                    kind: sn.kind,
-                    data: bytes,
-                });
             }
-        }
+        });
         Some(HexPopupContext {
             node_id,
             current_kind: kind,

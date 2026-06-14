@@ -3385,16 +3385,18 @@ impl RcxEditor {
         let mut shift: Vec<crate::core::OffsetAdj> = Vec::new();
         if anchor_end >= 0 && paste_total > 0 {
             let tree = self.controller.tree();
-            for si in tree.children_of(target_parent) {
-                let s = &tree.nodes[si];
-                if s.offset >= anchor_end {
-                    shift.push(crate::core::OffsetAdj {
-                        node_id: s.id,
-                        old_offset: s.offset,
-                        new_offset: s.offset + paste_total,
-                    });
+            tree.with_children(target_parent, |children| {
+                for &si in children {
+                    let s = &tree.nodes[si];
+                    if s.offset >= anchor_end {
+                        shift.push(crate::core::OffsetAdj {
+                            node_id: s.id,
+                            old_offset: s.offset,
+                            new_offset: s.offset + paste_total,
+                        });
+                    }
                 }
-            }
+            });
         }
 
         // One undo macro for the whole paste (the C++ beginMacro/endMacro group).
@@ -3456,14 +3458,16 @@ impl RcxEditor {
     /// anchor when there is no cursor node.
     fn container_tail(&self, parent_id: u64) -> i32 {
         let tree = self.controller.tree();
-        tree.children_of(parent_id)
-            .iter()
-            .map(|&ci| {
-                let c = &tree.nodes[ci];
-                c.offset + crate::core::size_for_kind(c.kind).max(0)
-            })
-            .max()
-            .unwrap_or(0)
+        tree.with_children(parent_id, |children| {
+            children
+                .iter()
+                .map(|&ci| {
+                    let c = &tree.nodes[ci];
+                    c.offset + crate::core::size_for_kind(c.kind).max(0)
+                })
+                .max()
+                .unwrap_or(0)
+        })
     }
 
     /// Ctrl+Shift+C — copy the current node's offset address as `0x{addr:X}`
