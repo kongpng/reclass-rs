@@ -104,6 +104,19 @@ impl KindGroup {
         KindGroup::Common,
     ];
 
+    fn bucket_index(self) -> usize {
+        match self {
+            KindGroup::Hex => 0,
+            KindGroup::Int => 1,
+            KindGroup::Float => 2,
+            KindGroup::Ptr => 3,
+            KindGroup::Vec => 4,
+            KindGroup::Str => 5,
+            KindGroup::Ctr => 6,
+            KindGroup::Common => 7,
+        }
+    }
+
     /// The short key (`kindGroupFor` returns these literals).
     pub fn key(self) -> &'static str {
         match self {
@@ -866,6 +879,14 @@ impl TypeModel {
                 .to_lowercase()
                 .cmp(&b.display_name.to_lowercase())
         };
+        let mut buckets: [Vec<TypeEntry>; KindGroup::ALL.len()] =
+            std::array::from_fn(|_| Vec::new());
+        for e in &self.entries {
+            if !self.group_allowed(e.group) || (!self.show_all_types && !keep_common(e)) {
+                continue;
+            }
+            buckets[e.group.bucket_index()].push(e.clone());
+        }
         for group in KindGroup::ALL {
             // Simple (default) mode: hide the std-lib "Common Types" group
             // entirely and drop the long-tail primitives, keeping only the
@@ -878,16 +899,7 @@ impl TypeModel {
             // Category-chip gate (`catAllowed` → `buckets`,
             // `typeselectorpopup.cpp:1687`): chip-hidden groups are skipped so
             // their rows never enter the bucketed list.
-            let mut group_entries: Vec<TypeEntry> = self
-                .entries
-                .iter()
-                .filter(|e| {
-                    e.group == group
-                        && self.group_allowed(e.group)
-                        && (self.show_all_types || keep_common(e))
-                })
-                .cloned()
-                .collect();
+            let mut group_entries = std::mem::take(&mut buckets[group.bucket_index()]);
             // Skip a group that became empty under the simple-mode gate (no
             // header) — matches the C++ `if (items.isEmpty()) continue;`.
             if group_entries.is_empty() {
