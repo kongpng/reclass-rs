@@ -662,46 +662,11 @@ impl super::RcxEditor {
         &self,
         idx: usize,
     ) -> Option<crate::ui::overlays::hextoolbar::HexPopupContext> {
-        use crate::ui::overlays::hextoolbar::{Adjacent, HexPopupContext};
-        let tree = self.controller.tree();
-        let n = tree.nodes.get(idx)?;
-        if !is_hex_preview(n.kind) {
-            return None;
-        }
-        let node_id = n.id;
-        let kind = n.kind;
-        let parent_id = n.parent_id;
-        let size = crate::core::size_for_kind(kind).max(0);
-        let (addr, _ok) = tree.absolute_address(idx as i32);
-        let provider = &self.controller.document().provider;
-        let data = provider.read_bytes(addr, size);
-        // Adjacent same-parent hex siblings after this node (for join previews).
-        let mut nexts: Vec<Adjacent> = Vec::new();
-        tree.with_children(parent_id, |siblings| {
-            if let Some(pos) = siblings.iter().position(|&s| s == idx) {
-                for &sib in siblings.iter().skip(pos + 1).take(15) {
-                    let sn = &tree.nodes[sib];
-                    if !is_hex_preview(sn.kind) {
-                        break;
-                    }
-                    let sz = crate::core::size_for_kind(sn.kind).max(0);
-                    let (saddr, _) = tree.absolute_address(sib as i32);
-                    let bytes = provider.read_bytes(saddr, sz);
-                    nexts.push(Adjacent {
-                        exists: true,
-                        kind: sn.kind,
-                        data: bytes,
-                    });
-                }
-            }
-        });
-        Some(HexPopupContext {
-            node_id,
-            current_kind: kind,
-            data,
-            nexts,
-            ..HexPopupContext::default()
-        })
+        crate::ui::overlays::hextoolbar::build_hex_popup_context(
+            self.controller.tree(),
+            self.controller.document().provider.as_ref(),
+            idx,
+        )
     }
 
     /// Open the [`HexToolbarPopup`] for the hex node at `idx` (item 9). On

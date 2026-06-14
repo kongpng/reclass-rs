@@ -15,6 +15,8 @@
 //! Gated behind the `ui` feature for the view; the algorithms are always built.
 
 use crate::core::kind::{is_hex_node, size_for_kind, NodeKind};
+use crate::core::NodeTree;
+use crate::provider::{Provider, K_PAGE_SIZE};
 
 /// `kHexSizes` (`hextoolbarpopup.cpp:14`) — the selectable hex sizes.
 pub const HEX_SIZES: [NodeKind; 5] = [
@@ -89,6 +91,130 @@ impl Default for HexPopupContext {
             multi_select_kind: NodeKind::Hex8,
         }
     }
+}
+
+struct HexPopupRead {
+    kind: NodeKind,
+    addr: u64,
+    len: i32,
+}
+
+fn same_page_run(start: u64, end_exclusive: u64) -> bool {
+    start <= end_exclusive
+        && (start == end_exclusive
+            || start / K_PAGE_SIZE == end_exclusive.saturating_sub(1) / K_PAGE_SIZE)
+}
+
+fn read_hex_popup_segments<P: Provider + ?Sized>(
+    provider: &P,
+    segments: &[HexPopupRead],
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(segments.len());
+    let mut run_start = 0usize;
+    while run_start < segments.len() {
+        let first = &segments[run_start];
+        let first_len = first.len.max(0) as u64;
+        let Some(mut run_end) = first.addr.checked_add(first_len) else {
+            out.push(provider.read_bytes(first.addr, first.len));
+            run_start += 1;
+            continue;
+        };
+        let mut run_len = first_len as usize;
+        let mut run_stop = run_start + 1;
+        while run_stop < segments.len() {
+            let next = &segments[run_stop];
+            let next_len = next.len.max(0) as u64;
+            let Some(next_end) = next.addr.checked_add(next_len) else {
+                break;
+            };
+            if next.addr != run_end || !same_page_run(first.addr, next_end) {
+                break;
+            }
+            run_end = next_end;
+            run_len += next_len as usize;
+            run_stop += 1;
+        }
+
+        if run_stop == run_start + 1 {
+            out.push(provider.read_bytes(first.addr, first.len));
+        } else {
+            let run_bytes = provider.read_bytes(first.addr, run_len as i32);
+            let mut offset = 0usize;
+            for segment in &segments[run_start..run_stop] {
+                let len = segment.len.max(0) as usize;
+                let bytes = run_bytes
+                    .get(offset..offset + len)
+                    .map_or_else(|| vec![0u8; len], |slice| slice.to_vec());
+                out.push(bytes);
+                offset += len;
+            }
+        }
+
+        run_start = run_stop;
+    }
+    out
+}
+
+/// Build the byte context for a hex toolbar popup from a node tree and provider.
+pub fn build_hex_popup_context<P: Provider + ?Sized>(
+    tree: &NodeTree,
+    provider: &P,
+    idx: usize,
+) -> Option<HexPopupContext> {
+    let n = tree.nodes.get(idx)?;
+    if !is_hex_node(n.kind) {
+        return None;
+    }
+    let node_id = n.id;
+    let kind = n.kind;
+    let parent_id = n.parent_id;
+    let size = size_for_kind(kind).max(0);
+    let (addr, _ok) = tree.absolute_address(idx as i32);
+
+    let mut segments: Vec<HexPopupRead> = Vec::with_capacity(16);
+    segments.push(HexPopupRead {
+        kind,
+        addr,
+        len: size,
+    });
+    tree.with_children(parent_id, |siblings| {
+        if let Some(pos) = siblings.iter().position(|&s| s == idx) {
+            for &sib in siblings.iter().skip(pos + 1).take(15) {
+                let sn = &tree.nodes[sib];
+                if !is_hex_node(sn.kind) {
+                    break;
+                }
+                let sz = size_for_kind(sn.kind).max(0);
+                let (saddr, _) = tree.absolute_address(sib as i32);
+                segments.push(HexPopupRead {
+                    kind: sn.kind,
+                    addr: saddr,
+                    len: sz,
+                });
+            }
+        }
+    });
+
+    let mut segment_bytes = read_hex_popup_segments(provider, &segments).into_iter();
+    let data = segment_bytes.next().unwrap_or_default();
+    let nexts = segments
+        .iter()
+        .skip(1)
+        .zip(segment_bytes)
+        .map(|(segment, data)| Adjacent {
+            exists: true,
+            kind: segment.kind,
+            data,
+        })
+        .collect();
+
+    Some(HexPopupContext {
+        node_id,
+        current_kind: kind,
+        data,
+        nexts,
+        ..HexPopupContext::default()
+    })
 }
 
 impl HexPopupContext {
@@ -788,8 +914,49 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_line, Adjacent, HexPopupContext};
+    use super::{build_hex_popup_context, hex_line, Adjacent, HexPopupContext};
     use crate::core::kind::NodeKind;
+    use crate::core::{Node, NodeTree};
+    use crate::provider::{Provider, K_PAGE_SIZE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingProvider {
+        data: Vec<u8>,
+        reads: AtomicUsize,
+    }
+
+    impl CountingProvider {
+        fn new(len: usize) -> Self {
+            let data = (0..len).map(|i| (i & 0xff) as u8).collect();
+            Self {
+                data,
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Provider for CountingProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let start = addr as usize;
+            let Some(end) = start.checked_add(buf.len()) else {
+                return false;
+            };
+            if end > self.data.len() {
+                return false;
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            true
+        }
+
+        fn size(&self) -> i32 {
+            self.data.len() as i32
+        }
+    }
 
     fn ctx_with(kind: NodeKind, data: Vec<u8>) -> HexPopupContext {
         HexPopupContext {
@@ -797,6 +964,66 @@ mod tests {
             data,
             ..Default::default()
         }
+    }
+
+    fn flat_hex_tree(kind: NodeKind, count: usize, start_offset: i32) -> NodeTree {
+        let mut tree = NodeTree::new();
+        tree.base_address = 0;
+        let root = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Root".to_string(),
+            parent_id: 0,
+            ..Node::default()
+        });
+        let root_id = tree.nodes[root].id;
+        let step = crate::core::size_for_kind(kind);
+        for i in 0..count {
+            tree.add_node(Node {
+                kind,
+                name: format!("field_{i}"),
+                parent_id: root_id,
+                offset: start_offset + (i as i32) * step,
+                ..Node::default()
+            });
+        }
+        tree
+    }
+
+    #[test]
+    fn build_hex_popup_context_coalesces_contiguous_same_page_reads() {
+        let tree = flat_hex_tree(NodeKind::Hex8, 16, 0);
+        let provider = CountingProvider::new(64);
+
+        let ctx = build_hex_popup_context(&tree, &provider, 1).expect("hex context");
+
+        assert_eq!(provider.reads(), 1);
+        assert_eq!(ctx.data, vec![0]);
+        assert_eq!(ctx.nexts.len(), 15);
+        assert_eq!(ctx.nexts[0].data, vec![1]);
+        assert_eq!(ctx.nexts[14].data, vec![15]);
+    }
+
+    #[test]
+    fn build_hex_popup_context_keeps_page_crossing_reads_separate() {
+        let tree = flat_hex_tree(NodeKind::Hex64, 2, K_PAGE_SIZE as i32 - 8);
+        let provider = CountingProvider::new(K_PAGE_SIZE as usize + 16);
+
+        let ctx = build_hex_popup_context(&tree, &provider, 1).expect("hex context");
+
+        assert_eq!(provider.reads(), 2);
+        assert_eq!(
+            ctx.data,
+            ((K_PAGE_SIZE as usize - 8)..K_PAGE_SIZE as usize)
+                .map(|i| (i & 0xff) as u8)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ctx.nexts.len(), 1);
+        assert_eq!(
+            ctx.nexts[0].data,
+            (K_PAGE_SIZE as usize..K_PAGE_SIZE as usize + 8)
+                .map(|i| (i & 0xff) as u8)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

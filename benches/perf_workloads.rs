@@ -41,6 +41,7 @@ use reclass::scanner::{
 use reclass::ui::chrome::statusbar::StatusInfo;
 use reclass::ui::editor::palette::EditorPalette;
 use reclass::ui::overlays::findbar::{FindMatch, FindState};
+use reclass::ui::overlays::hextoolbar::build_hex_popup_context;
 use reclass::ui::panels::modulespanel::build_module_rows;
 use reclass::ui::panels::scannerpanel::{
     apply_change_all_results, bench_scanner_table_filter_cached, bench_scanner_table_refresh,
@@ -5127,6 +5128,39 @@ fn hover_struct_preview_workloads(c: &mut Criterion) {
     group.finish();
 }
 
+fn hex_toolbar_context_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hex_toolbar_context");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &(kind_name, kind) in &[
+        ("hex8_contiguous_live_reads", NodeKind::Hex8),
+        ("hex64_contiguous_live_reads", NodeKind::Hex64),
+    ] {
+        for &nodes in &[1_000usize, 10_000, 50_000] {
+            group.throughput(Throughput::Elements(16));
+            group.bench_with_input(BenchmarkId::new(kind_name, nodes), &nodes, |b, &nodes| {
+                let tree = flat_tree_at_base(nodes, kind, 0);
+                let provider = CountingProvider::new(LiveLikeProvider::new_float_pairs(
+                    nodes.saturating_mul(16).saturating_add(64),
+                ));
+                let idx = 1 + nodes / 2;
+                b.iter(|| {
+                    let ctx = build_hex_popup_context(
+                        black_box(&tree),
+                        black_box(&provider),
+                        black_box(idx),
+                    )
+                    .expect("hex popup context");
+                    black_box((ctx.data.len(), ctx.nexts.len(), provider.reads()));
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn change_all_seed(rows: usize) -> (Vec<ScanResult>, Vec<(u64, Option<Vec<u8>>)>) {
     let results: Vec<_> = (0..rows)
         .map(|i| ScanResult {
@@ -6034,6 +6068,7 @@ criterion_group!(
     workspace_model_workloads,
     hover_memory_preview_workloads,
     hover_struct_preview_workloads,
+    hex_toolbar_context_workloads,
     scanner_change_all_workloads,
     scanner_table_workloads,
     scanner_workloads,
