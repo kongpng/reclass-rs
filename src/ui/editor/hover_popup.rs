@@ -71,6 +71,14 @@ impl HoverMemoryMaps {
         }
     }
 
+    fn from_provider_with_modules(
+        result_revision: u64,
+        provider: &Arc<dyn Provider + Send + Sync>,
+    ) -> Self {
+        let (modules, regions) = provider.enumerate_modules_and_regions();
+        Self::with_regions_modules(result_revision, provider, regions, modules)
+    }
+
     fn matches(&self, result_revision: u64, provider: &Arc<dyn Provider + Send + Sync>) -> bool {
         self.result_revision == result_revision
             && self
@@ -958,13 +966,9 @@ impl super::RcxEditor {
             .as_ref()
             .is_none_or(|maps| !maps.matches(result_revision, &prov));
         if needs_maps {
-            let regions = prov.enumerate_regions();
-            let modules = prov.enumerate_modules();
-            self.hover_memory_maps = Some(HoverMemoryMaps::with_regions_modules(
+            self.hover_memory_maps = Some(HoverMemoryMaps::from_provider_with_modules(
                 result_revision,
                 &prov,
-                regions,
-                modules,
             ));
             self.hover_memory_preview_cache = None;
         } else if self
@@ -2787,6 +2791,7 @@ mod tests {
     use crate::core::{ChipKind, LineChip, LineMeta, NodeKind};
     use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const S: i64 = 1000;
@@ -2856,6 +2861,37 @@ mod tests {
                 region_calls: Cell::new(0),
                 module_calls: Cell::new(0),
             }
+        }
+    }
+
+    struct CombinedCountingProvider {
+        inner: TestProvider,
+        region_calls: AtomicUsize,
+        module_calls: AtomicUsize,
+        combined_calls: AtomicUsize,
+    }
+
+    impl CombinedCountingProvider {
+        fn new(base: u64, data: Vec<u8>) -> Self {
+            Self {
+                inner: TestProvider {
+                    base,
+                    data,
+                    fail_reads: false,
+                },
+                region_calls: AtomicUsize::new(0),
+                module_calls: AtomicUsize::new(0),
+                combined_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn modules(&self) -> Vec<ModuleEntry> {
+            vec![ModuleEntry {
+                name: "combinedmod".into(),
+                full_path: String::new(),
+                base: self.inner.base,
+                size: self.inner.data.len() as u64,
+            }]
         }
     }
 
@@ -2932,6 +2968,35 @@ mod tests {
                 base: self.inner.base,
                 size: self.inner.data.len() as u64,
             }]
+        }
+
+        fn is_readable(&self, _addr: u64, _len: i32) -> bool {
+            false
+        }
+    }
+
+    impl Provider for CombinedCountingProvider {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.inner.read(addr, buf)
+        }
+
+        fn size(&self) -> i32 {
+            self.inner.size()
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.region_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.enumerate_regions()
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.module_calls.fetch_add(1, Ordering::Relaxed);
+            self.modules()
+        }
+
+        fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+            self.combined_calls.fetch_add(1, Ordering::Relaxed);
+            (self.modules(), self.inner.enumerate_regions())
         }
 
         fn is_readable(&self, _addr: u64, _len: i32) -> bool {
@@ -3287,6 +3352,33 @@ mod tests {
         assert_eq!(
             lookup.find_module(0x6008).map(|m| m.name.as_str()),
             Some("early.dll")
+        );
+    }
+
+    #[test]
+    fn hover_memory_maps_use_combined_provider_snapshot_when_modules_are_needed() {
+        let counted = Arc::new(CombinedCountingProvider::new(0x2000, vec![0xAA]));
+        let provider: Arc<dyn Provider + Send + Sync> = counted.clone();
+
+        let maps = HoverMemoryMaps::from_provider_with_modules(11, &provider);
+
+        assert_eq!(counted.combined_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counted.region_calls.load(Ordering::Relaxed),
+            0,
+            "fresh pointer hovers should not enumerate regions separately"
+        );
+        assert_eq!(
+            counted.module_calls.load(Ordering::Relaxed),
+            0,
+            "fresh pointer hovers should not enumerate modules separately"
+        );
+        assert!(maps.modules_loaded);
+        let lookup = maps.lookup();
+        assert!(lookup.is_readable(0x2000, 1));
+        assert_eq!(
+            lookup.find_module(0x2000).map(|m| m.name.as_str()),
+            Some("combinedmod")
         );
     }
 
