@@ -140,9 +140,8 @@ mod view {
 
     impl TargetDetails {
         fn from_provider(provider: &dyn Provider) -> Self {
-            let mut modules = provider.enumerate_modules();
+            let (mut modules, regions) = provider.enumerate_modules_and_regions();
             modules.sort_by_key(|m| m.base);
-            let regions = provider.enumerate_regions();
             let readable_regions = regions.iter().filter(|r| r.readable).count();
             let writable_regions = regions.iter().filter(|r| r.writable).count();
             let executable_regions = regions.iter().filter(|r| r.executable).count();
@@ -536,6 +535,76 @@ mod view {
             assert_eq!(details.readable_regions, 2);
             assert_eq!(details.writable_regions, 1);
             assert_eq!(details.executable_regions, 1);
+        }
+
+        struct CombinedTargetProvider {
+            module_calls: Cell<usize>,
+            region_calls: Cell<usize>,
+            combined_calls: Cell<usize>,
+        }
+
+        impl CombinedTargetProvider {
+            fn new() -> Self {
+                Self {
+                    module_calls: Cell::new(0),
+                    region_calls: Cell::new(0),
+                    combined_calls: Cell::new(0),
+                }
+            }
+        }
+
+        impl Provider for CombinedTargetProvider {
+            fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+                false
+            }
+
+            fn size(&self) -> i32 {
+                1
+            }
+
+            fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+                self.module_calls.set(self.module_calls.get() + 1);
+                Vec::new()
+            }
+
+            fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+                self.region_calls.set(self.region_calls.get() + 1);
+                Vec::new()
+            }
+
+            fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+                self.combined_calls.set(self.combined_calls.get() + 1);
+                (
+                    vec![ModuleEntry {
+                        name: "combined.dll".into(),
+                        full_path: String::new(),
+                        base: 0x1000,
+                        size: 0x100,
+                    }],
+                    vec![MemoryRegion {
+                        base: 0x1000,
+                        size: 0x100,
+                        readable: true,
+                        writable: false,
+                        executable: true,
+                        module_name: "combined.dll".into(),
+                        region_type: RegionType::Image,
+                    }],
+                )
+            }
+        }
+
+        #[test]
+        fn target_details_prefers_combined_provider_snapshot() {
+            let provider = CombinedTargetProvider::new();
+
+            let details = TargetDetails::from_provider(&provider);
+
+            assert_eq!(provider.combined_calls.get(), 1);
+            assert_eq!(provider.module_calls.get(), 0);
+            assert_eq!(provider.region_calls.get(), 0);
+            assert_eq!(details.modules.len(), 1);
+            assert_eq!(details.region_count, 1);
         }
     }
 }

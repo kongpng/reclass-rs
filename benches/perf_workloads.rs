@@ -18,8 +18,9 @@ use reclass::provider::bench_readable_ranges_from_regions;
 #[cfg(all(target_os = "linux", feature = "process-provider"))]
 use reclass::provider::LocalProcessProvider;
 use reclass::provider::{
-    BufferProvider, CachedPageProvider, MemoryRegion, ModuleEntry, ModuleLookup, Provider,
-    RegionType, SnapshotProvider, K_PAGE_SIZE,
+    bench_region_module_label_len_indexed, bench_region_module_label_len_linear, BufferProvider,
+    CachedPageProvider, MemoryRegion, ModuleEntry, ModuleLookup, Provider, RegionType,
+    SnapshotProvider, K_PAGE_SIZE,
 };
 #[cfg(feature = "symbols")]
 use reclass::rtti::browser::resolve_rtti;
@@ -4171,6 +4172,9 @@ fn module_lookup_workloads(c: &mut Criterion) {
         let addresses: Vec<u64> = (0..modules_len)
             .map(|i| modules[i].base + ((i as u64).wrapping_mul(17) % 0x1000))
             .collect();
+        let region_bases: Vec<u64> = (0..modules_len)
+            .map(|i| modules[i].base + ((i as u64).wrapping_mul(41) % 0x1000))
+            .collect();
 
         group.throughput(Throughput::Elements(modules_len as u64));
         group.bench_with_input(
@@ -4209,6 +4213,32 @@ fn module_lookup_workloads(c: &mut Criterion) {
                             indexed_module_symbol(black_box(&lookup), black_box(addr)).len(),
                         );
                     }
+                    black_box(total);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("linear_region_labels", modules_len),
+            &modules_len,
+            |b, _| {
+                b.iter(|| {
+                    let total = bench_region_module_label_len_linear(
+                        black_box(&region_bases),
+                        black_box(&modules),
+                    );
+                    black_box(total);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("indexed_region_labels", modules_len),
+            &modules_len,
+            |b, _| {
+                b.iter(|| {
+                    let total = bench_region_module_label_len_indexed(
+                        black_box(&region_bases),
+                        black_box(&modules),
+                    );
                     black_box(total);
                 });
             },
@@ -4273,9 +4303,8 @@ struct TargetPanelBenchDetails {
 
 impl TargetPanelBenchDetails {
     fn from_provider(provider: &dyn Provider) -> Self {
-        let mut modules = provider.enumerate_modules();
+        let (mut modules, regions) = provider.enumerate_modules_and_regions();
         modules.sort_by_key(|m| m.base);
-        let regions = provider.enumerate_regions();
         let readable_regions = regions.iter().filter(|r| r.readable).count();
         let writable_regions = regions.iter().filter(|r| r.writable).count();
         let executable_regions = regions.iter().filter(|r| r.executable).count();

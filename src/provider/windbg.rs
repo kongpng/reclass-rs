@@ -83,6 +83,10 @@ impl Provider for WinDbgMemoryProvider {
         self.inner.enumerate_modules()
     }
 
+    fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+        self.inner.enumerate_modules_and_regions()
+    }
+
     fn is_readable(&self, _addr: u64, len: i32) -> bool {
         self.inner.size() > 0 && len >= 0
     }
@@ -97,7 +101,7 @@ mod platform {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use crate::provider::{MemoryRegion, ModuleEntry, RegionType};
+    use crate::provider::{MemoryRegion, ModuleEntry, ModuleRangeLookup, RegionType};
     use windows::core::{Interface, PCSTR};
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
@@ -284,6 +288,20 @@ mod platform {
                 .recv_timeout(Duration::from_secs(30))
                 .unwrap_or_default()
         }
+
+        pub fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if self
+                .tx
+                .send(Request::ModulesAndRegions { reply: reply_tx })
+                .is_err()
+            {
+                return Default::default();
+            }
+            reply_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_default()
+        }
     }
 
     impl Drop for Inner {
@@ -317,6 +335,9 @@ mod platform {
         },
         Modules {
             reply: Sender<Vec<ModuleEntry>>,
+        },
+        ModulesAndRegions {
+            reply: Sender<(Vec<ModuleEntry>, Vec<MemoryRegion>)>,
         },
         Shutdown,
     }
@@ -358,6 +379,9 @@ mod platform {
                 }
                 Request::Modules { reply } => {
                     let _ = reply.send(session.enumerate_modules());
+                }
+                Request::ModulesAndRegions { reply } => {
+                    let _ = reply.send(session.enumerate_modules_and_regions());
                 }
                 Request::Shutdown => break,
             }
@@ -582,8 +606,19 @@ mod platform {
             modules
         }
 
+        fn enumerate_modules_and_regions(&mut self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+            let modules = self.enumerate_modules();
+            let regions = self.enumerate_regions_with_modules(&modules);
+            (modules, regions)
+        }
+
         fn enumerate_regions(&mut self) -> Vec<MemoryRegion> {
             let modules = self.enumerate_modules();
+            self.enumerate_regions_with_modules(&modules)
+        }
+
+        fn enumerate_regions_with_modules(&mut self, modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
+            let module_lookup = ModuleRangeLookup::new(modules);
             let mut regions = Vec::new();
             if let Some(data_spaces2) = &self.data_spaces2 {
                 let mut addr = 0u64;
@@ -596,12 +631,8 @@ mod platform {
                         && (mbi.Protect.0 & PAGE_NOACCESS.0) == 0
                         && (mbi.Protect.0 & PAGE_GUARD.0) == 0
                     {
-                        let module_name = modules
-                            .iter()
-                            .find(|m| {
-                                mbi.BaseAddress >= m.base
-                                    && mbi.BaseAddress < m.base.saturating_add(m.size)
-                            })
+                        let module_name = module_lookup
+                            .find_by_addr(mbi.BaseAddress)
                             .map(|m| m.name.clone())
                             .unwrap_or_default();
                         regions.push(MemoryRegion {
@@ -635,20 +666,15 @@ mod platform {
             }
 
             if regions.is_empty() {
-                regions.extend(
-                    modules
-                        .into_iter()
-                        .filter(|m| m.size > 0)
-                        .map(|m| MemoryRegion {
-                            base: m.base,
-                            size: m.size,
-                            readable: true,
-                            writable: false,
-                            executable: true,
-                            module_name: m.name,
-                            region_type: RegionType::Image,
-                        }),
-                );
+                regions.extend(modules.iter().filter(|m| m.size > 0).map(|m| MemoryRegion {
+                    base: m.base,
+                    size: m.size,
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                    module_name: m.name.clone(),
+                    region_type: RegionType::Image,
+                }));
             }
 
             regions
@@ -747,6 +773,9 @@ mod platform {
         }
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {
             Vec::new()
+        }
+        pub fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+            Default::default()
         }
     }
 }

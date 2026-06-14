@@ -165,6 +165,21 @@ impl Provider for CachedPageProvider {
         self.module_snapshot().as_ref().clone()
     }
 
+    fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+        if self.module_snapshot.get().is_none() && self.region_snapshot.get().is_none() {
+            let (modules, regions) = self.inner.enumerate_modules_and_regions();
+            let module_snapshot = Arc::new(modules);
+            let region_snapshot = Arc::new(regions);
+            let _ = self.module_snapshot.set(Arc::clone(&module_snapshot));
+            let _ = self.region_snapshot.set(Arc::clone(&region_snapshot));
+            return (
+                module_snapshot.as_ref().clone(),
+                region_snapshot.as_ref().clone(),
+            );
+        }
+        (self.enumerate_modules(), self.enumerate_regions())
+    }
+
     fn has_kernel_paging(&self) -> bool {
         self.inner.has_kernel_paging()
     }
@@ -474,6 +489,63 @@ mod tests {
         }
     }
 
+    struct CombinedSnapshotProvider {
+        module_enumerations: AtomicUsize,
+        region_enumerations: AtomicUsize,
+        combined_enumerations: AtomicUsize,
+    }
+
+    impl CombinedSnapshotProvider {
+        fn new() -> Self {
+            Self {
+                module_enumerations: AtomicUsize::new(0),
+                region_enumerations: AtomicUsize::new(0),
+                combined_enumerations: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Provider for CombinedSnapshotProvider {
+        fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+            false
+        }
+
+        fn size(&self) -> i32 {
+            1
+        }
+
+        fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            self.region_enumerations.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.module_enumerations.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+
+        fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+            self.combined_enumerations.fetch_add(1, Ordering::Relaxed);
+            (
+                vec![ModuleEntry {
+                    name: "combined.dll".into(),
+                    full_path: String::new(),
+                    base: 0,
+                    size: K_PAGE_SIZE,
+                }],
+                vec![MemoryRegion {
+                    base: 0,
+                    size: K_PAGE_SIZE,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                    module_name: "combined.dll".into(),
+                    region_type: crate::provider::RegionType::Image,
+                }],
+            )
+        }
+    }
+
     #[test]
     fn cached_page_provider_coalesces_same_page_reads() {
         let real = Arc::new(CountingProvider::new(
@@ -598,6 +670,23 @@ mod tests {
         assert_eq!(cache.enumerate_modules().len(), 1);
 
         assert_eq!(real.module_enumerations(), 1);
+    }
+
+    #[test]
+    fn cached_page_provider_forwards_combined_snapshot_when_cold() {
+        let real = Arc::new(CombinedSnapshotProvider::new());
+        let provider: Arc<dyn Provider + Send + Sync> = real.clone();
+        let cache = CachedPageProvider::new(provider);
+
+        let (modules, regions) = cache.enumerate_modules_and_regions();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(cache.enumerate_modules().len(), 1);
+        assert_eq!(cache.enumerate_regions().len(), 1);
+
+        assert_eq!(real.combined_enumerations.load(Ordering::Relaxed), 1);
+        assert_eq!(real.module_enumerations.load(Ordering::Relaxed), 0);
+        assert_eq!(real.region_enumerations.load(Ordering::Relaxed), 0);
     }
 
     #[test]

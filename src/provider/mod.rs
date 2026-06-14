@@ -254,6 +254,24 @@ enum ModuleLookupOrder {
     Linear,
 }
 
+pub(crate) struct ModuleRangeLookup<'a> {
+    modules: &'a [ModuleEntry],
+    range_order: ModuleLookupOrder,
+}
+
+impl<'a> ModuleRangeLookup<'a> {
+    pub(crate) fn new(modules: &'a [ModuleEntry]) -> Self {
+        Self {
+            modules,
+            range_order: module_lookup_order(modules),
+        }
+    }
+
+    pub(crate) fn find_by_addr(&self, addr: u64) -> Option<&'a ModuleEntry> {
+        find_module_by_addr(self.modules, &self.range_order, addr)
+    }
+}
+
 impl ModuleLookup {
     pub fn new(modules: Vec<ModuleEntry>) -> Self {
         let range_order = module_lookup_order(&modules);
@@ -285,25 +303,7 @@ impl ModuleLookup {
     }
 
     pub fn find_by_addr(&self, addr: u64) -> Option<&ModuleEntry> {
-        match &self.range_order {
-            ModuleLookupOrder::Input => {
-                let idx = self.modules.partition_point(|module| module.base <= addr);
-                idx.checked_sub(1)
-                    .and_then(|i| self.modules.get(i))
-                    .filter(|module| module_contains_addr(module, addr))
-            }
-            ModuleLookupOrder::Sorted(sorted_ranges) => {
-                let idx = sorted_ranges.partition_point(|range| range.base <= addr);
-                idx.checked_sub(1)
-                    .and_then(|i| sorted_ranges.get(i))
-                    .filter(|range| addr < range.end)
-                    .and_then(|range| self.modules.get(range.module_idx))
-            }
-            ModuleLookupOrder::Linear => self
-                .modules
-                .iter()
-                .find(|module| module_contains_addr(module, addr)),
-        }
+        find_module_by_addr(&self.modules, &self.range_order, addr)
     }
 
     pub fn symbol_for_addr_lower(&self, addr: u64) -> String {
@@ -367,6 +367,31 @@ fn module_lookup_order(modules: &[ModuleEntry]) -> ModuleLookupOrder {
     }
 }
 
+fn find_module_by_addr<'a>(
+    modules: &'a [ModuleEntry],
+    range_order: &ModuleLookupOrder,
+    addr: u64,
+) -> Option<&'a ModuleEntry> {
+    match range_order {
+        ModuleLookupOrder::Input => {
+            let idx = modules.partition_point(|module| module.base <= addr);
+            idx.checked_sub(1)
+                .and_then(|i| modules.get(i))
+                .filter(|module| module_contains_addr(module, addr))
+        }
+        ModuleLookupOrder::Sorted(sorted_ranges) => {
+            let idx = sorted_ranges.partition_point(|range| range.base <= addr);
+            idx.checked_sub(1)
+                .and_then(|i| sorted_ranges.get(i))
+                .filter(|range| addr < range.end)
+                .and_then(|range| modules.get(range.module_idx))
+        }
+        ModuleLookupOrder::Linear => modules
+            .iter()
+            .find(|module| module_contains_addr(module, addr)),
+    }
+}
+
 fn modules_non_overlapping_in_order(modules: &[ModuleEntry]) -> bool {
     modules.windows(2).all(|pair| {
         let left_end = pair[0].base.saturating_add(pair[0].size);
@@ -390,6 +415,36 @@ fn module_contains_addr(module: &ModuleEntry, addr: u64) -> bool {
         && addr
             .checked_sub(module.base)
             .is_some_and(|rel| rel < module.size)
+}
+
+#[doc(hidden)]
+pub fn bench_region_module_label_len_linear(
+    region_bases: &[u64],
+    modules: &[ModuleEntry],
+) -> usize {
+    region_bases.iter().fold(0usize, |acc, &addr| {
+        acc.wrapping_add(
+            modules
+                .iter()
+                .find(|module| module_contains_addr(module, addr))
+                .map_or(0, |module| module.name.len()),
+        )
+    })
+}
+
+#[doc(hidden)]
+pub fn bench_region_module_label_len_indexed(
+    region_bases: &[u64],
+    modules: &[ModuleEntry],
+) -> usize {
+    let lookup = ModuleRangeLookup::new(modules);
+    region_bases.iter().fold(0usize, |acc, &addr| {
+        acc.wrapping_add(
+            lookup
+                .find_by_addr(addr)
+                .map_or(0, |module| module.name.len()),
+        )
+    })
 }
 
 /// `class Provider` (`provider.h:38-153`) — the abstract data source.
@@ -471,6 +526,11 @@ pub trait Provider {
     }
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
         Vec::new()
+    }
+    /// Enumerate modules and regions from one provider snapshot when the provider
+    /// can do that cheaper or more consistently than two independent calls.
+    fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
+        (self.enumerate_modules(), self.enumerate_regions())
     }
 
     // --- Kernel paging (override in kernel providers) ---
@@ -564,8 +624,8 @@ pub trait Provider {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_page_list, read_pages_in_runs, ModuleEntry, ModuleLookup, NormalizedPages,
-        Provider, K_PAGE_SIZE,
+        normalize_page_list, read_pages_in_runs, ModuleEntry, ModuleLookup, ModuleRangeLookup,
+        NormalizedPages, Provider, K_PAGE_SIZE,
     };
     use std::sync::Mutex;
 
@@ -614,6 +674,28 @@ mod tests {
         ]);
 
         assert_eq!(lookup.find_by_addr(0x1900).unwrap().name, "first");
+    }
+
+    #[test]
+    fn borrowed_module_range_lookup_preserves_original_order_for_overlaps() {
+        let modules = vec![
+            ModuleEntry {
+                name: "first".to_string(),
+                base: 0x1000,
+                size: 0x2000,
+                ..ModuleEntry::default()
+            },
+            ModuleEntry {
+                name: "second".to_string(),
+                base: 0x1800,
+                size: 0x1000,
+                ..ModuleEntry::default()
+            },
+        ];
+        let lookup = ModuleRangeLookup::new(&modules);
+
+        assert_eq!(lookup.find_by_addr(0x1900).unwrap().name, "first");
+        assert!(lookup.find_by_addr(0x4000).is_none());
     }
 
     #[test]
