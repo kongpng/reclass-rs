@@ -9,6 +9,7 @@ use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
 
 use super::*;
 use gpui::*;
+use std::cell::Cell;
 use std::sync::{Arc, Weak};
 
 pub(super) const MEMORY_PREVIEW_MIN_ROWS: usize = 10;
@@ -2404,6 +2405,8 @@ struct MemoryPreviewLookup<'a> {
     modules: &'a [ModuleEntry],
     region_order: &'a MemoryPreviewLookupOrder,
     module_order: &'a MemoryPreviewLookupOrder,
+    last_region_pos: Cell<usize>,
+    last_module_pos: Cell<usize>,
 }
 
 enum MemoryPreviewLookupOrder {
@@ -2413,6 +2416,8 @@ enum MemoryPreviewLookupOrder {
 }
 
 impl<'a> MemoryPreviewLookup<'a> {
+    const NO_POS: usize = usize::MAX;
+
     fn with_orders(
         regions: &'a [MemoryRegion],
         modules: &'a [ModuleEntry],
@@ -2424,6 +2429,8 @@ impl<'a> MemoryPreviewLookup<'a> {
             modules,
             region_order,
             module_order,
+            last_region_pos: Cell::new(Self::NO_POS),
+            last_module_pos: Cell::new(Self::NO_POS),
         }
     }
 
@@ -2434,17 +2441,32 @@ impl<'a> MemoryPreviewLookup<'a> {
     fn find_region(&self, addr: u64, len: i32) -> Option<&'a MemoryRegion> {
         match &self.region_order {
             MemoryPreviewLookupOrder::Input => {
-                let idx = self.regions.partition_point(|r| r.base <= addr);
-                idx.checked_sub(1)
-                    .and_then(|i| self.regions.get(i))
-                    .filter(|region| region_contains_readable(region, addr, len))
+                if let Some(region) = self.find_region_near_cursor(addr, len) {
+                    return Some(region);
+                }
+                let pos = self.regions.partition_point(|r| r.base <= addr);
+                let pos = pos.checked_sub(1)?;
+                let region = self.regions.get(pos)?;
+                if region_contains_readable(region, addr, len) {
+                    self.last_region_pos.set(pos);
+                    Some(region)
+                } else {
+                    None
+                }
             }
             MemoryPreviewLookupOrder::Sorted(indices) => {
-                let idx = indices.partition_point(|&i| self.regions[i].base <= addr);
-                idx.checked_sub(1)
-                    .and_then(|i| indices.get(i))
-                    .and_then(|&i| self.regions.get(i))
-                    .filter(|region| region_contains_readable(region, addr, len))
+                if let Some(region) = self.find_region_near_cursor(addr, len) {
+                    return Some(region);
+                }
+                let pos = indices.partition_point(|&i| self.regions[i].base <= addr);
+                let pos = pos.checked_sub(1)?;
+                let region = indices.get(pos).and_then(|&i| self.regions.get(i))?;
+                if region_contains_readable(region, addr, len) {
+                    self.last_region_pos.set(pos);
+                    Some(region)
+                } else {
+                    None
+                }
             }
             MemoryPreviewLookupOrder::Linear => self
                 .regions
@@ -2462,22 +2484,103 @@ impl<'a> MemoryPreviewLookup<'a> {
     fn find_module(&self, addr: u64) -> Option<&'a ModuleEntry> {
         match &self.module_order {
             MemoryPreviewLookupOrder::Input => {
-                let idx = self.modules.partition_point(|m| m.base <= addr);
-                idx.checked_sub(1)
-                    .and_then(|i| self.modules.get(i))
-                    .filter(|module| module_contains(module, addr))
+                if let Some(module) = self.find_module_near_cursor(addr) {
+                    return Some(module);
+                }
+                let pos = self.modules.partition_point(|m| m.base <= addr);
+                let pos = pos.checked_sub(1)?;
+                let module = self.modules.get(pos)?;
+                if module_contains(module, addr) {
+                    self.last_module_pos.set(pos);
+                    Some(module)
+                } else {
+                    None
+                }
             }
             MemoryPreviewLookupOrder::Sorted(indices) => {
-                let idx = indices.partition_point(|&i| self.modules[i].base <= addr);
-                idx.checked_sub(1)
-                    .and_then(|i| indices.get(i))
-                    .and_then(|&i| self.modules.get(i))
-                    .filter(|module| module_contains(module, addr))
+                if let Some(module) = self.find_module_near_cursor(addr) {
+                    return Some(module);
+                }
+                let pos = indices.partition_point(|&i| self.modules[i].base <= addr);
+                let pos = pos.checked_sub(1)?;
+                let module = indices.get(pos).and_then(|&i| self.modules.get(i))?;
+                if module_contains(module, addr) {
+                    self.last_module_pos.set(pos);
+                    Some(module)
+                } else {
+                    None
+                }
             }
             MemoryPreviewLookupOrder::Linear => self
                 .modules
                 .iter()
                 .find(|module| module_contains(module, addr)),
+        }
+    }
+
+    fn find_region_near_cursor(&self, addr: u64, len: i32) -> Option<&'a MemoryRegion> {
+        let pos = self.last_region_pos.get();
+        let Some(region) = self.region_at_order_pos(pos) else {
+            return None;
+        };
+        if region_contains_readable(region, addr, len) {
+            return Some(region);
+        }
+        if addr < region.base {
+            self.last_region_pos.set(Self::NO_POS);
+            return None;
+        }
+        if addr >= region.base.saturating_add(region.size) {
+            let next_pos = pos.saturating_add(1);
+            let next = self.region_at_order_pos(next_pos)?;
+            if region_contains_readable(next, addr, len) {
+                self.last_region_pos.set(next_pos);
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn region_at_order_pos(&self, pos: usize) -> Option<&'a MemoryRegion> {
+        match self.region_order {
+            MemoryPreviewLookupOrder::Input => self.regions.get(pos),
+            MemoryPreviewLookupOrder::Sorted(indices) => {
+                indices.get(pos).and_then(|&i| self.regions.get(i))
+            }
+            MemoryPreviewLookupOrder::Linear => None,
+        }
+    }
+
+    fn find_module_near_cursor(&self, addr: u64) -> Option<&'a ModuleEntry> {
+        let pos = self.last_module_pos.get();
+        let Some(module) = self.module_at_order_pos(pos) else {
+            return None;
+        };
+        if module_contains(module, addr) {
+            return Some(module);
+        }
+        if addr < module.base {
+            self.last_module_pos.set(Self::NO_POS);
+            return None;
+        }
+        if addr >= module.base.saturating_add(module.size) {
+            let next_pos = pos.saturating_add(1);
+            let next = self.module_at_order_pos(next_pos)?;
+            if module_contains(next, addr) {
+                self.last_module_pos.set(next_pos);
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn module_at_order_pos(&self, pos: usize) -> Option<&'a ModuleEntry> {
+        match self.module_order {
+            MemoryPreviewLookupOrder::Input => self.modules.get(pos),
+            MemoryPreviewLookupOrder::Sorted(indices) => {
+                indices.get(pos).and_then(|&i| self.modules.get(i))
+            }
+            MemoryPreviewLookupOrder::Linear => None,
         }
     }
 }
@@ -3185,6 +3288,81 @@ mod tests {
             lookup.find_module(0x6008).map(|m| m.name.as_str()),
             Some("early.dll")
         );
+    }
+
+    #[test]
+    fn memory_preview_lookup_cursor_handles_sorted_region_and_module_maps() {
+        let provider: Arc<dyn Provider + Send + Sync> = Arc::new(TestProvider {
+            base: 0x1000,
+            data: vec![0xAA],
+            fail_reads: false,
+        });
+        let regions = vec![
+            MemoryRegion {
+                base: 0x3000,
+                size: 0x100,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "three".into(),
+                region_type: RegionType::Private,
+            },
+            MemoryRegion {
+                base: 0x1000,
+                size: 0x100,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "one".into(),
+                region_type: RegionType::Private,
+            },
+            MemoryRegion {
+                base: 0x2000,
+                size: 0x100,
+                readable: true,
+                writable: false,
+                executable: false,
+                module_name: "two".into(),
+                region_type: RegionType::Private,
+            },
+        ];
+        let modules = vec![
+            ModuleEntry {
+                name: "three.dll".into(),
+                full_path: String::new(),
+                base: 0x3000,
+                size: 0x100,
+            },
+            ModuleEntry {
+                name: "one.dll".into(),
+                full_path: String::new(),
+                base: 0x1000,
+                size: 0x100,
+            },
+            ModuleEntry {
+                name: "two.dll".into(),
+                full_path: String::new(),
+                base: 0x2000,
+                size: 0x100,
+            },
+        ];
+        let maps = HoverMemoryMaps::with_regions_modules(11, &provider, regions, modules);
+        let lookup = maps.lookup();
+
+        assert_eq!(lookup.find_region(0x1008, 1).map(|r| r.base), Some(0x1000));
+        assert_eq!(lookup.last_region_pos.get(), 0);
+        assert_eq!(lookup.find_region(0x2008, 1).map(|r| r.base), Some(0x2000));
+        assert_eq!(lookup.last_region_pos.get(), 1);
+        assert_eq!(
+            lookup.find_module(0x1008).map(|m| m.name.as_str()),
+            Some("one.dll")
+        );
+        assert_eq!(lookup.last_module_pos.get(), 0);
+        assert_eq!(
+            lookup.find_module(0x2008).map(|m| m.name.as_str()),
+            Some("two.dll")
+        );
+        assert_eq!(lookup.last_module_pos.get(), 1);
     }
 
     #[test]
