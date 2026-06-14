@@ -21,7 +21,8 @@ use reclass::provider::{
     RegionType, SnapshotProvider, K_PAGE_SIZE,
 };
 use reclass::scanner::pointer::{
-    find_pointer_chains, PointerChainRequest, PointerMap, PointerMapStats, PointerRecord,
+    bench_prepare_pointer_regions_from_regions, find_pointer_chains, PointerChainRequest,
+    PointerMap, PointerMapRequest, PointerMapStats, PointerRecord,
 };
 use reclass::scanner::{
     run_rescan, run_scan, AddressRange, NullObserver, ScanCondition, ScanRequest, ScanResult,
@@ -5291,6 +5292,53 @@ fn pointer_chain_workloads(c: &mut Criterion) {
     group.finish();
 }
 
+fn pointer_region_prepare_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pointer_region_prepare");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &regions_len in &[1_000usize, 10_000] {
+        let regions: Vec<_> = (0..regions_len)
+            .map(|i| MemoryRegion {
+                base: 0x1000_0000 + (i as u64) * 0x4000,
+                size: 0x3000,
+                readable: true,
+                writable: i % 3 != 0,
+                executable: i % 2 == 0,
+                module_name: String::new(),
+                region_type: RegionType::Private,
+            })
+            .collect();
+        let sparse_constraints: Vec<_> = (0..regions_len as u64)
+            .step_by(2)
+            .map(|i| AddressRange {
+                start: 0x1000_0000 + i * 0x4000 + 0x100,
+                end: 0x1000_0000 + i * 0x4000 + 0x900,
+            })
+            .collect();
+        let request = PointerMapRequest {
+            constrain_regions: sparse_constraints,
+            ..PointerMapRequest::default()
+        };
+        group.throughput(Throughput::Elements(regions_len as u64));
+        group.bench_with_input(
+            BenchmarkId::new("sparse_constraints", regions_len),
+            &regions_len,
+            |b, _| {
+                b.iter(|| {
+                    let total = bench_prepare_pointer_regions_from_regions(
+                        black_box(regions.clone()),
+                        black_box(&request),
+                    );
+                    black_box(total);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn formatting_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("format_pointer_deref");
     group.sample_size(10);
@@ -5519,6 +5567,7 @@ criterion_group!(
     scanner_table_workloads,
     scanner_workloads,
     pointer_chain_workloads,
+    pointer_region_prepare_workloads,
     rtti_workloads,
     compose_live_read_cache_workloads,
     formatting_workloads

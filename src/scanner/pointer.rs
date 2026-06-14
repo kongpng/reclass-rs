@@ -509,9 +509,14 @@ fn prepare_pointer_regions(
         }
     }
 
-    let constraints = RangeSet::new(request.constrain_regions.clone());
-    let has_constraints = !constraints.ranges.is_empty();
-    let mut out = Vec::new();
+    prepare_pointer_regions_from_regions(regions, request)
+}
+
+fn prepare_pointer_regions_from_regions(
+    regions: Vec<MemoryRegion>,
+    request: &PointerMapRequest,
+) -> Vec<MemoryRegion> {
+    let mut accepted = Vec::with_capacity(regions.len());
     for region in regions {
         if !region.readable || region.size == 0 {
             continue;
@@ -528,29 +533,57 @@ fn prepare_pointer_regions(
         if request.skip_system_modules && is_system_module(&region.module_name) {
             continue;
         }
-        let Some(mut clipped) =
+        let Some(clipped) =
             clip_region_to_bounds(region, request.start_address, request.end_address)
         else {
             continue;
         };
-        if !has_constraints {
-            out.push(clipped);
-            continue;
+        accepted.push(clipped);
+    }
+    accepted.sort_unstable_by_key(|r| r.base);
+
+    let constraints = RangeSet::new(request.constrain_regions.clone());
+    if constraints.ranges.is_empty() {
+        return accepted;
+    }
+
+    let mut out = Vec::with_capacity(accepted.len().min(constraints.ranges.len()));
+    let mut first_overlap = 0usize;
+    for region in accepted {
+        let base = region.base;
+        let end = region.base.saturating_add(region.size);
+        while first_overlap < constraints.ranges.len()
+            && constraints.ranges[first_overlap].end <= base
+        {
+            first_overlap += 1;
         }
-        let base = clipped.base;
-        let end = clipped.base.saturating_add(clipped.size);
-        for range in &constraints.ranges {
+        for range in &constraints.ranges[first_overlap..] {
+            if range.start >= end {
+                break;
+            }
             let start = base.max(range.start);
             let clipped_end = end.min(range.end);
-            if clipped_end > start {
-                clipped.base = start;
-                clipped.size = clipped_end - start;
-                out.push(clipped.clone());
+            if clipped_end <= start {
+                continue;
             }
+            let mut sub = region.clone();
+            sub.base = start;
+            sub.size = clipped_end - start;
+            out.push(sub);
         }
     }
-    out.sort_unstable_by_key(|r| r.base);
     out
+}
+
+#[doc(hidden)]
+pub fn bench_prepare_pointer_regions_from_regions(
+    regions: Vec<MemoryRegion>,
+    request: &PointerMapRequest,
+) -> usize {
+    let out = prepare_pointer_regions_from_regions(regions, request);
+    out.iter().fold(out.len(), |acc, region| {
+        acc.wrapping_add(region.size as usize)
+    })
 }
 
 fn clip_region_to_bounds(
@@ -717,6 +750,47 @@ mod tests {
             }]
         );
         assert_eq!(map.stats().pointers_found, 1);
+    }
+
+    #[test]
+    fn pointer_region_constraints_clip_sorted_without_nested_scan() {
+        let regions = vec![
+            MemoryRegion {
+                base: 0x3000,
+                size: 0x1000,
+                readable: true,
+                writable: true,
+                region_type: RegionType::Private,
+                ..MemoryRegion::default()
+            },
+            MemoryRegion {
+                base: 0x1000,
+                size: 0x1000,
+                readable: true,
+                writable: true,
+                region_type: RegionType::Private,
+                ..MemoryRegion::default()
+            },
+        ];
+        let request = PointerMapRequest {
+            constrain_regions: vec![
+                AddressRange {
+                    start: 0x1800,
+                    end: 0x1900,
+                },
+                AddressRange {
+                    start: 0x3100,
+                    end: 0x3300,
+                },
+            ],
+            ..PointerMapRequest::default()
+        };
+
+        let clipped = prepare_pointer_regions_from_regions(regions, &request);
+
+        assert_eq!(clipped.len(), 2);
+        assert_eq!((clipped[0].base, clipped[0].size), (0x1800, 0x100));
+        assert_eq!((clipped[1].base, clipped[1].size), (0x3100, 0x200));
     }
 
     #[test]
