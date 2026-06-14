@@ -535,6 +535,11 @@ pub trait Provider {
     fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
         (self.enumerate_modules(), self.enumerate_regions())
     }
+    /// Enumerate regions using a caller-supplied module snapshot. Providers that
+    /// label regions by module can avoid rebuilding the same module index.
+    fn enumerate_regions_with_modules(&self, _modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
+        self.enumerate_regions()
+    }
 
     // --- Kernel paging (override in kernel providers) ---
     fn has_kernel_paging(&self) -> bool {

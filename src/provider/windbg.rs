@@ -79,6 +79,10 @@ impl Provider for WinDbgMemoryProvider {
         self.inner.enumerate_regions()
     }
 
+    fn enumerate_regions_with_modules(&self, modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
+        self.inner.enumerate_regions_with_modules(modules)
+    }
+
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
         self.inner.enumerate_modules()
     }
@@ -279,6 +283,23 @@ mod platform {
                 .unwrap_or_default()
         }
 
+        pub fn enumerate_regions_with_modules(&self, modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if self
+                .tx
+                .send(Request::RegionsWithModules {
+                    modules: modules.to_vec(),
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                return Vec::new();
+            }
+            reply_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_default()
+        }
+
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {
             let (reply_tx, reply_rx) = mpsc::channel();
             if self.tx.send(Request::Modules { reply: reply_tx }).is_err() {
@@ -333,6 +354,10 @@ mod platform {
         Regions {
             reply: Sender<Vec<MemoryRegion>>,
         },
+        RegionsWithModules {
+            modules: Vec<ModuleEntry>,
+            reply: Sender<Vec<MemoryRegion>>,
+        },
         Modules {
             reply: Sender<Vec<ModuleEntry>>,
         },
@@ -376,6 +401,9 @@ mod platform {
                 }
                 Request::Regions { reply } => {
                     let _ = reply.send(session.enumerate_regions());
+                }
+                Request::RegionsWithModules { modules, reply } => {
+                    let _ = reply.send(session.enumerate_regions_with_modules(&modules));
                 }
                 Request::Modules { reply } => {
                     let _ = reply.send(session.enumerate_modules());
@@ -769,6 +797,12 @@ mod platform {
             String::new()
         }
         pub fn enumerate_regions(&self) -> Vec<MemoryRegion> {
+            Vec::new()
+        }
+        pub fn enumerate_regions_with_modules(
+            &self,
+            _modules: &[ModuleEntry],
+        ) -> Vec<MemoryRegion> {
             Vec::new()
         }
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {

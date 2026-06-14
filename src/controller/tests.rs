@@ -2670,7 +2670,9 @@ const TOTAL_SIZE: i32 = (MODULE_SIZE + HEAP_SIZE) as i32;
 struct CountingProvider {
     reads_per_page: Mutex<std::collections::HashMap<u64, i32>>,
     total_reads: AtomicI32,
+    module_enumerations: AtomicI32,
     region_enumerations: AtomicI32,
+    module_aware_region_enumerations: AtomicI32,
     data: Mutex<Vec<u8>>,
     unsorted_regions: bool,
 }
@@ -2679,7 +2681,9 @@ impl CountingProvider {
         CountingProvider {
             reads_per_page: Mutex::new(std::collections::HashMap::new()),
             total_reads: AtomicI32::new(0),
+            module_enumerations: AtomicI32::new(0),
             region_enumerations: AtomicI32::new(0),
+            module_aware_region_enumerations: AtomicI32::new(0),
             data: Mutex::new(vec![0u8; TOTAL_SIZE as usize]),
             unsorted_regions: false,
         }
@@ -2701,10 +2705,20 @@ impl CountingProvider {
     fn reset_counters(&self) {
         self.reads_per_page.lock().unwrap().clear();
         self.total_reads.store(0, Ordering::Relaxed);
+        self.module_enumerations.store(0, Ordering::Relaxed);
         self.region_enumerations.store(0, Ordering::Relaxed);
+        self.module_aware_region_enumerations
+            .store(0, Ordering::Relaxed);
+    }
+    fn module_enumerations(&self) -> i32 {
+        self.module_enumerations.load(Ordering::Relaxed)
     }
     fn region_enumerations(&self) -> i32 {
         self.region_enumerations.load(Ordering::Relaxed)
+    }
+    fn module_aware_region_enumerations(&self) -> i32 {
+        self.module_aware_region_enumerations
+            .load(Ordering::Relaxed)
     }
     fn write_at(&self, addr: usize, bytes: &[u8]) {
         let mut d = self.data.lock().unwrap();
@@ -2741,6 +2755,7 @@ impl Provider for CountingProvider {
         "Process".into()
     }
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+        self.module_enumerations.fetch_add(1, Ordering::Relaxed);
         vec![ModuleEntry {
             name: "synthetic.dll".into(),
             full_path: "synthetic.dll".into(),
@@ -2750,6 +2765,18 @@ impl Provider for CountingProvider {
     }
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         self.region_enumerations.fetch_add(1, Ordering::Relaxed);
+        self.region_snapshot()
+    }
+    fn enumerate_regions_with_modules(&self, modules: &[ModuleEntry]) -> Vec<MemoryRegion> {
+        self.module_aware_region_enumerations
+            .fetch_add(1, Ordering::Relaxed);
+        assert_eq!(modules.len(), 1, "module snapshot should be reused");
+        self.region_snapshot()
+    }
+}
+
+impl CountingProvider {
+    fn region_snapshot(&self) -> Vec<MemoryRegion> {
         let mut regions = vec![
             MemoryRegion {
                 base: MODULE_BASE,
@@ -2890,7 +2917,36 @@ fn permanent_page_classification_skips_region_walk_for_heap_pages_outside_module
         0,
         "heap-only live pages outside known modules should not enumerate regions"
     );
+    assert_eq!(prov.module_aware_region_enumerations(), 0);
     assert!(!c.snapshot_prov().unwrap().is_permanent(HEAP_BASE));
+}
+
+#[test]
+fn permanent_page_classification_reuses_module_snapshot_for_region_walk() {
+    let mut doc = RcxDocument::new();
+    build_speedup_tree(&mut doc.tree, false, true);
+    let prov = Arc::new(CountingProvider::new());
+    doc.provider = prov.clone();
+    let mut c = RcxController::new(doc);
+
+    let mut initial = PageMap::new();
+    initial.insert(HEAP_BASE, vec![0u8; 4096].into());
+    c.on_read_complete(initial);
+    prov.reset_counters();
+
+    let module_page = MODULE_BASE + 4096;
+    let mut pages = PageMap::new();
+    pages.insert(module_page, vec![0u8; 4096].into());
+    c.on_read_complete(pages);
+
+    assert_eq!(prov.module_enumerations(), 1);
+    assert_eq!(
+        prov.region_enumerations(),
+        0,
+        "module-page classification should not rebuild module labels through plain region enumeration"
+    );
+    assert_eq!(prov.module_aware_region_enumerations(), 1);
+    assert!(c.snapshot_prov().unwrap().is_permanent(module_page));
 }
 
 #[test]

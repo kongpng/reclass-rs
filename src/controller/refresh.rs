@@ -538,7 +538,7 @@ impl super::RcxController {
         let mut executable_regions: Vec<MemoryRegion> = self
             .doc
             .provider
-            .enumerate_regions()
+            .enumerate_regions_with_modules(&modules)
             .into_iter()
             .filter(|r| !r.module_name.is_empty() && r.executable)
             .collect();
