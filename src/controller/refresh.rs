@@ -53,7 +53,65 @@ fn flat_root_data_extent(tree: &NodeTree) -> Option<i32> {
     (extent > 0).then_some(extent.min(K_MAX_MAIN_EXTENT) as i32)
 }
 
+fn module_overlaps_page(modules: &[crate::provider::ModuleEntry], page_addr: u64) -> bool {
+    let page_end = page_addr.saturating_add(K_PAGE_SIZE);
+    let upper = modules.partition_point(|module| module.base < page_end);
+    for module in modules[..upper].iter().rev() {
+        let module_end = module.base.saturating_add(module.size);
+        if module_end <= page_addr {
+            break;
+        }
+        if module.base < page_end && module_end > page_addr {
+            return true;
+        }
+    }
+    false
+}
+
 impl super::RcxController {
+    fn pointer_snapshot_children(&mut self, parent_id: u64) -> PointerSnapshotChildren {
+        let generation = self.doc.tree.generation();
+        let rebuild = !matches!(
+            self.pointer_snapshot_child_cache.as_ref(),
+            Some((cached_generation, _)) if *cached_generation == generation
+        );
+
+        if rebuild {
+            self.pointer_snapshot_child_cache = Some((generation, AHashMap::new()));
+        }
+
+        if let Some(children) = self
+            .pointer_snapshot_child_cache
+            .as_ref()
+            .and_then(|(_, by_parent)| by_parent.get(&parent_id))
+        {
+            return children.clone();
+        }
+
+        let children = self.doc.tree.with_children(parent_id, |indices| {
+            let mut children = PointerSnapshotChildren {
+                has_children: !indices.is_empty(),
+                pointer_children: Vec::new(),
+            };
+            for &idx in indices {
+                let node = &self.doc.tree.nodes[idx];
+                if matches!(node.kind, NodeKind::Pointer32 | NodeKind::Pointer64)
+                    && !node.collapsed
+                    && node.ref_id != 0
+                {
+                    children.pointer_children.push(idx);
+                }
+            }
+            children
+        });
+
+        if let Some((_, by_parent)) = self.pointer_snapshot_child_cache.as_mut() {
+            by_parent.insert(parent_id, children.clone());
+        }
+
+        children
+    }
+
     /// `onRefreshTick()` (`controller.cpp:6586`) — returns the read plan.
     pub fn on_refresh_tick(&mut self) -> RefreshPlan {
         // Liveness-flip detection runs BEFORE early returns.
@@ -91,17 +149,32 @@ impl super::RcxController {
             if root_id == 0 && !self.doc.tree.nodes.is_empty() {
                 root_id = self.doc.tree.nodes[0].id;
             }
-            let mut visited: HashSet<(u64, u64)> = HashSet::new();
-            let mut budget = K_POINTER_SNAPSHOT_BYTE_BUDGET;
-            self.collect_pointer_ranges(
-                root_id,
-                base,
-                0,
-                99,
-                &mut visited,
-                &mut ranges,
-                &mut budget,
-            );
+            let root_children = self.pointer_snapshot_children(root_id);
+            let needs_embedded_ref_walk = !root_children.has_children
+                && self
+                    .doc
+                    .tree
+                    .index_of_id(root_id)
+                    .try_into()
+                    .ok()
+                    .and_then(|idx: usize| self.doc.tree.nodes.get(idx))
+                    .is_some_and(|node| node.kind == NodeKind::Struct && node.ref_id != 0);
+            if root_children.pointer_children.is_empty() && !needs_embedded_ref_walk {
+                ranges.push((base, extent));
+            } else {
+                let mut visited: HashSet<(u64, u64)> = HashSet::new();
+                let mut budget = K_POINTER_SNAPSHOT_BYTE_BUDGET;
+                self.collect_pointer_ranges(
+                    root_id,
+                    base,
+                    Some(extent),
+                    0,
+                    99,
+                    &mut visited,
+                    &mut ranges,
+                    &mut budget,
+                );
+            }
         }
         if ranges.is_empty() {
             ranges.push((base, extent));
@@ -116,37 +189,43 @@ impl super::RcxController {
 
         const OVERSCAN_PAGES: u64 = 2;
         let mut request_pages: Vec<u64> = Vec::new();
-        for &(range_start, range_len) in &ranges {
-            let page_start = range_start & K_PAGE_MASK;
-            let end = range_start.wrapping_add(range_len as u64);
-            let page_end = (end + K_PAGE_SIZE - 1) & K_PAGE_MASK;
-            let mut p = page_start;
-            while p < page_end {
-                let is_permanent = self.snapshot.as_ref().map_or(false, |s| s.is_permanent(p));
-                if is_permanent {
-                    p += K_PAGE_SIZE;
-                    continue;
-                }
-                if let Some((vlo, vhi)) = viewport {
-                    let lo = if vlo > OVERSCAN_PAGES * K_PAGE_SIZE {
-                        (vlo - OVERSCAN_PAGES * K_PAGE_SIZE) & K_PAGE_MASK
-                    } else {
-                        0
-                    };
-                    let hi = ((vhi + OVERSCAN_PAGES * K_PAGE_SIZE) + K_PAGE_SIZE - 1) & K_PAGE_MASK;
-                    let in_viewport = p >= lo && p < hi;
-                    let is_main_range = range_start == base;
-                    if is_main_range && !in_viewport {
-                        let stab = self.page_stability.get(&p).copied().unwrap_or(0);
-                        let is_stable = stab >= K_STABILITY_THRESHOLD;
-                        if is_stable && (self.tick_count & 1) == 1 {
-                            p += K_PAGE_SIZE;
-                            continue;
+        {
+            let permanent_pages = self.snapshot.as_ref().map(|s| s.permanent_pages());
+            for &(range_start, range_len) in &ranges {
+                let page_start = range_start & K_PAGE_MASK;
+                let end = range_start.wrapping_add(range_len as u64);
+                let page_end = (end + K_PAGE_SIZE - 1) & K_PAGE_MASK;
+                let mut p = page_start;
+                while p < page_end {
+                    if permanent_pages
+                        .as_ref()
+                        .is_some_and(|pages| pages.contains(&p))
+                    {
+                        p += K_PAGE_SIZE;
+                        continue;
+                    }
+                    if let Some((vlo, vhi)) = viewport {
+                        let lo = if vlo > OVERSCAN_PAGES * K_PAGE_SIZE {
+                            (vlo - OVERSCAN_PAGES * K_PAGE_SIZE) & K_PAGE_MASK
+                        } else {
+                            0
+                        };
+                        let hi =
+                            ((vhi + OVERSCAN_PAGES * K_PAGE_SIZE) + K_PAGE_SIZE - 1) & K_PAGE_MASK;
+                        let in_viewport = p >= lo && p < hi;
+                        let is_main_range = range_start == base;
+                        if is_main_range && !in_viewport {
+                            let stab = self.page_stability.get(&p).copied().unwrap_or(0);
+                            let is_stable = stab >= K_STABILITY_THRESHOLD;
+                            if is_stable && (self.tick_count & 1) == 1 {
+                                p += K_PAGE_SIZE;
+                                continue;
+                            }
                         }
                     }
+                    request_pages.push(p);
+                    p += K_PAGE_SIZE;
                 }
-                request_pages.push(p);
-                p += K_PAGE_SIZE;
             }
         }
 
@@ -292,9 +371,10 @@ impl super::RcxController {
     /// `collectPointerRanges(...)` (`controller.cpp:6532`).
     #[allow(clippy::too_many_arguments)]
     fn collect_pointer_ranges(
-        &self,
+        &mut self,
         struct_id: u64,
         mem_base: u64,
+        known_span: Option<i32>,
         depth: i32,
         max_depth: i32,
         visited: &mut HashSet<(u64, u64)>,
@@ -313,7 +393,7 @@ impl super::RcxController {
         }
         visited.insert(key);
 
-        let span = self.doc.tree.struct_span(struct_id);
+        let span = known_span.unwrap_or_else(|| self.doc.tree.struct_span(struct_id));
         if span <= 0 {
             return;
         }
@@ -323,49 +403,49 @@ impl super::RcxController {
             return;
         }
 
-        let Some(snap) = self.snapshot.as_ref() else {
-            return;
-        };
-
-        let mut has_children = false;
-        self.doc.tree.with_children(struct_id, |children| {
-            has_children = !children.is_empty();
-            for &ci in children {
-                if *budget <= 0 {
-                    break;
-                }
-                let child = &self.doc.tree.nodes[ci];
-                if !matches!(child.kind, NodeKind::Pointer32 | NodeKind::Pointer64) {
-                    continue;
-                }
-                if child.collapsed || child.ref_id == 0 {
-                    continue;
-                }
-                let ptr_addr = mem_base + child.offset as u64;
-                let ptr_size = child.byte_size();
+        let children = self.pointer_snapshot_children(struct_id);
+        let has_children = children.has_children;
+        for ci in children.pointer_children {
+            if *budget <= 0 {
+                break;
+            }
+            let Some((kind, offset, ptr_size, ref_id)) = self
+                .doc
+                .tree
+                .nodes
+                .get(ci)
+                .map(|child| (child.kind, child.offset, child.byte_size(), child.ref_id))
+            else {
+                continue;
+            };
+            let ptr_addr = mem_base + offset as u64;
+            let ptr_val = {
+                let Some(snap) = self.snapshot.as_ref() else {
+                    return;
+                };
                 if !snap.is_readable(ptr_addr, ptr_size) {
                     continue;
                 }
-                let ptr_val = if child.kind == NodeKind::Pointer32 {
+                if kind == NodeKind::Pointer32 {
                     snap.read_u32(ptr_addr) as u64
                 } else {
                     snap.read_u64(ptr_addr)
-                };
-                if ptr_val == 0 || ptr_val == u64::MAX {
-                    continue;
                 }
-                let ref_id = child.ref_id;
-                self.collect_pointer_ranges(
-                    ref_id,
-                    ptr_val,
-                    depth + 1,
-                    max_depth,
-                    visited,
-                    ranges,
-                    budget,
-                );
+            };
+            if ptr_val == 0 || ptr_val == u64::MAX {
+                continue;
             }
-        });
+            self.collect_pointer_ranges(
+                ref_id,
+                ptr_val,
+                None,
+                depth + 1,
+                max_depth,
+                visited,
+                ranges,
+                budget,
+            );
+        }
 
         // Embedded struct reference.
         let idx = self.doc.tree.index_of_id(struct_id);
@@ -374,7 +454,7 @@ impl super::RcxController {
             if sn.kind == NodeKind::Struct && sn.ref_id != 0 && !has_children {
                 let ref_id = sn.ref_id;
                 self.collect_pointer_ranges(
-                    ref_id, mem_base, depth, max_depth, visited, ranges, budget,
+                    ref_id, mem_base, None, depth, max_depth, visited, ranges, budget,
                 );
             }
         }
@@ -442,8 +522,18 @@ impl super::RcxController {
 
     /// `classifyPermanentPages(fresh)` (`controller.cpp:6832`).
     fn classify_permanent_pages(&mut self, fresh: &PageMap) {
-        if self.snapshot.is_none() {
+        if self.snapshot.is_none() || fresh.is_empty() {
             return;
+        }
+        let mut modules = self.doc.provider.enumerate_modules();
+        if !modules.is_empty() {
+            modules.sort_unstable_by_key(|module| module.base);
+            if !fresh
+                .keys()
+                .any(|&page_addr| module_overlaps_page(&modules, page_addr))
+            {
+                return;
+            }
         }
         let mut executable_regions: Vec<MemoryRegion> = self
             .doc

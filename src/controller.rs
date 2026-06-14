@@ -45,6 +45,12 @@ const SEL_STRIP_MASK: u64 =
     !(K_FOOTER_ID_BIT | K_ARRAY_ELEM_BIT | K_ARRAY_ELEM_MASK | K_MEMBER_BIT | K_MEMBER_SUB_MASK);
 type TrackedValueBytes = SmallVec<[u8; 16]>;
 
+#[derive(Clone, Debug, Default)]
+struct PointerSnapshotChildren {
+    has_children: bool,
+    pointer_children: Vec<usize>,
+}
+
 #[inline]
 fn strip_sel(id: u64) -> u64 {
     id & SEL_STRIP_MASK
@@ -983,6 +989,7 @@ pub struct RcxController {
     // append paths repopulate it only after their insert command has applied.
     append_tail_cache: Option<(u64, i32)>,
     data_extent_cache: Option<(u64, i32)>,
+    pointer_snapshot_child_cache: Option<(u64, AHashMap<u64, PointerSnapshotChildren>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1082,6 +1089,7 @@ impl RcxController {
             events: Vec::new(),
             append_tail_cache: None,
             data_extent_cache: None,
+            pointer_snapshot_child_cache: None,
         };
         // `setupAutoRefresh` (`controller.cpp:6515`): start the timer.
         c.apply_adaptive_interval();

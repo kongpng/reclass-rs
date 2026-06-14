@@ -1196,6 +1196,18 @@ fn apply_initial_live_snapshot(controller: &mut RcxController) {
     }
 }
 
+fn complete_next_live_tick(controller: &mut RcxController) -> usize {
+    match controller.on_refresh_tick() {
+        RefreshPlan::Read { pages, provider } => {
+            let count = pages.len();
+            let result = RcxController::read_pages(&provider, &pages);
+            controller.on_read_complete(result);
+            count
+        }
+        RefreshPlan::None => 0,
+    }
+}
+
 fn set_first_visible_field_window(controller: &mut RcxController, lines: usize) {
     let _ = set_visible_field_window_at(controller, 0, lines);
 }
@@ -3278,6 +3290,30 @@ fn refresh_page_plan_workloads(c: &mut Criterion) {
                         let mut controller =
                             controller_for(flat_tree(nodes, NodeKind::Hex64), provider);
                         assert!(controller.pump_refresh());
+                        controller
+                    },
+                    |mut controller| {
+                        let pages = match controller.on_refresh_tick() {
+                            reclass::controller::RefreshPlan::Read { pages, .. } => pages.len(),
+                            reclass::controller::RefreshPlan::None => 0,
+                        };
+                        black_box(pages);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("flat_live_steady_snapshot_tick", nodes),
+            &nodes,
+            |b, &nodes| {
+                b.iter_batched(
+                    || {
+                        let provider = Arc::new(LiveLikeProvider::new_float_pairs(nodes + 2048));
+                        let mut controller =
+                            controller_for(flat_tree(nodes, NodeKind::Hex64), provider);
+                        apply_initial_live_snapshot(&mut controller);
+                        let _ = complete_next_live_tick(&mut controller);
                         controller
                     },
                     |mut controller| {
