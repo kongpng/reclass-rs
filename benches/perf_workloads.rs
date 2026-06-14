@@ -38,6 +38,7 @@ use reclass::ui::panels::scannerpanel::{
 };
 use reclass::ui::panels::workspace::{WorkspaceDoc, WorkspaceModel};
 use reclass::ui::pickers::processpicker::ProcessPickerModel;
+use reclass::ui::pickers::typeselectorpopup::{SortMode, TypeEntry, TypeModel};
 use reclass::ui::state::DocId;
 use std::hint::black_box;
 
@@ -4336,6 +4337,73 @@ fn process_picker_workloads(c: &mut Criterion) {
     group.finish();
 }
 
+fn type_selector_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("type_selector_model");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &entries_len in &[1_000usize, 10_000, 50_000] {
+        let entries: Vec<_> = (0..entries_len)
+            .map(|i| {
+                TypeEntry::composite(
+                    i as u64 + 1,
+                    &format!("PlayerComponent_{:05}", entries_len - i),
+                    if i % 11 == 0 { "class" } else { "struct" },
+                    ((i % 256) * 4) as i32,
+                )
+            })
+            .collect();
+        group.throughput(Throughput::Elements(entries_len as u64));
+        group.bench_with_input(
+            BenchmarkId::new("open_bucketed_composites", entries_len),
+            &entries_len,
+            |b, _| {
+                b.iter_batched(
+                    || entries.clone(),
+                    |entries| {
+                        let model = TypeModel::new(black_box(entries));
+                        black_box(model.row_count());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("rebuild_bucketed_composites", entries_len),
+            &entries_len,
+            |b, _| {
+                b.iter_batched(
+                    || TypeModel::new(entries.clone()),
+                    |mut model| {
+                        model.apply_filter(black_box(""));
+                        black_box(model.row_count());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("open_name_sort_composites", entries_len),
+            &entries_len,
+            |b, _| {
+                b.iter_batched(
+                    || entries.clone(),
+                    |entries| {
+                        let mut model = TypeModel::new(black_box(entries));
+                        model.set_sort_mode(SortMode::Name);
+                        black_box(model.row_count());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn workspace_model_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("workspace_model");
     group.sample_size(10);
@@ -5680,6 +5748,7 @@ criterion_group!(
     modules_panel_workloads,
     target_panel_workloads,
     process_picker_workloads,
+    type_selector_workloads,
     workspace_model_workloads,
     hover_memory_preview_workloads,
     hover_struct_preview_workloads,
