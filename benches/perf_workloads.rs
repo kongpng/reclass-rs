@@ -543,6 +543,84 @@ impl LiveLikeProvider {
         }
     }
 
+    fn new_msvc_rtti_many_modules(modules: usize, slots: usize) -> (Self, u64) {
+        let module_count = modules.max(1);
+        let page = 4096usize;
+        let provider_base = 0x0000_7FF6_E000_0000u64;
+        let len = module_count.saturating_mul(page);
+        let mut data = vec![0u8; len];
+        let mut regions = Vec::with_capacity(module_count);
+        let mut module_entries = Vec::with_capacity(module_count);
+        for i in 0..module_count {
+            let base = provider_base + (i * page) as u64;
+            let name = format!("rtti_{i:05}.dll");
+            regions.push(MemoryRegion {
+                base,
+                size: page as u64,
+                readable: true,
+                writable: false,
+                executable: true,
+                module_name: name.clone(),
+                region_type: RegionType::Image,
+            });
+            module_entries.push(ModuleEntry {
+                name: name.clone(),
+                full_path: name,
+                base,
+                size: page as u64,
+            });
+        }
+
+        let image_off = (module_count - 1) * page;
+        let image_base = provider_base + image_off as u64;
+        let vtable_off = image_off + 0x100;
+        let col_off = image_off + 0x400;
+        let td_off = image_off + 0x600;
+        let chd_off = image_off + 0x800;
+        let bca_off = image_off + 0x900;
+        let bcd_off = image_off + 0xA00;
+        let base_td_off = image_off + 0xB00;
+        let method_off = image_off + 0xC00;
+
+        let write_u32 = |data: &mut [u8], off: usize, value: u32| {
+            data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let write_u64 = |data: &mut [u8], off: usize, value: u64| {
+            data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        let rva = |off: usize| (off - image_off) as u32;
+
+        write_u64(&mut data, vtable_off - 8, image_base + 0x400);
+        write_u32(&mut data, col_off, 1);
+        write_u32(&mut data, col_off + 4, 0);
+        write_u32(&mut data, col_off + 0x0C, rva(td_off));
+        write_u32(&mut data, col_off + 0x10, rva(chd_off));
+        write_u32(&mut data, col_off + 0x14, rva(col_off));
+        write_u32(&mut data, chd_off + 8, 1);
+        write_u32(&mut data, chd_off + 0x0C, rva(bca_off));
+        write_u32(&mut data, bca_off, rva(bcd_off));
+        write_u32(&mut data, bcd_off, rva(base_td_off));
+        data[td_off + 16..td_off + 28].copy_from_slice(b".?AVBench@@\0");
+        data[base_td_off + 16..base_td_off + 27].copy_from_slice(b".?AVBase@@\0");
+        for slot in 0..slots {
+            write_u64(
+                &mut data,
+                vtable_off + slot * 8,
+                provider_base + (method_off + slot * 0x10) as u64,
+            );
+        }
+
+        (
+            Self {
+                base: provider_base,
+                data,
+                regions,
+                modules: module_entries,
+            },
+            image_base + 0x100,
+        )
+    }
+
     fn new_module_pages(pages: usize) -> Self {
         let len = pages * 4096;
         let data = vec![0u8; len];
@@ -1029,6 +1107,21 @@ fn rtti_workloads(c: &mut Criterion) {
                 b.iter(|| {
                     let info = resolve_rtti(black_box(&provider), black_box(invalid_vtable), 8, 64);
                     black_box(info.ok);
+                });
+            },
+        );
+    }
+    #[cfg(feature = "symbols")]
+    for &modules in &[1_000usize, 10_000] {
+        let (provider, vtable) = LiveLikeProvider::new_msvc_rtti_many_modules(modules, 64);
+        group.throughput(Throughput::Elements(modules as u64));
+        group.bench_with_input(
+            BenchmarkId::new("browser_resolve_msvc_vtable_many_modules", modules),
+            &modules,
+            |b, _| {
+                b.iter(|| {
+                    let info = resolve_rtti(black_box(&provider), black_box(vtable), 8, 64);
+                    black_box(info.vtable.len());
                 });
             },
         );

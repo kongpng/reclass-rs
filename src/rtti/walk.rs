@@ -147,19 +147,61 @@ pub fn find_owning_module(prov: &dyn Provider, addr: u64) -> OwningModule {
 /// Module-snapshot variant of [`find_owning_module`]. Callers that already have
 /// a module list should use this to avoid live-provider re-enumeration.
 pub(crate) fn find_owning_module_in(mods: &[ModuleEntry], addr: u64) -> OwningModule {
-    for m in mods {
-        // C++ wraps in uint64_t; use wrapping_add to match on a pathological size.
-        if addr >= m.base && addr < m.base.wrapping_add(m.size) {
-            return OwningModule {
-                name: m.name.clone(),
-                full_path: m.full_path.clone(),
-                base: m.base,
-                size: m.size,
-                valid: true,
-            };
+    ModuleSearch::new(mods).owning(addr)
+}
+
+enum ModuleSearch<'a> {
+    Ordered(&'a [ModuleEntry]),
+    Linear(&'a [ModuleEntry]),
+}
+
+impl<'a> ModuleSearch<'a> {
+    fn new(modules: &'a [ModuleEntry]) -> Self {
+        if modules_non_overlapping_in_order(modules) {
+            Self::Ordered(modules)
+        } else {
+            Self::Linear(modules)
         }
     }
-    OwningModule::default()
+
+    fn owning(&self, addr: u64) -> OwningModule {
+        self.find(addr)
+            .map_or_else(OwningModule::default, |module| OwningModule {
+                name: module.name.clone(),
+                full_path: module.full_path.clone(),
+                base: module.base,
+                size: module.size,
+                valid: true,
+            })
+    }
+
+    fn contains(&self, addr: u64) -> bool {
+        self.find(addr).is_some()
+    }
+
+    fn find(&self, addr: u64) -> Option<&'a ModuleEntry> {
+        match self {
+            Self::Ordered(modules) => {
+                let idx = modules.partition_point(|module| module.base <= addr);
+                idx.checked_sub(1)
+                    .and_then(|i| modules.get(i))
+                    .filter(|module| module_contains(module, addr))
+            }
+            Self::Linear(modules) => modules.iter().find(|module| module_contains(module, addr)),
+        }
+    }
+}
+
+fn modules_non_overlapping_in_order(modules: &[ModuleEntry]) -> bool {
+    modules.windows(2).all(|pair| {
+        let left_end = pair[0].base.wrapping_add(pair[0].size);
+        left_end <= pair[1].base
+    })
+}
+
+fn module_contains(module: &ModuleEntry, addr: u64) -> bool {
+    // C++ wraps in uint64_t; use wrapping_add to match on a pathological size.
+    addr >= module.base && addr < module.base.wrapping_add(module.size)
 }
 
 /// `walkRtti(prov, vtableAddr, pointerSize, maxVtableSlots)` (`rtti.cpp:108`).
@@ -208,7 +250,8 @@ pub(crate) fn walk_rtti_with_modules(
     info.complete_locator = col_addr;
 
     // 2. image base — owning module, else (x64) the COL.pSelf @ +0x14 fallback.
-    let owner = find_owning_module_in(modules, col_addr);
+    let module_search = ModuleSearch::new(modules);
+    let owner = module_search.owning(col_addr);
     let mut image_base: u64 = 0;
     if owner.valid {
         info.module_name = owner.name.clone();
@@ -312,7 +355,7 @@ pub(crate) fn walk_rtti_with_modules(
         let in_some_module = if !owner.valid {
             true // synthetic: trust the input
         } else {
-            find_owning_module_in(modules, target).valid
+            module_search.contains(target)
         };
         if !in_some_module {
             break;
@@ -379,7 +422,8 @@ pub(crate) fn walk_rtti_itanium_with_modules(
     }
 
     // 2. type_info must be in a module.
-    let ti_owner = find_owning_module_in(modules, ti_addr);
+    let module_search = ModuleSearch::new(modules);
+    let ti_owner = module_search.owning(ti_addr);
     if !ti_owner.valid {
         info.error = "type_info pointer outside any module".to_owned();
         return info;
@@ -422,7 +466,7 @@ pub(crate) fn walk_rtti_itanium_with_modules(
         info.error = "could not read type_info vtable ptr".to_owned();
         return info;
     }
-    if ti_vtable == 0 || !find_owning_module_in(modules, ti_vtable).valid {
+    if ti_vtable == 0 || !module_search.contains(ti_vtable) {
         info.error = "type_info vtable not in any module".to_owned();
         return info;
     }
@@ -439,7 +483,7 @@ pub(crate) fn walk_rtti_itanium_with_modules(
         info.error = "could not read __name pointer".to_owned();
         return info;
     }
-    if name_ptr == 0 || !find_owning_module_in(modules, name_ptr).valid {
+    if name_ptr == 0 || !module_search.contains(name_ptr) {
         info.error = "__name pointer not in any module".to_owned();
         return info;
     }
@@ -501,7 +545,7 @@ pub(crate) fn walk_rtti_itanium_with_modules(
         if target == 0 {
             break;
         }
-        if !find_owning_module_in(modules, target).valid {
+        if !module_search.contains(target) {
             break;
         }
         let symbol = SymbolStore::global()
@@ -807,6 +851,45 @@ mod tests {
         // outside any module.
         assert!(!find_owning_module(&prov, K_IMAGE_BASE + 0x10000).valid);
         assert!(!find_owning_module(&prov, 0x10).valid);
+    }
+
+    #[test]
+    fn find_owning_module_snapshot_indexes_sorted_and_preserves_overlap_order() {
+        let sorted = vec![
+            ModuleEntry {
+                name: "a".into(),
+                full_path: "a".into(),
+                base: 0x1000,
+                size: 0x100,
+            },
+            ModuleEntry {
+                name: "b".into(),
+                full_path: "b".into(),
+                base: 0x3000,
+                size: 0x100,
+            },
+        ];
+        let hit = find_owning_module_in(&sorted, 0x3050);
+        assert!(hit.valid);
+        assert_eq!(hit.name, "b");
+
+        let overlapping = vec![
+            ModuleEntry {
+                name: "wide".into(),
+                full_path: "wide".into(),
+                base: 0x1000,
+                size: 0x300,
+            },
+            ModuleEntry {
+                name: "specific".into(),
+                full_path: "specific".into(),
+                base: 0x1100,
+                size: 0x80,
+            },
+        ];
+        let hit = find_owning_module_in(&overlapping, 0x1120);
+        assert!(hit.valid);
+        assert_eq!(hit.name, "wide");
     }
 
     // ── invalid pointer size guard ──
