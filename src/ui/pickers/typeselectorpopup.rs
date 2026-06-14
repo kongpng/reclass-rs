@@ -431,6 +431,8 @@ impl TypeRow {
 pub struct TypeModel {
     /// All candidate entries (primitives + composites), in insertion order.
     entries: Vec<TypeEntry>,
+    /// Prepared display names parallel to `entries`, built lazily for filtered keypresses.
+    search_texts: Option<Vec<crate::ui::fuzzy::SourceScoreText>>,
     /// The rendered rows after the last [`apply_filter`](TypeModel::apply_filter).
     rows: Vec<TypeRow>,
     /// The selected row index (into `rows`), `None` when empty.
@@ -475,6 +477,7 @@ impl TypeModel {
     pub fn new(entries: Vec<TypeEntry>) -> Self {
         let mut m = TypeModel {
             entries,
+            search_texts: None,
             rows: Vec::new(),
             selected: None,
             mode: TypePopupMode::default(),
@@ -940,6 +943,16 @@ impl TypeModel {
 
     /// Build the filtered flat ranked view (fuzzy, no headers).
     fn build_filtered(&mut self, query: &str) {
+        let pattern = crate::ui::fuzzy::SourceScorePattern::new(query);
+        if self.search_texts.is_none() {
+            self.search_texts = Some(
+                self.entries
+                    .iter()
+                    .map(|entry| crate::ui::fuzzy::SourceScoreText::new(&entry.display_name))
+                    .collect(),
+            );
+        }
+        let search_texts = self.search_texts.as_ref().unwrap();
         let mut scored: Vec<(i32, usize, Vec<usize>)> = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
             // Category-chip gate (`catAllowed`, `typeselectorpopup.cpp:1660`):
@@ -948,7 +961,8 @@ impl TypeModel {
                 continue;
             }
             let mut pos = Vec::new();
-            let s = crate::ui::fuzzy::source_score(query, &e.display_name, Some(&mut pos));
+            let s =
+                crate::ui::fuzzy::source_score_prepared(&pattern, &search_texts[i], Some(&mut pos));
             if s > 0 {
                 scored.push((s, i, pos));
             }

@@ -36,6 +36,34 @@
 /// source scorer (`fuzzy_match.h:32`, `sourcechooserpopup.cpp:22`).
 pub const MAX_FUZZY_LEN: usize = 64;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceScorePattern {
+    chars: Vec<char>,
+    lower: Vec<char>,
+}
+
+impl SourceScorePattern {
+    pub fn new(pattern: &str) -> Self {
+        let chars: Vec<char> = pattern.chars().collect();
+        let lower = chars.iter().map(|&c| lower(c)).collect();
+        Self { chars, lower }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceScoreText {
+    chars: Vec<char>,
+    lower: Vec<char>,
+}
+
+impl SourceScoreText {
+    pub fn new(text: &str) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let lower = chars.iter().map(|&c| lower(c)).collect();
+        Self { chars, lower }
+    }
+}
+
 // ── ASCII char classification (the QChar predicates the C++ used) ──
 
 #[inline]
@@ -245,10 +273,18 @@ pub fn command_score(needle: &str, haystack: &str) -> i32 {
 /// +5 contiguous; plus a final tightness (`max(0, 20 - gap)`) and +20 exact
 /// length. `out_positions`, when `Some`, receives the best match's char indices.
 pub fn source_score(pattern: &str, text: &str, out_positions: Option<&mut Vec<usize>>) -> i32 {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    let p_len = p.len();
-    let t_len = t.len();
+    let pattern = SourceScorePattern::new(pattern);
+    let text = SourceScoreText::new(text);
+    source_score_prepared(&pattern, &text, out_positions)
+}
+
+pub fn source_score_prepared(
+    pattern: &SourceScorePattern,
+    text: &SourceScoreText,
+    out_positions: Option<&mut Vec<usize>>,
+) -> i32 {
+    let p_len = pattern.chars.len();
+    let t_len = text.chars.len();
 
     if p_len == 0 {
         return 1;
@@ -258,21 +294,18 @@ pub fn source_score(pattern: &str, text: &str, out_positions: Option<&mut Vec<us
     }
     if p_len > MAX_FUZZY_LEN || t_len > 256 {
         // Degrade to a prefix check beyond the caps.
-        if index_of_ci(&t, &p) == Some(0) {
+        if index_of_ci(&text.chars, &pattern.chars) == Some(0) {
             return 1;
         }
         return 0;
     }
-
-    let p_low: Vec<char> = p.iter().map(|&c| lower(c)).collect();
-    let t_low: Vec<char> = t.iter().map(|&c| lower(c)).collect();
 
     // Fast subsequence reject (the C++ pre-pass).
     {
         let mut pi = 0usize;
         let mut ti = 0usize;
         while ti < t_len && pi < p_len {
-            if p_low[pi] == t_low[ti] {
+            if pattern.lower[pi] == text.lower[ti] {
                 pi += 1;
             }
             ti += 1;
@@ -354,9 +387,9 @@ pub fn source_score(pattern: &str, text: &str, out_positions: Option<&mut Vec<us
         0,
         p_len,
         t_len,
-        &p_low,
-        &t_low,
-        &t,
+        &pattern.lower,
+        &text.lower,
+        &text.chars,
         &mut cur_pos,
         &mut best,
         &mut best_pos,
@@ -376,7 +409,10 @@ pub fn source_score(pattern: &str, text: &str, out_positions: Option<&mut Vec<us
 
 #[cfg(test)]
 mod tests {
-    use super::{command_score, fuzzy_score, source_score};
+    use super::{
+        command_score, fuzzy_score, source_score, source_score_prepared, SourceScorePattern,
+        SourceScoreText,
+    };
 
     // ── command_score (CommandPalette::fuzzyScore) — test_command_palette.cpp ──
 
@@ -550,5 +586,17 @@ mod tests {
             source_score("note", "Notepad", None),
             source_score("NOTE", "Notepad", None)
         );
+    }
+
+    #[test]
+    fn source_prepared_matches_public_wrapper() {
+        let pattern = SourceScorePattern::new("pc");
+        let text = SourceScoreText::new("PlayerComponent_0042");
+        let mut direct_pos = Vec::new();
+        let mut prepared_pos = Vec::new();
+        let direct = source_score("pc", "PlayerComponent_0042", Some(&mut direct_pos));
+        let prepared = source_score_prepared(&pattern, &text, Some(&mut prepared_pos));
+        assert_eq!(prepared, direct);
+        assert_eq!(prepared_pos, direct_pos);
     }
 }

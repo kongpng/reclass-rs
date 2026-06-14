@@ -4399,6 +4399,35 @@ fn type_selector_workloads(c: &mut Criterion) {
                 );
             },
         );
+
+        let queries = [
+            "p",
+            "pl",
+            "player",
+            "pc",
+            "component",
+            "playercomponent",
+            "499",
+            "missing_type",
+        ];
+        group.bench_with_input(
+            BenchmarkId::new("filter_composites_keypresses", entries_len),
+            &entries_len,
+            |b, _| {
+                b.iter_batched(
+                    || TypeModel::new(entries.clone()),
+                    |mut model| {
+                        let mut total = 0usize;
+                        for query in queries {
+                            model.apply_filter(black_box(query));
+                            total = total.wrapping_add(model.row_count());
+                        }
+                        black_box(total);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();
