@@ -6,6 +6,8 @@ use std::time::Duration;
 use ahash::AHashMap;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use gpui::SharedString;
+#[cfg(feature = "remote-process-provider")]
+use rcx_rpc::{RcxRpcReadEntry, RCX_RPC_DATA_SIZE, RCX_RPC_MAX_BATCH};
 use reclass::compose;
 use reclass::controller::{PageMap, RcxController, RcxDocument, RefreshPlan};
 use reclass::core::{
@@ -21,6 +23,10 @@ use reclass::provider::{
     bench_region_module_label_len_indexed, bench_region_module_label_len_linear, BufferProvider,
     CachedPageProvider, MemoryRegion, ModuleEntry, ModuleLookup, Provider, RegionType,
     SnapshotProvider, K_PAGE_SIZE,
+};
+#[cfg(feature = "remote-process-provider")]
+use reclass::provider::{
+    bench_remote_read_batch_insert_adaptive, bench_remote_read_batch_insert_allocating,
 };
 #[cfg(feature = "symbols")]
 use reclass::rtti::browser::resolve_rtti;
@@ -3500,6 +3506,44 @@ fn refresh_read_pages_workloads(c: &mut Criterion) {
             },
         );
     }
+    #[cfg(feature = "remote-process-provider")]
+    {
+        let max_remote_pages = (RCX_RPC_DATA_SIZE
+            / (std::mem::size_of::<RcxRpcReadEntry>() + K_PAGE_SIZE as usize))
+            .min(RCX_RPC_MAX_BATCH)
+            .max(1);
+        for &pages in &[64usize, 128, max_remote_pages] {
+            let page_addrs: Vec<u64> = (0..pages)
+                .map(|idx| 0x1000_0000 + (idx as u64) * K_PAGE_SIZE)
+                .collect();
+            let payload = remote_read_batch_payload(&page_addrs);
+            group.throughput(Throughput::Bytes((pages * K_PAGE_SIZE as usize) as u64));
+            group.bench_with_input(
+                BenchmarkId::new("remote_rpc_batch_copy_allocating", pages),
+                &(page_addrs.clone(), payload.clone()),
+                |b, (page_addrs, payload)| {
+                    b.iter(|| {
+                        black_box(bench_remote_read_batch_insert_allocating(
+                            black_box(page_addrs),
+                            black_box(payload),
+                        ));
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("remote_rpc_batch_copy_adaptive", pages),
+                &(page_addrs, payload),
+                |b, (page_addrs, payload)| {
+                    b.iter(|| {
+                        black_box(bench_remote_read_batch_insert_adaptive(
+                            black_box(page_addrs),
+                            black_box(payload),
+                        ));
+                    });
+                },
+            );
+        }
+    }
     #[cfg(all(target_os = "linux", feature = "process-provider"))]
     {
         if let Ok(provider) = LocalProcessProvider::attach(&std::process::id().to_string()) {
@@ -3641,6 +3685,33 @@ fn read_pages_per_page(provider: &Arc<dyn Provider + Send + Sync>, pages: &[u64]
         out.insert(page_addr, bytes.into());
     }
     out
+}
+
+#[cfg(feature = "remote-process-provider")]
+fn remote_read_batch_payload(pages: &[u64]) -> Vec<u8> {
+    let entry_size = std::mem::size_of::<RcxRpcReadEntry>();
+    let page_len = K_PAGE_SIZE as usize;
+    let table_len = pages.len() * entry_size;
+    assert!(table_len + pages.len() * page_len <= RCX_RPC_DATA_SIZE);
+
+    let mut payload = vec![0u8; RCX_RPC_DATA_SIZE];
+    for (idx, &page_addr) in pages.iter().enumerate() {
+        let data_offset = table_len + idx * page_len;
+        let entry = RcxRpcReadEntry {
+            address: page_addr,
+            length: K_PAGE_SIZE as u32,
+            data_offset: data_offset as u32,
+        };
+        let entry_start = idx * entry_size;
+        payload[entry_start..entry_start + entry_size].copy_from_slice(bytemuck::bytes_of(&entry));
+        for (byte_idx, byte) in payload[data_offset..data_offset + page_len]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = (idx as u8).wrapping_add(byte_idx as u8);
+        }
+    }
+    payload
 }
 
 fn value_tracking_refresh_workloads(c: &mut Criterion) {

@@ -44,7 +44,10 @@ pub use process::{bench_readable_ranges_from_regions, LocalProcessProvider, Proc
 pub use read_cache::CachedPageProvider;
 pub use registry::{ProviderInfo, ProviderRegistry, SavedSourceDisplay};
 #[cfg(feature = "remote-process-provider")]
-pub use remote::{RemoteProcessProvider, RemoteProcessTarget};
+pub use remote::{
+    bench_remote_read_batch_insert_adaptive, bench_remote_read_batch_insert_allocating,
+    RemoteProcessProvider, RemoteProcessTarget,
+};
 pub use snapshot::{PageMap, SnapshotProvider, K_PAGE_SIZE};
 #[cfg(feature = "windbg-provider")]
 pub use windbg::WinDbgMemoryProvider;

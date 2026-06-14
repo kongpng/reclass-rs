@@ -2,7 +2,15 @@
 //!
 //! Target strings mirror the C++ plugin: `"rpm:{pid}:{name}"`.
 
-use super::{MemoryRegion, ModuleEntry, PageMap, Provider};
+use std::mem::size_of;
+
+use bytemuck::pod_read_unaligned;
+use bytes::Bytes;
+use rcx_rpc::RcxRpcReadEntry;
+
+use super::{MemoryRegion, ModuleEntry, PageMap, Provider, K_PAGE_SIZE};
+
+const REMOTE_BULK_PAGE_SLICE_THRESHOLD: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteProcessTarget {
@@ -38,6 +46,111 @@ impl RemoteProcessTarget {
     pub fn to_target(&self) -> String {
         format!("rpm:{}:{}", self.pid, self.name)
     }
+}
+
+fn read_batch_entry(data: &[u8], index: usize) -> Option<RcxRpcReadEntry> {
+    let entry_size = size_of::<RcxRpcReadEntry>();
+    let start = index.checked_mul(entry_size)?;
+    let end = start.checked_add(entry_size)?;
+    data.get(start..end)
+        .map(pod_read_unaligned::<RcxRpcReadEntry>)
+}
+
+fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
+    for &page_addr in pages {
+        out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize].into());
+    }
+}
+
+fn insert_read_batch_pages_from_payload(
+    pages: &[u64],
+    data: &[u8],
+    response_count: usize,
+    out: &mut PageMap,
+) {
+    let responses = response_count.min(pages.len());
+    if responses <= REMOTE_BULK_PAGE_SLICE_THRESHOLD {
+        insert_read_batch_pages_allocating_from_payload(pages, data, responses, out);
+        return;
+    }
+
+    let page_len = K_PAGE_SIZE as usize;
+    let mut copied = vec![0u8; responses * page_len];
+    let entry_size = size_of::<RcxRpcReadEntry>();
+    let table_len = pages.len() * entry_size;
+    let contiguous_end = table_len.saturating_add(copied.len());
+    if let Some(src) = data.get(table_len..contiguous_end) {
+        copied.copy_from_slice(src);
+    } else {
+        for i in 0..responses {
+            let Some(entry) = read_batch_entry(data, i) else {
+                continue;
+            };
+            let src_start = entry.data_offset as usize;
+            let src_end = src_start.saturating_add(page_len);
+            let dst_start = i * page_len;
+            let dst_end = dst_start + page_len;
+            if let Some(src) = data.get(src_start..src_end) {
+                copied[dst_start..dst_end].copy_from_slice(src);
+            }
+        }
+    }
+
+    let copied = Bytes::from(copied);
+    for (i, &page_addr) in pages.iter().take(responses).enumerate() {
+        let start = i * page_len;
+        let end = start + page_len;
+        out.insert(page_addr, copied.slice(start..end).into());
+    }
+    if responses < pages.len() {
+        insert_zero_pages(&pages[responses..], out);
+    }
+}
+
+fn insert_read_batch_pages_allocating_from_payload(
+    pages: &[u64],
+    data: &[u8],
+    responses: usize,
+    out: &mut PageMap,
+) {
+    let page_len = K_PAGE_SIZE as usize;
+    for (i, &page_addr) in pages.iter().enumerate() {
+        let mut bytes = vec![0u8; page_len];
+        if i < responses {
+            if let Some(entry) = read_batch_entry(data, i) {
+                let src_start = entry.data_offset as usize;
+                let src_end = src_start.saturating_add(page_len);
+                if let Some(src) = data.get(src_start..src_end) {
+                    bytes.copy_from_slice(src);
+                }
+            }
+        }
+        out.insert(page_addr, bytes.into());
+    }
+}
+
+#[doc(hidden)]
+pub fn bench_remote_read_batch_insert_allocating(pages: &[u64], data: &[u8]) -> usize {
+    let mut out = PageMap::new();
+    out.reserve(pages.len());
+    insert_read_batch_pages_allocating_from_payload(pages, data, pages.len(), &mut out);
+    bench_page_map_score(&out)
+}
+
+#[doc(hidden)]
+pub fn bench_remote_read_batch_insert_adaptive(pages: &[u64], data: &[u8]) -> usize {
+    let mut out = PageMap::new();
+    out.reserve(pages.len());
+    insert_read_batch_pages_from_payload(pages, data, pages.len(), &mut out);
+    bench_page_map_score(&out)
+}
+
+fn bench_page_map_score(map: &PageMap) -> usize {
+    map.values().fold(map.len(), |score, page| {
+        score
+            .wrapping_add(page.len())
+            .wrapping_add(page.first().copied().unwrap_or_default() as usize)
+    })
 }
 
 pub struct RemoteProcessProvider {
@@ -391,7 +504,7 @@ mod platform {
 
         fn read_page_batch(&self, pages: &[u64], out: &mut PageMap) {
             let Ok(_guard) = self.lock.lock() else {
-                insert_zero_pages(pages, out);
+                super::insert_zero_pages(pages, out);
                 return;
             };
             unsafe {
@@ -412,23 +525,17 @@ mod platform {
                 }
 
                 if !self.signal_and_wait(2000) {
-                    insert_zero_pages(pages, out);
+                    super::insert_zero_pages(pages, out);
                     return;
                 }
 
-                let responses = (hdr.response_count as usize).min(pages.len());
-                for (i, &page_addr) in pages.iter().enumerate() {
-                    let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
-                    if i < responses {
-                        let entry = data.add(i * entry_size) as *const RcxRpcReadEntry;
-                        copy_nonoverlapping(
-                            data.add((*entry).data_offset as usize),
-                            bytes.as_mut_ptr(),
-                            K_PAGE_SIZE as usize,
-                        );
-                    }
-                    out.insert(page_addr, bytes.into());
-                }
+                let payload = std::slice::from_raw_parts(data, RCX_RPC_DATA_SIZE);
+                super::insert_read_batch_pages_from_payload(
+                    pages,
+                    payload,
+                    hdr.response_count as usize,
+                    out,
+                );
             }
         }
 
@@ -544,12 +651,6 @@ mod platform {
         (RCX_RPC_DATA_SIZE / (size_of::<RcxRpcReadEntry>() + K_PAGE_SIZE as usize))
             .min(RCX_RPC_MAX_BATCH)
             .max(1)
-    }
-
-    fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
-        for &page_addr in pages {
-            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize].into());
-        }
     }
 
     impl Drop for IpcClient {
@@ -1093,7 +1194,7 @@ mod platform {
 
         fn read_page_batch(&self, pages: &[u64], out: &mut PageMap) {
             let Ok(_guard) = self.lock.lock() else {
-                insert_zero_pages(pages, out);
+                super::insert_zero_pages(pages, out);
                 return;
             };
             unsafe {
@@ -1114,23 +1215,17 @@ mod platform {
                 }
 
                 if !self.signal_and_wait(2000) {
-                    insert_zero_pages(pages, out);
+                    super::insert_zero_pages(pages, out);
                     return;
                 }
 
-                let responses = (hdr.response_count as usize).min(pages.len());
-                for (i, &page_addr) in pages.iter().enumerate() {
-                    let mut bytes = vec![0u8; K_PAGE_SIZE as usize];
-                    if i < responses {
-                        let entry = data.add(i * entry_size) as *const RcxRpcReadEntry;
-                        copy_nonoverlapping(
-                            data.add((*entry).data_offset as usize),
-                            bytes.as_mut_ptr(),
-                            K_PAGE_SIZE as usize,
-                        );
-                    }
-                    out.insert(page_addr, bytes.into());
-                }
+                let payload = std::slice::from_raw_parts(data, RCX_RPC_DATA_SIZE);
+                super::insert_read_batch_pages_from_payload(
+                    pages,
+                    payload,
+                    hdr.response_count as usize,
+                    out,
+                );
             }
         }
 
@@ -1246,12 +1341,6 @@ mod platform {
         (RCX_RPC_DATA_SIZE / (size_of::<RcxRpcReadEntry>() + K_PAGE_SIZE as usize))
             .min(RCX_RPC_MAX_BATCH)
             .max(1)
-    }
-
-    fn insert_zero_pages(pages: &[u64], out: &mut PageMap) {
-        for &page_addr in pages {
-            out.insert(page_addr, vec![0u8; K_PAGE_SIZE as usize].into());
-        }
     }
 
     impl Drop for IpcClient {
@@ -1643,7 +1732,46 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
+    use rcx_rpc::RCX_RPC_DATA_SIZE;
+
     use super::*;
+
+    #[test]
+    fn batch_payload_insert_copies_responses_and_zero_fills_missing_pages() {
+        let pages = [0x1000_u64, 0x2000, 0x3000];
+        let entry_size = std::mem::size_of::<RcxRpcReadEntry>();
+        let page_len = K_PAGE_SIZE as usize;
+        let mut data = vec![0u8; RCX_RPC_DATA_SIZE];
+        let table_len = pages.len() * entry_size;
+
+        for (idx, &page_addr) in pages.iter().take(2).enumerate() {
+            let data_offset = table_len + idx * page_len;
+            let entry = RcxRpcReadEntry {
+                address: page_addr,
+                length: K_PAGE_SIZE as u32,
+                data_offset: data_offset as u32,
+            };
+            let entry_start = idx * entry_size;
+            data[entry_start..entry_start + entry_size].copy_from_slice(bytemuck::bytes_of(&entry));
+            data[data_offset..data_offset + page_len].fill(0xA0 + idx as u8);
+        }
+
+        let mut out = PageMap::new();
+        insert_read_batch_pages_from_payload(&pages, &data, 2, &mut out);
+
+        assert_eq!(out.len(), pages.len());
+        assert_eq!(
+            out.get(&pages[0]).and_then(|page| page.first()),
+            Some(&0xA0)
+        );
+        assert_eq!(
+            out.get(&pages[1]).and_then(|page| page.first()),
+            Some(&0xA1)
+        );
+        assert!(out
+            .get(&pages[2])
+            .is_some_and(|page| page.iter().all(|byte| *byte == 0)));
+    }
 
     #[test]
     fn parses_remote_targets() {
