@@ -94,6 +94,58 @@ impl HoverMemoryMaps {
     }
 }
 
+pub(super) struct HoverMemoryPreviewCache {
+    result_revision: u64,
+    provider: Weak<dyn Provider + Send + Sync>,
+    target_addr: u64,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: Vec<u8>,
+    rows: Arc<[MemoryPreviewRow]>,
+}
+
+impl HoverMemoryPreviewCache {
+    fn new(
+        result_revision: u64,
+        provider: &Arc<dyn Provider + Send + Sync>,
+        target_addr: u64,
+        pointer_size: i32,
+        row_count: usize,
+        bytes: Vec<u8>,
+        rows: Arc<[MemoryPreviewRow]>,
+    ) -> Self {
+        Self {
+            result_revision,
+            provider: Arc::downgrade(provider),
+            target_addr,
+            pointer_size,
+            row_count,
+            bytes,
+            rows,
+        }
+    }
+
+    fn matches(
+        &self,
+        result_revision: u64,
+        provider: &Arc<dyn Provider + Send + Sync>,
+        target_addr: u64,
+        pointer_size: i32,
+        row_count: usize,
+        bytes: &[u8],
+    ) -> bool {
+        self.result_revision == result_revision
+            && self.target_addr == target_addr
+            && self.pointer_size == pointer_size
+            && self.row_count == row_count
+            && self.bytes == bytes
+            && self
+                .provider
+                .upgrade()
+                .is_some_and(|cached| Arc::ptr_eq(&cached, provider))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MemoryPreviewRow {
     offset: u64,
@@ -135,7 +187,7 @@ pub(super) enum HoverPopupKind {
         target_addr: u64,
         pointer_size: i32,
         row_count: usize,
-        rows: Vec<MemoryPreviewRow>,
+        rows: Arc<[MemoryPreviewRow]>,
     },
     /// Disassembly of the code at a function pointer's target (title "Disassembly")
     /// or a hex dump at a void pointer's target (title "Hex Dump").
@@ -198,7 +250,12 @@ pub(super) fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
                 row_count: rb,
                 rows: rb_rows,
             },
-        ) => ta == tb && pa == pb && ra == rb && ra_rows == rb_rows,
+        ) => {
+            ta == tb
+                && pa == pb
+                && ra == rb
+                && (Arc::ptr_eq(ra_rows, rb_rows) || ra_rows.as_ref() == rb_rows.as_ref())
+        }
         _ => false,
     }
 }
@@ -497,6 +554,7 @@ impl super::RcxEditor {
         } else {
             self.hover_probe = None;
             self.hover_memory_maps = None;
+            self.hover_memory_preview_cache = None;
             self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         }
         if changed_band || changed_popup {
@@ -548,6 +606,7 @@ impl super::RcxEditor {
 
         self.hover_probe = None;
         self.hover_memory_maps = None;
+        self.hover_memory_preview_cache = None;
         self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         self.hover_popup = Some(HoverPopupState {
             line,
@@ -585,6 +644,7 @@ impl super::RcxEditor {
             if self.hover_popup.is_none() {
                 self.hover_probe = None;
                 self.hover_memory_maps = None;
+                self.hover_memory_preview_cache = None;
                 self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
                 self.popup_cursor_inside = false;
             }
@@ -905,6 +965,7 @@ impl super::RcxEditor {
                 regions,
                 modules,
             ));
+            self.hover_memory_preview_cache = None;
         } else if self
             .hover_memory_maps
             .as_ref()
@@ -937,11 +998,42 @@ impl super::RcxEditor {
         if bytes.is_empty() {
             return None;
         }
-        let rows =
-            memory_preview_rows_with_lookup(&*prov, pointer_size, row_count, &bytes, &lookup);
+        if let Some(cache) = self.hover_memory_preview_cache.as_ref() {
+            if cache.matches(
+                result_revision,
+                &prov,
+                target_addr,
+                pointer_size,
+                row_count,
+                &bytes,
+            ) {
+                return Some(HoverPopupState {
+                    line: lm.node_idx.max(0) as usize,
+                    pos,
+                    kind: HoverPopupKind::MemoryPreview {
+                        target_addr,
+                        pointer_size,
+                        row_count,
+                        rows: cache.rows.clone(),
+                    },
+                });
+            }
+        }
+        let rows: Arc<[MemoryPreviewRow]> =
+            memory_preview_rows_with_lookup(&*prov, pointer_size, row_count, &bytes, &lookup)
+                .into();
         if rows.is_empty() {
             return None;
         }
+        self.hover_memory_preview_cache = Some(HoverMemoryPreviewCache::new(
+            result_revision,
+            &prov,
+            target_addr,
+            pointer_size,
+            row_count,
+            bytes,
+            rows.clone(),
+        ));
         Some(HoverPopupState {
             line: lm.node_idx.max(0) as usize,
             pos,
@@ -984,6 +1076,7 @@ impl super::RcxEditor {
                 &prov,
                 regions,
             ));
+            self.hover_memory_preview_cache = None;
         }
         let maps = self.hover_memory_maps.as_ref()?;
         let lookup = maps.lookup();
@@ -1819,6 +1912,15 @@ pub struct BenchMemoryPreviewLookup {
 }
 
 #[doc(hidden)]
+pub struct BenchPointerMemoryPreviewRowCache {
+    target_addr: u64,
+    pointer_size: i32,
+    row_count: usize,
+    bytes: Vec<u8>,
+    rows: Arc<[MemoryPreviewRow]>,
+}
+
+#[doc(hidden)]
 pub fn bench_memory_preview_lookup_orders(
     regions: &[MemoryRegion],
     modules: &[ModuleEntry],
@@ -1847,12 +1949,7 @@ pub fn bench_memory_preview_rows_with_cached_lookup(
     );
     memory_preview_rows_with_lookup(provider, pointer_size, row_count, bytes, &lookup)
         .into_iter()
-        .map(|row| {
-            row.hex.len()
-                + row.ascii.len()
-                + row.type_hint.as_deref().map_or(0, str::len)
-                + row.pointer_note.as_deref().map_or(0, str::len)
-        })
+        .map(|row| memory_preview_row_score(&row))
         .sum()
 }
 
@@ -1898,12 +1995,7 @@ pub fn bench_pointer_memory_preview_with_maps(
     };
     memory_preview_rows_with_lookup(provider, pointer_size, row_count, &bytes, &lookup)
         .into_iter()
-        .map(|row| {
-            row.hex.len()
-                + row.ascii.len()
-                + row.type_hint.as_deref().map_or(0, str::len)
-                + row.pointer_note.as_deref().map_or(0, str::len)
-        })
+        .map(|row| memory_preview_row_score(&row))
         .sum()
 }
 
@@ -1953,13 +2045,88 @@ pub fn bench_pointer_memory_preview_with_cached_lookup(
     };
     memory_preview_rows_with_lookup(provider, pointer_size, row_count, &bytes, &lookup)
         .into_iter()
-        .map(|row| {
-            row.hex.len()
-                + row.ascii.len()
-                + row.type_hint.as_deref().map_or(0, str::len)
-                + row.pointer_note.as_deref().map_or(0, str::len)
-        })
+        .map(|row| memory_preview_row_score(&row))
         .sum()
+}
+
+#[doc(hidden)]
+pub fn bench_pointer_memory_preview_with_row_cache(
+    provider: &dyn Provider,
+    pointer_addr: u64,
+    pointer_size: i32,
+    row_count: usize,
+    regions: &[MemoryRegion],
+    modules: &[ModuleEntry],
+    orders: &BenchMemoryPreviewLookup,
+    cache: &mut Option<BenchPointerMemoryPreviewRowCache>,
+) -> usize {
+    let lookup = MemoryPreviewLookup::with_orders(
+        regions,
+        modules,
+        &orders.region_order,
+        &orders.module_order,
+    );
+    if !provider_can_read_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        pointer_addr,
+        pointer_size,
+    ) {
+        return 0;
+    }
+    let target = if pointer_size <= 4 {
+        u64::from(provider.read_u32(pointer_addr))
+    } else {
+        provider.read_u64(pointer_addr)
+    };
+    if target == 0 {
+        return 0;
+    }
+    let len = row_count.saturating_mul(pointer_size.max(1) as usize);
+    let Some(bytes) = read_provider_bytes_best_effort_with_lookup(
+        provider,
+        Some(&lookup),
+        Some(regions),
+        target,
+        len,
+        1,
+    ) else {
+        return 0;
+    };
+    if let Some(cache) = cache.as_ref() {
+        if cache.target_addr == target
+            && cache.pointer_size == pointer_size
+            && cache.row_count == row_count
+            && cache.bytes == bytes
+        {
+            return memory_preview_rows_score(&cache.rows);
+        }
+    }
+    let rows: Arc<[MemoryPreviewRow]> =
+        memory_preview_rows_with_lookup(provider, pointer_size, row_count, &bytes, &lookup).into();
+    let total = memory_preview_rows_score(&rows);
+    *cache = Some(BenchPointerMemoryPreviewRowCache {
+        target_addr: target,
+        pointer_size,
+        row_count,
+        bytes,
+        rows,
+    });
+    total
+}
+
+#[inline]
+fn memory_preview_rows_score(rows: &[MemoryPreviewRow]) -> usize {
+    rows.iter().map(memory_preview_row_score).sum()
+}
+
+#[inline]
+fn memory_preview_row_score(row: &MemoryPreviewRow) -> usize {
+    row.hex.len()
+        + row.ascii.len()
+        + row.type_hint.as_deref().map_or(0, str::len)
+        + row.pointer_note.as_deref().map_or(0, str::len)
 }
 
 #[doc(hidden)]
@@ -2510,8 +2677,8 @@ mod tests {
         hover_kind_eq, memory_preview_rows, memory_preview_rows_with_maps,
         memory_preview_type_hint, read_provider_bytes, read_provider_bytes_best_effort,
         read_provider_bytes_best_effort_cached, recency_tier, target_is_readable,
-        target_is_readable_cached, try_parse_int, HoverMemoryMaps, HoverPopupKind, LastTypeHint,
-        MemoryPreviewRow,
+        target_is_readable_cached, try_parse_int, HoverMemoryMaps, HoverMemoryPreviewCache,
+        HoverPopupKind, LastTypeHint, MemoryPreviewRow,
     };
     use crate::compose::ColumnSpan;
     use crate::core::{ChipKind, LineChip, LineMeta, NodeKind};
@@ -3059,6 +3226,28 @@ mod tests {
     }
 
     #[test]
+    fn hover_memory_preview_cache_is_scoped_to_live_identity_and_bytes() {
+        let provider: Arc<dyn Provider + Send + Sync> = Arc::new(TestProvider {
+            base: 0x2000,
+            data: vec![0xAA],
+            fail_reads: false,
+        });
+        let other_provider: Arc<dyn Provider + Send + Sync> = Arc::new(TestProvider {
+            base: 0x2000,
+            data: vec![0xAA],
+            fail_reads: false,
+        });
+        let rows: Arc<[MemoryPreviewRow]> = vec![preview_row("AA")].into();
+        let cache = HoverMemoryPreviewCache::new(11, &provider, 0x2000, 8, 10, vec![0xAA], rows);
+
+        assert!(cache.matches(11, &provider, 0x2000, 8, 10, &[0xAA]));
+        assert!(!cache.matches(12, &provider, 0x2000, 8, 10, &[0xAA]));
+        assert!(!cache.matches(11, &other_provider, 0x2000, 8, 10, &[0xAA]));
+        assert!(!cache.matches(11, &provider, 0x2008, 8, 10, &[0xAA]));
+        assert!(!cache.matches(11, &provider, 0x2000, 8, 10, &[0xBB]));
+    }
+
+    #[test]
     fn best_effort_preview_finds_partial_tail_without_linear_retry() {
         let provider = PartialTailProvider::new(64);
         let bytes = read_provider_bytes_best_effort(&provider, 0, 4096, 1).unwrap();
@@ -3183,19 +3372,19 @@ mod tests {
             target_addr: 0x1000,
             pointer_size: 8,
             row_count: 10,
-            rows: vec![preview_row("01 02 03")],
+            rows: vec![preview_row("01 02 03")].into(),
         };
         let b = HoverPopupKind::MemoryPreview {
             target_addr: 0x1000,
             pointer_size: 8,
             row_count: 10,
-            rows: vec![preview_row("01 02 03")],
+            rows: vec![preview_row("01 02 03")].into(),
         };
         let changed = HoverPopupKind::MemoryPreview {
             target_addr: 0x1000,
             pointer_size: 8,
             row_count: 10,
-            rows: vec![preview_row("01 02 04")],
+            rows: vec![preview_row("01 02 04")].into(),
         };
         assert!(hover_kind_eq(&a, &b));
         assert!(!hover_kind_eq(&a, &changed));

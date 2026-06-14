@@ -4411,6 +4411,46 @@ fn hover_memory_preview_workloads(c: &mut Criterion) {
             },
         );
         group.bench_with_input(
+            BenchmarkId::new("full_pointer_popup_same_hover_uncached", mappings),
+            &mappings,
+            |b, _| {
+                b.iter(|| {
+                    let total =
+                        reclass::ui::editor::bench_pointer_memory_preview_with_cached_lookup(
+                            black_box(&provider),
+                            black_box(pointer_addr),
+                            8,
+                            rows,
+                            black_box(&regions),
+                            black_box(&modules),
+                            black_box(&orders),
+                        );
+                    black_box(total);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("full_pointer_popup_same_hover_row_cache", mappings),
+            &mappings,
+            |b, _| {
+                let mut cache: Option<reclass::ui::editor::BenchPointerMemoryPreviewRowCache> =
+                    None;
+                b.iter(|| {
+                    let total = reclass::ui::editor::bench_pointer_memory_preview_with_row_cache(
+                        black_box(&provider),
+                        black_box(pointer_addr),
+                        8,
+                        rows,
+                        black_box(&regions),
+                        black_box(&modules),
+                        black_box(&orders),
+                        black_box(&mut cache),
+                    );
+                    black_box(total);
+                });
+            },
+        );
+        group.bench_with_input(
             BenchmarkId::new("full_pointer_popup_reenumerate_many_mappings", mappings),
             &mappings,
             |b, _| {

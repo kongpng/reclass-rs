@@ -31,8 +31,9 @@ mod hover_popup;
 pub use hover_popup::{
     bench_memory_preview_lookup_orders, bench_memory_preview_rows_with_cached_lookup,
     bench_memory_preview_rows_with_maps, bench_pointer_memory_preview_with_cached_lookup,
-    bench_pointer_memory_preview_with_maps, bench_struct_preview_preflight_reenumerate,
-    bench_struct_preview_preflight_with_regions,
+    bench_pointer_memory_preview_with_maps, bench_pointer_memory_preview_with_row_cache,
+    bench_struct_preview_preflight_reenumerate, bench_struct_preview_preflight_with_regions,
+    BenchPointerMemoryPreviewRowCache,
 };
 pub mod inline_edit;
 pub mod minimap;
@@ -40,7 +41,8 @@ pub mod palette;
 pub mod selection;
 pub mod tab_cycle;
 use hover_popup::{
-    HoverMemoryMaps, HoverPopupKind, HoverPopupState, HoverProbe, MEMORY_PREVIEW_MIN_ROWS,
+    HoverMemoryMaps, HoverMemoryPreviewCache, HoverPopupKind, HoverPopupState, HoverProbe,
+    MEMORY_PREVIEW_MIN_ROWS,
 };
 mod context_menu;
 mod debug_view;
@@ -540,6 +542,9 @@ pub struct RcxEditor {
     /// is intentionally scoped to one hover probe/provider so live target maps are
     /// re-read when the pointer moves, the popup closes, or the source changes.
     hover_memory_maps: Option<HoverMemoryMaps>,
+    /// Last built memory-preview rows for the current hover. The live bytes are
+    /// still read every tick; this only avoids rebuilding identical row text.
+    hover_memory_preview_cache: Option<HoverMemoryPreviewCache>,
     /// The moving end of a keyboard range-selection (Shift+arrows/page/home/end).
     /// The C++ tracks the Scintilla caret line; here we mirror it so Shift-nav
     /// extends from the last caret position rather than from `first_selected_line`
@@ -1151,6 +1156,7 @@ impl RcxEditor {
             hover_popup: None,
             hover_probe: None,
             hover_memory_maps: None,
+            hover_memory_preview_cache: None,
             caret_line: None,
             drag_anchor_line: None,
             drag_on_byte_grid: false,
@@ -2259,6 +2265,8 @@ impl RcxEditor {
             self.hover_popup = None;
         }
         self.hover_probe = None;
+        self.hover_memory_maps = None;
+        self.hover_memory_preview_cache = None;
         self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
         self.popup_cursor_inside = false;
         self.hover_dwell_suppressed = true;
@@ -2933,6 +2941,10 @@ impl RcxEditor {
         }
         if self.hover_memory_maps.is_some() {
             self.hover_memory_maps = None;
+            changed = true;
+        }
+        if self.hover_memory_preview_cache.is_some() {
+            self.hover_memory_preview_cache = None;
             changed = true;
         }
         self.memory_preview_rows = MEMORY_PREVIEW_MIN_ROWS;
