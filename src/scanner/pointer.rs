@@ -287,6 +287,7 @@ pub fn build_generic_pointer_map(
         ..PointerMapStats::default()
     };
     let mut records = Vec::new();
+    let mut buf = Vec::new();
 
     'regions: for region in &regions {
         if abort.load(Ordering::Relaxed) {
@@ -301,7 +302,7 @@ pub fn build_generic_pointer_map(
             let scan_len = remaining.min(POINTER_SCAN_CHUNK);
             let read_len = remaining.min(scan_len + request.pointer_size.saturating_sub(1) as u64);
             let addr = region.base.saturating_add(region_off);
-            let mut buf = vec![0u8; read_len as usize];
+            buf.resize(read_len as usize, 0);
             if !provider.read(addr, &mut buf) {
                 stats.bytes_failed = stats.bytes_failed.saturating_add(scan_len);
                 region_off = region_off.saturating_add(scan_len);

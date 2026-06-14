@@ -21,8 +21,8 @@ use reclass::provider::{
     RegionType, SnapshotProvider, K_PAGE_SIZE,
 };
 use reclass::scanner::pointer::{
-    bench_prepare_pointer_regions_from_regions, find_pointer_chains, PointerChainRequest,
-    PointerMap, PointerMapRequest, PointerMapStats, PointerRecord,
+    bench_prepare_pointer_regions_from_regions, build_generic_pointer_map, find_pointer_chains,
+    PointerChainRequest, PointerMap, PointerMapRequest, PointerMapStats, PointerRecord,
 };
 use reclass::scanner::{
     run_rescan, run_scan, AddressRange, NullObserver, ScanCondition, ScanRequest, ScanResult,
@@ -458,6 +458,34 @@ impl LiveLikeProvider {
 
         Self {
             base: provider_base,
+            data,
+            regions,
+            modules: Vec::new(),
+        }
+    }
+
+    fn new_pointer_map_pages(pages: usize) -> Self {
+        let page = K_PAGE_SIZE as usize;
+        let len = pages.max(1).saturating_mul(page);
+        let mut data = vec![0u8; len];
+        let mut regions = Vec::with_capacity(pages);
+        for i in 0..pages {
+            let page_base = i.saturating_mul(page);
+            let target_page = (i + 1) % pages.max(1);
+            let target = target_page.saturating_mul(page) as u64;
+            data[page_base..page_base + 8].copy_from_slice(&target.to_le_bytes());
+            regions.push(MemoryRegion {
+                base: page_base as u64,
+                size: K_PAGE_SIZE,
+                readable: true,
+                writable: true,
+                executable: false,
+                module_name: String::new(),
+                region_type: RegionType::Private,
+            });
+        }
+        Self {
+            base: 0,
             data,
             regions,
             modules: Vec::new(),
@@ -5339,6 +5367,44 @@ fn pointer_region_prepare_workloads(c: &mut Criterion) {
     group.finish();
 }
 
+fn pointer_map_build_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pointer_map_build");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    let abort = AtomicBool::new(false);
+    for &pages in &[1_000usize, 10_000] {
+        let provider = LiveLikeProvider::new_pointer_map_pages(pages);
+        let request = PointerMapRequest {
+            pointer_size: 8,
+            alignment: 8,
+            max_pointers: 0,
+            backend: reclass::scanner::pointer::PointerMapBackend::GenericProvider,
+            ..PointerMapRequest::default()
+        };
+        group.throughput(Throughput::Bytes(
+            (pages as u64).saturating_mul(K_PAGE_SIZE),
+        ));
+        group.bench_with_input(
+            BenchmarkId::new("generic_small_regions", pages),
+            &pages,
+            |b, _| {
+                b.iter(|| {
+                    let map = build_generic_pointer_map(
+                        black_box(&provider),
+                        black_box(&request),
+                        black_box(&abort),
+                    )
+                    .expect("pointer map builds");
+                    black_box((map.records().len(), map.stats().bytes_scanned));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn formatting_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("format_pointer_deref");
     group.sample_size(10);
@@ -5568,6 +5634,7 @@ criterion_group!(
     scanner_workloads,
     pointer_chain_workloads,
     pointer_region_prepare_workloads,
+    pointer_map_build_workloads,
     rtti_workloads,
     compose_live_read_cache_workloads,
     formatting_workloads
