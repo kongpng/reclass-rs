@@ -98,6 +98,28 @@ impl ProcessRow {
 #[derive(Clone, Debug, Default)]
 pub struct ProcessPickerModel {
     rows: Vec<ProcessRow>,
+    search_keys: Vec<ProcessSearchKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessSearchKey {
+    name: String,
+    pid: String,
+    path: String,
+}
+
+impl ProcessSearchKey {
+    fn new(row: &ProcessRow) -> Self {
+        Self {
+            name: row.name.to_lowercase(),
+            pid: row.pid_text(),
+            path: row.path.to_lowercase(),
+        }
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.name.contains(query) || self.pid.contains(query) || self.path.contains(query)
+    }
 }
 
 impl ProcessPickerModel {
@@ -116,7 +138,7 @@ impl ProcessPickerModel {
             })
             .collect();
         Self::sort_default(&mut rows);
-        ProcessPickerModel { rows }
+        ProcessPickerModel::from_sorted_rows(rows)
     }
 
     /// Build a real C++-style process list for one provider id.
@@ -133,14 +155,19 @@ impl ProcessPickerModel {
             })
             .collect();
         Self::sort_default(&mut rows);
-        ProcessPickerModel { rows }
+        ProcessPickerModel::from_sorted_rows(rows)
     }
 
     /// Build a model from an explicit row list (the C++ custom-list constructor
     /// `ProcessPicker(customProcesses)`, e.g. for MCP/automation). Sorted default.
     pub fn from_rows(mut rows: Vec<ProcessRow>) -> ProcessPickerModel {
         Self::sort_default(&mut rows);
-        ProcessPickerModel { rows }
+        ProcessPickerModel::from_sorted_rows(rows)
+    }
+
+    fn from_sorted_rows(rows: Vec<ProcessRow>) -> ProcessPickerModel {
+        let search_keys = rows.iter().map(ProcessSearchKey::new).collect();
+        ProcessPickerModel { rows, search_keys }
     }
 
     /// `sortItems(0, DescendingOrder)` (`populateTable`): highest PID first.
@@ -171,11 +198,8 @@ impl ProcessPickerModel {
         }
         self.rows
             .iter()
-            .filter(|r| {
-                r.name.to_lowercase().contains(&q)
-                    || r.pid_text().contains(&q)
-                    || r.path.to_lowercase().contains(&q)
-            })
+            .zip(&self.search_keys)
+            .filter_map(|(row, key)| key.matches(&q).then_some(row))
             .collect()
     }
 

@@ -12,6 +12,7 @@ use reclass::core::{
     infer_strong_types, infer_types, InferHints, LineKind, LineMeta, Node, NodeKind, NodeTree,
 };
 use reclass::format;
+use reclass::plugin::contract::ProcessInfo;
 #[cfg(feature = "process-provider")]
 use reclass::provider::bench_readable_ranges_from_regions;
 #[cfg(all(target_os = "linux", feature = "process-provider"))]
@@ -36,6 +37,7 @@ use reclass::ui::panels::scannerpanel::{
     apply_change_all_results, bench_scanner_table_filter_cached, bench_scanner_table_refresh,
 };
 use reclass::ui::panels::workspace::{WorkspaceDoc, WorkspaceModel};
+use reclass::ui::pickers::processpicker::ProcessPickerModel;
 use reclass::ui::state::DocId;
 use std::hint::black_box;
 
@@ -4283,6 +4285,57 @@ fn target_panel_workloads(c: &mut Criterion) {
     group.finish();
 }
 
+fn process_picker_workloads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("process_picker_filter");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for &rows in &[1_000usize, 10_000] {
+        let processes: Vec<_> = (0..rows)
+            .map(|i| {
+                let pid = 2_000u32.saturating_add(i as u32);
+                ProcessInfo {
+                    pid,
+                    name: format!("TargetGameWorker_{i:05}.exe"),
+                    path: format!(
+                        "C:\\Program Files\\Vendor\\TargetGame\\bin\\x64\\TargetGameWorker_{i:05}.exe"
+                    ),
+                    is_32bit: i % 8 == 0,
+                }
+            })
+            .collect();
+        let model = ProcessPickerModel::from_processes(processes, "processmemory");
+        let tail_name = format!("worker_{:05}", rows.saturating_sub(1));
+        let tail_pid = (2_000u32.saturating_add(rows.saturating_sub(1) as u32)).to_string();
+
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_with_input(
+            BenchmarkId::new("filter_keypresses", rows),
+            &rows,
+            |b, _| {
+                b.iter(|| {
+                    let mut total = 0usize;
+                    for query in [
+                        "t",
+                        "ta",
+                        "target",
+                        "targetgame",
+                        "targetgameworker",
+                        tail_name.as_str(),
+                        tail_pid.as_str(),
+                        "program files",
+                    ] {
+                        total = total.wrapping_add(model.filtered(black_box(query)).len());
+                    }
+                    black_box(total);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn workspace_model_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("workspace_model");
     group.sample_size(10);
@@ -5626,6 +5679,7 @@ criterion_group!(
     module_lookup_workloads,
     modules_panel_workloads,
     target_panel_workloads,
+    process_picker_workloads,
     workspace_model_workloads,
     hover_memory_preview_workloads,
     hover_struct_preview_workloads,
