@@ -161,6 +161,9 @@ pub enum SpanRole {
     Address,
     /// The command-row source label (`'Reclass.exe'`/`source`) — muted.
     Source,
+    /// Clickable footer controls (`+1`, `+10`, `Trim`, `Top`) — secondary text,
+    /// brighter than the structural brace/footer chrome around them.
+    Action,
     /// Field-name column.
     Name,
     /// A formatted field value (resolved addresses / numbers) — One Dark green
@@ -306,14 +309,17 @@ pub fn style_runs(lm: &LineMeta, text: &str, type_w: i32, name_w: i32) -> Vec<Sp
             );
         }
         LineKind::Footer => {
-            // Whole footer is dim (`applyHexDimming`: footer text dim). The pills
-            // (`+10h`/`+100h`/`+1000h`/`Trim`) get their own background quads from
-            // the view; their glyphs read on the default dim text.
+            // Whole footer is dim (`applyHexDimming`: footer text dim), then lift
+            // the clickable controls to secondary text. The prior all-dim pass
+            // made `+1`/`+10`/`Trim` nearly disappear despite being actions.
             layers.push(SpanStyle {
                 start: 0,
                 end: n,
                 role: SpanRole::Dim,
             });
+            for span in footer_pill_spans(text) {
+                push(&mut layers, span, SpanRole::Action);
+            }
         }
         _ => {
             let is_hex = is_hex_preview(lm.node_kind);
@@ -1732,6 +1738,24 @@ mod tests {
     fn footer_pills_empty_when_no_controls() {
         assert!(footer_pill_spans("};").is_empty());
         assert!(footer_pill_spans("").is_empty());
+    }
+
+    #[test]
+    fn footer_actions_are_lifted_above_dim_structure_text() {
+        let text = "};  +1 +10h Trim";
+        let lm = LineMeta {
+            line_kind: LineKind::Footer,
+            ..LineMeta::default()
+        };
+        let runs = style_runs(&lm, text, 0, 0);
+        assert!(runs
+            .iter()
+            .any(|run| { run.role == SpanRole::Dim && run.start == 0 && run.end >= 2 }));
+        for pill in footer_pill_spans(text) {
+            assert!(runs.iter().any(|run| {
+                run.role == SpanRole::Action && run.start <= pill.start && run.end >= pill.end
+            }));
+        }
     }
 
     #[test]

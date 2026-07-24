@@ -19,7 +19,7 @@
 /// `RcxTooltip` geometry constants (`rcxtooltip.h:37`).
 pub const ARROW_H: f32 = 8.0;
 pub const ARROW_W: f32 = 14.0;
-pub const RADIUS: f32 = 6.0;
+pub const RADIUS: f32 = 0.0;
 pub const PAD: f32 = 10.0;
 pub const GAP: f32 = 4.0;
 pub const MAX_W: f32 = 550.0;
@@ -427,6 +427,7 @@ mod view {
         };
 
         crate::ui::design::elevated_surface(cx)
+            .rounded(px(0.0))
             .max_w(px(MAX_W))
             .p(px(PAD))
             .child(

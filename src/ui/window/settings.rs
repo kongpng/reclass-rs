@@ -146,7 +146,10 @@ pub(crate) mod settings_keys {
     pub const RELATIVE_OFFSETS: &str = "relativeOffsets";
     pub const TYPE_HINTS: &str = "typeHints";
     pub const SHOW_COMMENTS: &str = "showComments";
+    pub const SHOW_RTTI_CHIPS: &str = "showRttiChips";
+    pub const SHOW_ENUM_CHIPS: &str = "showEnumChips";
     pub const HOVER_EFFECTS: &str = "hoverEffects";
+    pub const VALUE_POPUPS: &str = "valuePopups";
     pub const MINIMAP: &str = "minimap";
     pub const THEME: &str = "theme";
     pub const REFRESH_MS: &str = "refreshMs";
@@ -159,12 +162,19 @@ pub(crate) mod settings_keys {
     /// The code-view scope index (the C++ `codeScope`; main.cpp:2441). Stored as
     /// the `CodeScope` enum discriminant; default `0` (Current struct).
     pub const CODE_SCOPE: &str = "codeScope";
+    /// Shared Reclass/Code/Debug point delta (`-8..=24`), displayed by each
+    /// pane's visible zoom slider/readout.
+    pub const VIEW_ZOOM_LEVEL: &str = "viewZoomLevel";
     /// Title-case (vs Title-Case) for the menu-bar top-level titles (the C++
     /// `menuBarTitleCase`; main.cpp:988). Default `false` → "Title Case".
     pub const MENU_BAR_TITLE_CASE: &str = "menuBarTitleCase";
     /// Whether the titlebar shows the app icon (the C++ `showIcon`;
     /// main.cpp:990). Default `false`.
     pub const SHOW_ICON: &str = "showIcon";
+    /// Whether the on-demand console is visible on Windows. The GUI-subsystem
+    /// binary starts console-less and restores this preference on launch.
+    #[cfg(windows)]
+    pub const SHOW_CONSOLE: &str = "showConsole";
     /// The last process the user attached to in the process picker, by name (the
     /// C++ `lastAttachedProcess`; processpicker.cpp:390). Read on picker open to
     /// preselect the matching row; written on a successful attach.

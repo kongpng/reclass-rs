@@ -99,12 +99,11 @@ pub enum WorkspaceNewType {
 /// for Rename, the new name the user typed in the inline rename prompt.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum WorkspaceTypeAction {
-    /// Rename the type/field node (the C++ `renameType`). Carries the current
-    /// display name to seed the window's rename prompt.
+    /// Commit an inline rename of the type/field node (the C++ `renameType`).
     Rename {
         doc: DocId,
         node_id: u64,
-        current: String,
+        name: String,
     },
     /// Duplicate the type/field node (the C++ `duplicateType`).
     Duplicate { doc: DocId, node_id: u64 },
@@ -485,9 +484,13 @@ impl WorkspaceModel {
         }
 
         // ── ALL TYPES section. ──
-        rows.push(WorkspaceRow::Section("ALL TYPES".to_string()));
-        for e in entries {
-            rows.push(WorkspaceRow::Type(e));
+        // Do not leave a header-only model for an empty/non-struct document;
+        // the panel's empty overlay relies on a genuinely empty row set.
+        if !entries.is_empty() {
+            rows.push(WorkspaceRow::Section("ALL TYPES".to_string()));
+            for e in entries {
+                rows.push(WorkspaceRow::Type(e));
+            }
         }
 
         WorkspaceModel {
@@ -518,8 +521,8 @@ impl WorkspaceModel {
         })
     }
 
-    /// The `"N structs · M enums"` count caption (empty when no types exist) —
-    /// shared by the dock title and the panel header.
+    /// The model count caption retained for diagnostics/tests. Upstream no longer
+    /// displays it in either the Project header or dock title.
     pub fn count_caption(&self) -> String {
         if self.struct_count == 0 && self.enum_count == 0 {
             return String::new();
@@ -539,20 +542,14 @@ impl WorkspaceModel {
         s
     }
 
-    /// The dock title (`m_dockTitleLabel` text; app-shell §10): `"Project"` plus
-    /// a `" — N structs · M enums"` suffix when any types exist. `dirty` adds the
-    /// leading `•` modified marker.
+    /// The dock title (`m_dockTitleLabel` text): Project plus the optional dirty
+    /// marker. Type counts deliberately stay out of the chrome.
     pub fn dock_title(&self, dirty: bool) -> String {
         let mut s = String::new();
         if dirty {
             s.push_str("\u{2022} ");
         }
         s.push_str("Project");
-        let caption = self.count_caption();
-        if !caption.is_empty() {
-            s.push_str(" \u{2014} ");
-            s.push_str(&caption);
-        }
         s
     }
 
@@ -619,7 +616,7 @@ impl WorkspaceModel {
 /// (the C++ "Open in Current Tab" default; app-shell §10 context menu). The
 /// window resolves it: set the owning document's view-root to `node_id` and
 /// activate its tab.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkspaceNav {
     pub doc: DocId,
     pub node_id: u64,
@@ -787,7 +784,17 @@ pub struct WorkspacePanel {
     /// `model_to_tree_items` re-applies this set — otherwise a rename/edit silently
     /// collapsed the whole tree.
     expanded_ids: Rc<RefCell<HashSet<u64>>>,
+    /// Active inline rename editor, if any. Kept panel-owned so rebuilding the
+    /// outer window never turns a row rename into a modal dialog.
+    rename: Option<WorkspaceRename>,
     focus_handle: FocusHandle,
+}
+
+struct WorkspaceRename {
+    target: WorkspaceNav,
+    original: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 impl WorkspacePanel {
@@ -813,6 +820,7 @@ impl WorkspacePanel {
             context_target_is_field: false,
             right_hit_row: false,
             expanded_ids: Rc::new(RefCell::new(HashSet::new())),
+            rename: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -883,22 +891,68 @@ impl WorkspacePanel {
         }
     }
 
-    /// "Rename" — raise a [`WorkspaceTypeAction::Rename`] for the targeted node
-    /// (the C++ `renameType` → `QInputDialog::getText`). The window owns the
-    /// dialog + the mutable controller; the panel only carries the current name so
-    /// the window can seed the rename prompt.
-    fn action_rename(&mut self, _: &WsRenameType, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(nav) = self.context_target {
-            let current = self.model.display_name_of(nav.node_id).unwrap_or_default();
-            cx.emit(WorkspaceTypeAction::Rename {
-                doc: nav.doc,
-                node_id: nav.node_id,
-                current,
+    /// "Rename" — begin editing the row in place. Enter/blur commits a trimmed,
+    /// changed, non-empty value; Escape cancels.
+    fn action_rename(&mut self, _: &WsRenameType, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = self.context_target {
+            let original = self
+                .model
+                .display_name_of(target.node_id)
+                .unwrap_or_default();
+            let initial = original.clone();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(initial.clone())
+                    .placeholder("Type name")
             });
+            let subscription = cx.subscribe_in(
+                &input,
+                window,
+                |this, _input, event: &gpui_component::input::InputEvent, _window, cx| {
+                    if matches!(
+                        event,
+                        gpui_component::input::InputEvent::PressEnter { .. }
+                            | gpui_component::input::InputEvent::Blur
+                    ) {
+                        this.finish_inline_rename(cx);
+                    }
+                },
+            );
+            self.rename = Some(WorkspaceRename {
+                target,
+                original,
+                input: input.clone(),
+                _subscription: subscription,
+            });
+            cx.defer_in(window, move |_this, window, cx| {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            });
+            cx.notify();
         }
         // Clear the recorded target so the empty-area New-X menu (shown when
         // context_target is None) is reachable again after a row action.
         self.context_target = None;
+    }
+
+    fn finish_inline_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.rename.take() else {
+            return;
+        };
+        let name = rename.input.read(cx).value().trim().to_string();
+        if !name.is_empty() && name != rename.original {
+            cx.emit(WorkspaceTypeAction::Rename {
+                doc: rename.target.doc,
+                node_id: rename.target.node_id,
+                name,
+            });
+        }
+        cx.notify();
+    }
+
+    fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) {
+        if self.rename.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// "Duplicate" — raise a [`WorkspaceTypeAction::Duplicate`] (the C++
@@ -1141,11 +1195,21 @@ impl Render for WorkspacePanel {
         let view = cx.entity();
         let meta = self.row_meta.clone();
         let expanded_ids = self.expanded_ids.clone();
+        let filter = self.filter(cx);
+        let filtered_empty = !filter.trim().is_empty()
+            && self.model.filtered(&filter).type_entries().next().is_none();
+        let model_empty = self.model.type_entries().next().is_none();
 
         gpui_component::v_flex()
             .id("rcx-workspace-panel")
             .track_focus(&self.focus_handle)
             .key_context("RcxWorkspace")
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "escape" && this.rename.is_some() {
+                    this.cancel_inline_rename(cx);
+                    cx.stop_propagation();
+                }
+            }))
             // Context-menu actions dispatched by the row right-click `PopupMenu`
             // bubble to here (the menu is a child of this tracked-focus subtree).
             .on_action(cx.listener(Self::action_open_in_tab))
@@ -1214,109 +1278,71 @@ impl Render for WorkspacePanel {
             .size_full()
             .bg(color::panel_bg(cx))
             .text_color(color::text(cx))
-            .child(self.render_header(cx))
             .child(self.render_search(cx))
-            .child(
-                div().flex_1().min_h_0().child(
-                    tree(&self.tree_state, move |ix, entry, selected, _window, cx| {
-                        let item = entry.item();
-                        let kind = meta.get(&item.id);
-                        let nav = parse_nav_item_id(&item.id);
-                        let depth = entry.depth();
-                        let is_folder = entry.is_folder();
-                        let is_expanded = entry.is_expanded();
+            .child(div().flex_1().min_h_0().child(if filtered_empty {
+                crate::ui::design::empty_state(icon::search(), "No types match the filter", cx)
+                    .into_any_element()
+            } else if model_empty {
+                crate::ui::design::empty_state_with_hint(
+                    icon::struct_(),
+                    "No types yet",
+                    "File ▸ New Class, or import a PDB",
+                    cx,
+                )
+                .into_any_element()
+            } else {
+                tree(&self.tree_state, move |ix, entry, selected, _window, cx| {
+                    let item = entry.item();
+                    let kind = meta.get(&item.id);
+                    let nav = parse_nav_item_id(&item.id);
+                    let depth = entry.depth();
+                    let is_folder = entry.is_folder();
+                    let is_expanded = entry.is_expanded();
+                    let rename_input = nav.and_then(|target| {
+                        view.read(cx).rename.as_ref().and_then(|rename| {
+                            (rename.target == target).then(|| rename.input.clone())
+                        })
+                    });
 
-                        // Capture live expansion so a workspace rebuild (`set_items`,
-                        // which collapses everything) can restore it. Keyed by the
-                        // type row's node id; only folder (type) rows toggle.
-                        if is_folder {
-                            if let Some(n) = nav.as_ref() {
-                                let mut ex = expanded_ids.borrow_mut();
-                                if is_expanded {
-                                    ex.insert(n.node_id);
-                                } else {
-                                    ex.remove(&n.node_id);
-                                }
+                    // Capture live expansion so a workspace rebuild (`set_items`,
+                    // which collapses everything) can restore it. Keyed by the
+                    // type row's node id; only folder (type) rows toggle.
+                    if is_folder {
+                        if let Some(n) = nav.as_ref() {
+                            let mut ex = expanded_ids.borrow_mut();
+                            if is_expanded {
+                                ex.insert(n.node_id);
+                            } else {
+                                ex.remove(&n.node_id);
                             }
                         }
+                    }
 
-                        render_row(RowCtx {
-                            ix,
-                            label: item.label.clone(),
-                            kind,
-                            depth,
-                            is_folder,
-                            is_expanded,
-                            selected,
-                            nav,
-                            view: &view,
-                            cx,
-                        })
+                    render_row(RowCtx {
+                        ix,
+                        label: item.label.clone(),
+                        kind,
+                        depth,
+                        is_folder,
+                        is_expanded,
+                        selected,
+                        nav,
+                        rename_input,
+                        view: &view,
+                        cx,
                     })
-                    .px(px(tokens::space::SM))
-                    .py(px(tokens::space::XS)),
-                ),
-            )
+                })
+                .px(px(tokens::space::SM))
+                .py(px(tokens::space::XS))
+                .into_any_element()
+            }))
     }
 }
 
 impl WorkspacePanel {
-    /// The Zed-style panel header: a small uppercase muted "PROJECT" title with
-    /// the struct/enum count, plus a close affordance on the right (the C++
-    /// 36px `workspaceHeader` with its `×` button).
-    fn render_header(&self, cx: &App) -> impl IntoElement {
-        use gpui_component::Sizable as _;
-
-        let m = &self.model;
-        // The count caption ("N structs · M enums"), or nothing when empty.
-        let count = m.count_caption();
-
-        crate::ui::design::panel_header_strip(cx)
-            .child(
-                gpui_component::h_flex()
-                    .min_w_0()
-                    .gap(px(tokens::space::MD))
-                    .items_baseline()
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(tokens::font::UI_SM))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(color::text_muted(cx))
-                            .child("PROJECT"),
-                    )
-                    .when(!count.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(tokens::font::UI_XS))
-                                .text_color(color::text_disabled(cx))
-                                .child(count),
-                        )
-                    }),
-            )
-            // Close affordance — the Assets-stage `design::icon::close` SVG (the
-            // C++ header close button, replacing the round-2 "×" text glyph).
-            // Closing the dock is the window's layout toggle; here it is a
-            // restrained chrome hint that lightens on hover.
-            .child(
-                div()
-                    .id("rcx-workspace-close")
-                    .flex_none()
-                    .size(px(18.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(tokens::radius::SM))
-                    .text_color(color::text_muted(cx))
-                    .hover(|s| s.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
-                    .child(icon::close().with_size(px(12.0))),
-            )
-    }
-
-    /// The Zed-style filter input row: a subtle-bg input with a leading
-    /// magnifier icon (the C++ `m_workspaceSearch` with its `filter.svg` leading
-    /// icon). The `Input` carries the focus ring + clear button.
+    /// The Zed-style filter input row. The magnifier is the input's real prefix,
+    /// rather than a sibling outside the field; that keeps it inside the panel's
+    /// padding and prevents the SVG from clipping against the dock edge.
     fn render_search(&self, cx: &App) -> impl IntoElement {
         use gpui_component::Sizable as _;
 
@@ -1325,22 +1351,13 @@ impl WorkspacePanel {
             .flex_none()
             .px(px(tokens::space::MD))
             .py(px(tokens::space::MD))
-            .gap(px(tokens::space::MD))
             .items_center()
-            // Leading magnifier — the Assets-stage `design::icon::search` SVG
-            // (replacing the round-2 emoji glyph), tinted muted.
             .child(
-                div().flex_none().child(
+                Input::new(&self.search).w_full().prefix(
                     icon::search()
                         .with_size(px(14.0))
                         .text_color(color::text_muted(cx)),
                 ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.search).w_full()),
             )
     }
 }
@@ -1367,6 +1384,7 @@ struct RowCtx<'a> {
     is_expanded: bool,
     selected: bool,
     nav: Option<WorkspaceNav>,
+    rename_input: Option<Entity<InputState>>,
     view: &'a Entity<WorkspacePanel>,
     cx: &'a mut App,
 }
@@ -1381,6 +1399,7 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
         is_expanded,
         selected,
         nav,
+        rename_input,
         view,
         cx,
     } = ctx;
@@ -1404,6 +1423,8 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
         }) => {
             let full_name = name.clone();
             let menu_name = name.clone();
+            let rename_for_name = rename_input.clone();
+            let is_renaming = rename_for_name.is_some();
             // The row content as an interactive (stateful) div so it can carry a
             // context menu (ContextMenuExt), a tooltip on the truncated name, AND
             // the click → navigation / right-click → menu-target handlers.
@@ -1434,9 +1455,13 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                         } else {
                             color::text_muted(cx)
                         })
-                        .child(SharedString::from(name.clone()))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(full_name.clone()).build(window, cx)
+                        .when_some(rename_for_name, |cell, input| {
+                            cell.child(Input::new(&input).w_full())
+                        })
+                        .when(!is_renaming, |cell| {
+                            cell.child(SharedString::from(name.clone())).tooltip(
+                                move |window, cx| Tooltip::new(full_name.clone()).build(window, cx),
+                            )
                         }),
                 )
                 // Trailing member count — a muted pill (the C++ count pill).
@@ -1512,6 +1537,8 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
             } else {
                 field_name.clone()
             };
+            let rename_for_field = rename_input.clone();
+            let is_renaming = rename_for_field.is_some();
             let mut row = gpui_component::h_flex()
                 .id(("ws-field-row", ix))
                 .w_full()
@@ -1543,7 +1570,12 @@ fn render_row(ctx: RowCtx<'_>) -> ListItem {
                             .min_w_0()
                             .truncate()
                             .text_color(color::text_muted(cx))
-                            .child(SharedString::from(field_name.clone())),
+                            .when_some(rename_for_field, |cell, input| {
+                                cell.child(Input::new(&input).w_full())
+                            })
+                            .when(!is_renaming, |cell| {
+                                cell.child(SharedString::from(field_name.clone()))
+                            }),
                     )
                 })
                 .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx));
@@ -1857,6 +1889,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_non_struct_documents_have_no_workspace_rows() {
+        let empty_tree = NodeTree::new();
+        let d = doc_id(1);
+        let empty = WorkspaceModel::build(
+            &[WorkspaceDoc {
+                doc: d,
+                tree: &empty_tree,
+            }],
+            &[],
+            &[],
+        );
+        assert!(empty.rows.is_empty());
+
+        let mut primitive_tree = NodeTree::new();
+        primitive_tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: "value".into(),
+            ..Node::default()
+        });
+        let primitive = WorkspaceModel::build(
+            &[WorkspaceDoc {
+                doc: d,
+                tree: &primitive_tree,
+            }],
+            &[],
+            &[],
+        );
+        assert!(primitive.rows.is_empty());
+    }
+
+    #[test]
     fn hex_pad_members_excluded_from_count_and_children() {
         let tree = sample_tree();
         let d = doc_id(1);
@@ -2026,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn dock_title_pluralizes_and_marks_dirty() {
+    fn dock_title_omits_counts_and_marks_dirty() {
         let tree = sample_tree();
         let d = doc_id(1);
         let docs = vec![WorkspaceDoc {
@@ -2034,11 +2097,9 @@ mod tests {
             tree: &tree,
         }];
         let m = WorkspaceModel::build(&docs, &[], &[]);
-        // 2 structs (Player, Small) + 1 enum (Color).
-        assert_eq!(
-            m.dock_title(false),
-            "Project \u{2014} 2 structs \u{b7} 1 enum"
-        );
+        // Counts stay in the model but no longer appear in Project chrome.
+        assert_eq!(m.count_caption(), "2 structs \u{b7} 1 enum");
+        assert_eq!(m.dock_title(false), "Project");
         // Dirty marker prefix.
         assert!(m.dock_title(true).starts_with("\u{2022} "));
 

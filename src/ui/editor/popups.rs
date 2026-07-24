@@ -3,7 +3,6 @@
 //! the oversized editor/mod.rs into a second `impl RcxEditor`. A child module of
 //! `editor`, it keeps full access to RcxEditor's private fields and methods.
 
-use super::hex_kind_for_size;
 use super::*;
 use crate::core::NodeKind;
 use gpui::*;
@@ -541,6 +540,11 @@ impl super::RcxEditor {
             window,
             move |this, _p, ev: &SourceChooserEvent, _window, cx| {
                 use crate::ui::pickers::sourcechooser::SourcePick;
+                if let SourceChooserEvent::RemoveSaved(idx) = ev {
+                    this.controller.remove_saved_source(*idx);
+                    this.after_mutation(cx);
+                    return;
+                }
                 cx.emit(RcxEditorEvent::CloseModal);
                 this._source_chooser_sub = None;
                 match ev {
@@ -560,6 +564,7 @@ impl super::RcxEditor {
                     | SourceChooserEvent::Cancel => {
                         cx.notify();
                     }
+                    SourceChooserEvent::RemoveSaved(_) => unreachable!(),
                 }
             },
         ));
@@ -662,10 +667,12 @@ impl super::RcxEditor {
         &self,
         idx: usize,
     ) -> Option<crate::ui::overlays::hextoolbar::HexPopupContext> {
+        let selected_ids: Vec<u64> = self.controller.selected_ids().iter().copied().collect();
         crate::ui::overlays::hextoolbar::build_hex_popup_context(
             self.controller.tree(),
             self.controller.document().provider.as_ref(),
             idx,
+            &selected_ids,
         )
     }
 
@@ -717,14 +724,12 @@ impl super::RcxEditor {
                     }
                 }
                 HexToolbarEvent::JoinSelected => {
-                    // Item 10: actually JOIN the contiguous hex run starting at the
-                    // toolbar's anchor node (was a close-only no-op). Sum the
-                    // anchor's size plus its consecutive same-parent hex siblings,
-                    // pick the largest hex kind that fits the total, and join. The
-                    // anchor is `node_id` captured when the toolbar opened.
+                    // Re-validate the current selected run at activation time. The
+                    // join must consume exactly the selected same-kind/same-parent
+                    // contiguous rows, never an arbitrary following hex run.
                     cx.emit(RcxEditorEvent::CloseModal);
                     this._hex_toolbar_sub = None;
-                    this.join_hex_run(node_id, cx);
+                    this.join_selected_hex_run(node_id, cx);
                 }
                 HexToolbarEvent::FillToOffset(id, offset) => {
                     // Item 11: actually FILL the gap from the node's end up to the
@@ -751,47 +756,25 @@ impl super::RcxEditor {
         cx.notify();
     }
 
-    /// Item 10: join the contiguous hex run starting at `anchor_id`. Sums the
-    /// anchor's byte size plus its consecutive same-parent hex siblings (the run the
-    /// toolbar's "join selected" affordance acts on), picks the largest hex
-    /// [`NodeKind`] whose size fits the accumulated total, and routes to the
-    /// controller `join_hex_nodes`. A single hex node (no following hex sibling) is a
-    /// no-op (nothing to join).
-    fn join_hex_run(&mut self, anchor_id: u64, cx: &mut Context<Self>) {
-        let tree = self.controller.tree();
-        let ni = tree.index_of_id(anchor_id);
-        if ni < 0 {
+    /// Join exactly the currently selected, validated hex run. The toolbar anchor
+    /// must still be a member of the selection; a stale popup or changed selection
+    /// therefore becomes a no-op instead of mutating unrelated rows.
+    fn join_selected_hex_run(&mut self, anchor_id: u64, cx: &mut Context<Self>) {
+        let selected_ids: Vec<u64> = self.controller.selected_ids().iter().copied().collect();
+        let run = crate::ui::overlays::hextoolbar::selected_hex_run(
+            self.controller.tree(),
+            &selected_ids,
+        );
+        if !run.node_ids.contains(&anchor_id) {
             return;
         }
-        let anchor = &tree.nodes[ni as usize];
-        if !is_hex_preview(anchor.kind) {
+        let Some(target) = run.join_kind() else {
             return;
-        }
-        let parent_id = anchor.parent_id;
-        let mut total = crate::core::size_for_kind(anchor.kind).max(0);
-        let mut next_off = anchor.offset + total;
-        // Walk consecutive same-parent hex siblings by offset.
-        loop {
-            let found = tree.nodes.iter().enumerate().find(|(_, s)| {
-                s.parent_id == parent_id
-                    && s.offset == next_off
-                    && crate::core::kind::is_hex_node(s.kind)
-            });
-            let Some((_, s)) = found else { break };
-            let sz = crate::core::size_for_kind(s.kind).max(0);
-            if sz <= 0 {
-                break;
-            }
-            total += sz;
-            next_off += sz;
-        }
-        // Largest hex kind that fits the accumulated run.
-        let target = hex_kind_for_size(total);
-        let target_sz = crate::core::size_for_kind(target);
-        if target_sz <= crate::core::size_for_kind(self.controller.tree().nodes[ni as usize].kind) {
-            return; // nothing larger to join into
-        }
-        self.controller.join_hex_nodes(anchor_id, target);
+        };
+        let Some(&first_id) = run.node_ids.first() else {
+            return;
+        };
+        self.controller.join_hex_nodes(first_id, target);
         self.apply_document(cx);
     }
 

@@ -668,6 +668,14 @@ pub fn apply_theme(theme: &Theme, window: &mut gpui::Window, cx: &mut gpui::App)
         gtheme.colors.accent = accent;
     }
 
+    // ListItem paints both the current selection and its internal, persistent
+    // right-click target with the same `list_active_border`. In a tree this can
+    // leave two bright blue rectangles on screen after a context click even
+    // though only one row is selected. Keep selection hierarchy in the fill and
+    // make that shared outline transparent; hover and keyboard selection remain
+    // visible through `list_hover` / `list_active`.
+    gtheme.colors.list_active_border = gpui::transparent_black();
+
     // Zed-like global typography + surface geometry (design tokens). Comfortable
     // ~14px UI text, a real monospace for the editor, small radii on elevated
     // surfaces, restrained shadows. See `ui/design.rs` for the token source.

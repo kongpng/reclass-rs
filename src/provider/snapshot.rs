@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
 
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -100,6 +100,10 @@ pub struct SnapshotProvider {
     inner: RwLock<SnapshotInner>,
     permanent_pages: RwLock<HashSet<u64>>,
     real_readable_ranges: RwLock<Option<Vec<(u64, u64)>>>,
+    // Module snapshots are immutable for one attach. Compose may ask for them
+    // once per pass while resolving RTTI/type hints, so retain the provider's
+    // expensive enumeration for the lifetime of this snapshot provider.
+    real_modules: OnceLock<Vec<ModuleEntry>>,
 }
 
 impl SnapshotProvider {
@@ -114,6 +118,7 @@ impl SnapshotProvider {
             inner: RwLock::new(SnapshotInner { pages, main_extent }),
             permanent_pages: RwLock::new(HashSet::new()),
             real_readable_ranges: RwLock::new(None),
+            real_modules: OnceLock::new(),
         }
     }
 
@@ -373,9 +378,13 @@ impl Provider for SnapshotProvider {
         self.real.as_ref().map_or(0, |r| r.symbol_to_address(name))
     }
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
-        self.real
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.enumerate_modules())
+        self.real_modules
+            .get_or_init(|| {
+                self.real
+                    .as_ref()
+                    .map_or_else(Vec::new, |r| r.modules_cached())
+            })
+            .clone()
     }
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         self.real
@@ -506,6 +515,53 @@ mod tests {
 
         assert!(snap.read(0x20, &mut buf));
         assert_eq!(buf, [0u8; 8]);
+    }
+
+    struct ModuleCountingProvider {
+        module_cache: crate::provider::ProviderModuleCache,
+        enumerate_calls: AtomicUsize,
+    }
+
+    impl Provider for ModuleCountingProvider {
+        fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+            false
+        }
+
+        fn size(&self) -> i32 {
+            0x1000
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.enumerate_calls.fetch_add(1, Ordering::Relaxed);
+            vec![ModuleEntry {
+                name: "cached.dll".into(),
+                full_path: "cached.dll".into(),
+                base: 0x1000,
+                size: 0x1000,
+            }]
+        }
+
+        fn module_cache(&self) -> Option<&crate::provider::ProviderModuleCache> {
+            Some(&self.module_cache)
+        }
+    }
+
+    #[test]
+    fn module_enumeration_is_cached_for_snapshot_lifetime() {
+        let real = Arc::new(ModuleCountingProvider {
+            module_cache: crate::provider::ProviderModuleCache::default(),
+            enumerate_calls: AtomicUsize::new(0),
+        });
+        let real_dyn: Arc<dyn Provider + Send + Sync> = real.clone();
+        let snap = SnapshotProvider::new(Some(real_dyn), PageMap::new(), 0);
+
+        assert_eq!(snap.enumerate_modules()[0].name, "cached.dll");
+        assert_eq!(snap.enumerate_modules()[0].name, "cached.dll");
+
+        let real_dyn: Arc<dyn Provider + Send + Sync> = real.clone();
+        let second_snap = SnapshotProvider::new(Some(real_dyn), PageMap::new(), 0);
+        assert_eq!(second_snap.enumerate_modules()[0].name, "cached.dll");
+        assert_eq!(real.enumerate_calls.load(Ordering::Relaxed), 1);
     }
 
     struct RegionCountingProvider {

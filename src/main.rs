@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, feature = "ui"), windows_subsystem = "windows")]
+
 //! The `reclass` application binary.
 use clap::Parser;
 #[derive(Parser, Debug, Clone, Default)]

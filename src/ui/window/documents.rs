@@ -369,7 +369,27 @@ impl super::MainWindow {
         self.goto_sub = Some(cx.subscribe_in(
             &picker,
             window,
-            move |this, _p, ev: &ProcessPickEvent, window, cx| match ev {
+            move |this, picker, ev: &ProcessPickEvent, window, cx| match ev {
+                ProcessPickEvent::RefreshRequested => {
+                    let Some(spec) = this.plugin_manager.provider_spec(provider_identifier) else {
+                        this.notify(
+                            format!("No provider registered as {provider_identifier}."),
+                            window,
+                            cx,
+                        );
+                        return;
+                    };
+                    let Some(processes) = spec.enumerate_processes() else {
+                        this.notify(
+                            format!("{provider_identifier} does not provide a process list."),
+                            window,
+                            cx,
+                        );
+                        return;
+                    };
+                    let model = ProcessPickerModel::from_processes(processes, provider_identifier);
+                    picker.update(cx, |picker, cx| picker.replace_model(model, cx));
+                }
                 ProcessPickEvent::Attach {
                     identifier,
                     name,
@@ -608,6 +628,44 @@ impl super::MainWindow {
                 if name.is_empty() {
                     return;
                 }
+                let _ = this.update(app, |me, cx| {
+                    editor2.update(cx, |ed, _cx| {
+                        ed.controller_mut().add_bookmark(&name, &formula);
+                    });
+                    me.after_bookmark_added(&name, &formula, window, cx);
+                });
+            },
+        );
+    }
+
+    /// Node-context "Bookmark this address…". Address/formula resolution stays
+    /// in the originating editor (where the clicked node and view frame are known);
+    /// this host method reuses the shared themed name prompt and bookmark-refresh
+    /// tail used by Edit ▸ Add Bookmark.
+    pub(super) fn prompt_bookmark_address(
+        &mut self,
+        editor: Entity<crate::ui::editor::RcxEditor>,
+        address: u64,
+        formula: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let default_name = self.next_bookmark_name(&editor, cx);
+        let editor2 = editor.clone();
+        let formula2 = formula.clone();
+        let this = cx.entity().downgrade();
+        self.open_text_prompt(
+            "Bookmark this address",
+            &format!("Symbol name for 0x{address:X}"),
+            &default_name,
+            window,
+            cx,
+            move |name, window, app| {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let formula = formula2.clone();
                 let _ = this.update(app, |me, cx| {
                     editor2.update(cx, |ed, _cx| {
                         ed.controller_mut().add_bookmark(&name, &formula);

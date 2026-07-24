@@ -77,7 +77,13 @@ default = [
 # `gpui-component-assets` is part of it: it bundles the SVG icon assets that back
 # `gpui_component::IconName`, registered via `application().with_assets(...)` in
 # main.rs — without it `IconName` variants render as empty boxes (no SVG source).
-ui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-component-assets"]
+ui = [
+    "dep:gpui",
+    "dep:gpui_platform",
+    "dep:gpui-component",
+    "dep:gpui-component-assets",
+    "dep:windows-sys",
+]
 
 # Source / ReClass-XML import+export, PDB import, and PE-debug extraction.
 # pdb2/object are pure Rust ⇒ build on all OSes.
@@ -254,6 +260,7 @@ windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",

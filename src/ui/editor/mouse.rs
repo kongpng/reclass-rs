@@ -28,6 +28,7 @@ impl super::RcxEditor {
         if self.editing.is_some() {
             self.commit_active_edit(window, cx);
         }
+        self.reconcile_type_picker_suppression();
 
         let Some(lm) = self.line_meta(line).cloned() else {
             return;
@@ -207,6 +208,7 @@ impl super::RcxEditor {
         // selectable node). Without this, the hit-test target falls into
         // `begin_inline_edit` → `resolved_span_for` and starts a plain text edit on
         // the chip/chevron instead of opening the picker (items 1/2/5/6).
+        let mut suppressed_type_picker_click = false;
         if let Some(target) = hit.target {
             if !modifiers.shift && !modifiers.control {
                 match target {
@@ -242,8 +244,13 @@ impl super::RcxEditor {
                     EditTarget::Type
                         if already_selected && lm.node_idx >= 0 && is_hex_preview(lm.node_kind) =>
                     {
-                        self.open_hex_toolbar(lm.node_idx as usize, window, cx);
-                        return;
+                        if self.consume_type_picker_suppression(node_id) {
+                            suppressed_type_picker_click = true;
+                        } else {
+                            self.arm_type_picker_suppression(node_id);
+                            self.open_hex_toolbar(lm.node_idx as usize, window, cx);
+                            return;
+                        }
                     }
                     // Field Type token / array element type / pointer target →
                     // the Type Selector in the matching mode (item 6). Only on a
@@ -252,15 +259,20 @@ impl super::RcxEditor {
                     EditTarget::Type | EditTarget::ArrayElementType | EditTarget::PointerTarget
                         if already_selected && lm.node_idx >= 0 =>
                     {
-                        let ctx = ContextTarget {
-                            line,
-                            node_idx: lm.node_idx as usize,
-                            node_id: lm.node_id,
-                            kind: lm.node_kind,
-                            sub_line: lm.sub_line,
-                        };
-                        self.open_type_selector_in_mode(ctx, target, window, cx);
-                        return;
+                        if self.consume_type_picker_suppression(node_id) {
+                            suppressed_type_picker_click = true;
+                        } else {
+                            self.arm_type_picker_suppression(node_id);
+                            let ctx = ContextTarget {
+                                line,
+                                node_idx: lm.node_idx as usize,
+                                node_id: lm.node_id,
+                                kind: lm.node_kind,
+                                sub_line: lm.sub_line,
+                            };
+                            self.open_type_selector_in_mode(ctx, target, window, cx);
+                            return;
+                        }
                     }
                     _ => {}
                 }
@@ -273,6 +285,11 @@ impl super::RcxEditor {
             if (already_selected || lm.line_kind == LineKind::CommandRow)
                 && !modifiers.shift
                 && !modifiers.control
+                && !(suppressed_type_picker_click
+                    && matches!(
+                        target,
+                        EditTarget::Type | EditTarget::ArrayElementType | EditTarget::PointerTarget
+                    ))
             {
                 // Item 4: record the clicked column so a Vec/Mat Value edit narrows
                 // to the clicked comma-component. Cleared by begin_inline_edit.

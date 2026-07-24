@@ -113,7 +113,7 @@ impl SourceEntry {
     pub fn clear_action() -> Self {
         SourceEntry {
             entry_kind: SourceEntryKind::ClearAction,
-            display_name: "Clear data source".to_string(),
+            display_name: "Clear All".to_string(),
             ..Default::default()
         }
     }
@@ -371,6 +371,47 @@ impl SourceModel {
             None => SourceAccept::None,
         }
     }
+
+    /// Remove one saved source without dismissing the chooser. Remaining saved
+    /// indices are compacted to stay aligned with the controller's vector.
+    pub fn remove_saved_source(&mut self, saved_index: i32, filter: &str) -> bool {
+        if saved_index < 0 {
+            return false;
+        }
+        let Some(entry_index) = self.entries.iter().position(|entry| {
+            entry.entry_kind == SourceEntryKind::SavedSource && entry.saved_index == saved_index
+        }) else {
+            return false;
+        };
+        self.entries.remove(entry_index);
+        for entry in &mut self.entries {
+            if entry.entry_kind == SourceEntryKind::SavedSource && entry.saved_index > saved_index {
+                entry.saved_index -= 1;
+            }
+        }
+        let has_saved = self
+            .entries
+            .iter()
+            .any(|entry| entry.entry_kind == SourceEntryKind::SavedSource);
+        if !has_saved {
+            // Upstream only shows the Connected section when at least one bound
+            // source exists. Removing the last row must remove its now-orphaned
+            // header in-place (the popup stays open after a per-row delete).
+            self.entries.retain(|entry| {
+                !(entry.entry_kind == SourceEntryKind::SectionHeader
+                    && entry.display_name == "Connected")
+            });
+        }
+        if let Some(clear) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.entry_kind == SourceEntryKind::ClearAction)
+        {
+            clear.enabled = has_saved;
+        }
+        self.apply_filter(filter);
+        true
+    }
 }
 
 /// The kind label for a provider, keyed off its identifier (the C++ `kindLabelFor`,
@@ -424,23 +465,25 @@ pub fn provider_entries() -> Vec<SourceEntry> {
     provider_entries_from_registry(&reg)
 }
 
-/// The full default chooser content (PIC4): the provider list, a separator, the
-/// `recent` saved sources (with the active one flagged), a separator, and the
-/// "Clear All" action. `recent` are `(name, kind_label, active)` tuples in
-/// most-recent-first order.
+/// The full upstream chooser content: saved sources under **Connected** first,
+/// providers under **Add Source** second, then the standalone **Clear All**
+/// action. `recent` are `(name, kind_label, active)` tuples in most-recent-first
+/// order. Connected is omitted and Clear All is disabled when there are no saved
+/// sources, matching `RcxController::showSourcePopup`.
 pub fn default_entries(recent: &[(String, String, bool)]) -> Vec<SourceEntry> {
-    let mut entries = provider_entries();
+    let mut entries = Vec::new();
     if !recent.is_empty() {
-        entries.push(SourceEntry::section("Recent"));
+        entries.push(SourceEntry::section("Connected"));
         for (i, (name, kind, active)) in recent.iter().enumerate() {
             let mut e = SourceEntry::saved(i as i32, name, kind);
             e.is_active = *active;
             entries.push(e);
         }
     }
-    entries.push(SourceEntry::section("Actions"));
+    entries.push(SourceEntry::section("Add Source"));
+    entries.extend(provider_entries());
     let mut clear = SourceEntry::clear_action();
-    clear.display_name = "Clear All".to_string();
+    clear.enabled = !recent.is_empty();
     entries.push(clear);
     entries
 }
@@ -533,6 +576,8 @@ mod view {
         OpenFile,
         /// Clear the data source (`clearRequested`).
         Clear,
+        /// Remove a saved source while leaving the chooser open.
+        RemoveSaved(i32),
         /// Dismissed (Esc / clicked outside / an already-active source).
         Cancel,
     }
@@ -686,6 +731,27 @@ mod view {
             self.emit_accept(outcome, cx);
         }
 
+        fn remove_saved(&mut self, saved_index: i32, cx: &mut Context<Self>) {
+            let query = self.input.read(cx).value().to_string();
+            if self.model.remove_saved_source(saved_index, &query) {
+                cx.emit(SourceChooserEvent::RemoveSaved(saved_index));
+                cx.notify();
+            }
+        }
+
+        fn remove_selected_saved(&mut self, cx: &mut Context<Self>) -> bool {
+            let Some(saved_index) = self.model.selected().and_then(|row| {
+                self.model.rows().get(row).and_then(|row| {
+                    (row.entry.entry_kind == SourceEntryKind::SavedSource)
+                        .then_some(row.entry.saved_index)
+                })
+            }) else {
+                return false;
+            };
+            self.remove_saved(saved_index, cx);
+            true
+        }
+
         /// Keyboard navigation (`sourcechooserpopup.cpp:603` `eventFilter`):
         /// Up/Down move the selection (skipping section headers), Enter accepts the
         /// selected row, Esc cancels. Down from the (focused) filter traverses into
@@ -741,6 +807,7 @@ mod view {
                     cx.emit(SourceChooserEvent::Cancel);
                     true
                 }
+                "delete" => self.remove_selected_saved(cx),
                 _ => false,
             }
         }
@@ -790,15 +857,21 @@ mod view {
                 .map(|(row, r)| {
                     let e = &r.entry;
                     match e.entry_kind {
-                        SourceEntryKind::SectionHeader => div()
-                            .h(px(tokens::border::THIN))
-                            .my(px(tokens::space::XS))
-                            .mx(px(tokens::space::SM))
-                            .bg(border)
+                        SourceEntryKind::SectionHeader => gpui_component::h_flex()
+                            .w_full()
+                            .h(px(28.0))
+                            .px(px(tokens::space::SM))
+                            .items_center()
+                            .when(row > 0, |d| d.border_t_1().border_color(border))
+                            .text_size(px(tokens::font::UI_XS))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(disabled)
+                            .child(e.display_name.to_uppercase())
                             .into_any_element(),
                         _ => {
                             let is_sel = selected == Some(row);
                             let is_clear = e.entry_kind == SourceEntryKind::ClearAction;
+                            let saved_index = e.saved_index;
                             let row_fg = if !e.enabled {
                                 disabled
                             } else if is_clear {
@@ -818,7 +891,7 @@ mod view {
                                 String::new()
                             };
 
-                            gpui_component::h_flex()
+                            let row_element = gpui_component::h_flex()
                                 .id(("source-row", row))
                                 .w_full()
                                 // Stable min-height (not a tight fixed height): the
@@ -925,7 +998,48 @@ mod view {
                                             .child(hint),
                                     )
                                 })
-                                .into_any_element()
+                                // Faint on row hover; bright only over the x itself.
+                                // The child stops propagation so removing a source
+                                // neither activates the row nor closes the chooser.
+                                .when(e.entry_kind == SourceEntryKind::SavedSource, |d| {
+                                    d.child(
+                                        div()
+                                            .id(("remove-saved-source", saved_index as u64))
+                                            .flex_none()
+                                            .p(px(tokens::space::XS))
+                                            .rounded(px(tokens::radius::SM))
+                                            .cursor_pointer()
+                                            .text_color(color::with_alpha(muted, 0.42))
+                                            .hover(|s| s.bg(hover_bg).text_color(danger))
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.remove_saved(saved_index, cx);
+                                                },
+                                            ))
+                                            .child(icon::close().size_3()),
+                                    )
+                                })
+                                .into_any_element();
+
+                            if is_clear {
+                                // Keep the destructive global action visually
+                                // separate from the provider list, matching the
+                                // inset rule and extra gap in the upstream row.
+                                gpui_component::v_flex()
+                                    .w_full()
+                                    .pt(px(tokens::space::XS))
+                                    .child(
+                                        div()
+                                            .h(px(tokens::border::THIN))
+                                            .mx(px(tokens::space::SM))
+                                            .bg(border),
+                                    )
+                                    .child(row_element)
+                                    .into_any_element()
+                            } else {
+                                row_element
+                            }
                         }
                     }
                 })
@@ -945,7 +1059,10 @@ mod view {
                 }))
                 .min_w(px(360.))
                 .max_h(px(520.))
-                .p(px(tokens::space::XS))
+                // No horizontal outer inset: the list separators and footer
+                // rule meet the popup's side borders, while their contents own
+                // their normal horizontal padding.
+                .py(px(tokens::space::XS))
                 .bg(color::elevated_bg(cx))
                 .border_1()
                 .border_color(border)
@@ -1151,18 +1268,30 @@ mod tests {
     }
 
     #[test]
-    fn default_entries_have_separators_recents_and_clear() {
+    fn default_entries_match_connected_then_add_source_then_clear_order() {
         let recent = vec![
             ("Reclass.exe".to_string(), "Process".to_string(), false),
             ("Reclass.exe".to_string(), "File".to_string(), true),
         ];
         let es = default_entries(&recent);
-        // Two section separators (Recent + Actions).
-        let sections = es
+        let sections: Vec<_> = es
             .iter()
             .filter(|e| e.entry_kind == SourceEntryKind::SectionHeader)
-            .count();
-        assert_eq!(sections, 2);
+            .map(|e| e.display_name.as_str())
+            .collect();
+        assert_eq!(sections, ["Connected", "Add Source"]);
+        assert_eq!(es.first().unwrap().display_name, "Connected");
+
+        let add_source = es
+            .iter()
+            .position(|e| e.display_name == "Add Source")
+            .unwrap();
+        assert!(es[1..add_source]
+            .iter()
+            .all(|e| e.entry_kind == SourceEntryKind::SavedSource));
+        assert!(es[add_source + 1..es.len() - 1]
+            .iter()
+            .all(|e| e.entry_kind == SourceEntryKind::ProviderAction));
         // The active recent source is flagged.
         assert!(es
             .iter()
@@ -1171,17 +1300,24 @@ mod tests {
         let last = es.last().unwrap();
         assert_eq!(last.entry_kind, SourceEntryKind::ClearAction);
         assert_eq!(last.display_name, "Clear All");
+        assert!(last.enabled);
     }
 
     #[test]
     fn default_entries_without_recents_skip_recent_section() {
         let es = default_entries(&[]);
-        // Only the "Actions" separator, no "Recent".
-        assert_eq!(
-            es.iter()
-                .filter(|e| e.entry_kind == SourceEntryKind::SectionHeader)
-                .count(),
-            1
+        let sections: Vec<_> = es
+            .iter()
+            .filter(|e| e.entry_kind == SourceEntryKind::SectionHeader)
+            .map(|e| e.display_name.as_str())
+            .collect();
+        assert_eq!(sections, ["Add Source"]);
+        assert_eq!(es.first().unwrap().display_name, "Add Source");
+        let clear = es.last().unwrap();
+        assert_eq!(clear.entry_kind, SourceEntryKind::ClearAction);
+        assert!(
+            !clear.enabled,
+            "Clear All is disabled with no connected source"
         );
     }
 }
@@ -1334,6 +1470,48 @@ mod model_tests {
         assert!(dead.is_stale);
         let alive = model.entries().iter().find(|e| e.saved_index == 0).unwrap();
         assert!(!alive.is_stale);
+    }
+
+    #[test]
+    fn removing_saved_source_compacts_indices_and_keeps_filter() {
+        let mut model = SourceModel::new(entries());
+        assert!(model.remove_saved_source(0, "game"));
+        let saved: Vec<_> = model
+            .entries()
+            .iter()
+            .filter(|entry| entry.entry_kind == super::SourceEntryKind::SavedSource)
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].display_name, "game.bin");
+        assert_eq!(saved[0].saved_index, 0);
+        assert_eq!(model.rows().len(), 1, "the active filter is reapplied");
+        assert_eq!(model.rows()[0].entry.display_name, "game.bin");
+    }
+
+    #[test]
+    fn removing_invalid_saved_source_is_a_noop() {
+        let mut model = SourceModel::new(entries());
+        let before = model.entries().to_vec();
+        assert!(!model.remove_saved_source(-1, ""));
+        assert!(!model.remove_saved_source(99, ""));
+        assert_eq!(model.entries(), before);
+    }
+
+    #[test]
+    fn removing_last_default_source_drops_connected_header_and_disables_clear() {
+        let recent = vec![("game.exe".to_string(), "Process".to_string(), true)];
+        let mut model = SourceModel::new(super::default_entries(&recent));
+        assert!(model.remove_saved_source(0, ""));
+        assert!(!model.entries().iter().any(|entry| {
+            entry.entry_kind == super::SourceEntryKind::SectionHeader
+                && entry.display_name == "Connected"
+        }));
+        let clear = model
+            .entries()
+            .iter()
+            .find(|entry| entry.entry_kind == super::SourceEntryKind::ClearAction)
+            .unwrap();
+        assert!(!clear.enabled);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// The seven checkable View-menu options (the C++ View menu defaults; the
+/// The eight checkable View-menu options (the C++ View menu defaults; the
 /// `[check]` items in the MENU CONTRACT). All default **on** except comments.
 /// `compact_columns`/`relative_offsets`/`hover_effects`/`minimap` are
 /// render-level (the editor view); `tree_lines`/`type_hints`/`show_comments` are
@@ -18,7 +18,10 @@ pub(crate) struct ViewOptions {
     pub(crate) relative_offsets: bool,
     pub(crate) type_hints: bool,
     pub(crate) show_comments: bool,
+    pub(crate) auto_rtti: bool,
+    pub(crate) enum_chips: bool,
     pub(crate) hover_effects: bool,
+    pub(crate) value_popups: bool,
     pub(crate) minimap: bool,
 }
 
@@ -34,7 +37,10 @@ impl Default for ViewOptions {
             relative_offsets: true,
             type_hints: false,
             show_comments: false,
+            auto_rtti: false,
+            enum_chips: true,
             hover_effects: true,
+            value_popups: true,
             minimap: false,
         }
     }
@@ -52,7 +58,10 @@ impl ViewOptions {
             relative_offsets: store.get_bool(settings_keys::RELATIVE_OFFSETS, d.relative_offsets),
             type_hints: store.get_bool(settings_keys::TYPE_HINTS, d.type_hints),
             show_comments: store.get_bool(settings_keys::SHOW_COMMENTS, d.show_comments),
+            auto_rtti: store.get_bool(settings_keys::SHOW_RTTI_CHIPS, d.auto_rtti),
+            enum_chips: store.get_bool(settings_keys::SHOW_ENUM_CHIPS, d.enum_chips),
             hover_effects: store.get_bool(settings_keys::HOVER_EFFECTS, d.hover_effects),
+            value_popups: store.get_bool(settings_keys::VALUE_POPUPS, d.value_popups),
             minimap: store.get_bool(settings_keys::MINIMAP, d.minimap),
         }
     }
@@ -65,7 +74,10 @@ impl ViewOptions {
             ViewOpt::RelativeOffsets => settings_keys::RELATIVE_OFFSETS,
             ViewOpt::TypeHints => settings_keys::TYPE_HINTS,
             ViewOpt::ShowComments => settings_keys::SHOW_COMMENTS,
+            ViewOpt::AutoRtti => settings_keys::SHOW_RTTI_CHIPS,
+            ViewOpt::EnumChips => settings_keys::SHOW_ENUM_CHIPS,
             ViewOpt::HoverEffects => settings_keys::HOVER_EFFECTS,
+            ViewOpt::ValuePopups => settings_keys::VALUE_POPUPS,
             ViewOpt::Minimap => settings_keys::MINIMAP,
         }
     }
@@ -77,7 +89,10 @@ impl ViewOptions {
             ViewOpt::RelativeOffsets => self.relative_offsets,
             ViewOpt::TypeHints => self.type_hints,
             ViewOpt::ShowComments => self.show_comments,
+            ViewOpt::AutoRtti => self.auto_rtti,
+            ViewOpt::EnumChips => self.enum_chips,
             ViewOpt::HoverEffects => self.hover_effects,
+            ViewOpt::ValuePopups => self.value_popups,
             ViewOpt::Minimap => self.minimap,
         }
     }
@@ -89,7 +104,10 @@ impl ViewOptions {
             ViewOpt::RelativeOffsets => self.relative_offsets = value,
             ViewOpt::TypeHints => self.type_hints = value,
             ViewOpt::ShowComments => self.show_comments = value,
+            ViewOpt::AutoRtti => self.auto_rtti = value,
+            ViewOpt::EnumChips => self.enum_chips = value,
             ViewOpt::HoverEffects => self.hover_effects = value,
+            ViewOpt::ValuePopups => self.value_popups = value,
             ViewOpt::Minimap => self.minimap = value,
         }
     }
@@ -104,18 +122,24 @@ pub(crate) enum ViewOpt {
     RelativeOffsets,
     TypeHints,
     ShowComments,
+    AutoRtti,
+    EnumChips,
     HoverEffects,
+    ValuePopups,
     Minimap,
 }
 
 impl ViewOpt {
-    pub(crate) const ALL: [ViewOpt; 7] = [
+    pub(crate) const ALL: [ViewOpt; 10] = [
         ViewOpt::CompactColumns,
         ViewOpt::TreeLines,
         ViewOpt::RelativeOffsets,
         ViewOpt::TypeHints,
         ViewOpt::ShowComments,
+        ViewOpt::AutoRtti,
+        ViewOpt::EnumChips,
         ViewOpt::HoverEffects,
+        ViewOpt::ValuePopups,
         ViewOpt::Minimap,
     ];
 
@@ -127,7 +151,10 @@ impl ViewOpt {
             ViewOpt::RelativeOffsets => "view.relative_offsets",
             ViewOpt::TypeHints => "view.type_hints",
             ViewOpt::ShowComments => "view.comments",
+            ViewOpt::AutoRtti => "view.auto_rtti",
+            ViewOpt::EnumChips => "view.enum_chips",
             ViewOpt::HoverEffects => "view.hover",
+            ViewOpt::ValuePopups => "view.value_popups",
             ViewOpt::Minimap => "view.minimap",
         }
     }
@@ -207,7 +234,16 @@ impl super::MainWindow {
                 ViewOpt::RelativeOffsets => ed.set_relative_offsets(value, cx),
                 ViewOpt::TypeHints => ed.set_type_hints(value, cx),
                 ViewOpt::ShowComments => ed.set_show_comments(value, cx),
+                ViewOpt::AutoRtti => {
+                    ed.controller_mut().set_show_rtti(value);
+                    ed.apply_document(cx);
+                }
+                ViewOpt::EnumChips => {
+                    ed.controller_mut().set_show_enum_chips(value);
+                    ed.apply_document(cx);
+                }
                 ViewOpt::HoverEffects => ed.set_hover_effects(value, cx),
+                ViewOpt::ValuePopups => ed.set_value_popups(value, cx),
                 ViewOpt::Minimap => ed.set_minimap(value, cx),
             });
         }
@@ -252,7 +288,10 @@ impl super::MainWindow {
             ed.set_relative_offsets(o.relative_offsets, cx);
             ed.set_type_hints(o.type_hints, cx);
             ed.set_show_comments(o.show_comments, cx);
+            ed.controller_mut().set_show_rtti(o.auto_rtti);
+            ed.controller_mut().set_show_enum_chips(o.enum_chips);
             ed.set_hover_effects(o.hover_effects, cx);
+            ed.set_value_popups(o.value_popups, cx);
             ed.set_minimap(o.minimap, cx);
             ed.set_font_family(font_family.clone(), cx);
             // Generator brace-wrap + the persisted refresh interval are

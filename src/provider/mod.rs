@@ -10,9 +10,11 @@
 //! and the connector-backed memflow provider.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use ahash::AHashMap;
 use bytes::Bytes;
+use parking_lot::RwLock;
 
 mod buffer;
 mod file;
@@ -227,6 +229,33 @@ pub struct ModuleEntry {
     pub full_path: String,
     pub base: u64,
     pub size: u64,
+}
+
+/// Lazily populated, provider-lifetime module snapshot.
+///
+/// Module enumeration can be a full OS or plugin round trip. Providers whose
+/// module list is not already captured at attach time expose one of these via
+/// [`Provider::module_cache`], making RTTI/compose lookups persistent across
+/// refresh passes.
+#[derive(Debug, Default)]
+pub struct ProviderModuleCache {
+    modules: RwLock<Option<Arc<[ModuleEntry]>>>,
+}
+
+impl ProviderModuleCache {
+    fn get_or_init(&self, enumerate: impl FnOnce() -> Vec<ModuleEntry>) -> Vec<ModuleEntry> {
+        if let Some(modules) = self.modules.read().as_ref() {
+            return modules.as_ref().to_vec();
+        }
+        let mut slot = self.modules.write();
+        let modules = slot.get_or_insert_with(|| Arc::from(enumerate()));
+        modules.as_ref().to_vec()
+    }
+
+    /// Drop the snapshot so the next lookup observes module load/unload changes.
+    pub fn invalidate(&self) {
+        *self.modules.write() = None;
+    }
 }
 
 /// Indexed module snapshot for live providers.
@@ -530,10 +559,31 @@ pub trait Provider {
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
         Vec::new()
     }
+    /// Optional storage used by the default provider-lifetime module cache.
+    /// Providers that already hold an attach-time module snapshot can leave
+    /// this as `None`; syscall/IPC-backed providers should return their cache.
+    fn module_cache(&self) -> Option<&ProviderModuleCache> {
+        None
+    }
+    /// Memoized module enumeration for RTTI and compose hot paths.
+    fn modules_cached(&self) -> Vec<ModuleEntry> {
+        self.module_cache().map_or_else(
+            || self.enumerate_modules(),
+            |cache| cache.get_or_init(|| self.enumerate_modules()),
+        )
+    }
+    /// Invalidate the optional provider-lifetime module snapshot.
+    fn invalidate_module_cache(&self) {
+        if let Some(cache) = self.module_cache() {
+            cache.invalidate();
+        }
+    }
     /// Enumerate modules and regions from one provider snapshot when the provider
     /// can do that cheaper or more consistently than two independent calls.
     fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
-        (self.enumerate_modules(), self.enumerate_regions())
+        let modules = self.modules_cached();
+        let regions = self.enumerate_regions_with_modules(&modules);
+        (modules, regions)
     }
     /// Enumerate regions using a caller-supplied module snapshot. Providers that
     /// label regions by module can avoid rebuilding the same module index.
@@ -633,9 +683,53 @@ pub trait Provider {
 mod tests {
     use super::{
         normalize_page_list, read_pages_in_runs, ModuleEntry, ModuleLookup, ModuleRangeLookup,
-        NormalizedPages, Provider, K_PAGE_SIZE,
+        NormalizedPages, Provider, ProviderModuleCache, K_PAGE_SIZE,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct ModuleCachedProvider {
+        cache: ProviderModuleCache,
+        enumerations: AtomicUsize,
+    }
+
+    impl Provider for ModuleCachedProvider {
+        fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+            false
+        }
+
+        fn size(&self) -> i32 {
+            1
+        }
+
+        fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+            self.enumerations.fetch_add(1, Ordering::Relaxed);
+            vec![ModuleEntry {
+                name: "cached.dll".into(),
+                base: 0x1000,
+                size: 0x1000,
+                ..ModuleEntry::default()
+            }]
+        }
+
+        fn module_cache(&self) -> Option<&ProviderModuleCache> {
+            Some(&self.cache)
+        }
+    }
+
+    #[test]
+    fn provider_module_cache_persists_until_explicit_invalidation() {
+        let provider = ModuleCachedProvider::default();
+        for _ in 0..5 {
+            assert_eq!(provider.modules_cached()[0].name, "cached.dll");
+        }
+        assert_eq!(provider.enumerations.load(Ordering::Relaxed), 1);
+
+        provider.invalidate_module_cache();
+        assert_eq!(provider.modules_cached()[0].base, 0x1000);
+        assert_eq!(provider.enumerations.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn module_lookup_indexes_address_name_path_and_file_name() {

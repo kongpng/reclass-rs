@@ -73,6 +73,9 @@ impl super::MainWindow {
                 s.set(settings_keys::CODE_FORMAT, &format_idx.to_string());
                 s.set(settings_keys::CODE_SCOPE, &scope_idx.to_string());
             }
+            DocAreaEvent::ViewZoomChanged(level) => {
+                self.set_primary_view_zoom_level(level, window, cx);
+            }
         }
         cx.notify();
     }
@@ -105,12 +108,24 @@ impl super::MainWindow {
             subs.push(cx.subscribe_in(
                 &editor,
                 window,
-                |this, _editor, ev: &crate::ui::editor::RcxEditorEvent, window, cx| match ev {
+                |this, editor, ev: &crate::ui::editor::RcxEditorEvent, window, cx| match ev {
                     crate::ui::editor::RcxEditorEvent::OpenTypeInNewTab { ref_id } => {
                         this.open_type_in_new_tab(*ref_id, window, cx);
                     }
                     crate::ui::editor::RcxEditorEvent::Status { message } => {
                         this.notify(message.clone(), window, cx);
+                    }
+                    crate::ui::editor::RcxEditorEvent::BookmarkAddressRequested {
+                        address,
+                        formula,
+                    } => {
+                        this.prompt_bookmark_address(
+                            editor.clone(),
+                            *address,
+                            formula.clone(),
+                            window,
+                            cx,
+                        );
                     }
                     // The editor mutated its document (rename / structural op /
                     // undo). Rebuild the workspace TYPES list so a class rename /
@@ -119,6 +134,9 @@ impl super::MainWindow {
                     // cached `WorkspaceModel` stale (a renamed class kept its name).
                     crate::ui::editor::RcxEditorEvent::DocumentEdited => {
                         this.rebuild_workspace(cx);
+                    }
+                    crate::ui::editor::RcxEditorEvent::ZoomChanged { level } => {
+                        this.set_primary_view_zoom_level(*level, window, cx);
                     }
                     // An in-editor View-option toggle (offset-margin double-click /
                     // right-click Relative/Absolute): the editor already applied it
@@ -129,6 +147,9 @@ impl super::MainWindow {
                         let opt = match option {
                             crate::ui::editor::EditorViewOption::RelativeOffsets => {
                                 ViewOpt::RelativeOffsets
+                            }
+                            crate::ui::editor::EditorViewOption::ValuePopups => {
+                                ViewOpt::ValuePopups
                             }
                         };
                         this.set_view_option_value(opt, *value, cx);
@@ -332,55 +353,27 @@ impl super::MainWindow {
         cx: &mut Context<Self>,
     ) {
         match action {
-            WorkspaceTypeAction::Rename {
-                doc,
-                node_id,
-                current,
-            } => {
-                // The C++ `renameType` opens `QInputDialog::getText`; collect the
-                // new name in a free-text prompt, then apply on accept.
+            WorkspaceTypeAction::Rename { doc, node_id, name } => {
                 let Some(editor) = self.editor_for_doc(doc, cx) else {
                     return;
                 };
-                let this = cx.entity().downgrade();
-                self.open_text_prompt(
-                    "Rename Type",
-                    "New name",
-                    &current,
-                    window,
-                    cx,
-                    move |name, window, app| {
-                        let name = name.trim().to_string();
-                        if name.is_empty() {
-                            return;
+                editor.update(cx, |ed, cx| {
+                    let idx = ed.controller().tree().index_of_id(node_id);
+                    if idx >= 0 {
+                        let node = &ed.controller().tree().nodes[idx as usize];
+                        let is_type = node.parent_id == 0 && !node.struct_type_name.is_empty();
+                        if is_type {
+                            ed.controller_mut().rename_struct_type(node_id, &name);
+                        } else {
+                            ed.controller_mut().rename_node(idx as usize, &name);
                         }
-                        let _ = this.update(app, |me, cx| {
-                            editor.update(cx, |ed, cx| {
-                                let idx = ed.controller().tree().index_of_id(node_id);
-                                if idx >= 0 {
-                                    let node = &ed.controller().tree().nodes[idx as usize];
-                                    // A top-level composite (enum/class/struct) is shown
-                                    // by its struct_type_name — the C++ renameType renames
-                                    // the TYPE; a child field is shown by its `name`.
-                                    // Match the displayed name, else renaming a type wrote
-                                    // the hidden instance `name` and looked like a no-op.
-                                    let is_type =
-                                        node.parent_id == 0 && !node.struct_type_name.is_empty();
-                                    if is_type {
-                                        ed.controller_mut().rename_struct_type(node_id, &name);
-                                    } else {
-                                        ed.controller_mut().rename_node(idx as usize, &name);
-                                    }
-                                    ed.apply_document(cx);
-                                }
-                            });
-                            me.rebuild_workspace(cx);
-                            me.sync_dirty_state(cx);
-                            me.notify(format!("Renamed to {name}"), window, cx);
-                            cx.notify();
-                        });
-                    },
-                );
+                        ed.apply_document(cx);
+                    }
+                });
+                self.rebuild_workspace(cx);
+                self.sync_dirty_state(cx);
+                self.notify(format!("Renamed to {name}"), window, cx);
+                cx.notify();
             }
             WorkspaceTypeAction::Duplicate { doc, node_id } => {
                 let Some(editor) = self.editor_for_doc(doc, cx) else {

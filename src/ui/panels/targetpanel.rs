@@ -402,7 +402,8 @@ mod view {
         let fg = match summary.health() {
             TargetHealth::Live => cx.theme().green,
             TargetHealth::Static => color::text_muted(cx),
-            TargetHealth::Offline => cx.theme().red,
+            TargetHealth::Stale => cx.theme().yellow,
+            TargetHealth::Disconnected => cx.theme().red,
             TargetHealth::NoSource => color::text_disabled(cx),
         };
         gpui_component::h_flex()

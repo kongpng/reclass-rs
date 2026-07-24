@@ -6,15 +6,21 @@
 //! - `"pid:1234"`
 //! - `"dump:C:/path/to/file.dmp"`
 
-use super::{read_pages_in_runs, MemoryRegion, ModuleEntry, PageMap, Provider};
+use super::{
+    read_pages_in_runs, MemoryRegion, ModuleEntry, PageMap, Provider, ProviderModuleCache,
+};
 
 pub struct WinDbgMemoryProvider {
     inner: platform::Inner,
+    module_cache: ProviderModuleCache,
 }
 
 impl WinDbgMemoryProvider {
     pub fn attach(target: &str) -> Result<Self, String> {
-        platform::Inner::attach(target).map(|inner| Self { inner })
+        platform::Inner::attach(target).map(|inner| Self {
+            inner,
+            module_cache: ProviderModuleCache::default(),
+        })
     }
 
     pub fn can_handle(target: &str) -> bool {
@@ -87,8 +93,14 @@ impl Provider for WinDbgMemoryProvider {
         self.inner.enumerate_modules()
     }
 
+    fn module_cache(&self) -> Option<&ProviderModuleCache> {
+        Some(&self.module_cache)
+    }
+
     fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
-        self.inner.enumerate_modules_and_regions()
+        let modules = self.modules_cached();
+        let regions = self.inner.enumerate_regions_with_modules(&modules);
+        (modules, regions)
     }
 
     fn is_readable(&self, _addr: u64, len: i32) -> bool {
@@ -309,20 +321,6 @@ mod platform {
                 .recv_timeout(Duration::from_secs(30))
                 .unwrap_or_default()
         }
-
-        pub fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            if self
-                .tx
-                .send(Request::ModulesAndRegions { reply: reply_tx })
-                .is_err()
-            {
-                return Default::default();
-            }
-            reply_rx
-                .recv_timeout(Duration::from_secs(30))
-                .unwrap_or_default()
-        }
     }
 
     impl Drop for Inner {
@@ -360,9 +358,6 @@ mod platform {
         },
         Modules {
             reply: Sender<Vec<ModuleEntry>>,
-        },
-        ModulesAndRegions {
-            reply: Sender<(Vec<ModuleEntry>, Vec<MemoryRegion>)>,
         },
         Shutdown,
     }
@@ -407,9 +402,6 @@ mod platform {
                 }
                 Request::Modules { reply } => {
                     let _ = reply.send(session.enumerate_modules());
-                }
-                Request::ModulesAndRegions { reply } => {
-                    let _ = reply.send(session.enumerate_modules_and_regions());
                 }
                 Request::Shutdown => break,
             }
@@ -634,12 +626,6 @@ mod platform {
             modules
         }
 
-        fn enumerate_modules_and_regions(&mut self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
-            let modules = self.enumerate_modules();
-            let regions = self.enumerate_regions_with_modules(&modules);
-            (modules, regions)
-        }
-
         fn enumerate_regions(&mut self) -> Vec<MemoryRegion> {
             let modules = self.enumerate_modules();
             self.enumerate_regions_with_modules(&modules)
@@ -807,9 +793,6 @@ mod platform {
         }
         pub fn enumerate_modules(&self) -> Vec<ModuleEntry> {
             Vec::new()
-        }
-        pub fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
-            Default::default()
         }
     }
 }

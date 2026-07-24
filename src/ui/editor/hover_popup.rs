@@ -75,7 +75,8 @@ impl HoverMemoryMaps {
         result_revision: u64,
         provider: &Arc<dyn Provider + Send + Sync>,
     ) -> Self {
-        let (modules, regions) = provider.enumerate_modules_and_regions();
+        let modules = provider.modules_cached();
+        let regions = provider.enumerate_regions_with_modules(&modules);
         Self::with_regions_modules(result_revision, provider, regions, modules)
     }
 
@@ -183,6 +184,9 @@ pub(super) enum HoverPopupKind {
     /// popup is shown during an active edit and each row gets a Set button that
     /// writes the value back into the node.
     ValueHistory {
+        /// Stable identity for the dwell fingerprint. Live history entries are a
+        /// snapshot and deliberately do not participate in popup replacement.
+        node_id: u64,
         entries: Vec<(String, i64)>,
         total_count: i64,
         node_idx: i32,
@@ -218,23 +222,21 @@ pub(super) fn hover_kind_eq(a: &HoverPopupKind, b: &HoverPopupKind) -> bool {
     match (a, b) {
         (
             HoverPopupKind::ValueHistory {
-                entries: la,
+                node_id: na,
                 set_buttons: sa,
                 ..
             },
             HoverPopupKind::ValueHistory {
-                entries: lb,
+                node_id: nb,
                 set_buttons: sb,
                 ..
             },
         ) => {
-            // Compare only the VALUE column (ignore the raw msec timestamps, which
-            // are constant per entry but irrelevant to identity) + the Set-button
-            // mode — the C++ `vals == m_values` test. This avoids constant popup
-            // re-creation as the elapsed-time labels advance each frame.
-            sa == sb
-                && la.len() == lb.len()
-                && la.iter().zip(lb.iter()).all(|((va, _), (vb, _))| va == vb)
+            // Fingerprint only the hovered node + hover/edit mode. A live row can
+            // record several values per second; rebuilding the card for each new
+            // entry tears down its contents and visibly flickers. Keep the history
+            // captured at first dwell until the row/slate/mode changes.
+            na == nb && sa == sb
         }
         (
             HoverPopupKind::TitleBody {
@@ -545,7 +547,7 @@ impl super::RcxEditor {
             return;
         }
         let probe = HoverProbe { line, rel_x, pos };
-        let want = if self.hover_effects {
+        let want = if self.hover_effects && self.value_popups {
             self.compute_hover_popup(line, rel_x, pos)
         } else {
             None
@@ -635,6 +637,7 @@ impl super::RcxEditor {
         if self.context_menu.is_some()
             || self.hover_dwell_suppressed
             || !self.hover_effects
+            || !self.value_popups
             || self.hover_popup.is_none()
         {
             return;
@@ -846,6 +849,7 @@ impl super::RcxEditor {
                             line,
                             pos,
                             kind: HoverPopupKind::ValueHistory {
+                                node_id: lm.node_id,
                                 entries,
                                 total_count: i64::from(hist.count),
                                 node_idx: lm.node_idx,
@@ -976,7 +980,7 @@ impl super::RcxEditor {
             .as_ref()
             .is_some_and(|maps| !maps.modules_loaded)
         {
-            let modules = prov.enumerate_modules();
+            let modules = prov.modules_cached();
             if let Some(maps) = self.hover_memory_maps.as_mut() {
                 maps.set_modules(modules);
             }
@@ -1171,6 +1175,7 @@ impl super::RcxEditor {
         let palette = EditorPalette::from_theme(cx);
         let card = match &state.kind {
             HoverPopupKind::ValueHistory {
+                node_id: _,
                 entries,
                 total_count,
                 node_idx,
@@ -1553,22 +1558,31 @@ impl super::RcxEditor {
                     .position(state.pos + point(px(12.0), px(16.0)))
                     .snap_to_window_with_margin(px(8.0))
                     .child(
-                        card.id("rcx-hover-popup-card")
-                            .bg(palette.gutter_bg)
-                            .border_1()
-                            .border_color(palette.border)
-                            .rounded(px(design::tokens::radius::MD))
-                            .px(px(design::tokens::space::SM))
-                            .py(px(design::tokens::space::XS))
-                            .shadow_md()
-                            // Item 13: containment guard — while the cursor is over
-                            // the card, set `popup_cursor_inside` so the row-level
-                            // hover handler beneath does NOT dismiss the popup before
-                            // a click (notably the value-history 'Set' buttons) lands.
-                            // Cleared when the cursor leaves the card.
-                            .on_hover(cx.listener(|this, inside: &bool, _w, _cx| {
+                        card.child(
+                            div()
+                                .pt(px(design::tokens::space::XS))
+                                .text_size(px(design::tokens::font::UI_XS))
+                                .text_color(palette.dim)
+                                .child("H  hide popups"),
+                        )
+                        .id("rcx-hover-popup-card")
+                        .bg(palette.gutter_bg)
+                        .border_1()
+                        .border_color(palette.border)
+                        .rounded(px(0.0))
+                        .px(px(design::tokens::space::SM))
+                        .py(px(design::tokens::space::XS))
+                        .shadow_md()
+                        // Item 13: containment guard — while the cursor is over
+                        // the card, set `popup_cursor_inside` so the row-level
+                        // hover handler beneath does NOT dismiss the popup before
+                        // a click (notably the value-history 'Set' buttons) lands.
+                        // Cleared when the cursor leaves the card.
+                        .on_hover(cx.listener(
+                            |this, inside: &bool, _w, _cx| {
                                 this.popup_cursor_inside = *inside;
-                            })),
+                            },
+                        )),
                     ),
             )
             .with_priority(2)
@@ -2789,7 +2803,7 @@ mod tests {
     };
     use crate::compose::ColumnSpan;
     use crate::core::{ChipKind, LineChip, LineMeta, NodeKind};
-    use crate::provider::{MemoryRegion, ModuleEntry, Provider, RegionType};
+    use crate::provider::{MemoryRegion, ModuleEntry, Provider, ProviderModuleCache, RegionType};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2869,6 +2883,7 @@ mod tests {
         region_calls: AtomicUsize,
         module_calls: AtomicUsize,
         combined_calls: AtomicUsize,
+        module_cache: ProviderModuleCache,
     }
 
     impl CombinedCountingProvider {
@@ -2882,6 +2897,7 @@ mod tests {
                 region_calls: AtomicUsize::new(0),
                 module_calls: AtomicUsize::new(0),
                 combined_calls: AtomicUsize::new(0),
+                module_cache: ProviderModuleCache::default(),
             }
         }
 
@@ -2992,6 +3008,10 @@ mod tests {
         fn enumerate_modules(&self) -> Vec<ModuleEntry> {
             self.module_calls.fetch_add(1, Ordering::Relaxed);
             self.modules()
+        }
+
+        fn module_cache(&self) -> Option<&ProviderModuleCache> {
+            Some(&self.module_cache)
         }
 
         fn enumerate_modules_and_regions(&self) -> (Vec<ModuleEntry>, Vec<MemoryRegion>) {
@@ -3356,24 +3376,26 @@ mod tests {
     }
 
     #[test]
-    fn hover_memory_maps_use_combined_provider_snapshot_when_modules_are_needed() {
+    fn hover_memory_maps_reuse_provider_lifetime_module_snapshot() {
         let counted = Arc::new(CombinedCountingProvider::new(0x2000, vec![0xAA]));
         let provider: Arc<dyn Provider + Send + Sync> = counted.clone();
 
         let maps = HoverMemoryMaps::from_provider_with_modules(11, &provider);
+        let maps_again = HoverMemoryMaps::from_provider_with_modules(12, &provider);
 
-        assert_eq!(counted.combined_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.combined_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             counted.region_calls.load(Ordering::Relaxed),
-            0,
-            "fresh pointer hovers should not enumerate regions separately"
+            2,
+            "region maps remain scoped to each hover/result revision"
         );
         assert_eq!(
             counted.module_calls.load(Ordering::Relaxed),
-            0,
-            "fresh pointer hovers should not enumerate modules separately"
+            1,
+            "module enumeration should be memoized for the provider lifetime"
         );
         assert!(maps.modules_loaded);
+        assert!(maps_again.modules_loaded);
         let lookup = maps.lookup();
         assert!(lookup.is_readable(0x2000, 1));
         assert_eq!(

@@ -96,7 +96,10 @@ fn view_options_load_reads_persisted_keys_and_defaults_the_rest() {
     assert!(o.tree_lines);
     assert!(o.relative_offsets);
     assert!(o.hover_effects);
+    assert!(o.value_popups);
     assert!(!o.show_comments);
+    assert!(!o.auto_rtti);
+    assert!(o.enum_chips);
     assert!(!o.minimap);
     let _ = std::fs::remove_file(&path);
 }
@@ -113,7 +116,10 @@ fn view_option_persist_key_matches_cpp_qsettings_key() {
     );
     assert_eq!(ViewOptions::key(ViewOpt::TypeHints), "typeHints");
     assert_eq!(ViewOptions::key(ViewOpt::ShowComments), "showComments");
+    assert_eq!(ViewOptions::key(ViewOpt::AutoRtti), "showRttiChips");
+    assert_eq!(ViewOptions::key(ViewOpt::EnumChips), "showEnumChips");
     assert_eq!(ViewOptions::key(ViewOpt::HoverEffects), "hoverEffects");
+    assert_eq!(ViewOptions::key(ViewOpt::ValuePopups), "valuePopups");
     assert_eq!(ViewOptions::key(ViewOpt::Minimap), "minimap");
 }
 
@@ -516,15 +522,18 @@ fn safe_unload_through_host_removes_row_and_keeps_builtins() {
 #[test]
 fn view_options_default_matches_cpp_view_menu() {
     // C++ persisted QSettings defaults (main.cpp:1336-1411): compactColumns,
-    // treeLines, relativeOffsets, hoverEffects ON; typeHints, showComments,
-    // minimap OFF.
+    // treeLines, relativeOffsets, hoverEffects, valuePopups ON; typeHints,
+    // showComments, minimap OFF.
     let d = ViewOptions::default();
     assert!(d.compact_columns);
     assert!(d.tree_lines);
     assert!(d.relative_offsets);
     assert!(!d.type_hints);
     assert!(!d.show_comments);
+    assert!(!d.auto_rtti);
+    assert!(d.enum_chips);
     assert!(d.hover_effects);
+    assert!(d.value_popups);
     assert!(!d.minimap);
 }
 
@@ -552,7 +561,10 @@ fn view_option_command_ids_match_menu_contract() {
     );
     assert_eq!(ViewOpt::TypeHints.command_id(), "view.type_hints");
     assert_eq!(ViewOpt::ShowComments.command_id(), "view.comments");
+    assert_eq!(ViewOpt::AutoRtti.command_id(), "view.auto_rtti");
+    assert_eq!(ViewOpt::EnumChips.command_id(), "view.enum_chips");
     assert_eq!(ViewOpt::HoverEffects.command_id(), "view.hover");
+    assert_eq!(ViewOpt::ValuePopups.command_id(), "view.value_popups");
     assert_eq!(ViewOpt::Minimap.command_id(), "view.minimap");
     // Every variant maps to a distinct id.
     let ids: Vec<&str> = ViewOpt::ALL.iter().map(|o| o.command_id()).collect();

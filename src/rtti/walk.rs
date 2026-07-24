@@ -137,10 +137,10 @@ fn read_cstring(p: &dyn Provider, addr: u64, max_len: usize) -> String {
 }
 
 /// `findOwningModule(prov, addr)` (`rtti.cpp:20`). Linear scan over
-/// `enumerate_modules()`; returns the first module containing `addr`, else an
+/// the provider-lifetime module snapshot; returns the first module containing `addr`, else an
 /// invalid [`OwningModule`].
 pub fn find_owning_module(prov: &dyn Provider, addr: u64) -> OwningModule {
-    let mods = prov.enumerate_modules();
+    let mods = prov.modules_cached();
     find_owning_module_in(&mods, addr)
 }
 
@@ -212,7 +212,7 @@ pub fn walk_rtti(
     pointer_size: i32,
     max_vtable_slots: i32,
 ) -> RttiInfo {
-    let modules = prov.enumerate_modules();
+    let modules = prov.modules_cached();
     walk_rtti_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots)
 }
 
@@ -386,7 +386,7 @@ pub fn walk_rtti_itanium(
     pointer_size: i32,
     max_vtable_slots: i32,
 ) -> RttiInfo {
-    let modules = prov.enumerate_modules();
+    let modules = prov.modules_cached();
     walk_rtti_itanium_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots)
 }
 

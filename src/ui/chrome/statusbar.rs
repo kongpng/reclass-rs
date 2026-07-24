@@ -456,6 +456,7 @@ mod view {
         info: &StatusInfo,
         source: &DataSource,
         target: &TargetStatusSummary,
+        on_open_goto: impl Fn(&mut Window, &mut App) + 'static,
         on_open_target: impl Fn(&mut Window, &mut App) + 'static,
         cx: &App,
     ) -> impl IntoElement {
@@ -494,9 +495,11 @@ mod view {
         let target_color = match target_health {
             TargetHealth::Live => cx.theme().green,
             TargetHealth::Static => muted,
-            TargetHealth::Offline => cx.theme().red,
+            TargetHealth::Stale => cx.theme().yellow,
+            TargetHealth::Disconnected => cx.theme().red,
             TargetHealth::NoSource => color::text_disabled(cx),
         };
+        let goto_open = Rc::new(on_open_goto);
         let target_open = Rc::new(on_open_target);
 
         // The C++ selection extras (`reclass_right_click_on_address.png`):
@@ -538,7 +541,8 @@ mod view {
             .min_h(px(STATUS_BAR_HEIGHT))
             .max_h(px(STATUS_BAR_HEIGHT))
             .overflow_hidden()
-            .px(px(tokens::space::LG))
+            .pl(px(tokens::space::LG))
+            .pr(px(2.0))
             .gap(px(tokens::space::MD))
             .items_center()
             .justify_between()
@@ -553,11 +557,20 @@ mod view {
             // the right cluster off-screen.
             .child(
                 gpui_component::h_flex()
+                    .id("rcx-status-location")
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .gap(px(tokens::space::MD))
                     .items_center()
+                    .cursor_pointer()
+                    .rounded(px(tokens::radius::SM))
+                    .px(px(tokens::space::XS))
+                    .hover(|s| s.bg(color::hover_overlay(cx)))
+                    .on_click(move |_e, window, cx| {
+                        (goto_open)(window, cx);
+                    })
+                    .tooltip(|window, cx| Tooltip::new("Go to Address…").build(window, cx))
                     .when(has_path, |row| {
                         row.child(div().flex_none().text_color(path_color).child(path.clone()))
                     })
@@ -657,6 +670,29 @@ mod view {
                             .text_color(muted)
                             .child(segment_icon(icon::settings()))
                             .child(div().flex_none().child(theme_label)),
+                    )
+                    // Visible bottom-right resize grip. gpui-component's Root
+                    // already supplies edge/corner hit zones; this mirrors the
+                    // upstream QSizeGrip affordance and drives the same native
+                    // bottom-right resize operation.
+                    .child(
+                        div()
+                            .id("rcx-window-resize-grip")
+                            .flex_none()
+                            .w(px(14.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_end()
+                            .justify_end()
+                            .pb(px(1.0))
+                            .pr(px(1.0))
+                            .cursor(CursorStyle::ResizeUpLeftDownRight)
+                            .text_color(color::text_disabled(cx))
+                            .child("◢")
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                cx.stop_propagation();
+                                window.start_window_resize(ResizeEdge::BottomRight);
+                            }),
                     ),
             )
     }

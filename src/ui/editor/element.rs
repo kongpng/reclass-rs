@@ -34,6 +34,9 @@ pub struct RowPaint {
     /// subtle Zed buttons behind footer add-bytes/Trim controls and the
     /// command-row chevron/source chips (editor-surface.md §5 step 14, PIC4/PIC5).
     pub pills: Vec<PillPaint>,
+    /// Optional unreadable-value span in character columns. Only these glyphs
+    /// receive the error-colored strike; the field name/type remain untouched.
+    pub strike: Option<(i32, i32)>,
     pub palette: EditorPalette,
     pub metrics: CellMetrics,
     pub font: Font,
@@ -207,6 +210,7 @@ impl Element for RowElement {
             &self.row.palette,
             &self.row.font,
             None,
+            self.row.strike,
         );
         // Shape the line FIRST: pill backgrounds and inline overlays must anchor to
         // the SAME shaped-glyph x-positions the glyphs paint at, not the `col * cell`
@@ -241,6 +245,7 @@ impl Element for RowElement {
                 &self.row.palette,
                 &self.row.font,
                 hover_recolor,
+                self.row.strike,
             );
             line = window
                 .text_system()
@@ -448,6 +453,7 @@ fn build_text_runs(
     palette: &EditorPalette,
     font: &Font,
     hover_recolor: Option<(i32, i32)>,
+    strike: Option<(i32, i32)>,
 ) -> Vec<TextRun> {
     // Hover-recolor byte range (link-blue). Empty/invalid → no override.
     let hover_bytes: Option<(usize, usize)> = hover_recolor.and_then(|(s, e)| {
@@ -458,33 +464,52 @@ fn build_text_runs(
         let eb = geometry::byte_for_col(text, e);
         (eb > sb).then_some((sb, eb))
     });
-    let mk = |len: usize, color: Hsla| TextRun {
+    let strike_bytes: Option<(usize, usize)> = strike.and_then(|(s, e)| {
+        if e <= s {
+            return None;
+        }
+        let sb = geometry::byte_for_col(text, s);
+        let eb = geometry::byte_for_col(text, e);
+        (eb > sb).then_some((sb, eb))
+    });
+    let mk = |len: usize, color: Hsla, struck: bool| TextRun {
         len,
         font: font.clone(),
         color,
         background_color: None,
         underline: None,
-        strikethrough: None,
+        strikethrough: struck.then_some(StrikethroughStyle {
+            thickness: px(1.0),
+            color: Some(palette.error_fg),
+        }),
     };
-    // Emit a `[start,end)` byte run with `base` color, but split out any
-    // sub-portion that overlaps the hover range and paint it link-blue instead.
+    // Emit a `[start,end)` byte run with `base` color, splitting at hover and
+    // unreadable-strike boundaries so both effects can coexist exactly.
     let push_colored = |runs: &mut Vec<TextRun>, start: usize, end: usize, base: Hsla| {
         if end <= start {
             return;
         }
-        match hover_bytes {
-            Some((hs, he)) if he > start && hs < end => {
-                let mid_s = hs.max(start);
-                let mid_e = he.min(end);
-                if mid_s > start {
-                    runs.push(mk(mid_s - start, base));
-                }
-                runs.push(mk(mid_e - mid_s, palette.accent));
-                if end > mid_e {
-                    runs.push(mk(end - mid_e, base));
-                }
+        let mut cuts = vec![start, end];
+        for (lo, hi) in [hover_bytes, strike_bytes].into_iter().flatten() {
+            if lo > start && lo < end {
+                cuts.push(lo);
             }
-            _ => runs.push(mk(end - start, base)),
+            if hi > start && hi < end {
+                cuts.push(hi);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let lo = pair[0];
+            let hi = pair[1];
+            let hovered = hover_bytes.is_some_and(|(hs, he)| he > lo && hs < hi);
+            let struck = strike_bytes.is_some_and(|(ss, se)| se > lo && ss < hi);
+            runs.push(mk(
+                hi - lo,
+                if hovered { palette.accent } else { base },
+                struck,
+            ));
         }
     };
     if spans.is_empty() {

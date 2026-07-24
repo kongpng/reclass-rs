@@ -45,6 +45,7 @@ thread_local! {
 #[derive(Clone, Debug)]
 struct ModuleInfo {
     name: String,
+    full_path: String,
     base: u64,
     size: u64,
 }
@@ -67,7 +68,12 @@ extern "C" fn module_callback(data: *mut EnumerateRemoteModuleData) {
     let size = data.size;
     let path = decode_utf16_fixed(&path_buf);
     let name = file_name_of(&path);
-    let info = ModuleInfo { name, base, size };
+    let info = ModuleInfo {
+        name,
+        full_path: path,
+        base,
+        size,
+    };
     MODULE_SINK.with(|sink| {
         let ptr = *sink.borrow();
         if !ptr.is_null() {
@@ -230,7 +236,7 @@ impl RcNetProvider {
                 .iter()
                 .map(|m| ModuleEntry {
                     name: m.name.clone(),
-                    full_path: String::new(),
+                    full_path: m.full_path.clone(),
                     base: m.base,
                     size: m.size,
                 })
@@ -371,6 +377,20 @@ impl Provider for RcNetProvider {
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         // [fix] (2): real regions from the section callback (C++ returned empty).
         self.regions.clone()
+    }
+
+    fn enumerate_modules(&self) -> Vec<ModuleEntry> {
+        // The plugin enumeration was captured synchronously at attach time, so
+        // expose that same provider-lifetime snapshot to RTTI/compose callers.
+        self.modules
+            .iter()
+            .map(|module| ModuleEntry {
+                name: module.name.clone(),
+                full_path: module.full_path.clone(),
+                base: module.base,
+                size: module.size,
+            })
+            .collect()
     }
 
     fn trusts_enumerated_region_readability(&self) -> bool {
@@ -538,6 +558,13 @@ mod tests {
         assert_eq!(p.get_symbol(0x9999), "");
         assert_eq!(p.symbol_to_address("FAKE.EXE"), 0x1000);
         assert_eq!(p.symbol_to_address("nope"), 0);
+
+        let modules = p.enumerate_modules();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "fake.exe");
+        assert_eq!(modules[0].full_path, r"C:\games\fake.exe");
+        assert_eq!(modules[0].base, 0x1000);
+        assert_eq!(modules[0].size, 0x2000);
     }
 
     #[test]

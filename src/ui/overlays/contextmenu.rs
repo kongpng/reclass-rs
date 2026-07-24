@@ -220,7 +220,7 @@ pub fn menu_item_labels(items: &[MenuItem]) -> Vec<Option<(String, CommandId, bo
 #[cfg(feature = "ui")]
 pub fn context_shortcut_for(command: &str) -> &'static str {
     match command {
-        "hex.break_into_class" => "Ctrl+R",
+        "hex.break_into_class" => "Ctrl+Shift+B",
         "hex.copy_hex" => "Ctrl+C",
         "hex.paste" => "Ctrl+V",
         "node.duplicate" => "Ctrl+D",

@@ -247,16 +247,46 @@ pub mod color {
 
     // ── Surfaces ───────────────────────────────────────────────────────────
 
-    /// Window / chrome background (titlebar, menubar, status bar) — the darkest
-    /// shell. Maps to the theme `background`.
-    pub fn chrome_bg(cx: &gpui::App) -> Hsla {
-        cx.theme().background
+    /// Editor-paper surface shared by the editor and its peer data views. Light
+    /// themes use crisp white; dark themes use the same subtle darkening as the
+    /// editor palette (`background.darker(115)` upstream).
+    pub fn editor_paper(cx: &gpui::App) -> Hsla {
+        let background = cx.theme().background;
+        if background.l > 0.78 {
+            Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 1.0,
+                a: 1.0,
+            }
+        } else {
+            Hsla {
+                l: (background.l - 0.06).clamp(0.0, 1.0),
+                ..background
+            }
+        }
     }
 
-    /// Dockable panel background (workspace / scanner sidebars). Maps to
-    /// `sidebar` (≈ chrome, intentionally near-identical for a flat look).
+    /// Darker band used by the frameless title/menu and compact chrome. Qt's
+    /// `darker(127)` divides channel intensity by 1.27; scaling HSL lightness
+    /// gives the corresponding theme-driven result in GPUI.
+    pub fn menu_bar_bg(cx: &gpui::App) -> Hsla {
+        let paper = editor_paper(cx);
+        Hsla {
+            l: (paper.l / 1.27).clamp(0.0, 1.0),
+            ..paper
+        }
+    }
+
+    /// Window / chrome background (titlebar, menubar, status bar).
+    pub fn chrome_bg(cx: &gpui::App) -> Hsla {
+        menu_bar_bg(cx)
+    }
+
+    /// Dockable data-panel surface. Workspace, Bookmarks, scanner results, and
+    /// Symbols/Modules deliberately share the editor-paper role upstream.
     pub fn panel_bg(cx: &gpui::App) -> Hsla {
-        cx.theme().sidebar
+        editor_paper(cx)
     }
 
     /// Elevated surface (popover / dropdown / dialog / card) — one step lighter
@@ -265,10 +295,9 @@ pub mod color {
         cx.theme().popover
     }
 
-    /// Content / editor "paper" background. Maps to `background` (the editor
-    /// surface darkens it slightly itself; see `ui/editor/palette.rs`).
+    /// Content / editor paper background.
     pub fn content_bg(cx: &gpui::App) -> Hsla {
-        cx.theme().background
+        editor_paper(cx)
     }
 
     // ── Lines / overlays ─────────────────────────────────────────────────────
@@ -651,6 +680,45 @@ pub fn empty_state(
                 .text_size(px(tokens::font::UI_SM))
                 .text_color(color::text_muted(cx))
                 .child(caption.into()),
+        )
+}
+
+/// A centered two-line panel empty-state: the primary explanation uses the
+/// normal muted treatment and the follow-up action is quieter. This mirrors
+/// upstream's shared empty-overlay painter for panels that need to distinguish
+/// "nothing exists yet" from a filtered-to-zero result.
+pub fn empty_state_with_hint(
+    icon: gpui_component::Icon,
+    primary: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+    cx: &gpui::App,
+) -> Div {
+    use gpui_component::Sizable as _;
+    gpui_component::v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(tokens::space::MD))
+        .child(
+            icon.with_size(px(20.0))
+                .text_color(color::text_disabled(cx)),
+        )
+        .child(
+            gpui_component::v_flex()
+                .items_center()
+                .gap(px(tokens::space::XS))
+                .child(
+                    div()
+                        .text_size(px(tokens::font::UI_SM))
+                        .text_color(color::text_muted(cx))
+                        .child(primary.into()),
+                )
+                .child(
+                    div()
+                        .text_size(px(tokens::font::UI_XS))
+                        .text_color(color::text_disabled(cx))
+                        .child(hint.into()),
+                ),
         )
 }
 

@@ -129,7 +129,7 @@ pub fn resolve_rtti(
     pointer_size: i32,
     max_vtable_slots: i32,
 ) -> RttiInfo {
-    let modules = prov.enumerate_modules();
+    let modules = prov.modules_cached();
     let msvc = walk_rtti_with_modules(prov, &modules, vtable_addr, pointer_size, max_vtable_slots);
     if msvc.ok {
         return msvc;
@@ -199,19 +199,10 @@ pub fn resolve_field_vtable(
     selected_ids: &[u64],
     prov: &dyn Provider,
 ) -> Result<u64, RttiFieldError> {
-    use crate::core::linemeta::{
-        K_ARRAY_ELEM_BIT, K_ARRAY_ELEM_MASK, K_FOOTER_ID_BIT, K_MEMBER_BIT, K_MEMBER_SUB_MASK,
-    };
-
     if selected_ids.len() != 1 {
         return Err(RttiFieldError::NoSingleSelection);
     }
-    let nid = selected_ids[0]
-        & !(K_FOOTER_ID_BIT
-            | K_ARRAY_ELEM_BIT
-            | K_ARRAY_ELEM_MASK
-            | K_MEMBER_BIT
-            | K_MEMBER_SUB_MASK);
+    let nid = crate::core::linemeta::base_node_id_from_sel_id(selected_ids[0]);
 
     let idx = tree.index_of_id(nid);
     if idx < 0 {

@@ -6,13 +6,76 @@
 use super::*;
 
 impl super::MainWindow {
+    /// Always-visible 22px Project rail used while the left workspace dock is
+    /// closed. This is intentionally outside `DockArea`: a closed dock otherwise
+    /// has no hit target, while upstream reserves this narrow strip so Project is
+    /// discoverable without opening the View menu.
+    pub(super) fn render_workspace_rail(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        use crate::ui::design::{color, icon, tokens};
+        use gpui_component::Sizable as _;
+
+        if self
+            .dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Left, cx)
+        {
+            return None;
+        }
+
+        let letters = "PROJECT".chars().map(|ch| {
+            div()
+                .h(px(11.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(ch.to_string())
+        });
+
+        Some(
+            gpui_component::v_flex()
+                .id("rcx-workspace-collapsed-rail")
+                .flex_none()
+                .w(px(22.0))
+                .h_full()
+                .items_center()
+                .border_r_1()
+                .border_color(color::border(cx))
+                .bg(color::chrome_bg(cx))
+                .text_color(color::text_muted(cx))
+                .cursor_pointer()
+                .hover(|d| d.bg(color::hover_overlay(cx)).text_color(color::text(cx)))
+                .on_click(cx.listener(|this, _e, window, cx| {
+                    this.apply_layout_preset(LayoutPreset::Workspace, window, cx);
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon::chevron_right().with_size(px(12.0))),
+                )
+                .child(
+                    gpui_component::v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(tokens::font::UI_XS))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .children(letters),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Build the editor split panes (View ▸ Split Editor) — one element per extra
     /// pane in [`split_panes`](Self::split_panes). Each pane views the SAME active
-    /// document as the primary editor (the C++ `SplitPane` binds to the tab's
-    /// controller) with its OWN view mode: a Tree pane embeds the live editor
-    /// entity; a Rendered pane shows the generated C/C++ for the view root. Each
-    /// pane carries a header with a per-pane Tree/Code segmented toggle (the C++
-    /// per-`SplitPane` view-mode combo) and an "✕" that removes it. Returns an
+    /// document as the primary editor with its OWN view mode. The current Rust
+    /// editor combines controller/document ownership with pane-local UI state, so
+    /// extra Tree panes are read-only projections of the active editor; Rendered
+    /// panes show generated source from that same controller. Each pane carries a
+    /// header with a per-pane mode toggle and an "✕" that removes it. Returns an
     /// empty vec when unsplit (the primary pane is the dock area itself).
     pub(super) fn render_split_panes(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         use crate::ui::design::color;
@@ -22,10 +85,9 @@ impl super::MainWindow {
         let editor = self.document_area.read(cx).active_editor().cloned();
         self.split_panes
             .iter()
-            .copied()
             .enumerate()
-            .map(|(pane_ix, mode)| {
-                let inner = self.render_one_split_pane(pane_ix, mode, editor.as_ref(), cx);
+            .map(|(pane_ix, pane)| {
+                let inner = self.render_one_split_pane(pane_ix, pane, editor.as_ref(), cx);
                 // Each pane is an equal-flex column with a left divider separating it
                 // from the dock area / its sibling panes (Zed split gutter).
                 gpui_component::v_flex()
@@ -48,11 +110,12 @@ impl super::MainWindow {
     pub(super) fn render_one_split_pane(
         &self,
         pane_ix: usize,
-        mode: ViewMode,
+        pane: &SplitPaneState,
         editor: Option<&Entity<crate::ui::editor::RcxEditor>>,
         cx: &Context<Self>,
     ) -> AnyElement {
         use crate::ui::design::{color, tokens};
+        let mode = pane.mode;
 
         // ── Header: per-pane view-mode segmented toggle + close button. ──
         let segment = |label: &'static str, this_mode: ViewMode, cx: &Context<Self>| {
@@ -79,7 +142,7 @@ impl super::MainWindow {
                         // Land exactly on this segment's mode (a 3-mode control
                         // can't blindly toggle). Clicking the active segment is a
                         // no-op, like the C++ exclusive combo.
-                        if this.split_panes.get(pane_ix).copied() != Some(this_mode) {
+                        if this.split_panes.get(pane_ix).map(|pane| pane.mode) != Some(this_mode) {
                             this.set_split_pane_mode(pane_ix, this_mode, cx);
                         }
                     }),
@@ -101,42 +164,52 @@ impl super::MainWindow {
                     .gap(px(tokens::space::XXS))
                     .child(segment("Tree", ViewMode::Tree, cx))
                     .child(segment("Code", ViewMode::Rendered, cx))
-                    .child(segment("Debug", ViewMode::Debug, cx)),
+                    .child(segment("Debug", ViewMode::Debug, cx))
+                    .child(segment("Both", ViewMode::Both, cx)),
             )
             .child(
-                div()
-                    .id(SharedString::from(format!("split-close-{pane_ix}")))
-                    .px(px(tokens::space::XS))
-                    .text_size(px(13.))
-                    .text_color(color::text_muted(cx))
-                    .hover(|d| d.text_color(color::text(cx)))
-                    .cursor_pointer()
-                    .child("✕")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _e, _w, cx| {
-                            // Remove THIS pane (the C++ closes the pane's tab widget).
-                            if pane_ix < this.split_panes.len() {
-                                this.split_panes.remove(pane_ix);
-                                cx.notify();
-                            }
-                        }),
+                gpui_component::h_flex()
+                    .items_center()
+                    .gap(px(tokens::space::SM))
+                    .child(self.render_split_zoom_control(pane, cx))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("split-close-{pane_ix}")))
+                            .px(px(tokens::space::XS))
+                            .text_size(px(13.))
+                            .text_color(color::text_muted(cx))
+                            .hover(|d| d.text_color(color::text(cx)))
+                            .cursor_pointer()
+                            .child("✕")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _e, _w, cx| {
+                                    // Remove THIS pane (the C++ closes the pane's tab widget).
+                                    if pane_ix < this.split_panes.len() {
+                                        this.split_panes.remove(pane_ix);
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
                     ),
             );
 
         // ── Body: the same document in the pane's view mode. ──
         //
-        // NOTE: a split pane must NOT re-render the live `RcxEditor` entity — gpui
-        // renders an entity once per frame, and the primary pane (inside the dock
-        // area) already owns that render. So a split's *Tree* view shows a
-        // read-only projection of the editor's composed tree text (the C++
-        // `SplitPane` views the same document; here it mirrors the composed
-        // output), and the *Code* view shows the generated C/C++. Both are pure
-        // read-only projections built from the controller — never the live entity.
+        // Upstream already created a distinct RcxEditor per SplitPane, all bound to
+        // one shared RcxController, before be9c2b6; that commit only reparented one
+        // pane's existing editor + Code widgets into its new Both splitter. In this
+        // port RcxEditor itself owns both RcxController and pane-local scroll,
+        // focus, hover, edit, and zoom state. Reusing one Entity here would share
+        // those supposedly pane-local states (and its element identity), while
+        // constructing another RcxEditor creates a separate controller/document.
+        // Until those layers are separated, extra Tree/Both surfaces remain
+        // read-only projections over the authoritative active controller.
         let body = match (editor, mode) {
-            (Some(ed), ViewMode::Tree) => self.render_split_tree(ed, cx),
-            (Some(ed), ViewMode::Rendered) => self.render_split_code(ed, cx),
-            (Some(ed), ViewMode::Debug) => self.render_split_debug(ed, cx),
+            (Some(ed), ViewMode::Tree) => self.render_split_tree(ed, pane.zoom_level, cx),
+            (Some(ed), ViewMode::Rendered) => self.render_split_code(ed, pane.zoom_level, cx),
+            (Some(ed), ViewMode::Debug) => self.render_split_debug(ed, pane.zoom_level, cx),
+            (Some(ed), ViewMode::Both) => self.render_split_both(ed, pane, cx),
             (None, _) => div()
                 .size_full()
                 .flex()
@@ -154,6 +227,36 @@ impl super::MainWindow {
             .into_any_element()
     }
 
+    /// Continuous zoom slider/readout owned by one extra pane.
+    fn render_split_zoom_control(&self, pane: &SplitPaneState, cx: &Context<Self>) -> AnyElement {
+        use crate::ui::design::{color, tokens};
+        use gpui_component::slider::Slider;
+        let current = pane.zoom_level;
+        let percent = view_zoom_percent(current, tokens::font::EDITOR_SIZE);
+
+        gpui_component::h_flex()
+            .items_center()
+            .gap(px(tokens::space::XS))
+            .text_size(px(10.))
+            .text_color(color::text_muted(cx))
+            .child("Zoom")
+            .child(
+                div().w(px(60.)).h(px(18.0)).flex().items_center().child(
+                    Slider::new(&pane.zoom_slider)
+                        .w_full()
+                        .bg(color::border(cx))
+                        .text_color(color::text_muted(cx)),
+                ),
+            )
+            .child(
+                div()
+                    .min_w(px(32.))
+                    .text_color(color::text(cx))
+                    .child(format!("{percent}%")),
+            )
+            .into_any_element()
+    }
+
     /// The read-only Tree projection for a split pane: the editor's last composed
     /// tree text (the C++ `SplitPane` tree view shows the same document). Rendered
     /// as monospaced lines so the split mirrors the primary editor's structure
@@ -163,6 +266,7 @@ impl super::MainWindow {
     pub(super) fn render_split_tree(
         &self,
         editor: &Entity<crate::ui::editor::RcxEditor>,
+        zoom_level: i32,
         cx: &Context<Self>,
     ) -> AnyElement {
         use crate::ui::design::{color, tokens};
@@ -180,7 +284,8 @@ impl super::MainWindow {
                 .child("// empty document")
                 .into_any_element();
         }
-        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let font_size = tokens::font::EDITOR_SIZE + zoom_level as f32;
+        let line_h = px(font_size * tokens::font::EDITOR_LINE_HEIGHT);
         let rows: Vec<AnyElement> = text
             .lines()
             .map(|line| {
@@ -198,7 +303,7 @@ impl super::MainWindow {
             .bg(color::content_bg(cx))
             .overflow_scroll()
             .font_family(tokens::font::mono_family())
-            .text_size(px(tokens::font::EDITOR_SIZE))
+            .text_size(px(font_size))
             .py(px(tokens::space::SM))
             .children(rows)
             .into_any_element()
@@ -215,6 +320,7 @@ impl super::MainWindow {
     pub(super) fn render_split_debug(
         &self,
         editor: &Entity<crate::ui::editor::RcxEditor>,
+        zoom_level: i32,
         cx: &Context<Self>,
     ) -> AnyElement {
         use crate::ui::design::{color, tokens};
@@ -232,7 +338,8 @@ impl super::MainWindow {
                 .child("// empty document")
                 .into_any_element();
         }
-        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let font_size = tokens::font::EDITOR_SIZE + zoom_level as f32;
+        let line_h = px(font_size * tokens::font::EDITOR_LINE_HEIGHT);
         let rows: Vec<AnyElement> = text
             .lines()
             .map(|line| {
@@ -251,24 +358,29 @@ impl super::MainWindow {
             .bg(color::content_bg(cx))
             .overflow_scroll()
             .font_family(tokens::font::mono_family())
-            .text_size(px(tokens::font::EDITOR_SIZE))
+            .text_size(px(font_size))
             .py(px(tokens::space::SM))
             .children(rows)
             .into_any_element()
     }
 
-    /// The rendered C/C++ projection for a split pane (the C++ `updateRenderedView`
+    /// The rendered-code projection for a split pane (the C++ `updateRenderedView`
     /// for a `SplitPane`): generate the source for the active editor's view root
     /// and show it as a read-only, line-numbered, monospaced text block. A
     /// self-contained mirror of the document area's code view (which lives in the
-    /// out-of-ownership `tabs.rs`); kept deliberately simple (no per-token syntax
-    /// colouring) since it is a secondary pane.
+    /// out-of-ownership `tabs.rs`). It uses the same format/scope generator and
+    /// format-aware highlighter as the primary Code/Both paths.
     pub(super) fn render_split_code(
         &self,
         editor: &Entity<crate::ui::editor::RcxEditor>,
+        zoom_level: i32,
         cx: &Context<Self>,
     ) -> AnyElement {
         use crate::ui::design::{color, tokens};
+        let (format, scope) = {
+            let area = self.document_area.read(cx);
+            (area.code_format(), area.code_scope())
+        };
         let ed = editor.read(cx);
         let ctrl = ed.controller();
         let aliases = &ctrl.document().type_aliases;
@@ -277,9 +389,12 @@ impl super::MainWindow {
         } else {
             Some(aliases)
         };
-        let source = crate::generator::render_cpp_tree(
+        let root = crate::ui::chrome::tabs::rendered_root_for_controller(ctrl);
+        let source = crate::generator::render_code_scoped(
+            format,
+            scope,
             ctrl.tree(),
-            ctrl.view_root_id(),
+            root,
             aliases,
             /* emit_asserts */ self.generator_asserts,
         );
@@ -296,7 +411,8 @@ impl super::MainWindow {
                 .child("// nothing to render — open or build a struct")
                 .into_any_element();
         }
-        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let font_size = tokens::font::EDITOR_SIZE + zoom_level as f32;
+        let line_h = px(font_size * tokens::font::EDITOR_LINE_HEIGHT);
         let rows: Vec<AnyElement> = source
             .lines()
             .enumerate()
@@ -312,7 +428,15 @@ impl super::MainWindow {
                             .text_color(color::syntax_address(cx))
                             .child(format!("{}", i + 1)),
                     )
-                    .child(div().flex_1().min_w_0().child(line.to_string()))
+                    .child(
+                        gpui_component::h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .children(crate::ui::cpp_highlight::highlight_code_line(
+                                line, format, cx,
+                            )),
+                    )
                     .into_any_element()
             })
             .collect();
@@ -322,11 +446,47 @@ impl super::MainWindow {
             .bg(color::content_bg(cx))
             .overflow_scroll()
             .font_family(tokens::font::mono_family())
-            .text_size(px(tokens::font::EDITOR_SIZE))
+            .text_size(px(font_size))
             .py(px(tokens::space::SM))
             .px(px(tokens::space::SM))
             .children(rows)
             .into_any_element()
+    }
+
+    /// Read-only 67/33 Tree + Code projection for an extra split pane. The live
+    /// editor entity already renders in the primary pane, so both halves here are
+    /// projections over the same active controller.
+    pub(super) fn render_split_both(
+        &self,
+        editor: &Entity<crate::ui::editor::RcxEditor>,
+        pane: &SplitPaneState,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use crate::ui::design::color;
+        use gpui_component::resizable::{h_resizable, resizable_panel};
+
+        h_resizable(SharedString::from(format!(
+            "rcx-split-both-view-{}",
+            pane.id
+        )))
+        .with_state(&pane.both_split)
+        .child(
+            resizable_panel()
+                .w(relative(2.0 / 3.0))
+                .size_range(px(120.0)..Pixels::MAX)
+                .h_full()
+                .child(self.render_split_tree(editor, pane.zoom_level, cx)),
+        )
+        .child(
+            resizable_panel()
+                .w(relative(1.0 / 3.0))
+                .size_range(px(120.0)..Pixels::MAX)
+                .h_full()
+                .border_l_1()
+                .border_color(color::border(cx))
+                .child(self.render_split_code(editor, pane.zoom_level, cx)),
+        )
+        .into_any_element()
     }
 
     /// Feed the active document's provider into the scanner + modules docks and
@@ -582,7 +742,33 @@ impl super::MainWindow {
         }
         // New panes default to the rendered (code) view — the primary keeps the
         // tree, so the user gets the side-by-side tree⇄code split out of the box.
-        self.split_panes.push(ViewMode::Rendered);
+        self.next_split_pane_id += 1;
+        let pane_id = self.next_split_pane_id;
+        let zoom_level = self.view_zoom_level;
+        let zoom_slider = cx.new(|_| {
+            gpui_component::slider::SliderState::new()
+                .min(VIEW_ZOOM_MIN as f32)
+                .max(VIEW_ZOOM_MAX as f32)
+                .step(1.0)
+                .default_value(zoom_level as f32)
+        });
+        let zoom_subscription = cx.subscribe(
+            &zoom_slider,
+            move |this, _slider, event: &gpui_component::slider::SliderEvent, cx| {
+                if let gpui_component::slider::SliderEvent::Change(value) = event {
+                    this.set_split_pane_zoom_by_id(pane_id, value.start().round() as i32, cx);
+                }
+            },
+        );
+        let both_split = cx.new(|_| gpui_component::resizable::ResizableState::default());
+        self.split_panes.push(SplitPaneState {
+            id: pane_id,
+            mode: ViewMode::Rendered,
+            zoom_level,
+            zoom_slider,
+            _zoom_subscription: zoom_subscription,
+            both_split,
+        });
         cx.notify();
     }
 
@@ -605,8 +791,8 @@ impl super::MainWindow {
     /// stale.
     #[allow(dead_code)]
     pub(super) fn toggle_split_pane_mode(&mut self, pane_ix: usize, cx: &mut Context<Self>) {
-        if let Some(mode) = self.split_panes.get_mut(pane_ix) {
-            *mode = mode.toggled();
+        if let Some(pane) = self.split_panes.get_mut(pane_ix) {
+            pane.mode = pane.mode.toggled();
             cx.notify();
         }
     }
@@ -620,12 +806,51 @@ impl super::MainWindow {
         mode: ViewMode,
         cx: &mut Context<Self>,
     ) {
-        if let Some(slot) = self.split_panes.get_mut(pane_ix) {
-            if *slot != mode {
-                *slot = mode;
+        if let Some(pane) = self.split_panes.get_mut(pane_ix) {
+            if pane.mode != mode {
+                pane.mode = mode;
                 cx.notify();
             }
         }
+    }
+
+    /// Apply zoom to exactly one extra pane. The persisted value remains the seed
+    /// for subsequently-created panes, while every existing pane keeps its own
+    /// independent slider and projection size.
+    fn set_split_pane_zoom_by_id(&mut self, pane_id: u64, level: i32, cx: &mut Context<Self>) {
+        let level = clamp_view_zoom(level);
+        let Some(pane) = self.split_panes.iter_mut().find(|pane| pane.id == pane_id) else {
+            return;
+        };
+        if pane.zoom_level == level {
+            return;
+        }
+        pane.zoom_level = level;
+        self.view_zoom_level = level;
+        self.settings
+            .borrow_mut()
+            .set(settings_keys::VIEW_ZOOM_LEVEL, &level.to_string());
+        cx.notify();
+    }
+
+    /// Apply zoom to the active document's primary pane. Existing extra panes keep
+    /// their own zoom values; the persisted value seeds future panes/documents.
+    pub(super) fn set_primary_view_zoom_level(
+        &mut self,
+        level: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let level = clamp_view_zoom(level);
+        self.view_zoom_level = level;
+        self.document_area.update(cx, |area, cx| {
+            area.set_default_view_zoom_level(level, cx);
+            area.set_active_view_zoom_level(level, window, cx);
+        });
+        self.settings
+            .borrow_mut()
+            .set(settings_keys::VIEW_ZOOM_LEVEL, &level.to_string());
+        cx.notify();
     }
 
     /// View ▸ Reset Windows — restore the canonical dock layout (the C++ "Reset

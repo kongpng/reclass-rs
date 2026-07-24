@@ -17,7 +17,8 @@ pub enum TargetHealth {
     NoSource,
     Static,
     Live,
-    Offline,
+    Stale,
+    Disconnected,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -38,6 +39,7 @@ pub struct TargetStatusSummary {
     pub target_label: String,
     pub valid: bool,
     pub live: bool,
+    pub last_read_ok: bool,
     pub writable: bool,
     pub pointer_size: i32,
     pub base: u64,
@@ -61,6 +63,7 @@ impl TargetStatusSummary {
         summary.view_class = view_class_name(ctrl.tree(), ctrl.view_root_id());
         summary.view_base = ctrl.tree().base_address;
         summary.view_formula = ctrl.tree().base_address_formula.clone();
+        summary.last_read_ok = ctrl.last_read_ok();
         summary
     }
 
@@ -97,6 +100,7 @@ impl TargetStatusSummary {
             target_label,
             valid,
             live: provider.is_live(),
+            last_read_ok: true,
             writable: provider.is_writable(),
             pointer_size: provider.pointer_size(),
             base: provider.base(),
@@ -132,7 +136,9 @@ impl TargetStatusSummary {
         if self.provider_kind == "None" {
             TargetHealth::NoSource
         } else if !self.valid {
-            TargetHealth::Offline
+            TargetHealth::Disconnected
+        } else if self.live && !self.last_read_ok {
+            TargetHealth::Stale
         } else if self.live {
             TargetHealth::Live
         } else {
@@ -145,7 +151,8 @@ impl TargetStatusSummary {
             TargetHealth::NoSource => "no source",
             TargetHealth::Static => "static",
             TargetHealth::Live => "live",
-            TargetHealth::Offline => "offline",
+            TargetHealth::Stale => "stale",
+            TargetHealth::Disconnected => "disconnected",
         }
     }
 
@@ -295,6 +302,38 @@ mod tests {
         assert!(summary.writable);
         assert_eq!(summary.pointer_label(), "64b");
         assert_eq!(summary.size_label(), "size 0x10");
+    }
+
+    #[test]
+    fn live_read_failure_reports_stale_until_recovery() {
+        let stale = TargetStatusSummary {
+            provider_kind: "Process".into(),
+            valid: true,
+            live: true,
+            last_read_ok: false,
+            ..TargetStatusSummary::default()
+        };
+        assert_eq!(stale.health(), TargetHealth::Stale);
+        assert_eq!(stale.health_label(), "stale");
+
+        let recovered = TargetStatusSummary {
+            last_read_ok: true,
+            ..stale
+        };
+        assert_eq!(recovered.health(), TargetHealth::Live);
+    }
+
+    #[test]
+    fn invalid_saved_target_reports_disconnected() {
+        let summary = TargetStatusSummary {
+            provider_kind: "Process".into(),
+            valid: false,
+            live: true,
+            last_read_ok: true,
+            ..TargetStatusSummary::default()
+        };
+        assert_eq!(summary.health(), TargetHealth::Disconnected);
+        assert_eq!(summary.health_label(), "disconnected");
     }
 
     #[test]

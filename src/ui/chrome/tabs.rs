@@ -15,7 +15,7 @@
 //! - **always-visible strip** + a trailing **"+" tab** that opens a new document,
 //! - **per-tab source icon** (full opacity = live, dimmed = disconnected),
 //! - **active-tab follows selection / close** (the `m_activeDocDock` rules),
-//! - **never leave a blank area** — closing the last tab opens a fresh document,
+//! - **zero documents is valid** — closing the last tab reveals the empty-workspace hatch,
 //! - the **dual view-mode toggle** (tree ⇄ rendered C/C++) in the strip suffix.
 //!
 //! The drag-to-reorder/redock overlay, middle-click close, and right-click tab
@@ -48,13 +48,20 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::dock::{Panel, PanelControl, PanelEvent, TitleStyle};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
+use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
+use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
+use crate::controller::RcxController;
+use crate::core::{NodeKind, NodeTree};
 use crate::generator::{self, code_format_name, code_scope_name, CodeFormat, CodeScope};
 use crate::ui::design::{color, icon, tokens};
 use crate::ui::editor::RcxEditor;
-use crate::ui::state::{DataSource, DocId, SourceKind, ViewMode};
+use crate::ui::state::{
+    clamp_view_zoom, view_zoom_percent, DataSource, DocId, SourceKind, ViewMode, VIEW_ZOOM_MAX,
+    VIEW_ZOOM_MIN,
+};
 
 // ── Document-tab context-menu actions (the C++ doc-tab `QMenu`, `main.cpp:3652`)
 //
@@ -116,14 +123,82 @@ impl Render for TabDrag {
 /// Tab-strip height (logical px). The C++ dock tab bar was a fixed 37px
 /// (`MenuBarStyle::sizeFromContents` `CT_TabBarTab`, app-shell §3); Zed runs a
 /// touch shorter for a tighter chrome.
-const TAB_STRIP_H: f32 = 36.0;
+const TAB_STRIP_H: f32 = 31.0;
 /// Maximum tab width before the title middle-elides (Zed caps tab width so a long
 /// struct name never crowds the strip).
 const TAB_MAX_W: f32 = 220.0;
 /// Bottom view-mode toggle bar height.
-const VIEW_TOGGLE_H: f32 = 30.0;
+const VIEW_TOGGLE_H: f32 = 34.0;
 /// One segment's height inside the view-mode toggle.
 const SEGMENT_H: f32 = 22.0;
+
+/// Find the outer/root-level struct that owns `node_id`, matching upstream's
+/// `findRootStructForNode`. The walk is cycle-safe and remembers the highest
+/// struct encountered, including a malformed-tree case where a struct sits
+/// below a non-struct root.
+fn find_root_struct_for_node(tree: &NodeTree, node_id: u64) -> u64 {
+    let mut visited = std::collections::HashSet::new();
+    let mut current = node_id;
+    let mut last_struct = 0;
+    while current != 0 && visited.insert(current) {
+        let index = tree.index_of_id(current);
+        if index < 0 {
+            break;
+        }
+        let node = &tree.nodes[index as usize];
+        if node.kind == NodeKind::Struct {
+            last_struct = node.id;
+        }
+        if node.parent_id == 0 {
+            return if node.kind == NodeKind::Struct {
+                node.id
+            } else {
+                last_struct
+            };
+        }
+        current = node.parent_id;
+    }
+    last_struct
+}
+
+/// Resolve the struct root used by Code/Both projections. Upstream first maps a
+/// decorated selection id back to its node, then falls back to the controller's
+/// view root and finally the project's first root-level struct.
+fn rendered_root_for_selection(
+    tree: &NodeTree,
+    selected_ids: &std::collections::HashSet<u64>,
+    view_root_id: u64,
+) -> u64 {
+    let selected_root = selected_ids
+        .iter()
+        .next()
+        .map(|id| crate::core::linemeta::base_node_id_from_sel_id(*id))
+        .map(|id| find_root_struct_for_node(tree, id))
+        .unwrap_or(0);
+    if selected_root != 0 {
+        return selected_root;
+    }
+
+    let view_root = find_root_struct_for_node(tree, view_root_id);
+    if view_root != 0 {
+        return view_root;
+    }
+
+    tree.nodes
+        .iter()
+        .find(|node| node.parent_id == 0 && node.kind == NodeKind::Struct)
+        .map(|node| node.id)
+        .unwrap_or(0)
+}
+
+/// Controller-shaped wrapper shared by the primary and extra rendered panes.
+pub(crate) fn rendered_root_for_controller(controller: &RcxController) -> u64 {
+    rendered_root_for_selection(
+        controller.tree(),
+        controller.selected_ids(),
+        controller.view_root_id(),
+    )
+}
 
 /// The code-format options in `enum class CodeFormat` order (generator.h:11-18) —
 /// the items the C++ `fmtCombo` is filled with (main.cpp:2413-2414).
@@ -159,10 +234,25 @@ pub struct DocEntry {
     /// pushes it in via [`DocumentArea::set_modified`].
     pub modified: bool,
     pub editor: Entity<RcxEditor>,
+    /// Zoom belongs to this document's primary SplitPane, not to the window.
+    pub zoom_level: i32,
+    zoom_slider: Entity<SliderState>,
+    /// Keeps the per-pane continuous-slider event bridge alive.
+    _zoom_subscription: Subscription,
+    /// Persistent drag state for this pane's Reclass/Code divider in Both mode.
+    both_split: Entity<ResizableState>,
 }
 
 impl DocEntry {
-    fn new(id: DocId, title: impl Into<SharedString>, editor: Entity<RcxEditor>) -> Self {
+    fn new(
+        id: DocId,
+        title: impl Into<SharedString>,
+        editor: Entity<RcxEditor>,
+        zoom_level: i32,
+        zoom_slider: Entity<SliderState>,
+        zoom_subscription: Subscription,
+        both_split: Entity<ResizableState>,
+    ) -> Self {
         DocEntry {
             id,
             title: title.into(),
@@ -170,6 +260,10 @@ impl DocEntry {
             view_mode: ViewMode::default(),
             modified: false,
             editor,
+            zoom_level,
+            zoom_slider,
+            _zoom_subscription: zoom_subscription,
+            both_split,
         }
     }
 }
@@ -192,6 +286,9 @@ pub enum DocAreaEvent {
     /// the new indices to the `codeFormat`/`codeScope` settings keys. Carries the
     /// raw enum indices (`CodeFormat as i32` / `CodeScope as i32`).
     CodeOptionsChanged { format_idx: i32, scope_idx: i32 },
+    /// The visible pane zoom slider changed. The window persists the shared
+    /// `viewZoomLevel` and mirrors it into split-pane projections.
+    ViewZoomChanged(i32),
 }
 
 /// The center MDI document area: a [`TabBar`] + the active editor.
@@ -220,13 +317,17 @@ pub struct DocumentArea {
     /// option; main.cpp:5453). Pushed in from the window's persisted setting so the
     /// live code view honors it like the export path does.
     generator_asserts: bool,
+    /// Persisted seed applied when a new primary pane is created. Existing pane
+    /// zooms remain independent.
+    default_zoom_level: i32,
 }
 
 impl DocumentArea {
-    /// Build the area with one initial document (the C++ "never leave a blank
-    /// window": a document is always present; app-shell §8 step 9).
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut area = DocumentArea {
+    /// Build an empty area. Upstream deliberately permits zero documents: the
+    /// start page or the hatched empty-workspace surface occupies the center
+    /// until File ▸ New Class / Open creates a real tab.
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        DocumentArea {
             tabs: Vec::new(),
             active: 0,
             focus_handle: cx.focus_handle(),
@@ -238,9 +339,8 @@ impl DocumentArea {
             code_format: CodeFormat::CppHeader,
             code_scope: CodeScope::Current,
             generator_asserts: false,
-        };
-        area.push_document("Untitled", window, cx);
-        area
+            default_zoom_level: 0,
+        }
     }
 
     /// Construct as an [`Entity`] (the form the dock holds).
@@ -254,6 +354,44 @@ impl DocumentArea {
         DocId::from_raw(self.next_id)
     }
 
+    /// Construct one document's primary pane and all pane-local UI state.
+    fn make_entry(
+        &mut self,
+        id: DocId,
+        title: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> DocEntry {
+        let zoom_level = self.default_zoom_level;
+        let editor = RcxEditor::view(window, cx);
+        editor.update(cx, |ed, cx| ed.set_view_zoom_level(zoom_level, cx));
+        let zoom_slider = cx.new(|_| {
+            SliderState::new()
+                .min(VIEW_ZOOM_MIN as f32)
+                .max(VIEW_ZOOM_MAX as f32)
+                .step(1.0)
+                .default_value(zoom_level as f32)
+        });
+        let zoom_subscription = cx.subscribe(
+            &zoom_slider,
+            move |this, _slider, event: &SliderEvent, cx| {
+                if let SliderEvent::Change(value) = event {
+                    this.select_document_zoom(id, value.start().round() as i32, cx);
+                }
+            },
+        );
+        let both_split = cx.new(|_| ResizableState::default());
+        DocEntry::new(
+            id,
+            title,
+            editor,
+            zoom_level,
+            zoom_slider,
+            zoom_subscription,
+            both_split,
+        )
+    }
+
     /// Append a new document tab hosting a fresh editor, and make it active
     /// (`createTab` + `m_activeDocDock = dock`). Returns its id.
     pub fn push_document(
@@ -263,8 +401,8 @@ impl DocumentArea {
         cx: &mut Context<Self>,
     ) -> DocId {
         let id = self.alloc_id();
-        let editor = RcxEditor::view(window, cx);
-        self.tabs.push(DocEntry::new(id, title, editor));
+        let entry = self.make_entry(id, title, window, cx);
+        self.tabs.push(entry);
         self.active = self.tabs.len() - 1;
         id
     }
@@ -287,6 +425,24 @@ impl DocumentArea {
     /// The active tab index.
     pub fn active_index(&self) -> usize {
         self.active
+    }
+
+    /// Current app-wide generated-code format (shared with split projections).
+    pub fn code_format(&self) -> CodeFormat {
+        self.code_format
+    }
+
+    /// Current app-wide generated-code scope (shared with split projections).
+    pub fn code_scope(&self) -> CodeScope {
+        self.code_scope
+    }
+
+    /// Current primary pane's zoom, falling back to the persisted seed while no
+    /// document exists.
+    pub fn view_zoom_level(&self) -> i32 {
+        self.active_entry()
+            .map(|entry| entry.zoom_level)
+            .unwrap_or(self.default_zoom_level)
     }
 
     /// Index of a tab by id.
@@ -363,10 +519,10 @@ impl DocumentArea {
     }
 
     /// Close the tab at `ix`, fixing up the active index (`dock.destroyed`:
-    /// reassign `m_activeDocDock` to the last remaining tab). When the final tab
-    /// closes, a fresh one is opened so the area is never blank (the C++
-    /// "never leave a blank window" reflex; app-shell §8/§20).
-    pub fn close_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// reassign `m_activeDocDock` to the last remaining tab). Closing the final
+    /// tab leaves the list empty; [`Self::render`] then exposes the upstream
+    /// hatched "No document open" workspace instead of manufacturing Untitled.
+    pub fn close_index(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
         }
@@ -375,9 +531,8 @@ impl DocumentArea {
         cx.emit(DocAreaEvent::Closed(closed.id));
 
         if self.tabs.is_empty() {
-            // Never leave a blank area.
-            self.push_document("Untitled", window, cx);
-            cx.emit(DocAreaEvent::NewDocumentRequested);
+            self.active = 0;
+            self.context_target = None;
         } else {
             // Fix up the active index so the *same* document stays active:
             // - the active tab itself was closed → reassign to the last tab
@@ -432,26 +587,25 @@ impl DocumentArea {
         // an empty `project_new`).
         self.active = 0;
         let id = self.alloc_id();
-        let editor = RcxEditor::view(window, cx);
-        self.tabs.push(DocEntry::new(id, title, editor.clone()));
+        let entry = self.make_entry(id, title, window, cx);
+        let editor = entry.editor.clone();
+        self.tabs.push(entry);
         self.active = self.tabs.len() - 1;
         cx.notify();
         (id, editor)
     }
 
-    /// Close **every** tab (the C++ "Close All Tabs"; `closeAllDocDocks`). The
-    /// "never leave a blank area" reflex still applies — closing the final tab
-    /// re-opens a fresh document — so this collapses to one fresh untitled tab.
-    fn close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Emit a Closed for each existing doc, then reset to a single fresh tab.
+    /// Close **every** tab (the C++ "Close All Tabs"; `closeAllDocDocks`) and
+    /// reveal the zero-document workspace.
+    fn close_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // Emit a Closed for each existing doc, then leave the area genuinely empty.
         let ids: Vec<DocId> = self.tabs.iter().map(|t| t.id).collect();
         self.tabs.clear();
         for id in ids {
             cx.emit(DocAreaEvent::Closed(id));
         }
         self.active = 0;
-        self.push_document("Untitled", window, cx);
-        cx.emit(DocAreaEvent::NewDocumentRequested);
+        self.context_target = None;
         cx.notify();
     }
 
@@ -668,6 +822,62 @@ impl DocumentArea {
             self.generator_asserts = emit_asserts;
             cx.notify();
         }
+    }
+
+    /// Set the persisted seed used by panes created later. Existing panes keep
+    /// their own level.
+    pub fn set_default_view_zoom_level(&mut self, level: i32, cx: &mut Context<Self>) {
+        let level = clamp_view_zoom(level);
+        if self.default_zoom_level != level {
+            self.default_zoom_level = level;
+            cx.notify();
+        }
+    }
+
+    /// Apply an external Ctrl+wheel zoom to the active primary pane and mirror it
+    /// into that pane's slider. Other documents and extra panes are untouched.
+    pub fn set_active_view_zoom_level(
+        &mut self,
+        level: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let level = clamp_view_zoom(level);
+        self.default_zoom_level = level;
+        let Some(entry) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if entry.zoom_level != level {
+            entry.zoom_level = level;
+            entry
+                .editor
+                .update(cx, |editor, cx| editor.set_view_zoom_level(level, cx));
+        }
+        let slider = entry.zoom_slider.clone();
+        slider.update(cx, |slider, cx| {
+            if slider.value().start().round() as i32 != level {
+                slider.set_value(level as f32, window, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Continuous-slider origin: apply only to the pane that owns `id`, then ask
+    /// the window to persist this as the seed for future panes.
+    fn select_document_zoom(&mut self, id: DocId, level: i32, cx: &mut Context<Self>) {
+        let level = clamp_view_zoom(level);
+        let Some(ix) = self.index_of(id) else {
+            return;
+        };
+        if self.tabs[ix].zoom_level == level {
+            return;
+        }
+        self.default_zoom_level = level;
+        self.tabs[ix].zoom_level = level;
+        let editor = self.tabs[ix].editor.clone();
+        editor.update(cx, |editor, cx| editor.set_view_zoom_level(level, cx));
+        cx.emit(DocAreaEvent::ViewZoomChanged(level));
+        cx.notify();
     }
 
     /// Select the code-view format (the C++ `fmtCombo::currentIndexChanged`;
@@ -930,8 +1140,9 @@ impl DocumentArea {
             }))
     }
 
-    /// The dual view-mode toggle, styled as a Zed **segmented control** —
-    /// "Reclass" (tree) | "Code" (rendered C/C++), each with a real SVG glyph.
+    /// The four-way view-mode toggle, styled as a Zed **segmented control** —
+    /// Reclass | Code | Debug | Both. `Both` is one pane with a 67/33 body split,
+    /// not another window-level split pane.
     /// Matches the C++ bottom view tabs (PIC5/PIC2; `reclass_view_click_active`):
     /// the track is a recessed pill and the **selected segment lifts** out of it
     /// to the elevated surface for a clear, high-contrast active state.
@@ -1015,14 +1226,57 @@ impl DocumentArea {
                     // The third surface: the read-only developer dump (the C++
                     // `SplitPane` `VM_Debug`). A ✓/verified glyph reads as the
                     // "inspect the composed model" affordance.
-                    .child(segment("Debug", icon::check(), ViewMode::Debug, cx)),
+                    .child(segment("Debug", icon::check(), ViewMode::Debug, cx))
+                    .child(segment("Both", icon::array(), ViewMode::Both, cx)),
             )
-            // The C++ corner widget (`fmtCombo` + `scopeCombo`) is hidden until the
-            // Code tab is selected (main.cpp:2449). Mirror that: the format/scope
-            // selectors only appear in rendered mode.
-            .when(has_doc && view_mode == ViewMode::Rendered, |s| {
-                s.child(self.render_code_selectors(cx))
-            })
+            .child(
+                gpui_component::h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(tokens::space::SM))
+                    // Code controls are meaningful for Code and for Both's code
+                    // half; the zoom control stays visible in every mode.
+                    .when(
+                        has_doc && matches!(view_mode, ViewMode::Rendered | ViewMode::Both),
+                        |s| s.child(self.render_code_selectors(cx)),
+                    )
+                    .when(has_doc, |s| s.child(self.render_zoom_control(cx))),
+            )
+    }
+
+    /// Visible upstream-compatible continuous slider/readout (`-8..=24`). The
+    /// slider entity belongs to the active primary pane, so switching documents
+    /// restores each pane's independent zoom.
+    fn render_zoom_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.active_entry() else {
+            return div().into_any_element();
+        };
+        let current = entry.zoom_level;
+        let percent = view_zoom_percent(current, tokens::font::EDITOR_SIZE);
+
+        gpui_component::h_flex()
+            .id("rcx-view-zoom")
+            .flex_none()
+            .items_center()
+            .gap(px(tokens::space::XS))
+            .text_size(px(tokens::font::UI_SM))
+            .text_color(color::text_muted(cx))
+            .child("Zoom")
+            .child(
+                div().w(px(90.)).h(px(18.0)).flex().items_center().child(
+                    Slider::new(&entry.zoom_slider)
+                        .w_full()
+                        .bg(color::border(cx))
+                        .text_color(color::text_muted(cx)),
+                ),
+            )
+            .child(
+                div()
+                    .min_w(px(38.))
+                    .text_color(color::text(cx))
+                    .child(format!("{percent}%")),
+            )
+            .into_any_element()
     }
 
     /// The rendered code-view corner: the **format** + **scope** selectors (the
@@ -1109,21 +1363,85 @@ impl DocumentArea {
     /// highlighting (see [`Self::render_code_view`]).
     fn render_body(&self, cx: &Context<Self>) -> AnyElement {
         let Some(entry) = self.active_entry() else {
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(color::text_muted(cx))
-                .child("No document")
-                .into_any_element();
+            return self.render_empty_workspace(cx);
         };
 
         match entry.view_mode {
             ViewMode::Tree => entry.editor.clone().into_any_element(),
             ViewMode::Rendered => self.render_code_view(entry, cx),
             ViewMode::Debug => self.render_debug_view(entry, cx),
+            ViewMode::Both => self.render_both_view(entry, cx),
         }
+    }
+
+    /// The upstream zero-document central widget: editor-paper base, a subtle
+    /// diagonal hatch, and the exact discovery hint for creating a document.
+    /// GPUI provides a native slash pattern background, avoiding a raster asset
+    /// and keeping the hatch crisp at fractional display scales.
+    fn render_empty_workspace(&self, cx: &Context<Self>) -> AnyElement {
+        let stripe = color::with_alpha(color::border(cx), 0.30);
+        div()
+            .id("rcx-empty-workspace")
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(color::content_bg(cx))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(pattern_slash(stripe, 1.0, 12.0)),
+            )
+            .child(
+                gpui_component::v_flex()
+                    .absolute()
+                    .inset_0()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(tokens::space::LG))
+                    .text_align(TextAlign::Center)
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(color::text_muted(cx))
+                            .child("No document open"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens::font::UI_SM))
+                            .text_color(color::text_disabled(cx))
+                            .child("File ▸ New Class    (Ctrl+N)"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One-pane Reclass + Code view. The live editor remains the single interactive
+    /// entity on the left; the generated projection on the right pulls from the
+    /// same controller and refreshes whenever that entity changes.
+    fn render_both_view(&self, entry: &DocEntry, cx: &Context<Self>) -> AnyElement {
+        h_resizable(SharedString::from(format!(
+            "rcx-both-view-{}",
+            entry.id.get()
+        )))
+        .with_state(&entry.both_split)
+        .child(
+            resizable_panel()
+                .w(relative(2.0 / 3.0))
+                .size_range(px(160.0)..Pixels::MAX)
+                .h_full()
+                .child(entry.editor.clone()),
+        )
+        .child(
+            resizable_panel()
+                .w(relative(1.0 / 3.0))
+                .size_range(px(160.0)..Pixels::MAX)
+                .h_full()
+                .border_l_1()
+                .border_color(color::border(cx))
+                .child(self.render_code_view(entry, cx)),
+        )
+        .into_any_element()
     }
 
     /// The read-only Debug developer view (the C++ `SplitPane` `VM_Debug`
@@ -1155,7 +1473,8 @@ impl DocumentArea {
                 .child("// empty document")
                 .into_any_element();
         }
-        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let font_size = tokens::font::EDITOR_SIZE + entry.zoom_level as f32;
+        let line_h = px(font_size * tokens::font::EDITOR_LINE_HEIGHT);
         let rows: Vec<AnyElement> = text
             .lines()
             .map(|line| {
@@ -1174,7 +1493,7 @@ impl DocumentArea {
             .bg(color::content_bg(cx))
             .overflow_scroll()
             .font_family(tokens::font::mono_family())
-            .text_size(px(tokens::font::EDITOR_SIZE))
+            .text_size(px(font_size))
             .py(px(tokens::space::SM))
             .children(rows)
             .into_any_element()
@@ -1198,10 +1517,11 @@ impl DocumentArea {
     /// returns an empty string; we show a centered muted placeholder instead.
     fn render_code_view(&self, entry: &DocEntry, cx: &Context<Self>) -> AnyElement {
         let ed = entry.editor.read(cx);
-        let tree = ed.controller().tree();
-        let root = ed.controller().view_root_id();
+        let controller = ed.controller();
+        let tree = controller.tree();
+        let root = rendered_root_for_controller(controller);
         // The document's per-kind name overrides feed the renderer's type names.
-        let aliases = &ed.controller().document().type_aliases;
+        let aliases = &controller.document().type_aliases;
         let aliases = if aliases.is_empty() {
             None
         } else {
@@ -1237,7 +1557,8 @@ impl DocumentArea {
         let line_count = source.lines().count().max(1);
         let digits = ((line_count as f32).log10().floor() as usize) + 1;
         let gutter_w = px(digits as f32 * 8.5 + 24.0);
-        let line_h = px(tokens::font::EDITOR_SIZE * tokens::font::EDITOR_LINE_HEIGHT);
+        let font_size = tokens::font::EDITOR_SIZE + entry.zoom_level as f32;
+        let line_h = px(font_size * tokens::font::EDITOR_LINE_HEIGHT);
 
         let gutter_fg = color::syntax_address(cx);
 
@@ -1253,7 +1574,7 @@ impl DocumentArea {
             .bg(color::content_bg(cx))
             .overflow_scroll()
             .font_family(tokens::font::mono_family())
-            .text_size(px(tokens::font::EDITOR_SIZE))
+            .text_size(px(font_size))
             .py(px(tokens::space::SM))
             .children(rows)
             .into_any_element()
@@ -1270,7 +1591,7 @@ impl DocumentArea {
         gutter_fg: Hsla,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let spans = crate::ui::cpp_highlight::highlight_cpp_line(line, cx);
+        let spans = crate::ui::cpp_highlight::highlight_code_line(line, self.code_format, cx);
 
         gpui_component::h_flex()
             .w_full()
@@ -1363,9 +1684,10 @@ impl Focusable for DocumentArea {
 
 impl Render for DocumentArea {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let strip = self.render_tab_strip(cx);
+        let has_doc = !self.tabs.is_empty();
+        let strip = has_doc.then(|| self.render_tab_strip(cx));
         let body = self.render_body(cx);
-        let view_toggle = self.render_view_toggle(cx);
+        let view_toggle = has_doc.then(|| self.render_view_toggle(cx));
 
         // Top → bottom: the document tab strip, the active editor/rendered body,
         // then the Zed segmented "Reclass | Code" view-mode toggle (PIC5/PIC2).
@@ -1385,9 +1707,9 @@ impl Render for DocumentArea {
             .flex()
             .flex_col()
             .bg(color::content_bg(cx))
-            .child(strip)
+            .children(strip)
             .child(div().flex_1().min_h_0().child(body))
-            .child(view_toggle)
+            .children(view_toggle)
     }
 }
 
@@ -1483,7 +1805,7 @@ mod tests {
     // Pure state-transition tests for the tab model. The gpui-bound rendering is
     // covered by the build; here we test the active-index reducer logic directly
     // on a lightweight mirror of `DocumentArea`'s rules (the same invariants the
-    // gpui methods enforce: active follows close, never blank, monotonic ids),
+    // gpui methods enforce: active follows close, zero tabs is valid, monotonic ids),
     // to keep them gpui-free and deterministic.
     use crate::ui::state::{DocId, SourceKind, ViewMode};
 
@@ -1498,14 +1820,12 @@ mod tests {
     }
     impl TabModel {
         fn new() -> Self {
-            let mut m = TabModel {
+            TabModel {
                 ids: Vec::new(),
                 kinds: Vec::new(),
                 active: 0,
                 next: 0,
-            };
-            m.push();
-            m
+            }
         }
         fn push(&mut self) -> DocId {
             self.next += 1;
@@ -1548,7 +1868,7 @@ mod tests {
             self.ids.remove(ix);
             self.kinds.remove(ix);
             if self.ids.is_empty() {
-                self.push();
+                self.active = 0;
             } else {
                 if was_active {
                     self.active = self.ids.len() - 1;
@@ -1572,12 +1892,11 @@ mod tests {
                 self.active = i;
             }
         }
-        // Mirror of close_all: collapse to one fresh tab.
+        // Mirror of close_all: leave the zero-document workspace.
         fn close_all(&mut self) {
             self.ids.clear();
             self.kinds.clear();
             self.active = 0;
-            self.push();
         }
         // Mirror of replace_all_with_fresh: drop every tab, allocate ONE fresh tab
         // and make it active — the same shape as `close_all` (the C++ replace-all
@@ -1613,16 +1932,16 @@ mod tests {
     }
 
     #[test]
-    fn starts_with_one_active_document() {
+    fn starts_with_zero_documents() {
         let m = TabModel::new();
-        assert_eq!(m.ids.len(), 1);
+        assert!(m.ids.is_empty());
         assert_eq!(m.active, 0);
     }
 
     #[test]
     fn ids_are_monotonic_and_unique() {
         let mut m = TabModel::new();
-        let a = m.ids[0];
+        let a = m.push();
         let b = m.push();
         let c = m.push();
         assert!(a.get() < b.get() && b.get() < c.get());
@@ -1632,27 +1951,25 @@ mod tests {
     fn push_makes_new_tab_active() {
         let mut m = TabModel::new();
         let _b = m.push();
-        assert_eq!(m.active, 1);
+        assert_eq!(m.active, 0);
         let _c = m.push();
-        assert_eq!(m.active, 2);
+        assert_eq!(m.active, 1);
     }
 
     #[test]
-    fn close_last_tab_opens_a_fresh_one() {
-        // Never leave a blank area (app-shell §8/§20).
+    fn close_last_tab_leaves_zero_document_workspace() {
         let mut m = TabModel::new();
-        let only = m.ids[0];
+        m.push();
         m.close(0);
-        assert_eq!(m.ids.len(), 1);
-        // The fresh tab has a new id (not the closed one).
-        assert_ne!(m.ids[0], only);
+        assert!(m.ids.is_empty());
         assert_eq!(m.active, 0);
     }
 
     #[test]
     fn closing_active_reassigns_active() {
-        let mut m = TabModel::new(); // [1]
-        m.push(); // [1,2]
+        let mut m = TabModel::new();
+        m.push();
+        m.push();
         m.push(); // [1,2,3], active=2
                   // Close the active last tab → active clamps to new last (index 1).
         m.close(2);
@@ -1668,8 +1985,9 @@ mod tests {
 
     #[test]
     fn closing_non_active_keeps_active_document() {
-        let mut m = TabModel::new(); // [1]
-        m.push(); // [1,2]
+        let mut m = TabModel::new();
+        m.push();
+        m.push();
         m.push(); // [1,2,3] active=2
         m.activate(2);
         let active_id = m.ids[2];
@@ -1687,8 +2005,9 @@ mod tests {
     #[test]
     fn close_others_keeps_only_the_target() {
         // The C++ "Close All But This": every tab except `keep` closes.
-        let mut m = TabModel::new(); // [1]
-        m.push(); // [1,2]
+        let mut m = TabModel::new();
+        m.push();
+        m.push();
         m.push(); // [1,2,3]
         let keep = m.ids[1];
         m.close_others(keep);
@@ -1697,18 +2016,13 @@ mod tests {
     }
 
     #[test]
-    fn close_all_collapses_to_one_fresh_tab() {
-        // The C++ "Close All Tabs" + "never leave a blank area": all tabs close,
-        // a single fresh (new-id) tab remains.
+    fn close_all_leaves_zero_document_workspace() {
         let mut m = TabModel::new();
         m.push();
         m.push();
-        let old: Vec<DocId> = m.ids.clone();
         m.close_all();
-        assert_eq!(m.ids.len(), 1);
+        assert!(m.ids.is_empty());
         assert_eq!(m.active, 0);
-        // The surviving tab is brand-new (not any previously open id).
-        assert!(!old.contains(&m.ids[0]));
     }
 
     #[test]
@@ -1717,6 +2031,7 @@ mod tests {
         // main.cpp:6147-6150 / 6190-6194): every prior tab is dropped and ONE fresh
         // tab is left active to host the loaded document.
         let mut m = TabModel::new();
+        m.push();
         m.push();
         m.push(); // [1,2,3]
         let old: Vec<DocId> = m.ids.clone();
@@ -1736,8 +2051,8 @@ mod tests {
     fn reorder_moves_tab_to_target_position_and_keeps_it_active() {
         // Drag tab #1 (index 0) onto tab #3 (index 2): the strip becomes
         // [2, 3, 1] and the dragged tab stays active (the C++ movable QTabBar).
-        let mut m = TabModel::new(); // [1]
-        let a = m.ids[0];
+        let mut m = TabModel::new();
+        let a = m.push();
         let b = m.push(); // [1,2]
         let c = m.push(); // [1,2,3]
         m.reorder(a, c);
@@ -1760,7 +2075,8 @@ mod tests {
     fn detach_sources_of_kind_closes_only_matching_and_returns_count() {
         // The live-host safe-unload detach: close only the tabs whose source kind
         // matches, leave the rest, and report how many closed (design §7.A [fix]).
-        let mut m = TabModel::new(); // [1] kind None
+        let mut m = TabModel::new();
+        m.push(); // [1]
         m.push(); // [1,2]
         m.push(); // [1,2,3]
         m.push(); // [1,2,3,4]
@@ -1787,18 +2103,14 @@ mod tests {
     }
 
     #[test]
-    fn detach_sources_of_kind_never_leaves_blank_area() {
-        // Closing the last remaining tab via a detach re-opens a fresh untitled
-        // tab (the never-blank reflex still applies through `close_index`).
-        let mut m = TabModel::new(); // [1] kind None
+    fn detach_sources_of_kind_can_leave_zero_documents() {
+        let mut m = TabModel::new();
+        m.push();
         m.set_kind(0, SourceKind::File);
-        let only = m.ids[0];
         let closed = m.detach_sources_of_kind(SourceKind::File);
         assert_eq!(closed, 1);
-        // One fresh (new-id, None-kind) tab remains.
-        assert_eq!(m.ids.len(), 1);
-        assert_ne!(m.ids[0], only);
-        assert_eq!(m.kinds[0], SourceKind::None);
+        assert!(m.ids.is_empty());
+        assert!(m.kinds.is_empty());
     }
 
     #[test]
@@ -1835,5 +2147,67 @@ mod tests {
             );
             assert_eq!(CodeScope::from_index(i as i32), scope);
         }
+    }
+
+    fn code_root_fixture() -> (crate::core::NodeTree, u64, u64, u64) {
+        use crate::core::{Node, NodeKind, NodeTree};
+
+        let mut tree = NodeTree::default();
+        let root_a = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "A".into(),
+            ..Node::default()
+        });
+        let root_a = tree.nodes[root_a].id;
+        let nested = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "Nested".into(),
+            parent_id: root_a,
+            ..Node::default()
+        });
+        let nested = tree.nodes[nested].id;
+        let field = tree.add_node(Node {
+            kind: NodeKind::UInt32,
+            name: "value".into(),
+            parent_id: nested,
+            ..Node::default()
+        });
+        let field = tree.nodes[field].id;
+        let root_b = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            name: "B".into(),
+            ..Node::default()
+        });
+        let root_b = tree.nodes[root_b].id;
+        (tree, root_a, field, root_b)
+    }
+
+    #[test]
+    fn rendered_root_tracks_decorated_selection_to_owning_root() {
+        use crate::core::linemeta::make_member_sel_id;
+        use std::collections::HashSet;
+
+        let (tree, root_a, field, root_b) = code_root_fixture();
+        let selected = HashSet::from([make_member_sel_id(field, 3)]);
+        assert_eq!(
+            super::rendered_root_for_selection(&tree, &selected, root_b),
+            root_a
+        );
+    }
+
+    #[test]
+    fn rendered_root_falls_back_to_view_root_then_first_project_root() {
+        use std::collections::HashSet;
+
+        let (tree, root_a, _field, root_b) = code_root_fixture();
+        let selected = HashSet::from([u64::MAX - 1]);
+        assert_eq!(
+            super::rendered_root_for_selection(&tree, &selected, root_b),
+            root_b
+        );
+        assert_eq!(
+            super::rendered_root_for_selection(&tree, &HashSet::new(), u64::MAX - 2),
+            root_a
+        );
     }
 }

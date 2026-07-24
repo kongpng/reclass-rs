@@ -60,12 +60,16 @@ use crate::ui::panels::workspace::{
     WorkspaceDoc, WorkspaceModel, WorkspaceNav, WorkspaceNewType, WorkspacePanel,
     WorkspaceTypeAction,
 };
-use crate::ui::state::{AppState, DocId, ViewMode};
+use crate::ui::state::{
+    clamp_view_zoom, view_zoom_percent, AppState, DocId, ViewMode, VIEW_ZOOM_MAX, VIEW_ZOOM_MIN,
+};
 use crate::ui::target_status::TargetStatusSummary;
 use crate::ui::theme_apply::ThemeRegistryGlobal;
 
 // Cohesive method clusters extracted from the original single `impl MainWindow`
 // (mirrors src/ui/editor/): each sibling holds an `impl super::MainWindow` block.
+#[cfg(windows)]
+mod console;
 mod dialogs;
 mod documents;
 mod files;
@@ -174,6 +178,7 @@ actions!(
         CloseDocAction,
         UndoAction,
         RedoAction,
+        BreakIntoClassAction,
         AddBookmarkAction,
         QuickBookmarkAction,
         ShortcutsAction,
@@ -354,6 +359,8 @@ pub struct MainWindow {
     /// the disk store.
     brace_wrap: bool,
     generator_asserts: bool,
+    /// Shared persisted pane zoom point delta (`viewZoomLevel`, `-8..=24`).
+    view_zoom_level: i32,
     /// Persisted refresh interval (ms) (the C++ `refreshMs`). Pushed into the
     /// active controllers when Options applies; persisted via the disk store.
     refresh_ms: i32,
@@ -365,13 +372,19 @@ pub struct MainWindow {
     /// Owned + persisted here so Options can toggle it; the titlebar has no icon
     /// slot in this port yet, so this is faithfully persisted but visually inert.
     show_icon: bool,
+    /// Whether the on-demand Windows console is enabled (View ▸ Show Console).
+    /// The UI binary uses the Windows GUI subsystem, so no console exists unless
+    /// this persisted option asks [`console`] to allocate one.
+    #[cfg(windows)]
+    show_console: bool,
     /// The **extra** editor split panes beyond the primary document pane (the C++
     /// `TabState::panes` minus the primary `panes[0]`). Each carries its own
-    /// [`ViewMode`] (Tree / rendered C/C++) and views the SAME active document as
+    /// view mode and zoom state and views the SAME active document as
     /// the primary pane (the C++ `createSplitPane` binds the pane to the tab's
     /// controller). Empty ⇒ the editor is unsplit (the default single-pane view).
     /// `view.split` appends a pane; `view.unsplit` removes the last.
-    split_panes: Vec<ViewMode>,
+    split_panes: Vec<SplitPaneState>,
+    next_split_pane_id: u64,
     /// The mounted plugin [`PluginPanel`](crate::ui::plugins::pluginpanel::PluginPanel) views,
     /// keyed by the contributed panel id (design §6 Phase 2). One per enabled
     /// `Panel` contribution, built in [`new`](Self::new) after the demo gating and
@@ -395,6 +408,19 @@ enum RightDockPanel {
     Target,
     Modules,
     Bookmarks,
+}
+
+/// Window-hosted extra SplitPane state. The primary pane's equivalent lives in
+/// `DocEntry`; extra panes are read-only projections because a GPUI entity cannot
+/// be mounted twice in one frame, but their mode, zoom slider, and Both divider
+/// remain independently interactive.
+struct SplitPaneState {
+    id: u64,
+    mode: ViewMode,
+    zoom_level: i32,
+    zoom_slider: Entity<gpui_component::slider::SliderState>,
+    _zoom_subscription: Subscription,
+    both_split: Entity<gpui_component::resizable::ResizableState>,
 }
 
 impl MainWindow {
@@ -504,6 +530,14 @@ impl MainWindow {
                 s.get_bool(settings_keys::SHOW_ICON, false),
             )
         };
+        #[cfg(windows)]
+        let show_console = {
+            let visible = settings
+                .borrow()
+                .get_bool(settings_keys::SHOW_CONSOLE, false);
+            console::set_visible(visible);
+            visible
+        };
         // Code-view generator selectors (the C++ `codeFormat`/`codeScope`; both
         // default index 0; main.cpp:2415/2441). Decoded into the generator enums.
         let (code_format, code_scope) = {
@@ -521,12 +555,17 @@ impl MainWindow {
                 crate::generator::CodeScope::from_index(scope_idx),
             )
         };
+        let view_zoom_level = settings
+            .borrow()
+            .get(settings_keys::VIEW_ZOOM_LEVEL)
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(clamp_view_zoom)
+            .unwrap_or(0);
 
-        // Seed window state with the initial document tab (the C++ "never leave a
-        // blank window"; app-shell §8 step 9). The center `DocumentArea` already
-        // created its first editor tab; mirror it into `AppState`.
+        // Zero documents is a valid startup state. The start page overlays the
+        // center initially; after it is dismissed, DocumentArea's hatched empty
+        // workspace remains until New/Open creates a real tab.
         let mut state = AppState::new();
-        state.open_document("Untitled");
 
         // The left workspace dock is open by default (Layout_Workspace); reflect
         // that in the toggle preset.
@@ -567,6 +606,7 @@ impl MainWindow {
         // view honors all three from the first paint.
         document_area.update(cx, |area, cx| {
             area.set_generator_options(code_format, code_scope, generator_asserts, cx);
+            area.set_default_view_zoom_level(view_zoom_level, cx);
         });
 
         // ── Wire workspace quick-navigation (app-shell §10 "Open in Current Tab"). ──
@@ -774,11 +814,15 @@ impl MainWindow {
             auto_start_mcp,
             brace_wrap,
             generator_asserts,
+            view_zoom_level,
             refresh_ms,
             menu_bar_title_case,
             show_icon,
+            #[cfg(windows)]
+            show_console,
             // The editor starts unsplit (single pane); `view.split` appends panes.
             split_panes: Vec::new(),
+            next_split_pane_id: 0,
             // Plugin panels are mounted just below (after the window is built so the
             // mount can subscribe to `self`). Empty until a plugin contributes UI.
             plugin_panels: Vec::new(),
@@ -794,6 +838,8 @@ impl MainWindow {
         win.sync_font_menu_checked(cx);
         win.sync_theme_menu_checked(cx);
         win.rebuild_menus(cx);
+        #[cfg(windows)]
+        win.sync_console_menu_checked(cx);
         // Push the persisted menu-bar title-case preference (the C++
         // `applyMenuBarTitleCase(m_menuBarTitleCase)` on startup; main.cpp:989).
         let title_case = win.menu_bar_title_case;
@@ -1034,13 +1080,26 @@ impl Render for MainWindow {
             })
             .unwrap_or_else(|| (StatusInfo::default(), TargetStatusSummary::no_source()));
         let source = self.state.active_source();
+        let open_goto = {
+            let this = cx.entity().downgrade();
+            move |window: &mut Window, app: &mut App| {
+                let _ = this.update(app, |me, cx| me.open_goto_address(window, cx));
+            }
+        };
         let open_target = {
             let this = cx.entity().downgrade();
             move |window: &mut Window, app: &mut App| {
                 let _ = this.update(app, |me, cx| me.raise_target(window, cx));
             }
         };
-        let status_bar = render_status_bar(&status_info, &source, &target_summary, open_target, cx);
+        let status_bar = render_status_bar(
+            &status_info,
+            &source,
+            &target_summary,
+            open_goto,
+            open_target,
+            cx,
+        );
 
         // Presentation Mode (View ▸ Presentation Mode): fade the surrounding chrome
         // (titlebar + status bar) so the editor surface reads as the focus, like the
@@ -1053,6 +1112,7 @@ impl Render for MainWindow {
         // active document as the primary editor (the C++ `SplitPane`s bound to the
         // tab's controller); lay them side-by-side to the right of the dock area.
         let split_panes = self.render_split_panes(cx);
+        let workspace_rail = self.render_workspace_rail(cx);
 
         // Our in-house centered-modal overlay (command palette / type+enum+source
         // pickers), painted OVER the content with no `focus_trap` so the focused
@@ -1087,6 +1147,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::on_close_doc))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
+            .on_action(cx.listener(Self::on_break_into_class))
             .on_action(cx.listener(Self::on_add_bookmark))
             .on_action(cx.listener(Self::on_quick_bookmark))
             .on_action(cx.listener(Self::on_shortcuts))
@@ -1137,6 +1198,7 @@ impl Render for MainWindow {
                         gpui_component::h_flex()
                             .size_full()
                             .items_stretch()
+                            .children(workspace_rail)
                             // The dock area (incl. the primary editor pane) takes the
                             // remaining width; each split pane shares the rest evenly.
                             .child(
@@ -1384,6 +1446,20 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
         ToggleBookmarks,
         Some("RcxWindow"),
     ));
+    // Upstream also assigns Ctrl+Shift+B to Edit ▸ Break into Class. Scope that
+    // binding to the editor so it wins while a document surface has focus;
+    // outside the editor the existing window-level binding still opens the
+    // Bookmarks dock (avoiding Qt's ambiguous-shortcut dead zone).
+    bindings.push(KeyBinding::new(
+        "ctrl-shift-b",
+        BreakIntoClassAction,
+        Some("RcxEditor"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-shift-b",
+        BreakIntoClassAction,
+        Some("RcxEditor"),
+    ));
     bindings.push(KeyBinding::new("ctrl-\\", SplitEditor, Some("RcxWindow")));
     bindings.push(KeyBinding::new("cmd-\\", SplitEditor, Some("RcxWindow")));
     bindings.push(KeyBinding::new(
@@ -1510,6 +1586,7 @@ pub fn open_main_window_with(cx: &mut App, options: StartupOptions) {
     // `TitleBar` also only renders its min/max/close controls when client-decorated.
     let window_options = WindowOptions {
         window_decorations: Some(WindowDecorations::Client),
+        window_bounds: Some(WindowBounds::centered(size(px(1080.0), px(720.0)), cx)),
         ..Default::default()
     };
 

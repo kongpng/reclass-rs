@@ -22,6 +22,8 @@
 //! `--no-default-features` (no gpui) and is reachable everywhere.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -151,6 +153,45 @@ impl Profiler {
         map.clear();
     }
 
+    /// `dumpToStderr()` (`profiler.cpp`) — print a headless summary sorted by
+    /// total time. This is useful to launch/test harnesses which cannot open
+    /// the profiler dialog; callers decide when the capture is complete.
+    pub fn dump_to_stderr() {
+        let report = Self::format_report(Self::snapshot());
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = stderr.write_all(report.as_bytes());
+        let _ = stderr.flush();
+    }
+
+    fn format_report(mut rows: Vec<(String, ProfileStats)>) -> String {
+        rows.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns).then_with(|| a.0.cmp(&b.0)));
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "\n=== PROFILE (by total time, {} scopes) ===",
+            rows.len()
+        );
+        let _ = writeln!(
+            out,
+            "{:<46} {:>10} {:>7} {:>10} {:>10}",
+            "scope", "total_ms", "count", "avg_us", "max_us"
+        );
+        for (name, stats) in rows {
+            let total_ms = stats.total_ns as f64 / 1_000_000.0;
+            let avg_us = stats.mean_ns() / 1_000.0;
+            let max_us = stats.max_ns as f64 / 1_000.0;
+            let _ = writeln!(
+                out,
+                "{name:<46} {total_ms:>10.2} {:>7} {avg_us:>10.1} {max_us:>10.1}",
+                stats.count
+            );
+        }
+        out.push_str("=== END PROFILE ===\n");
+        out
+    }
+
     /// Number of distinct buckets currently recorded (test/diagnostic helper).
     pub fn bucket_count() -> usize {
         match state().stats.lock() {
@@ -271,6 +312,20 @@ mod tests {
             Profiler::reset();
             assert_eq!(Profiler::bucket_count(), 0);
             assert!(Profiler::snapshot().is_empty());
+        });
+    }
+
+    #[test]
+    fn stderr_report_is_sorted_by_total_time() {
+        with_clean(|| {
+            Profiler::set_enabled(true);
+            Profiler::record("small", 1_000);
+            Profiler::record("large", 5_000);
+
+            let report = Profiler::format_report(Profiler::snapshot());
+            assert!(report.contains("PROFILE (by total time, 2 scopes)"));
+            assert!(report.find("large").unwrap() < report.find("small").unwrap());
+            assert!(report.ends_with("=== END PROFILE ===\n"));
         });
     }
 

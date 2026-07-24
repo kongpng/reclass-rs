@@ -33,6 +33,8 @@ pub struct EditorPalette {
     /// (≈ #ce9178), distinct from the green numeric value color.
     pub string_val: Hsla,
     pub dim: Hsla,
+    /// Secondary editor chrome/action text, brighter than [`Self::dim`].
+    pub muted: Hsla,
     /// `struct`/`class`/`enum`/`void*` keyword — One Dark magenta/purple.
     pub keyword: Hsla,
     /// The root class name on the command row — One Dark blue (the screenshots
@@ -112,11 +114,7 @@ impl EditorPalette {
         // > 0.78) get pure-white editor paper instead of a darkened tint, matching
         // the C++ `applyTheme` rule (`lightnessF() > 0.78 ? #FFFFFF : darker(115)`)
         // so the body stays crisp instead of a dirty khaki that fights the chrome.
-        let paper = if t.background.l > 0.78 {
-            rgb_u8(0xff, 0xff, 0xff)
-        } else {
-            darker(t.background, 0.06)
-        };
+        let paper = crate::ui::design::color::editor_paper(cx);
         EditorPalette {
             text: t.foreground,
             // Item 21: primitive type tokens (uint8_t/hex64/…) render BLUE (the C++
@@ -136,6 +134,7 @@ impl EditorPalette {
             // Item 29: the dim role (hex byte run + ASCII preview + braces/footer)
             // uses the deeper C++ `textFaint`, not the brighter muted foreground.
             dim: text_faint(t.muted_foreground),
+            muted: t.muted_foreground,
             // Item 39: the C++ colors `struct`/`class`/`enum`/`union`/pointer C++
             // keyword tokens with `syntaxKeyword` (≈ #569cd6 blue), NOT magenta —
             // magenta is `syntaxPreproc`, used only for `#define` lines. Tie the
@@ -153,10 +152,10 @@ impl EditorPalette {
             // hex/ASCII columns read as dim as C++. Build a faint tone by darkening
             // the muted foreground toward the paper.
             ascii: with_alpha(text_faint(t.muted_foreground), 0.9),
-            // Comments need to be visually legible against dense row text. Use the
-            // stronger One Dark comment green instead of the muted hint green; type
-            // inference keeps the muted tone below so the two roles remain distinct.
-            comment_green: rgb_u8(0x98, 0xc3, 0x79),
+            // Comments are annotation, not the primary value column. Follow the
+            // active theme's syntax-comment role (`#5c6370` in Zed One Dark)
+            // instead of hard-coding the much louder string/value green.
+            comment_green: t.green_light,
             // Item 38: `IND_TYPE_HINT` is set to `theme.indHintGreen` (≈ #5a8248),
             // the muted comment-green family), NOT a dim gray.
             type_hint: t.green_light,
@@ -233,6 +232,7 @@ impl EditorPalette {
             SpanRole::Keyword => self.keyword,
             SpanRole::Address => self.number,
             SpanRole::Source => self.dim,
+            SpanRole::Action => self.muted,
             SpanRole::Name => self.name_fg,
             SpanRole::Value => self.value_fg,
             SpanRole::StringVal => self.string_val,
@@ -277,15 +277,6 @@ impl EditorPalette {
             3 => Some(self.heat_hot),
             _ => None,
         }
-    }
-}
-
-/// Darken an `Hsla` by reducing lightness, approximating Qt's `color.darker(115)`
-/// (≈ multiply lightness by 1/1.15). Clamped to `[0,1]`.
-fn darker(c: Hsla, amount: f32) -> Hsla {
-    Hsla {
-        l: (c.l - amount).clamp(0.0, 1.0),
-        ..c
     }
 }
 

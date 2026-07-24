@@ -365,6 +365,7 @@ fn compose_with_symbols_at_base_inner(
         hint_regions: Vec::new(),
         hint_regions_indexable: false,
         rtti_cache: AHashMap::new(),
+        type_hint_cache: AHashMap::new(),
     };
 
     // Precompute parent→children map (`compose.cpp:1527-1528`).
@@ -908,6 +909,10 @@ struct ComposeState<'a> {
     hint_regions: Vec<MemoryRegion>,
     hint_regions_indexable: bool,
     rtti_cache: AHashMap<u64, RttiInfo>,
+    /// Per-compose memo of the post-threshold type-hint decision. Both positive
+    /// and negative results are cached; the lifetime is exactly one immutable
+    /// compose pass, so `(address, size)` cannot go stale.
+    type_hint_cache: AHashMap<(u64, i32), Vec<(String, Vec<NodeKind>)>>,
 }
 
 impl ComposeState<'_> {
@@ -1204,7 +1209,7 @@ fn rtti_for_vtable(state: &mut ComposeState, prov: &dyn Provider, candidate_addr
     }
 
     if !state.rtti_modules_cached {
-        state.rtti_modules = prov.enumerate_modules();
+        state.rtti_modules = prov.modules_cached();
         state.rtti_modules_indexable = modules_are_indexable(&state.rtti_modules);
         state.rtti_modules_cached = true;
     }
@@ -1401,7 +1406,7 @@ fn ensure_hint_regions(state: &mut ComposeState<'_>, prov: &dyn Provider) {
 
 fn ensure_hint_modules(state: &mut ComposeState<'_>, prov: &dyn Provider) {
     if !state.rtti_modules_cached {
-        state.rtti_modules = prov.enumerate_modules();
+        state.rtti_modules = prov.modules_cached();
         state.rtti_modules_indexable = modules_are_indexable(&state.rtti_modules);
         state.rtti_modules_cached = true;
     }
@@ -1492,6 +1497,25 @@ fn provider_can_read_target(
     }
     let mut probe = [0u8; 1];
     provider.read(addr, &mut probe)
+}
+
+fn probe_display_readable(provider: &dyn Provider, addr: u64, len: i32) -> bool {
+    if len <= 0 {
+        return len == 0;
+    }
+    let len = len as usize;
+    let mut stack = [0u8; 16];
+    if len <= stack.len() {
+        return provider.read(addr, &mut stack[..len]);
+    }
+
+    // Large leaf widths are uncommon (strings are reduced to one code unit by
+    // the caller). Avoid allocating the full display window merely to test it,
+    // while still catching a span whose tail crosses out of readable memory.
+    let Some(last) = addr.checked_add(len as u64 - 1) else {
+        return false;
+    };
+    provider.read(addr, &mut stack[..1]) && provider.read(last, &mut stack[..1])
 }
 
 fn named_address_from_maps(
@@ -1616,7 +1640,11 @@ fn attach_rtti_chip(
         u64::from_le_bytes(candidate_bytes)
     };
     if candidate == 0 {
-        if allow_null_cta && state.show_rtti {
+        // A null "Name class" CTA is useful for live process memory, but would
+        // cover every zero-valued pointer in a flat file. SnapshotProvider
+        // delegates is_live to its real source, preserving the CTA for frozen
+        // live targets while suppressing it for ordinary buffers/files.
+        if allow_null_cta && state.show_rtti && prov.is_live() {
             push_chip(line_text, lm, ChipKind::Rtti, "(Name class\u{2026})", |c| {
                 c.rtti_vtable_addr = 0;
             });
@@ -1748,6 +1776,31 @@ fn compose_leaf(
         } else {
             None
         };
+
+        // A valid source with an unreadable value address is materially
+        // different from a detached NullProvider. Use the actual read path, not
+        // `is_readable`: live implementations may build an expensive region
+        // snapshot there, and compose already has the bytes for type-hint hex
+        // rows. Strings probe only their first code unit because their declared
+        // width commonly extends beyond the terminating NUL.
+        let mut value_size = node.byte_size();
+        if value_size <= 0 {
+            value_size = size_for_kind(node.kind);
+        }
+        if crate::core::is_string_kind(node.kind) {
+            value_size = if node.kind == NodeKind::UTF16 { 2 } else { 1 };
+        }
+        if value_size > 0 && prov.is_valid() {
+            let preview_covers_value = hex_preview_bytes.is_some()
+                && value_size == size_for_kind(node.kind)
+                && value_size as usize <= hex_stack_bytes.len();
+            let readable = if preview_covers_value {
+                hex_preview_read_ok
+            } else {
+                probe_display_readable(prov, abs_addr, value_size)
+            };
+            lm.unreadable = !readable;
+        }
 
         let mut line_text = if let Some(bytes) = hex_preview_bytes {
             render::fmt_node_line_with_hex_preview_bytes(
@@ -1885,32 +1938,33 @@ fn compose_leaf(
             // the green chip is suppressed (`test_rtti_hint.cpp:313`).
             if state.type_hints && is_hex_node(node.kind) {
                 let sz = size_for_kind(node.kind);
-                let mut stack_bytes = [0u8; 16];
-                let owned_bytes;
-                let b = if let Some(bytes) = hex_preview_bytes {
-                    bytes
-                } else if sz > 0 && (sz as usize) <= stack_bytes.len() {
-                    let len = sz as usize;
-                    let _ = prov.read(abs_addr, &mut stack_bytes[..len]);
-                    &stack_bytes[..len]
+                let cache_key = (abs_addr, sz);
+                let cached = state.type_hint_cache.get(&cache_key).cloned();
+                let hints = if let Some(cached) = cached {
+                    cached
                 } else {
-                    owned_bytes = prov.read_bytes(abs_addr, sz);
-                    owned_bytes.as_slice()
-                };
-                let suggestions = crate::core::infer_strong_types(&b, &Default::default(), 2);
-                let mut emitted = 0usize;
-                for suggestion in suggestions.iter().filter(|s| s.strength >= 3) {
-                    if emitted >= 2 {
-                        break;
-                    }
-                    let kinds = suggestion.kinds.to_vec();
-                    // Value-preview + bracketed type label, mirroring
-                    // `lm.typeHint` (`compose.cpp:450-458`). Pointer guesses
-                    // are promoted only when the target is actually readable;
-                    // otherwise they are passive noise over arbitrary bytes.
-                    let type_name = crate::core::format_hint(suggestion);
-                    let chip_text =
-                        if let Some(ptr_kind) = pointer_kind_from_prediction(&suggestion.kinds) {
+                    let mut stack_bytes = [0u8; 16];
+                    let owned_bytes;
+                    let b = if let Some(bytes) = hex_preview_bytes {
+                        bytes
+                    } else if sz > 0 && (sz as usize) <= stack_bytes.len() {
+                        let len = sz as usize;
+                        let _ = prov.read(abs_addr, &mut stack_bytes[..len]);
+                        &stack_bytes[..len]
+                    } else {
+                        owned_bytes = prov.read_bytes(abs_addr, sz);
+                        owned_bytes.as_slice()
+                    };
+                    let suggestions = crate::core::infer_strong_types(b, &Default::default(), 2);
+                    let mut hints = Vec::with_capacity(2);
+                    for suggestion in suggestions.iter().filter(|s| s.strength >= 3).take(2) {
+                        let kinds = suggestion.kinds.to_vec();
+                        // Pointer guesses are promoted only when the target is
+                        // actually readable; otherwise they are passive noise.
+                        let type_name = crate::core::format_hint(suggestion);
+                        let chip_text = if let Some(ptr_kind) =
+                            pointer_kind_from_prediction(&suggestion.kinds)
+                        {
                             pointer_type_hint_chip_text(state, prov, b, ptr_kind, &type_name)
                         } else {
                             let preview = format_preview(b, sz, &suggestion.kinds);
@@ -1920,9 +1974,14 @@ fn compose_leaf(
                                 format!("{preview} [{type_name}]")
                             })
                         };
-                    let Some(chip_text) = chip_text else {
-                        continue;
-                    };
+                        if let Some(chip_text) = chip_text {
+                            hints.push((chip_text, kinds));
+                        }
+                    }
+                    state.type_hint_cache.insert(cache_key, hints.clone());
+                    hints
+                };
+                for (chip_text, kinds) in hints {
                     push_chip(
                         &mut line_text,
                         &mut lm,
@@ -1932,7 +1991,6 @@ fn compose_leaf(
                             c.type_hint_kinds = kinds;
                         },
                     );
-                    emitted += 1;
                 }
             }
 

@@ -6,13 +6,63 @@
 //! [`RcxController::pump_refresh`] (policy/transport split — PORTING §0) and a
 //! mock [`EditorView`], so there is no sleeping/timer flakiness.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::*;
-use crate::core::linemeta::{make_array_elem_sel_id, make_member_sel_id};
+use crate::core::linemeta::{make_array_elem_sel_id, make_member_sel_id, K_FOOTER_ID_BIT};
 use crate::core::{Node, NodeKind, NodeTree, OffsetAdj, ValueHistory};
-use crate::provider::{BufferProvider, MemoryRegion, ModuleEntry, Provider, RegionType};
+use crate::provider::{
+    BufferProvider, MemoryRegion, ModuleEntry, Provider, ProviderModuleCache, RegionType,
+};
+
+struct ToggleLivenessProvider {
+    valid: AtomicBool,
+}
+
+impl Provider for ToggleLivenessProvider {
+    fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
+        false
+    }
+
+    fn size(&self) -> i32 {
+        i32::from(self.valid.load(Ordering::Relaxed))
+    }
+
+    fn is_live(&self) -> bool {
+        true
+    }
+
+    fn kind(&self) -> String {
+        "Process".into()
+    }
+}
+
+#[test]
+fn liveness_transition_is_visible_even_when_refresh_returns_early() {
+    let provider = Arc::new(ToggleLivenessProvider {
+        valid: AtomicBool::new(true),
+    });
+    let mut doc = RcxDocument::new();
+    doc.provider = provider.clone();
+    let mut ctrl = RcxController::new(doc);
+    ctrl.last_live = true;
+    ctrl.suppress_refresh = true;
+
+    provider.valid.store(false, Ordering::Relaxed);
+    assert!(
+        ctrl.pump_refresh_output_changed(),
+        "valid-to-invalid must repaint source/status chrome despite the suppressed read"
+    );
+    assert!(ctrl
+        .take_events()
+        .iter()
+        .any(|event| { *event == ControllerEvent::SourceLivenessChanged(false) }));
+    assert!(
+        !ctrl.pump_refresh_output_changed(),
+        "the same health state is transition-only"
+    );
+}
 
 // ── Shared fixtures (port of buildSmallTree + makeSmallBuffer) ──
 
@@ -2670,6 +2720,7 @@ const TOTAL_SIZE: i32 = (MODULE_SIZE + HEAP_SIZE) as i32;
 struct CountingProvider {
     reads_per_page: Mutex<std::collections::HashMap<u64, i32>>,
     total_reads: AtomicI32,
+    module_cache: ProviderModuleCache,
     module_enumerations: AtomicI32,
     region_enumerations: AtomicI32,
     module_aware_region_enumerations: AtomicI32,
@@ -2681,6 +2732,7 @@ impl CountingProvider {
         CountingProvider {
             reads_per_page: Mutex::new(std::collections::HashMap::new()),
             total_reads: AtomicI32::new(0),
+            module_cache: ProviderModuleCache::default(),
             module_enumerations: AtomicI32::new(0),
             region_enumerations: AtomicI32::new(0),
             module_aware_region_enumerations: AtomicI32::new(0),
@@ -2762,6 +2814,9 @@ impl Provider for CountingProvider {
             base: MODULE_BASE,
             size: MODULE_SIZE,
         }]
+    }
+    fn module_cache(&self) -> Option<&ProviderModuleCache> {
+        Some(&self.module_cache)
     }
     fn enumerate_regions(&self) -> Vec<MemoryRegion> {
         self.region_enumerations.fetch_add(1, Ordering::Relaxed);
@@ -2922,7 +2977,7 @@ fn permanent_page_classification_skips_region_walk_for_heap_pages_outside_module
 }
 
 #[test]
-fn permanent_page_classification_reuses_module_snapshot_for_region_walk() {
+fn permanent_page_classification_reuses_persistent_module_snapshot_for_region_walk() {
     let mut doc = RcxDocument::new();
     build_speedup_tree(&mut doc.tree, false, true);
     let prov = Arc::new(CountingProvider::new());
@@ -2939,7 +2994,11 @@ fn permanent_page_classification_reuses_module_snapshot_for_region_walk() {
     pages.insert(module_page, vec![0u8; 4096].into());
     c.on_read_complete(pages);
 
-    assert_eq!(prov.module_enumerations(), 1);
+    assert_eq!(
+        prov.module_enumerations(),
+        0,
+        "the heap-page pass already populated the per-attach module cache"
+    );
     assert_eq!(
         prov.region_enumerations(),
         0,
@@ -2963,6 +3022,51 @@ fn permanent_page_classification_handles_unsorted_regions() {
     c.on_read_complete(pages);
 
     assert!(c.snapshot_prov().unwrap().is_permanent(module_page));
+}
+
+#[test]
+fn permanent_page_classification_caches_metadata_and_refreshes_regions_every_64_ticks() {
+    let mut doc = RcxDocument::new();
+    build_speedup_tree(&mut doc.tree, false, true);
+    let prov = Arc::new(CountingProvider::new());
+    doc.provider = prov.clone();
+    let mut c = RcxController::new(doc);
+    let module_page = MODULE_BASE + 4096;
+
+    let page = || {
+        let mut pages = PageMap::new();
+        pages.insert(module_page, vec![0u8; 4096].into());
+        pages
+    };
+    c.on_read_complete(page());
+    c.on_read_complete(page());
+    assert_eq!(prov.module_enumerations(), 1);
+    assert_eq!(prov.module_aware_region_enumerations(), 1);
+
+    c.tick_count = K_REGION_REFRESH_TICKS;
+    c.on_read_complete(page());
+    assert_eq!(
+        prov.module_enumerations(),
+        1,
+        "module metadata remains cached for the attach lifetime"
+    );
+    assert_eq!(
+        prov.module_aware_region_enumerations(),
+        2,
+        "region metadata refreshes after 64 ticks"
+    );
+
+    c.reset_snapshot();
+    // `reset_snapshot` invalidates any in-flight completion by advancing the
+    // generation. Model the next accepted read without running the timer plan.
+    c.read_gen = c.refresh_gen;
+    c.on_read_complete(page());
+    assert_eq!(
+        prov.module_enumerations(),
+        1,
+        "snapshot resets must reuse the real provider's lifetime module cache"
+    );
+    assert_eq!(prov.module_aware_region_enumerations(), 3);
 }
 
 #[test]
@@ -3703,9 +3807,21 @@ fn all_zero_page0_discarded() {
     zero_pages.insert(0, vec![0u8; 4096].into());
     let snap_before = c.snapshot_prov().unwrap().pages().len();
     // refresh_gen/read_gen must match for the guard to be reached.
-    c.on_read_complete(zero_pages);
+    assert!(
+        c.on_read_complete(zero_pages),
+        "the live-to-stale status transition is visible output"
+    );
     let snap_after = c.snapshot_prov().unwrap().pages().len();
     assert_eq!(snap_before, snap_after, "all-zero page-0 must be discarded");
+    assert!(!c.last_read_ok(), "rejected data marks the snapshot stale");
+
+    let mut recovered = PageMap::new();
+    recovered.insert(0, vec![1u8; 4096].into());
+    assert!(
+        c.on_read_complete(recovered),
+        "stale-to-live recovery must repaint the source status"
+    );
+    assert!(c.last_read_ok());
 }
 
 // ── SnapshotProvider primitives (pure unit) ──
@@ -5267,6 +5383,399 @@ fn on_byte_selection_rows_replaces_selection_and_clears() {
         .take_events()
         .iter()
         .any(|e| *e == crate::controller::ControllerEvent::SelectionChanged(0)));
+}
+
+#[test]
+fn stale_click_for_deleted_node_does_not_select_shifted_row() {
+    let mut c = make_ctrl_zero();
+    c.refresh();
+    let deleted_id = find_id(&c, "field_u32");
+    let deleted_line = c
+        .last_result()
+        .line_for_node(deleted_id)
+        .expect("deleted field should have a composed row");
+    let deleted_idx = c.tree().index_of_id(deleted_id);
+    assert!(deleted_idx >= 0);
+
+    c.remove_node(deleted_idx as usize);
+    c.clear_selection();
+    assert!(c.tree().index_of_id(deleted_id) < 0);
+    assert!(
+        c.last_result().meta.get(deleted_line).is_some(),
+        "a following row should have shifted into the cached click line"
+    );
+
+    // This models mouse-up replaying the press-time `(line, node_id)` pair.
+    c.handle_node_click(deleted_line as i64, deleted_id, Modifiers::NONE);
+    assert!(
+        c.selected_ids().is_empty(),
+        "a stale node id must not select the row that shifted into its line"
+    );
+}
+
+#[test]
+fn user_edit_ranges_are_consumed_on_every_tracking_early_return() {
+    // Static provider: returns before sampling.
+    let mut static_ctrl = make_ctrl_zero();
+    static_ctrl.user_edit_ranges.push((0, 4));
+    static_ctrl.value_tracking_pass(None);
+    assert!(static_ctrl.user_edit_ranges.is_empty());
+
+    // Live provider, tracking disabled: a different early-return branch.
+    let mut doc = RcxDocument::new();
+    build_small_tree(&mut doc.tree);
+    doc.provider = Arc::new(BaseAwareProvider {
+        data: vec![0u8; 64],
+        base: 0,
+    });
+    let mut live_ctrl = RcxController::new(doc);
+    live_ctrl.track_values = false;
+    live_ctrl.user_edit_ranges.push((0, 4));
+    live_ctrl.value_tracking_pass(None);
+    assert!(live_ctrl.user_edit_ranges.is_empty());
+
+    // Live provider, active cooldown: the last early-return branch.
+    live_ctrl.track_values = true;
+    live_ctrl.value_track_cooldown = 2;
+    live_ctrl.user_edit_ranges.push((4, 8));
+    live_ctrl.value_tracking_pass(None);
+    assert!(live_ctrl.user_edit_ranges.is_empty());
+}
+
+#[test]
+fn user_value_and_byte_edits_update_baseline_without_recording_history() {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+    let root_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Tracked".into(),
+        parent_id: 0,
+        collapsed: false,
+        ..Node::default()
+    });
+    let root_id = doc.tree.nodes[root_idx].id;
+    let field_idx = doc.tree.add_node(Node {
+        kind: NodeKind::UInt32,
+        name: "value".into(),
+        parent_id: root_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let field_id = doc.tree.nodes[field_idx].id;
+    let provider = Arc::new(LiveWritableProvider::new(0, 64));
+    doc.provider = provider.clone();
+
+    let mut c = RcxController::new(doc);
+    c.refresh();
+    assert!(c.value_history().contains_key(&field_id));
+    assert_eq!(c.value_history()[&field_id].unique_count(), 1);
+
+    // Byte-selection paste is a user write. The changed raw bytes become the new
+    // baseline, but "1" is not added as an observed value.
+    c.byte_paste_hex(0, 4, "01 00 00 00");
+    assert_eq!(provider.byte_at(0), 1);
+    assert_eq!(c.value_history()[&field_id].unique_count(), 1);
+
+    // A later external mutation must not be hidden by a stale one-shot range.
+    assert!(provider.write(0, &2u32.to_le_bytes()));
+    c.refresh();
+    assert_eq!(c.value_history()[&field_id].unique_count(), 2);
+
+    // Inline value edits use the same suppression contract.
+    let live_idx = c.tree().index_of_id(field_id) as usize;
+    c.set_node_value(live_idx, -1, "3", false, 0);
+    assert_eq!(provider.byte_at(0), 3);
+    assert_eq!(c.value_history()[&field_id].unique_count(), 2);
+
+    assert!(provider.write(0, &4u32.to_le_bytes()));
+    c.refresh();
+    assert_eq!(c.value_history()[&field_id].unique_count(), 3);
+}
+
+#[test]
+fn copy_saved_sources_emits_document_changed() {
+    let mut c = make_ctrl_zero();
+    let _ = c.take_events();
+    c.copy_saved_sources(
+        vec![SavedSourceEntry {
+            kind: "processmemory".into(),
+            display_name: "demo.exe".into(),
+            provider_target: "7:demo.exe".into(),
+            ..Default::default()
+        }],
+        0,
+    );
+    assert!(c
+        .take_events()
+        .iter()
+        .any(|event| *event == ControllerEvent::DocumentChanged));
+}
+
+#[test]
+fn remove_active_saved_source_detaches_but_keeps_other_entries() {
+    let mut doc = RcxDocument::new();
+    doc.provider = Arc::new(BufferProvider::new(vec![1u8; 16], "active.bin"));
+    let mut c = RcxController::new(doc);
+    c.copy_saved_sources(
+        vec![
+            SavedSourceEntry {
+                display_name: "active.bin".into(),
+                kind: "File".into(),
+                ..Default::default()
+            },
+            SavedSourceEntry {
+                display_name: "other.bin".into(),
+                kind: "File".into(),
+                ..Default::default()
+            },
+        ],
+        0,
+    );
+
+    c.remove_saved_source(0);
+    assert_eq!(c.saved_sources().len(), 1);
+    assert_eq!(c.saved_sources()[0].display_name, "other.bin");
+    assert_eq!(c.active_source_index(), -1);
+    assert!(!c.document().provider.is_valid());
+}
+
+#[test]
+fn remove_inactive_saved_source_preserves_active_provider_and_reindexes() {
+    let mut doc = RcxDocument::new();
+    let provider: Arc<dyn Provider + Send + Sync> =
+        Arc::new(BufferProvider::new(vec![1u8; 16], "active.bin"));
+    doc.provider = provider.clone();
+    let mut c = RcxController::new(doc);
+    c.copy_saved_sources(
+        vec![
+            SavedSourceEntry {
+                display_name: "old.bin".into(),
+                kind: "File".into(),
+                ..Default::default()
+            },
+            SavedSourceEntry {
+                display_name: "active.bin".into(),
+                kind: "File".into(),
+                ..Default::default()
+            },
+        ],
+        1,
+    );
+
+    c.remove_saved_source(0);
+    assert_eq!(c.saved_sources().len(), 1);
+    assert_eq!(c.active_source_index(), 0);
+    assert!(Arc::ptr_eq(&c.document().provider, &provider));
+
+    let before = c.saved_sources().to_vec();
+    c.remove_saved_source(-1);
+    c.remove_saved_source(99);
+    assert_eq!(c.saved_sources(), before.as_slice());
+}
+
+fn make_break_fixture() -> (RcxController, u64, u64, u64, u64, u64, u64) {
+    let mut doc = RcxDocument::new();
+    doc.tree.base_address = 0;
+
+    // Referenced class used by the embedded Struct field.
+    let inner_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Inner".into(),
+        name: "inner_type".into(),
+        parent_id: 0,
+        ..Node::default()
+    });
+    let inner_id = doc.tree.nodes[inner_idx].id;
+    doc.tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "inner_value".into(),
+        parent_id: inner_id,
+        offset: 0,
+        ..Node::default()
+    });
+
+    let main_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Main".into(),
+        name: "main".into(),
+        parent_id: 0,
+        ..Node::default()
+    });
+    let main_id = doc.tree.nodes[main_idx].id;
+    let head_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "head".into(),
+        parent_id: main_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let head_id = doc.tree.nodes[head_idx].id;
+    let embed_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Struct,
+        name: "embedded".into(),
+        struct_type_name: "Inner".into(),
+        comment: "keep me".into(),
+        parent_id: main_id,
+        offset: 8,
+        ref_id: inner_id,
+        ..Node::default()
+    });
+    let embed_id = doc.tree.nodes[embed_idx].id;
+    let array_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Array,
+        name: "samples".into(),
+        parent_id: main_id,
+        offset: 16,
+        element_kind: NodeKind::UInt16,
+        array_len: 4,
+        ..Node::default()
+    });
+    let array_id = doc.tree.nodes[array_idx].id;
+    let tail_idx = doc.tree.add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "tail".into(),
+        parent_id: main_id,
+        offset: 24,
+        ..Node::default()
+    });
+    let tail_id = doc.tree.nodes[tail_idx].id;
+
+    doc.provider = Arc::new(BufferProvider::new(vec![0; 64], "break.bin"));
+    let mut c = RcxController::new(doc);
+    c.set_view_root_id(main_id);
+    (c, main_id, inner_id, head_id, embed_id, array_id, tail_id)
+}
+
+#[test]
+fn break_into_class_moves_contained_struct_and_array_atomically() {
+    let (mut c, main_id, inner_id, _head_id, _embed_id, _array_id, _tail_id) = make_break_fixture();
+    let before_nodes = c.tree().nodes.len();
+    let before_undo = c.undo_stack().count();
+
+    // Exactly covers Struct@8..16 and Array@16..24.
+    c.extract_byte_selection_to_new_class(8, 24);
+    assert_eq!(c.undo_stack().count(), before_undo + 1);
+
+    let extracted = c
+        .tree()
+        .nodes
+        .iter()
+        .find(|n| {
+            n.parent_id == 0
+                && n.kind == NodeKind::Struct
+                && n.struct_type_name.starts_with("UnnamedClass")
+        })
+        .expect("extracted class root");
+    let extracted_id = extracted.id;
+    assert_eq!(c.tree().struct_span(extracted_id), 16);
+    let mut moved: Vec<Node> = c
+        .tree()
+        .children_of(extracted_id)
+        .into_iter()
+        .map(|idx| c.tree().nodes[idx].clone())
+        .collect();
+    moved.sort_by_key(|n| n.offset);
+    assert_eq!(moved.len(), 2);
+    assert_eq!(moved[0].kind, NodeKind::Struct);
+    assert_eq!(moved[0].offset, 0);
+    assert_eq!(moved[0].ref_id, inner_id);
+    assert_eq!(moved[0].comment, "keep me");
+    assert_eq!(moved[1].kind, NodeKind::Array);
+    assert_eq!(moved[1].offset, 8);
+    assert_eq!(moved[1].element_kind, NodeKind::UInt16);
+    assert_eq!(moved[1].array_len, 4);
+
+    let replacement = c
+        .tree()
+        .children_of(main_id)
+        .into_iter()
+        .map(|idx| &c.tree().nodes[idx])
+        .find(|n| n.offset == 8 && n.ref_id == extracted_id)
+        .expect("embedded extracted class replacement");
+    assert_eq!(c.tree().struct_span(replacement.id), 16);
+
+    // The whole transformation is one undo entry and restores the original tree.
+    c.undo();
+    assert_eq!(c.tree().nodes.len(), before_nodes);
+    assert!(c
+        .tree()
+        .nodes
+        .iter()
+        .any(|n| n.parent_id == main_id && n.offset == 8 && n.ref_id == inner_id));
+    assert!(!c
+        .tree()
+        .nodes
+        .iter()
+        .any(|n| n.struct_type_name.starts_with("UnnamedClass")));
+}
+
+#[test]
+fn break_into_class_refuses_straddling_container_without_mutation() {
+    let (mut c, _main_id, _inner_id, _head_id, _embed_id, _array_id, _tail_id) =
+        make_break_fixture();
+    let before_nodes = c.tree().nodes.clone();
+    let before_undo = c.undo_stack().count();
+
+    // [4,12) cuts across the embedded Struct's [8,16) boundary.
+    c.extract_byte_selection_to_new_class(4, 12);
+    assert_eq!(c.tree().nodes, before_nodes);
+    assert_eq!(c.undo_stack().count(), before_undo);
+    assert!(c.take_events().iter().any(|event| matches!(
+        event,
+        ControllerEvent::StatusHint(text) if text.contains("Struct/Array boundary")
+    )));
+}
+
+#[test]
+fn break_region_unions_direct_rows_and_rejects_nested_frames() {
+    use std::collections::HashSet;
+
+    let (mut c, main_id, _inner_id, head_id, _embed_id, _array_id, tail_id) = make_break_fixture();
+    c.on_byte_selection_rows(HashSet::from([head_id, tail_id]));
+    assert_eq!(c.region_from_current_selection(None), Some((0, 32)));
+
+    // Add an inline container whose child reaches Main but stores offset 0 in the
+    // nested frame. The container is direct/breakable; its child is not.
+    let inline_idx = c.tree_mut().add_node(Node {
+        kind: NodeKind::Struct,
+        name: "inline".into(),
+        parent_id: main_id,
+        offset: 32,
+        ..Node::default()
+    });
+    let inline_id = c.tree().nodes[inline_idx].id;
+    let nested_idx = c.tree_mut().add_node(Node {
+        kind: NodeKind::Hex64,
+        name: "nested".into(),
+        parent_id: inline_id,
+        offset: 0,
+        ..Node::default()
+    });
+    let nested_id = c.tree().nodes[nested_idx].id;
+    assert!(c.node_in_view(nested_id));
+    assert!(c.is_direct_view_frame_child(inline_id));
+    assert!(!c.is_direct_view_frame_child(nested_id));
+
+    c.on_byte_selection_rows(HashSet::from([nested_id]));
+    assert_eq!(c.region_from_current_selection(None), None);
+}
+
+#[test]
+fn shrinking_a_selected_node_clears_the_emitted_row_selection() {
+    use std::collections::HashSet;
+
+    let mut c = make_ctrl_zero();
+    let idx = find_idx(&c, "field_hex");
+    let id = c.tree().nodes[idx].id;
+    c.on_byte_selection_rows(HashSet::from([id]));
+    assert_eq!(c.selected_ids().len(), 1);
+
+    c.change_node_kind(idx, NodeKind::Hex16);
+    assert!(c.selected_ids().is_empty());
+    assert!(c
+        .take_events()
+        .iter()
+        .any(|event| *event == ControllerEvent::SelectionChanged(0)));
 }
 
 #[test]

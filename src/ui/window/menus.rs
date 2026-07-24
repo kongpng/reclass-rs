@@ -137,6 +137,11 @@ impl super::MainWindow {
     menu_action!(on_close_doc, CloseDocAction, "file.close");
     menu_action!(on_undo, UndoAction, "edit.undo");
     menu_action!(on_redo, RedoAction, "edit.redo");
+    menu_action!(
+        on_break_into_class,
+        BreakIntoClassAction,
+        "edit.break_into_class"
+    );
     menu_action!(on_add_bookmark, AddBookmarkAction, "edit.add_bookmark");
     menu_action!(
         on_quick_bookmark,
@@ -229,10 +234,21 @@ impl super::MainWindow {
             // ── Edit (Undo / Redo / Add Bookmark… / Quick Bookmark Here) ──
             "edit.undo" => self.active_editor_undo(false, cx),
             "edit.redo" => self.active_editor_undo(true, cx),
+            "edit.break_into_class" => {
+                if let Some(editor) = self.document_area.read(cx).active_editor().cloned() {
+                    editor.update(cx, |editor, cx| {
+                        editor.break_current_selection_into_class(cx)
+                    });
+                } else {
+                    self.notify("Break: no document is open.", window, cx);
+                }
+            }
             "edit.add_bookmark" => self.prompt_add_bookmark(window, cx),
             "edit.quick_bookmark" => self.quick_bookmark_here(window, cx),
 
             // ── View: docks / windows ──
+            #[cfg(windows)]
+            "view.show_console" => self.toggle_console(cx),
             "view.project" => self.toggle_left_dock(window, cx),
             "view.scanner" => self.toggle_scanner_dock(&ToggleScanner, window, cx),
             "view.modules" => self.raise_modules(window, cx),
@@ -248,9 +264,12 @@ impl super::MainWindow {
             "view.comments" | "view.comment_chips" => {
                 self.toggle_view_option(ViewOpt::ShowComments, cx)
             }
+            "view.auto_rtti" => self.toggle_view_option(ViewOpt::AutoRtti, cx),
+            "view.enum_chips" => self.toggle_view_option(ViewOpt::EnumChips, cx),
             "view.hover" | "view.hover_effects" => {
                 self.toggle_view_option(ViewOpt::HoverEffects, cx)
             }
+            "view.value_popups" => self.toggle_view_option(ViewOpt::ValuePopups, cx),
             "view.minimap" => self.toggle_view_option(ViewOpt::Minimap, cx),
 
             // ── View: font family (the C++ exclusive Consolas / JetBrains Mono
@@ -291,6 +310,7 @@ impl super::MainWindow {
             "view.tree" => self.set_active_view_mode(ViewMode::Tree, window, cx),
             "view.rendered" => self.set_active_view_mode(ViewMode::Rendered, window, cx),
             "view.debug" => self.set_active_view_mode(ViewMode::Debug, window, cx),
+            "view.both" => self.set_active_view_mode(ViewMode::Both, window, cx),
 
             // Theme by name (`view.theme.<NAME>`) — switch the active theme.
             other if other.starts_with("view.theme.") => {
@@ -562,5 +582,7 @@ impl super::MainWindow {
             self.menubar
                 .update(cx, |mb, cx| mb.set_command_checked(&cmd, true, cx));
         }
+        #[cfg(windows)]
+        self.sync_console_menu_checked(cx);
     }
 }

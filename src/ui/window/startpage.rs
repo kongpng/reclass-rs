@@ -7,14 +7,13 @@ use super::*;
 
 impl super::MainWindow {
     /// Show the start-page welcome overlay over the workspace (`showStartPage`).
-    /// No-op if already shown. Mirrors the C++ reflex of preloading a New Class
-    /// behind the splash (main.cpp:9383-9384) so dismissing lands on an editable
-    /// class, not a blank editor.
+    /// No-op if already shown. The start page intentionally preserves the
+    /// zero-document state behind it; dismissing lands on the empty-workspace
+    /// hatch, matching upstream's `splash`/normal-launch path.
     pub fn show_start_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_page.is_some() {
             return;
         }
-        self.preload_new_class_if_empty(window, cx);
         let entries = self.recent_entries();
         let page = StartPage::view(entries, window, cx);
         cx.subscribe_in(
@@ -27,39 +26,6 @@ impl super::MainWindow {
         .detach();
         self.start_page = Some(page);
         cx.notify();
-    }
-
-    /// Preload a New Class behind the splash when the active document is still the
-    /// blank initial doc — the C++ `showStartPage` reflex `if (m_tabs.isEmpty())
-    /// newClass()` (main.cpp:9383-9384). The Rust shell always holds the initial
-    /// tab, so the equivalent guard is "the active document has no top-level struct
-    /// yet". Seeds the same New Class the File ▸ New Class command does, retitles
-    /// the tab, and resyncs the view options / workspace / docks.
-    fn preload_new_class_if_empty(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.document_area.read(cx).active_editor().cloned() else {
-            return;
-        };
-        let is_empty = !editor
-            .read(cx)
-            .controller()
-            .tree()
-            .nodes
-            .iter()
-            .any(|n| n.parent_id == 0 && n.kind == crate::core::NodeKind::Struct);
-        if !is_empty {
-            return;
-        }
-        editor.update(cx, |ed, cx| {
-            ed.set_document(seed_root_doc(RootKind::Class), cx)
-        });
-        if let Some(id) = self.document_area.read(cx).active_id() {
-            self.document_area.update(cx, |area, cx| {
-                area.set_title(id, RootKind::Class.title(), cx)
-            });
-        }
-        self.apply_view_opts_to_editor(&editor, cx);
-        self.rebuild_workspace(cx);
-        self.refresh_docks_for_active(cx);
     }
 
     /// Dismiss the start page (`dismissStartPage`).

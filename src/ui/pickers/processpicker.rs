@@ -91,6 +91,17 @@ impl ProcessRow {
     pub fn is_attachable(&self) -> bool {
         self.availability == SourceAvailability::Available
     }
+
+    /// Whether this is a process row that needs the generic Name-cell glyph.
+    ///
+    /// Upstream's ProcessMemory provider now falls back to `SP_FileIcon` whenever
+    /// executable-icon extraction fails, guaranteeing every process has an icon.
+    /// The Rust `ProcessInfo` contract intentionally carries no platform icon
+    /// payload, so the faithful host-side adaptation is a generic file/process
+    /// glyph for process-provider rows (and explicit PID rows).
+    fn uses_generic_process_icon(&self) -> bool {
+        self.pid != 0 || self.identifier.to_ascii_lowercase().contains("process")
+    }
 }
 
 /// The process-picker model — the row list + the filter, built from the provider
@@ -269,7 +280,7 @@ mod view {
         Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
     };
     use gpui_component::tooltip::Tooltip;
-    use gpui_component::Sizable as _;
+    use gpui_component::{Icon, IconName, Sizable as _};
 
     use super::{ProcessPickerModel, ProcessRow, SourceAvailability};
 
@@ -284,6 +295,8 @@ mod view {
     /// The picker's outcome (the C++ `accept`/`reject`).
     #[derive(Clone, Debug)]
     pub enum ProcessPickEvent {
+        /// Re-enumerate the selected provider's process list in place.
+        RefreshRequested,
         /// Attach to the chosen source (carries the row's identifier + pid + name).
         Attach {
             identifier: String,
@@ -402,7 +415,22 @@ mod view {
                 .text_color(fg)
                 .text_size(px(tokens::font::UI_SM))
                 .when(mono, |d| d.font_family(tokens::font::mono_family()));
-            if col_ix == COL_PATH && !text.is_empty() {
+            if col_ix == COL_NAME && row.uses_generic_process_icon() {
+                // ProcessMemory's upstream fallback is `SP_FileIcon`: retain the
+                // same guarantee at the presentation boundary because ProcessInfo
+                // has no OS-icon field in Rust.
+                cell.w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens::space::XS))
+                    .child(
+                        Icon::new(IconName::File)
+                            .xsmall()
+                            .text_color(color::text_muted(cx)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(text))
+                    .into_any_element()
+            } else if col_ix == COL_PATH && !text.is_empty() {
                 // The C++ Path column elides (Qt::ElideLeft, cpp:61) and carries a
                 // tooltip with the full path (`pathItem->setToolTip(proc.path)`,
                 // cpp:349). gpui truncates trailing rather than leading — an
@@ -550,6 +578,14 @@ mod view {
         /// The backing model (for tests / external wiring).
         pub fn model(&self) -> &ProcessPickerModel {
             &self.model
+        }
+
+        /// Replace the enumerated process snapshot while preserving the current
+        /// filter and remembered-process preference. The table is rebuilt and a
+        /// valid preferred row is selected immediately.
+        pub fn replace_model(&mut self, model: ProcessPickerModel, cx: &mut Context<Self>) {
+            self.model = model;
+            self.refresh_table(cx);
         }
 
         /// The current filter text.
@@ -820,13 +856,30 @@ mod view {
 
             let footer = modal::footer(cx)
                 .child(
+                    Button::new("process-refresh")
+                        .outline()
+                        .rounded(px(0.0))
+                        .h(px(30.0))
+                        .label("Refresh")
+                        .on_click(cx.listener(|_this, _e, _w, cx| {
+                            cx.emit(ProcessPickEvent::RefreshRequested);
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
                     Button::new("process-cancel")
+                        .outline()
+                        .rounded(px(0.0))
+                        .h(px(30.0))
                         .label("Cancel")
                         .on_click(cx.listener(|this, _e, _w, cx| this.cancel(cx))),
                 )
                 .child(
                     Button::new("process-attach")
                         .primary()
+                        .outline()
+                        .rounded(px(0.0))
+                        .h(px(30.0))
                         .label("Attach")
                         .on_click(cx.listener(|this, _e, _w, cx| this.attach_selected(cx))),
                 );
@@ -935,6 +988,23 @@ mod tests {
     fn pid_text_blank_for_synthetic_rows() {
         assert_eq!(available(0, "x").pid_text(), "");
         assert_eq!(available(42, "x").pid_text(), "42");
+    }
+
+    #[test]
+    fn process_rows_always_request_the_generic_fallback_icon() {
+        let enumerated = ProcessRow {
+            pid: 0,
+            identifier: "processmemory".to_string(),
+            ..available(0, "Idle")
+        };
+        assert!(enumerated.uses_generic_process_icon());
+        assert!(available(42, "target.exe").uses_generic_process_icon());
+
+        let file_source = ProcessRow {
+            identifier: "file".to_string(),
+            ..available(0, "File")
+        };
+        assert!(!file_source.uses_generic_process_icon());
     }
 
     #[test]

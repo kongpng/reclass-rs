@@ -364,14 +364,16 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
         N::submenu(
             "&Edit",
             vec![
-                // C++ Edit menu (main.cpp:1188-1215): Undo / Redo / —— / Add
-                // Bookmark… (Ctrl+B) / Quick Bookmark Here (Ctrl+Alt+B). The Rust
-                // tree previously invented a Cut/Copy/Paste/Delete/Select-All set
-                // that has no C++ counterpart; replaced to match parity.
+                // C++ Edit menu: Undo / Redo / —— / Break into Class / —— /
+                // Add Bookmark… / Quick Bookmark Here. The Rust tree previously
+                // invented a Cut/Copy/Paste/Delete/Select-All set that has no C++
+                // counterpart; replaced to match parity.
                 N::item("Undo", "Ctrl+Z", "edit.undo"),
                 // Redo is QKeySequence::Redo — Ctrl+Y (Windows/Linux) or
                 // Ctrl+Shift+Z. Show the primary platform sequence.
                 N::item("Redo", "Ctrl+Y", "edit.redo"),
+                N::Separator,
+                N::item("Break into Class", "Ctrl+Shift+B", "edit.break_into_class"),
                 N::Separator,
                 N::item("Add Bookmark…", "Ctrl+B", "edit.add_bookmark"),
                 N::item("Quick Bookmark Here", "Ctrl+Alt+B", "edit.quick_bookmark"),
@@ -380,6 +382,10 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
         N::submenu(
             "&View",
             vec![
+                #[cfg(windows)]
+                N::item("Show Console", "", "view.show_console"),
+                #[cfg(windows)]
+                N::Separator,
                 N::item("Reset Windows", "", "view.reset_windows"),
                 N::Separator,
                 // C++ Font submenu (main.cpp:1300-1315) is an exclusive
@@ -394,13 +400,29 @@ pub fn menu_tree_with(recent: &[RecentMenuEntry], sources: &[SourceMenuEntry]) -
                     ],
                 ),
                 N::submenu("Theme", theme_menu_items()),
+                N::submenu(
+                    "View Mode",
+                    vec![
+                        N::item("Reclass", "", "view.tree"),
+                        N::item("Code", "", "view.rendered"),
+                        N::item("Debug", "", "view.debug"),
+                        N::item("Both", "", "view.both"),
+                    ],
+                ),
                 N::Separator,
                 N::item("Compact Columns", "", "view.compact_columns"),
                 N::item("Tree Lines", "", "view.tree_lines"),
                 N::item("Relative Offsets", "", "view.relative_offsets"),
-                N::item("Type Hints", "", "view.type_hints"),
-                N::item("Comments", "", "view.comments"),
+                N::submenu(
+                    "Visual hints",
+                    vec![
+                        N::item("Comment chips", "", "view.comments"),
+                        N::item("Auto-detect RTTI", "", "view.auto_rtti"),
+                        N::item("Enum value chips", "", "view.enum_chips"),
+                    ],
+                ),
                 N::item("Hover Effects", "", "view.hover"),
+                N::item("Value Popups", "", "view.value_popups"),
                 N::item("Minimap", "", "view.minimap"),
                 N::Separator,
                 N::item("Refresh", "F5", "view.refresh"),
@@ -1115,12 +1137,18 @@ mod tests {
             "view.compact_columns",
             "view.tree_lines",
             "view.relative_offsets",
-            "view.type_hints",
             "view.comments",
+            "view.auto_rtti",
+            "view.enum_chips",
             "view.hover",
+            "view.value_popups",
             "view.minimap",
             "view.font.consolas",
             "view.font.jetbrains",
+            "view.tree",
+            "view.rendered",
+            "view.debug",
+            "view.both",
             "view.split",
             "view.presentation",
             "view.theme_edit",
@@ -1139,12 +1167,14 @@ mod tests {
 
     #[test]
     fn edit_menu_matches_cpp_bookmark_structure() {
-        // The Edit menu is Undo/Redo/——/Add Bookmark…/Quick Bookmark Here — the
-        // C++ structure (main.cpp:1188). The invented clipboard items are gone.
+        // The Edit menu includes the selection-aware Break into Class action
+        // added upstream, followed by the bookmark actions. Invented clipboard
+        // items remain absent.
         let entries = flatten_menu_bar(&default_menu_tree());
         let cmds: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
         assert!(cmds.contains(&"edit.undo"));
         assert!(cmds.contains(&"edit.redo"));
+        assert!(cmds.contains(&"edit.break_into_class"));
         assert!(cmds.contains(&"edit.add_bookmark"));
         assert!(cmds.contains(&"edit.quick_bookmark"));
         // No phantom clipboard/select-all/validate/docs entries.

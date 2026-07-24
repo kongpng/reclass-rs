@@ -2,7 +2,7 @@
 //!
 //! Port of `src/titlebar.{h,cpp}`. The C++ `TitleBarWidget` is a 32px frameless
 //! bar: app label, the menu bar (or Linux tool-button-mirrored menus), a stretch,
-//! the **workspace layout-toggle pair**, then the min/max/close window controls.
+//! then the min/max/close window controls.
 //! gpui-component's [`TitleBar`](gpui_component::TitleBar) already provides the
 //! frameless bar + native min/max/close controls (cookbook §Chrome), so this
 //! module contributes:
@@ -10,7 +10,7 @@
 //! - [`LayoutPreset`] — the two-mode workspace toggle enum (`titlebar.h:15-18`),
 //!   (`setMenuBarTitleCase`, `titlebar.cpp:222-253`), unit-tested headlessly,
 //! - [`render_titlebar`] — assembles the bar contents (app label, the in-window
-//!   menu bar, stretch, the document title, and the workspace **sidebar toggle**)
+//!   menu bar, stretch, and the document title)
 //!   into a [`TitleBar`].
 //!
 //! The **view-mode** switch (Reclass ⇄ Code) is deliberately NOT here: it lives
@@ -18,10 +18,9 @@
 //! (`tabs::DocumentArea::render_view_toggle`; PIC5). A duplicate titlebar copy
 //! was inconsistent dead UI and has been removed.
 //!
-//! The sidebar toggle emits its intent by calling back into the owning
-//! [`MainWindow`](crate::ui::window::MainWindow) (the C++ `layoutPresetSelected`
-//! signal → `applyLayoutPreset`); rendering takes a plain closure so this module
-//! stays decoupled from the window type.
+//! Workspace visibility remains available through View ▸ Project and the dock's
+//! own close/collapsed-rail controls; upstream removed the duplicate titlebar
+//! toggle in `be9c2b6`.
 //!
 //! Gated behind the `ui` feature.
 
@@ -31,6 +30,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme, Icon, IconName, Selectable as _, Sizable as _, TitleBar};
 
 use crate::ui::chrome::menubar::MenuBar;
+use crate::ui::design::color;
 
 /// The two-mode workspace layout toggle (`enum LayoutPreset`, `titlebar.h:15-18`).
 ///
@@ -126,19 +126,17 @@ fn app_label_mode(show_icon: bool) -> AppLabelMode {
 }
 
 /// Assemble the titlebar contents into a [`TitleBar`] (app-shell §5 layout:
-/// app label · menu bar · stretch · document title · sidebar toggle). The window
+/// app label · menu bar · stretch · document title). The window
 /// controls (min/max/close) are supplied by the gpui-component [`TitleBar`]
 /// itself.
 ///
 /// The **view-mode** switch is NOT in the titlebar: PIC5 shows it as a
 /// "Reclass | Code" *segmented control* pinned to the bottom of the document
 /// area (rendered by `tabs::DocumentArea::render_view_toggle`). Having a second
-/// titlebar copy was inconsistent dead UI, so this bar carries only the sidebar
-/// (workspace) toggle.
+/// titlebar copy was inconsistent dead UI. The workspace toggle was likewise
+/// removed upstream once the Project dock gained its own close/collapsed rail.
 ///
 /// Callbacks (plain `Fn`s so the titlebar stays decoupled from `MainWindow`):
-/// - `on_layout` — the workspace-toggle button was clicked (the C++
-///   `layoutPresetSelected`); receives the chosen [`LayoutPreset`].
 /// - `on_close` — the in-app titlebar **close** (X) control was clicked. Wired to
 ///   the bar's [`TitleBar::on_close_window`] so the close routes through the
 ///   window's unsaved-changes guard instead of the gpui-component default
@@ -162,19 +160,18 @@ pub fn render_titlebar(
     has_doc: bool,
     show_icon: bool,
     menubar: Entity<MenuBar>,
-    on_layout: impl Fn(LayoutPreset, &mut Window, &mut App) + 'static,
+    _on_layout: impl Fn(LayoutPreset, &mut Window, &mut App) + 'static,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> TitleBar {
-    let on_layout = std::rc::Rc::new(on_layout);
-
     // App label — the C++ `m_appLabel`. Two modes (the C++ `setShowIcon`,
     // titlebar.cpp:202-214): when `show_icon` is set, the text is cleared and a
     // class-icon badge (the C++ `class.png` 24×24 pixmap) is shown; otherwise the
     // bold "Reclass" text. [`app_label_mode`] picks the mode (unit-tested).
     let app_label = div()
         .flex_none()
-        .px_2()
+        .pl(px(10.0))
+        .pr_2()
         .when(app_label_mode(show_icon) == AppLabelMode::Icon, |d| {
             // The class-icon badge (the C++ `class.png`); `Frame` is the closest
             // gpui-component glyph for a struct/class outline.
@@ -186,37 +183,12 @@ pub fn render_titlebar(
                 .child("Reclass")
         });
 
-    // Workspace (sidebar) toggle — a single clean ghost icon button (Zed's panel
-    // toggle), replacing the crude exclusive glyph pair. Selected = sidebar shown.
-    let sidebar_open = preset == LayoutPreset::Workspace;
-    let sidebar_btn = {
-        let cb = on_layout.clone();
-        let next = if sidebar_open {
-            LayoutPreset::Off
-        } else {
-            LayoutPreset::Workspace
-        };
-        let icon = if sidebar_open {
-            IconName::PanelLeftClose
-        } else {
-            IconName::PanelLeftOpen
-        };
-        Button::new("toggle-sidebar")
-            .ghost()
-            .small()
-            .selected(sidebar_open)
-            .child(Icon::new(icon))
-            .tooltip(if sidebar_open {
-                "Hide workspace"
-            } else {
-                "Show workspace"
-            })
-            .on_click(move |_e, w, cx| cb(next, w, cx))
-    };
+    let _ = preset;
 
     let title: SharedString = doc_title.into();
 
     TitleBar::new()
+        .bg(color::menu_bar_bg(cx))
         // Route the titlebar X through the window's unsaved-changes guard (the
         // gpui-component default would call `window.remove_window()` directly and
         // bypass the prompt; title_bar.rs:189-194). Linux-only at this layer.
@@ -245,8 +217,7 @@ pub fn render_titlebar(
                             .text_color(cx.theme().muted_foreground)
                             .child(title.clone()),
                     )
-                })
-                .child(sidebar_btn),
+                }),
         )
 }
 

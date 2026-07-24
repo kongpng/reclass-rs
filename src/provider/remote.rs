@@ -8,7 +8,7 @@ use bytemuck::pod_read_unaligned;
 use bytes::Bytes;
 use rcx_rpc::RcxRpcReadEntry;
 
-use super::{MemoryRegion, ModuleEntry, PageMap, Provider, K_PAGE_SIZE};
+use super::{MemoryRegion, ModuleEntry, PageMap, Provider, ProviderModuleCache, K_PAGE_SIZE};
 
 const REMOTE_BULK_PAGE_SLICE_THRESHOLD: usize = 128;
 
@@ -155,12 +155,16 @@ fn bench_page_map_score(map: &PageMap) -> usize {
 
 pub struct RemoteProcessProvider {
     inner: platform::Inner,
+    module_cache: ProviderModuleCache,
 }
 
 impl RemoteProcessProvider {
     pub fn attach(target: &str) -> Result<Self, String> {
         let parsed = RemoteProcessTarget::parse(target)?;
-        platform::Inner::attach(parsed).map(|inner| Self { inner })
+        platform::Inner::attach(parsed).map(|inner| Self {
+            inner,
+            module_cache: ProviderModuleCache::default(),
+        })
     }
 
     pub fn can_handle(target: &str) -> bool {
@@ -239,6 +243,10 @@ impl Provider for RemoteProcessProvider {
 
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
         self.inner.enumerate_modules()
+    }
+
+    fn module_cache(&self) -> Option<&ProviderModuleCache> {
+        Some(&self.module_cache)
     }
 }
 

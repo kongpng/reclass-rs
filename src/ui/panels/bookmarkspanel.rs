@@ -143,7 +143,10 @@ mod view {
     pub struct BookmarksPanel {
         rows: Vec<BookmarkRow>,
         /// The substring filter input (the C++ "Filter bookmarks…" line edit).
-        filter_input: Entity<InputState>,
+        /// Lazily constructed on first panel render. The dock entity must exist
+        /// for layout ownership, but its interactive contents need not be built
+        /// during initial-window construction while the right dock is closed.
+        filter_input: Option<Entity<InputState>>,
         /// Current filter text (synced from the input on change).
         filter: String,
         /// The row index a right-click context menu targets (the C++
@@ -155,25 +158,14 @@ mod view {
 
     impl BookmarksPanel {
         /// Build an empty bookmarks panel.
-        pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-            let filter_input =
-                cx.new(|cx| InputState::new(window, cx).placeholder("Filter bookmarks..."));
-            let mut subs = Vec::new();
-            subs.push(
-                cx.subscribe(&filter_input, |this, input, ev: &InputEvent, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        this.filter = input.read(cx).value().to_string();
-                        cx.notify();
-                    }
-                }),
-            );
+        pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
             BookmarksPanel {
                 rows: Vec::new(),
-                filter_input,
+                filter_input: None,
                 filter: String::new(),
                 context_target: None,
                 focus_handle: cx.focus_handle(),
-                _subs: subs,
+                _subs: Vec::new(),
             }
         }
 
@@ -194,6 +186,22 @@ mod view {
         /// The current rows (for tests / external wiring).
         pub fn rows(&self) -> &[BookmarkRow] {
             &self.rows
+        }
+
+        /// Materialize the filter/input subscription on first reveal/render.
+        fn ensure_contents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.filter_input.is_some() {
+                return;
+            }
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter bookmarks..."));
+            self._subs
+                .push(cx.subscribe(&input, |this, input, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        this.filter = input.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                }));
+            self.filter_input = Some(input);
         }
     }
 
@@ -237,7 +245,8 @@ mod view {
     }
 
     impl Render for BookmarksPanel {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.ensure_contents(window, cx);
             let view = cx.entity();
             // Apply the substring filter (the C++ "Filter bookmarks…" line edit),
             // keeping each row's stable remove-index.
@@ -259,15 +268,19 @@ mod view {
                 .child(render_header(&view, self.rows.len(), cx))
                 // Filter row (only when there are bookmarks to filter).
                 .when(has_bookmarks, |col| {
+                    let input = self
+                        .filter_input
+                        .as_ref()
+                        .expect("bookmark contents initialized before render");
                     col.child(
                         gpui_component::h_flex()
                             .px(px(tokens::space::LG))
                             .py(px(tokens::space::XS))
-                            .child(Input::new(&self.filter_input).small().flex_1()),
+                            .child(Input::new(input).small().flex_1()),
                     )
                 })
                 .child(div().flex_1().min_h_0().child(if is_empty {
-                    empty_state(cx).into_any_element()
+                    empty_state(has_bookmarks, cx).into_any_element()
                 } else {
                     bookmark_list(&view, rows, cx).into_any_element()
                 }))
@@ -422,12 +435,17 @@ mod view {
     }
 
     /// The clean empty-state body: a centered muted caption (Zed panel state).
-    fn empty_state(cx: &App) -> impl IntoElement {
-        crate::ui::design::empty_state(
-            icon::pointer(),
-            "No bookmarks — add one from an address",
-            cx,
-        )
+    fn empty_state(filtered: bool, cx: &App) -> impl IntoElement {
+        if filtered {
+            crate::ui::design::empty_state(icon::search(), "No bookmarks match the filter", cx)
+        } else {
+            crate::ui::design::empty_state_with_hint(
+                icon::pointer(),
+                "No bookmarks",
+                "Right-click a field ▸ Bookmark this address…",
+                cx,
+            )
+        }
     }
 
     use gpui_component::Sizable as _;

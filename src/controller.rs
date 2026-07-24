@@ -24,8 +24,7 @@ use smallvec::SmallVec;
 
 use crate::compose;
 use crate::core::linemeta::{
-    is_synthetic_line, sel_id_for_line, K_ARRAY_ELEM_BIT, K_ARRAY_ELEM_MASK, K_COMMAND_ROW_ID,
-    K_FOOTER_ID_BIT, K_MEMBER_BIT, K_MEMBER_SUB_MASK,
+    base_node_id_from_sel_id, is_synthetic_line, sel_id_for_line, K_COMMAND_ROW_ID,
 };
 use crate::core::{
     alignment_for, find_common_type, is_container_kind, is_func_ptr, is_hex_node, is_hex_preview,
@@ -39,10 +38,6 @@ use crate::provider::{
     SnapshotProvider, K_PAGE_SIZE,
 };
 
-/// Strip mask for selection ids (footer / array-element / member tag + sub bits).
-/// Mirrors the inline `& ~(...)` in `controller.cpp:5168` etc.
-const SEL_STRIP_MASK: u64 =
-    !(K_FOOTER_ID_BIT | K_ARRAY_ELEM_BIT | K_ARRAY_ELEM_MASK | K_MEMBER_BIT | K_MEMBER_SUB_MASK);
 type TrackedValueBytes = SmallVec<[u8; 16]>;
 
 #[derive(Clone, Debug, Default)]
@@ -53,7 +48,7 @@ struct PointerSnapshotChildren {
 
 #[inline]
 fn strip_sel(id: u64) -> u64 {
-    id & SEL_STRIP_MASK
+    base_node_id_from_sel_id(id)
 }
 
 /// Public wrapper over [`strip_sel`] for the UI: recover the bare node id from a
@@ -335,6 +330,7 @@ fn provider_read_cache_eligible(provider: &dyn Provider) -> bool {
 
 const K_PAGE_MASK: u64 = !(K_PAGE_SIZE - 1);
 const K_STABILITY_THRESHOLD: i32 = 5;
+const K_REGION_REFRESH_TICKS: u64 = 64;
 const K_IDLE_BACKOFF_TICKS: i32 = 8;
 const K_POINTER_SNAPSHOT_BYTE_BUDGET: i64 = 64 * 1024 * 1024;
 const K_MAX_MAIN_EXTENT: i64 = 16 * 1024 * 1024;
@@ -964,6 +960,11 @@ pub struct RcxController {
     saved_sources: Vec<SavedSourceEntry>,
     active_source_idx: i32,
     last_live: bool,
+    last_read_ok: bool,
+    // Set when provider validity changes before a refresh early-return. The UI
+    // consumes this through `pump_refresh_output_changed`, so source chrome is
+    // repainted even when no memory page changed (or no read was launched).
+    source_status_dirty: bool,
 
     // auto-refresh state (`controller.h:313-324`)
     snapshot: Option<Box<SnapshotProvider>>,
@@ -978,6 +979,11 @@ pub struct RcxController {
     // bytes — Hex64 "0x0" -> Pointer64 "nullptr", endianness/RVA toggle — doesn't
     // register as a value change and spuriously light the heatmap.
     last_value_bytes: AHashMap<u64, TrackedValueBytes>,
+    // Absolute [lo, hi) ranges written by the user through an inline value edit
+    // or byte-selection edit. The next value-history pass still refreshes the raw
+    // byte baseline for overlapping nodes, but does not record the user's own
+    // write as an observed external change. Consumed after that pass.
+    user_edit_ranges: Vec<(u64, u64)>,
     track_values: bool,
     value_track_cooldown: i32,
     refresh_gen: u64,
@@ -987,6 +993,14 @@ pub struct RcxController {
     // refresh speedups (`controller.h:331-351`)
     page_stability: HashMap<u64, i32>,
     tick_count: u64,
+    // Per-attach provider metadata used by permanent-page classification.
+    // Module enumeration is persistent for the provider lifetime; the much
+    // larger region sweep is refreshed at most once every 64 refresh ticks.
+    classify_modules: Vec<crate::provider::ModuleEntry>,
+    classify_modules_valid: bool,
+    classify_regions: Vec<MemoryRegion>,
+    classify_regions_valid: bool,
+    classify_regions_tick: u64,
     idle_ticks: i32,
     refresh_interval_base_ms: i32,
     refresh_interval_max_ms: i32,
@@ -1074,13 +1088,17 @@ impl RcxController {
             brace_wrap: false,
             type_hints: false,
             show_comments: false,
-            show_rtti: true,
+            // Auto-RTTI is intentionally opt-in: walking every pointer/Hex64
+            // candidate on each live refresh is expensive on module-heavy targets.
+            show_rtti: false,
             show_enum_chips: true,
             suppress_refresh: false,
             read_only_override: false,
             saved_sources: Vec::new(),
             active_source_idx: -1,
             last_live: false,
+            last_read_ok: true,
+            source_status_dirty: false,
             snapshot: None,
             prev_pages: PageMap::new(),
             changed_ranges: Vec::new(),
@@ -1089,6 +1107,7 @@ impl RcxController {
             value_history: HashMap::new(),
             last_value_addr: AHashMap::new(),
             last_value_bytes: AHashMap::new(),
+            user_edit_ranges: Vec::new(),
             track_values: true,
             value_track_cooldown: 0,
             refresh_gen: 0,
@@ -1096,6 +1115,11 @@ impl RcxController {
             read_in_flight: false,
             page_stability: HashMap::new(),
             tick_count: 0,
+            classify_modules: Vec::new(),
+            classify_modules_valid: false,
+            classify_regions: Vec::new(),
+            classify_regions_valid: false,
+            classify_regions_tick: 0,
             idle_ticks: 0,
             refresh_interval_base_ms: 200,
             refresh_interval_max_ms: 1500,
@@ -1174,6 +1198,11 @@ impl RcxController {
     }
     pub fn active_source_index(&self) -> i32 {
         self.active_source_idx
+    }
+    /// Whether the latest completed live read produced usable data. A rejected
+    /// all-zero page-0 read leaves the prior snapshot visible and marks it stale.
+    pub fn last_read_ok(&self) -> bool {
+        self.last_read_ok
     }
     pub fn track_values(&self) -> bool {
         self.track_values
@@ -2023,6 +2052,12 @@ impl RcxController {
             return;
         }
 
+        // The write below is user-originated. Let the refresh triggered by the
+        // undo command adopt these bytes as the new tracking baseline without
+        // treating the edit itself as an externally-observed value change.
+        self.user_edit_ranges
+            .push((addr, addr.saturating_add(write_size as u64)));
+
         // Push undo command (redo re-writes; harmless).
         self.push_command(Command::WriteBytes {
             addr,
@@ -2063,10 +2098,9 @@ impl RcxController {
 
     /// `extractByteSelectionToNewClass(selLo, selHi)` (`controller.cpp:2272`). Break
     /// the byte range `[sel_lo, sel_hi)` out into a new root class and embed an
-    /// instance of it at the selection start in the original parent. Refuses (with a
-    /// `StatusHint`) when the selection starts before the base address, crosses a
-    /// parent-struct boundary, crosses a Struct/Array, or partially crosses a typed
-    /// (non-hex) field. Undoable as a single "Extract to New Class" macro.
+    /// instance of it at the selection start in the original parent. Fully-contained
+    /// typed fields and Struct/Array references move intact; a range that straddles a
+    /// typed field or container boundary is refused. Undoable as one macro.
     pub fn extract_byte_selection_to_new_class(&mut self, sel_lo: u64, sel_hi: u64) {
         if sel_hi <= sel_lo {
             self.emit(ControllerEvent::StatusHint("No bytes selected".to_string()));
@@ -2111,14 +2145,16 @@ impl RcxController {
             }
         };
 
-        // Pass 1: determine the single parent struct from the first intersected LEAF
-        // child (containers skipped — their span includes children).
+        // Pass 1: determine the single parent struct from the first intersected
+        // field. Skip only ROOT containers: their span covers the whole class and
+        // would conflate "root intersects" with "a field intersects". An embedded
+        // Struct/Array is itself a real field and may be moved when fully covered.
         let mut parent_id = 0u64;
         let mut parent_set = false;
         {
             let tree = &self.doc.tree;
             for n in &tree.nodes {
-                if matches!(n.kind, NodeKind::Struct | NodeKind::Array) {
+                if matches!(n.kind, NodeKind::Struct | NodeKind::Array) && n.parent_id == 0 {
                     continue;
                 }
                 if !is_in_view(tree, n.id) {
@@ -2168,12 +2204,14 @@ impl RcxController {
                 }
                 let fully_contained = row_lo >= rel_lo && row_hi <= rel_hi;
                 if matches!(sib.kind, NodeKind::Struct | NodeKind::Array) {
-                    self.emit(ControllerEvent::StatusHint(
-                        "Selection crosses a Struct/Array — refusing extract".to_string(),
-                    ));
-                    return;
-                }
-                if !fully_contained && !is_hex_preview(sib.kind) {
+                    if !fully_contained {
+                        self.emit(ControllerEvent::StatusHint(
+                            "Selection crosses a Struct/Array boundary — refusing break"
+                                .to_string(),
+                        ));
+                        return;
+                    }
+                } else if !fully_contained && !is_hex_preview(sib.kind) {
                     self.emit(ControllerEvent::StatusHint(
                         "Selection partially crosses a typed field — refusing".to_string(),
                     ));
@@ -2359,6 +2397,94 @@ impl RcxController {
         )));
     }
 
+    /// Whether `node_id` belongs to the active view's declaration tree. Fields
+    /// shown through an embedded referenced class belong to that other definition
+    /// and therefore do not have offsets in the current view frame.
+    pub fn node_in_view(&self, node_id: u64) -> bool {
+        if self.view_root_id == 0 {
+            return true;
+        }
+        let mut id = node_id;
+        while id != 0 {
+            if id == self.view_root_id {
+                return true;
+            }
+            let idx = self.doc.tree.index_of_id(id);
+            if idx < 0 {
+                return false;
+            }
+            id = self.doc.tree.nodes[idx as usize].parent_id;
+        }
+        false
+    }
+
+    /// Stricter frame check used by row-selection Break into Class. A selected
+    /// node's `offset` is comparable with the root-relative break region only when
+    /// the node is a direct field of the viewed root. Union members and inline
+    /// container children reach the root but use a nested, parent-relative frame.
+    pub fn is_direct_view_frame_child(&self, node_id: u64) -> bool {
+        let idx = self.doc.tree.index_of_id(node_id);
+        if idx < 0 {
+            return false;
+        }
+        let parent_id = self.doc.tree.nodes[idx as usize].parent_id;
+        if self.view_root_id != 0 {
+            return parent_id == self.view_root_id;
+        }
+        if parent_id == 0 {
+            return false;
+        }
+        let parent_idx = self.doc.tree.index_of_id(parent_id);
+        parent_idx >= 0 && self.doc.tree.nodes[parent_idx as usize].parent_id == 0
+    }
+
+    /// Compute the absolute address region for Break into Class. An active byte
+    /// range wins because it is already expressed in the view's address frame.
+    /// Otherwise union the spans of all selected direct view-frame fields. Any
+    /// nested selected row refuses the entire operation instead of resolving its
+    /// parent-relative offset against the wrong class.
+    pub fn region_from_current_selection(
+        &self,
+        byte_range: Option<(u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        if let Some((lo, hi)) = byte_range.filter(|(lo, hi)| hi > lo) {
+            return Some((lo, hi));
+        }
+
+        let mut bounds: Option<(i32, i32)> = None;
+        for &sel_id in &self.sel_ids {
+            let node_id = strip_sel(sel_id);
+            let idx = self.doc.tree.index_of_id(node_id);
+            if idx < 0 {
+                continue;
+            }
+            if !self.is_direct_view_frame_child(node_id) {
+                return None;
+            }
+            let node = &self.doc.tree.nodes[idx as usize];
+            let size = self.node_size(node);
+            if size <= 0 {
+                continue;
+            }
+            let lo = node.offset;
+            let hi = lo.saturating_add(size);
+            bounds = Some(match bounds {
+                Some((min_lo, max_hi)) => (min_lo.min(lo), max_hi.max(hi)),
+                None => (lo, hi),
+            });
+        }
+
+        let (lo, hi) = bounds?;
+        if hi <= lo || lo < 0 {
+            return None;
+        }
+        let base = self.doc.tree.base_address;
+        Some((
+            base.saturating_add(lo as u64),
+            base.saturating_add(hi as u64),
+        ))
+    }
+
     /// Greedy hex packer (`controller.cpp:2322` lambda): fill `n_bytes` at
     /// consecutive offsets under `parent_id` with the largest hex kind that fits
     /// (Hex64 → Hex8). No-op for `n_bytes <= 0`.
@@ -2536,6 +2662,10 @@ impl RcxController {
         } else {
             vec![0u8; n as usize]
         };
+        if n > 0 {
+            self.user_edit_ranges
+                .push((lo, lo.saturating_add(n as u64)));
+        }
         self.push_command(Command::WriteBytes {
             addr: lo,
             old_bytes,
@@ -2770,6 +2900,13 @@ impl RcxController {
             self.end_macro();
             self.suppress_refresh = was_suppressed;
             if !self.suppress_refresh {
+                // A shrink replaces one field with the smaller kind plus fresh
+                // hex padding. Neither emitted node should inherit the old row
+                // selection; a deliberate click can select the result again.
+                // Suppressed batch callers restore their own selection below.
+                self.sel_ids.clear();
+                self.anchor_line = -1;
+                self.update_command_row();
                 self.refresh();
             }
         } else {
@@ -5385,7 +5522,7 @@ impl RcxController {
             return true;
         }
         let modules =
-            rtti_modules.get_or_insert_with(|| ModuleLookup::new(provider.enumerate_modules()));
+            rtti_modules.get_or_insert_with(|| ModuleLookup::new(provider.modules_cached()));
         if modules.modules().is_empty() {
             return true;
         }
@@ -5589,18 +5726,15 @@ impl RcxController {
         //
         // The headless build has no `g_nameLookupHook`, so this mirrors the C++
         // test-build fallback (`SymbolStore::getSymbolForAddress` directly). It
-        // is gated on the `symbols` feature (where `SymbolStore` lives) and on a
-        // real, non-`NullProvider` source (`provider.size() > 0`, the Rust
-        // analogue of C++'s non-null `m_doc->provider`); without symbols loaded
-        // `get_symbol_for_address` returns empty anyway, so output is unchanged.
+        // is gated only on a real, non-`NullProvider` source
+        // (`provider.size() > 0`, the Rust analogue of C++'s non-null
+        // `m_doc->provider`). `SymbolStore` first tries imported PDB symbols and
+        // then falls back to the provider's synthetic resolver, so an empty PDB
+        // store must not suppress this callback.
         #[cfg(feature = "symbols")]
         let sym: compose::SymbolLookupFn<'_> = {
             use crate::rtti::symbol_store::SymbolStore;
-            let has_syms = SymbolStore::global()
-                .lock()
-                .map(|s| s.has_symbols())
-                .unwrap_or(false);
-            if has_syms && self.doc.provider.size() > 0 {
+            if self.doc.provider.size() > 0 {
                 let prov = Arc::clone(&self.doc.provider);
                 Some(Box::new(move |addr: u64| {
                     SymbolStore::global()
@@ -5613,15 +5747,22 @@ impl RcxController {
             }
         };
         #[cfg(not(feature = "symbols"))]
-        let sym: compose::SymbolLookupFn<'_> = None;
+        let sym: compose::SymbolLookupFn<'_> = if self.doc.provider.size() > 0 {
+            let prov = Arc::clone(&self.doc.provider);
+            Some(Box::new(move |addr: u64| prov.get_symbol(addr)))
+        } else {
+            None
+        };
 
         // Compose against snapshot if active, else real provider. For live
         // changed-page refreshes where the viewport is a strict prefix, first
         // try a bounded preview compose and splice that prefix into the existing
         // full result. If line identity changes, fall back to full compose.
-        let used_visible_rows = sym.is_none() && self.try_refresh_visible_rows(value_refresh_mode);
+        let symbol_free_refresh = !self.show_comments || sym.is_none();
+        let used_visible_rows =
+            symbol_free_refresh && self.try_refresh_visible_rows(value_refresh_mode);
         let used_visible_prefix = !used_visible_rows
-            && sym.is_none()
+            && symbol_free_refresh
             && self.try_refresh_visible_prefix(value_refresh_mode);
         if !used_visible_rows && !used_visible_prefix {
             self.last_result = if let Some(snap) = &self.snapshot {
@@ -5782,6 +5923,12 @@ impl RcxController {
 
     /// Step 4 of refresh — value history + heat. Split out for clarity.
     fn value_tracking_pass(&mut self, live_read_cache: Option<&dyn Provider>) {
+        // User-write suppression is a one-shot even when this particular pass
+        // cannot sample values (detached/static provider, tracking disabled, or
+        // cooldown). Taking the ranges up front guarantees an early return cannot
+        // leak a stale write range into a later live/tracked refresh.
+        let user_edit_ranges = std::mem::take(&mut self.user_edit_ranges);
+
         // Resolve the tracking provider (snapshot if live, else real if valid+live).
         let use_snapshot = self.snapshot.as_ref().map_or(false, |s| s.is_live());
         let use_real = !use_snapshot && self.doc.provider.is_valid() && self.doc.provider.is_live();
@@ -5909,6 +6056,10 @@ impl RcxController {
                 }
                 changed
             };
+            let tracked_hi = addr.saturating_add(sz as u64);
+            let user_wrote = user_edit_ranges
+                .iter()
+                .any(|&(lo, hi)| addr < hi && lo < tracked_hi);
             // ALWAYS create the entry (heat_level needs it, even when not
             // recording — mirrors C++ fetching m_valueHistory[id]).
             let vh = self.value_history.entry(node_id).or_default();
@@ -5928,7 +6079,10 @@ impl RcxController {
                         format::read_value(node, prov, addr, sub_line)
                     }
                 };
-                if !val.is_empty() {
+                // User edits are not observations. `last_value_bytes` was updated
+                // above even on this path, so a later unchanged tick stays quiet;
+                // only the history record/heat bump is suppressed once.
+                if !val.is_empty() && !user_wrote {
                     vh.record(&val);
                 }
             }
@@ -6100,6 +6254,13 @@ impl RcxController {
     pub fn handle_node_click(&mut self, line: i64, node_id: u64, mods: Modifiers) {
         if node_id == 0 {
             self.clear_selection();
+            return;
+        }
+        // Deferred clicks carry both the node id and its line at press time. A
+        // structural edit can delete that node and shift another row into the
+        // cached line before mouse-up; deriving `effective_id` from the shifted
+        // line would then select the wrong node. Reject deleted click targets.
+        if self.doc.tree.index_of_id(node_id) < 0 {
             return;
         }
         let sel_id = self.effective_id(line, node_id);
@@ -6325,11 +6486,11 @@ impl RcxController {
                 self.doc.load_data_file(&entry.file_path);
                 // Restore the slot's *literal* saved base + formula. C++
                 // (`controller.cpp:5228-5232`) deliberately does NOT reevaluate
-                // the formula here — it keeps exactly what was saved — and does
-                // NOT resetSnapshot in this branch; only `refresh()` follows
-                // `loadData`.
+                // the formula here — it keeps exactly what was saved. The prior
+                // provider's snapshot must be dropped before composing the file.
                 self.doc.tree.base_address = entry.base_address;
                 self.doc.tree.base_address_formula = entry.base_address_formula.clone();
+                self.reset_snapshot();
                 self.refresh();
             }
         } else if !entry.provider_target.is_empty() {
@@ -6372,10 +6533,37 @@ impl RcxController {
         self.refresh();
     }
 
+    /// Remove one saved source. Removing the active source detaches to the null
+    /// provider while retaining every other saved entry; removing an earlier
+    /// inactive entry merely shifts the active index down.
+    pub fn remove_saved_source(&mut self, idx: i32) {
+        if idx < 0 || idx as usize >= self.saved_sources.len() {
+            return;
+        }
+        let was_active = idx == self.active_source_idx;
+        self.saved_sources.remove(idx as usize);
+        if was_active {
+            self.active_source_idx = -1;
+        } else if self.active_source_idx > idx {
+            self.active_source_idx -= 1;
+        }
+
+        if was_active {
+            self.doc.provider = Arc::new(NullProvider);
+            self.doc.data_path = None;
+            self.reset_snapshot();
+        }
+        self.on_document_changed();
+    }
+
     /// `copySavedSources(sources, activeIdx)` (`controller.cpp:6408`).
     pub fn copy_saved_sources(&mut self, sources: Vec<SavedSourceEntry>, active_idx: i32) {
         self.saved_sources = sources;
         self.active_source_idx = active_idx;
+        // Tab/source chrome observes DocumentChanged. Without this notification a
+        // newly-created document that inherits the active source can retain its
+        // disconnected placeholder icon until an unrelated reconciliation.
+        self.on_document_changed();
     }
 
     /// In-scope subset of `attachViaPlugin` / `selectSource` source-attach

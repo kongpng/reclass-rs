@@ -100,6 +100,7 @@ actions!(
         EditorTab,
         EditorTabPrev,
         EditorEscape,
+        EditorHideValuePopups,
         EditorUndo,
         EditorRedo,
         // Node context-menu / accelerator actions (the C++ node right-click menu,
@@ -198,6 +199,9 @@ actions!(
         EditorPasteNodes,
         // Ctrl+Shift+C — copy the current node's address (`0x{addr:X}`) as text.
         EditorCopyAddress,
+        // Node context menu — prompt for a symbol name and add a bookmark at the
+        // target node's computed address.
+        EditorBookmarkAddress,
         // Item 27: offset/address-margin right-click → checkable Relative (+0x) /
         // Absolute address mode.
         EditorOffsetsRelative,
@@ -300,6 +304,9 @@ pub fn editor_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("tab", EditorTab, Some("RcxEditor")),
         KeyBinding::new("shift-tab", EditorTabPrev, Some("RcxEditor")),
         KeyBinding::new("escape", EditorEscape, Some("RcxEditor")),
+        // Active hover-card footer shortcut: disable all value/preview popups
+        // until View ▸ Value Popups is re-enabled.
+        KeyBinding::new("h", EditorHideValuePopups, Some("RcxEditor")),
         KeyBinding::new("cmd-z", EditorUndo, Some("RcxEditor")),
         KeyBinding::new("ctrl-z", EditorUndo, Some("RcxEditor")),
         KeyBinding::new("cmd-shift-z", EditorRedo, Some("RcxEditor")),
@@ -412,6 +419,10 @@ pub enum RcxEditorEvent {
     /// `setAppStatus(...)`, e.g. "Copied C struct to clipboard"). The host
     /// status bar reads this; if unconsumed it is harmless.
     Status { message: String },
+    /// The node context menu's "Bookmark this address…" action. The editor owns
+    /// node/address resolution; the host owns the shared themed text prompt and
+    /// feeds the accepted name back through `RcxController::add_bookmark`.
+    BookmarkAddressRequested { address: u64, formula: String },
     /// Item 12: an in-editor View-option toggle the user flipped from WITHIN the
     /// editor surface (the offset-margin double-click or the right-click
     /// Relative/Absolute actions), which must propagate like the menu toggle: the
@@ -450,6 +461,10 @@ pub enum RcxEditorEvent {
     /// `WorkspaceModel` that the per-selection `observe` (status-bar `cx.notify()`)
     /// does NOT refresh, so without this a renamed class kept its stale name.
     DocumentEdited,
+    /// Ctrl+wheel / Ctrl+plus/minus changed this editor's zoom. The window mirrors
+    /// the point delta to the visible pane slider, every generated-code/debug
+    /// projection, and the persisted `viewZoomLevel` setting.
+    ZoomChanged { level: i32 },
 }
 
 /// Item 12: the editor-originated View options that can be toggled from within the
@@ -458,6 +473,7 @@ pub enum RcxEditorEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorViewOption {
     RelativeOffsets,
+    ValuePopups,
 }
 
 /// A top-level struct/enum declared in ANOTHER open document, surfaced in this
@@ -580,6 +596,12 @@ pub struct RcxEditor {
     /// whole group; on a plain release (no drag) the pending click fires and
     /// collapses to the clicked node. `(line, node_id, mods)`.
     pending_click: Option<(usize, u64, Modifiers)>,
+    /// One-shot guard for a type/hex picker opened by clicking the Type token of
+    /// an already-selected node. The next same-node Type click is consumed as a
+    /// plain re-select instead of immediately reopening the picker. The captured
+    /// sorted selection lets genuine selection changes cancel the guard while a
+    /// picker-driven same-selection recompose preserves it.
+    type_picker_suppression: Option<(u64, Vec<u64>)>,
     /// The node-clipboard payload (the `rcx-clipboard/v1` blob written by
     /// EditorCopy/Cut). gpui's clipboard is text-only here, so the serialized blob
     /// also lands on the system clipboard; this field is the in-process fast path
@@ -605,6 +627,10 @@ pub struct RcxEditor {
     /// the View menu's "Hover effects" item flips it. When off, no hover band is
     /// drawn (the row still tracks the pointer for other affordances).
     hover_effects: bool,
+    /// View-option toggle for value history, memory/disassembly, and struct
+    /// preview cards. Kept separate from the row hover wash and persisted as
+    /// `valuePopups`, matching upstream.
+    value_popups: bool,
     /// View-option toggle: render the right-side minimap overview column (the Zed
     /// minimap / the C++ purple overview block, data_options.png). Purely-visual
     /// editor state, defaults off; the View menu's "Minimap" item flips it.
@@ -1024,11 +1050,67 @@ fn hsla_key(color: Hsla) -> [u32; 4] {
     ]
 }
 
-fn minimap_rows_for_meta(meta: &[LineMeta], palette: EditorPalette) -> Arc<[minimap::MinimapRow]> {
+fn minimap_rows_for_widths(
+    meta: &[LineMeta],
+    display_widths: &[usize],
+    palette: EditorPalette,
+) -> Arc<[minimap::MinimapRow]> {
+    let max_display_width = display_widths.iter().copied().max().unwrap_or(0);
     meta.iter()
-        .map(|lm| minimap::minimap_row_for(lm, &palette))
+        .enumerate()
+        .map(|(line, lm)| {
+            minimap::minimap_row_for(
+                lm,
+                &palette,
+                display_widths.get(line).copied().unwrap_or(0),
+                max_display_width,
+            )
+        })
         .collect::<Vec<_>>()
         .into()
+}
+
+/// Build minimap rows from the real composed text. `line_byte_starts` avoids a
+/// second line-layout pass and keeps UTF-8 slicing aligned with ComposeResult;
+/// trimming removes fixed leading/tree padding because depth is represented by
+/// [`minimap::MinimapRow::indent`] separately.
+fn minimap_rows_for_result(
+    result: &ComposeResult,
+    palette: EditorPalette,
+) -> Arc<[minimap::MinimapRow]> {
+    let display_widths: Vec<usize> = (0..result.meta.len())
+        .map(|line| {
+            let Some(&start) = result.line_byte_starts.get(line) else {
+                return 0;
+            };
+            let end = result
+                .line_byte_starts
+                .get(line + 1)
+                .copied()
+                .unwrap_or(result.text.len());
+            result
+                .text
+                .get(start..end)
+                .map_or(0, |text| text.trim().chars().count())
+        })
+        .collect();
+    minimap_rows_for_widths(&result.meta, &display_widths, palette)
+}
+
+fn minimap_rows_for_meta(meta: &[LineMeta], palette: EditorPalette) -> Arc<[minimap::MinimapRow]> {
+    // Benchmark/test compatibility path for metadata-only callers. The rendered
+    // editor uses `minimap_rows_for_result` above and therefore real line lengths.
+    let widths: Vec<usize> = meta
+        .iter()
+        .map(|lm| {
+            lm.chips
+                .iter()
+                .map(|chip| chip.end_col.max(0) as usize)
+                .max()
+                .unwrap_or_else(|| (lm.effective_type_w + lm.effective_name_w).max(1) as usize)
+        })
+        .collect();
+    minimap_rows_for_widths(meta, &widths, palette)
 }
 
 fn row_selected_by_set(selected: &HashSet<u64>, lm: &LineMeta) -> bool {
@@ -1049,6 +1131,80 @@ fn first_selected_line_from_meta(meta: &[LineMeta], selected: &HashSet<u64>) -> 
     meta.iter()
         .enumerate()
         .find_map(|(i, lm)| (lm.node_id != 0 && selected_bare.contains(&lm.node_id)).then_some(i))
+}
+
+/// Absolute addresses for a node selection in ascending structural offset,
+/// formatted exactly as the batch context-menu clipboard payload. Selection ids
+/// may carry footer/array/member tags; duplicate underlying nodes are emitted
+/// once. Invalid/deleted ids are skipped.
+fn selected_addresses_text(tree: &crate::core::NodeTree, selected: &HashSet<u64>) -> String {
+    let mut seen = HashSet::with_capacity(selected.len());
+    let mut rows: Vec<(i64, u64)> = selected
+        .iter()
+        .filter_map(|&sel_id| {
+            let node_id = crate::core::linemeta::base_node_id_from_sel_id(sel_id);
+            if !seen.insert(node_id) {
+                return None;
+            }
+            let idx = tree.index_of_id(node_id);
+            if idx < 0 {
+                return None;
+            }
+            let offset = tree.compute_offset(idx);
+            if offset < 0 {
+                return None;
+            }
+            Some((offset, tree.base_address.saturating_add(offset as u64)))
+        })
+        .collect();
+    rows.sort_unstable_by_key(|&(offset, addr)| (offset, addr));
+    rows.into_iter()
+        .map(|(_, addr)| format!("0x{addr:X}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn bookmark_address_for_node(tree: &crate::core::NodeTree, node_id: u64) -> Option<(u64, String)> {
+    let idx = tree.index_of_id(node_id);
+    if idx < 0 {
+        return None;
+    }
+    let offset = tree.compute_offset(idx);
+    if offset < 0 {
+        return None;
+    }
+    let address = tree.base_address.saturating_add(offset as u64);
+    let formula = if tree.base_address_formula.is_empty() {
+        format!("0x{address:X}")
+    } else {
+        format!("{}+0x{:x}", tree.base_address_formula, offset)
+    };
+    Some((address, formula))
+}
+
+fn reconcile_type_picker_guard(guard: &mut Option<(u64, Vec<u64>)>, current_selection: &[u64]) {
+    if guard
+        .as_ref()
+        .is_some_and(|(_, armed_selection)| armed_selection.as_slice() != current_selection)
+    {
+        *guard = None;
+    }
+}
+
+fn consume_type_picker_guard(
+    guard: &mut Option<(u64, Vec<u64>)>,
+    node_id: u64,
+    current_selection: &[u64],
+) -> bool {
+    reconcile_type_picker_guard(guard, current_selection);
+    if guard
+        .as_ref()
+        .is_some_and(|(armed_id, _)| *armed_id == node_id)
+    {
+        *guard = None;
+        return true;
+    }
+    false
 }
 
 fn byte_row_count(lm: &LineMeta) -> i32 {
@@ -1131,6 +1287,22 @@ fn byte_row_line_from_index(rows: &[ByteRowInterval], addr: u64) -> Option<usize
     (addr >= row.start && addr < row.end).then_some(row.line)
 }
 
+/// Apply the byte-selection → row-selection mirror, optionally bypassing the
+/// drag-time covered-row dedup. Kept as a small headless helper so the refresh
+/// reconciliation regression can be exercised without constructing a GPUI window.
+fn mirror_byte_rows(
+    controller: &mut RcxController,
+    last_rows: &mut std::collections::HashSet<u64>,
+    covered: std::collections::HashSet<u64>,
+    force: bool,
+) {
+    if !force && covered == *last_rows {
+        return;
+    }
+    *last_rows = covered.clone();
+    controller.on_byte_selection_rows(covered);
+}
+
 #[doc(hidden)]
 pub fn bench_minimap_rows_for_meta(
     meta: &[LineMeta],
@@ -1165,12 +1337,14 @@ impl RcxEditor {
             pending_click_col: None,
             drag_init_mods: Modifiers::default(),
             pending_click: None,
+            type_picker_suppression: None,
             node_clipboard: None,
             _refresh_task: Self::spawn_refresh_loop(cx),
             last_tab_target: None,
             relative_offsets: true,
             compact_columns: false,
             hover_effects: true,
+            value_popups: true,
             minimap: false,
             minimap_rows_cache: None,
             byte_row_index_cache: None,
@@ -1240,6 +1414,8 @@ impl RcxEditor {
         self.editing = None;
         self.byte_sel.clear();
         self.last_byte_rows.clear();
+        self.pending_click = None;
+        self.type_picker_suppression = None;
         self.close_context_menu(cx);
         self.context_target = None;
         cx.notify();
@@ -1283,8 +1459,13 @@ impl RcxEditor {
     /// `applyDocument` analogue — recompose if the controller has not already
     /// composed the current tree/view state, then repaint.
     pub fn apply_document(&mut self, cx: &mut Context<Self>) {
+        // A deferred click caches a display line from mouse-down. Any structural
+        // compose can shift that line before mouse-up, so discard the cached pair.
+        self.pending_click = None;
         self.sync_controller_visible_line_range();
         self.controller.refresh_if_stale();
+        self.reconcile_type_picker_suppression();
+        self.force_reconcile_byte_rows();
         cx.emit(RcxEditorEvent::DocumentEdited);
         cx.notify();
     }
@@ -1296,8 +1477,11 @@ impl RcxEditor {
     /// would snap the expanded tree shut. (Structural edits still use
     /// `apply_document`; this is the no-edit recompose.)
     pub fn recompose_view(&mut self, cx: &mut Context<Self>) {
+        self.pending_click = None;
         self.sync_controller_visible_line_range();
         self.controller.refresh_if_stale();
+        self.reconcile_type_picker_suppression();
+        self.force_reconcile_byte_rows();
         cx.notify();
     }
 
@@ -1354,6 +1538,7 @@ impl RcxEditor {
             // output. Keep the old safety net for stale view/options without
             // forcing a second full compose after an incremental live refresh.
             self.controller.refresh_if_stale();
+            self.force_reconcile_byte_rows();
             self.refresh_hover_popup_from_probe(cx);
             let _ = self.controller.take_events();
             cx.notify();
@@ -1428,11 +1613,31 @@ impl RcxEditor {
     /// every byte-selection mutation.
     fn sync_byte_rows(&mut self) {
         let covered = self.covered_byte_rows();
-        if covered == self.last_byte_rows {
+        mirror_byte_rows(
+            &mut self.controller,
+            &mut self.last_byte_rows,
+            covered,
+            false,
+        );
+    }
+
+    /// Refresh-tail reconciliation for an ACTIVE byte selection. Unlike
+    /// [`sync_byte_rows`], this deliberately bypasses `last_byte_rows` dedup: a
+    /// controller refresh can prune or otherwise replace its row selection while
+    /// the address-based byte range (and therefore its covered rows) stays exactly
+    /// the same. Pulling the freshly composed covered set restores the grey row band
+    /// before the host observes the repaint.
+    fn force_reconcile_byte_rows(&mut self) {
+        if !self.byte_sel.is_active() {
             return;
         }
-        self.last_byte_rows = covered.clone();
-        self.controller.on_byte_selection_rows(covered);
+        let covered = self.covered_byte_rows();
+        mirror_byte_rows(
+            &mut self.controller,
+            &mut self.last_byte_rows,
+            covered,
+            true,
+        );
     }
 
     /// Clear the byte selection AND its mirrored row selection together (the
@@ -1531,6 +1736,27 @@ impl RcxEditor {
             self.hover_effects = v;
             cx.notify();
         }
+    }
+
+    pub fn value_popups(&self) -> bool {
+        self.value_popups
+    }
+
+    /// Enable/disable the hover and inline-edit preview host. Disabling closes
+    /// any open card immediately; the per-row hover wash remains independent.
+    pub fn set_value_popups(&mut self, v: bool, cx: &mut Context<Self>) {
+        if self.value_popups == v {
+            return;
+        }
+        self.value_popups = v;
+        if !v {
+            self.hover_popup = None;
+            self.hover_probe = None;
+            self.hover_memory_maps = None;
+            self.hover_memory_preview_cache = None;
+            self.popup_cursor_inside = false;
+        }
+        cx.notify();
     }
 
     /// Whether the right-side minimap overview column is shown (view-only).
@@ -2061,6 +2287,7 @@ impl RcxEditor {
             line,
             pos,
             kind: HoverPopupKind::ValueHistory {
+                node_id: lm.node_id,
                 entries,
                 total_count,
                 node_idx: lm.node_idx,
@@ -2188,10 +2415,37 @@ impl RcxEditor {
     /// the app shell) and recompose. The controller's mutators recompose
     /// internally via `refresh`, but draining keeps the event queue bounded.
     fn after_mutation(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_type_picker_suppression();
+        self.force_reconcile_byte_rows();
         let _events = self.controller.take_events();
         self.sync_find_bar_lines(cx);
         cx.emit(RcxEditorEvent::DocumentEdited);
         cx.notify();
+    }
+
+    fn selected_ids_snapshot(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.controller.selected_ids().iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Cancel the one-shot picker guard after a genuine selection change. A type
+    /// change keeps the same ids selected, so its recompose intentionally leaves
+    /// the guard armed for the next same-node click.
+    fn reconcile_type_picker_suppression(&mut self) {
+        let current = self.selected_ids_snapshot();
+        reconcile_type_picker_guard(&mut self.type_picker_suppression, &current);
+    }
+
+    fn arm_type_picker_suppression(&mut self, node_id: u64) {
+        self.type_picker_suppression = Some((node_id, self.selected_ids_snapshot()));
+    }
+
+    /// Consume and clear the one-shot guard when this is the next Type click on
+    /// the same node. Returns false for a different node or a changed selection.
+    fn consume_type_picker_suppression(&mut self, node_id: u64) -> bool {
+        let current = self.selected_ids_snapshot();
+        consume_type_picker_guard(&mut self.type_picker_suppression, node_id, &current)
     }
 
     /// Drain the controller's pending events and surface any `StatusHint` as a host
@@ -2275,6 +2529,24 @@ impl RcxEditor {
         }
         self.controller.clear_selection();
         self.after_mutation(cx);
+    }
+
+    fn action_hide_value_popups(
+        &mut self,
+        _: &EditorHideValuePopups,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Plain H only owns this shortcut while a preview is actually visible;
+        // otherwise it remains inert, matching upstream's popup-visible guard.
+        if self.hover_popup.is_none() {
+            return;
+        }
+        self.set_value_popups(false, cx);
+        cx.emit(RcxEditorEvent::ViewOptionToggled {
+            option: EditorViewOption::ValuePopups,
+            value: false,
+        });
     }
     fn action_undo(&mut self, _: &EditorUndo, _window: &mut Window, cx: &mut Context<Self>) {
         self.undo(cx);
@@ -3298,6 +3570,13 @@ impl RcxEditor {
         if idxs.is_empty() {
             return;
         }
+        // Structural deletion invalidates an address-based byte selection: keeping
+        // it would repaint the same addresses onto whichever row shifts into the
+        // deleted range, and the refresh-tail reconcile would faithfully restore
+        // that stale band. Drop byte + mirrored rows before mutating the tree.
+        if self.byte_sel.is_active() {
+            self.clear_byte_selection();
+        }
         if idxs.len() > 1 {
             self.controller.batch_remove_nodes(&idxs);
         } else {
@@ -3470,19 +3749,46 @@ impl RcxEditor {
         })
     }
 
-    /// Ctrl+Shift+C — copy the current node's offset address as `0x{addr:X}`
-    /// (item 10, editor.cpp `Key_C` + Ctrl+Shift). No-op when no node / addr 0.
+    /// Ctrl+Shift+C / Copy Address. A batch selection copies every valid selected
+    /// address in ascending structural offset, newline-separated; otherwise copy
+    /// the current node as before.
     fn action_copy_address(
         &mut self,
         _: &EditorCopyAddress,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.controller.selected_ids().len() > 1 {
+            let text =
+                selected_addresses_text(self.controller.tree(), self.controller.selected_ids());
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         if let Some((_l, lm)) = self.current_node() {
             if lm.offset_addr != 0 {
                 cx.write_to_clipboard(ClipboardItem::new_string(format!("0x{:X}", lm.offset_addr)));
             }
         }
+    }
+
+    fn action_bookmark_address(
+        &mut self,
+        _: &EditorBookmarkAddress,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+        let Some(target) = self.action_target() else {
+            return;
+        };
+        let Some((address, formula)) =
+            bookmark_address_for_node(self.controller.tree(), target.node_id)
+        else {
+            return;
+        };
+        cx.emit(RcxEditorEvent::BookmarkAddressRequested { address, formula });
     }
 
     fn action_begin_value_edit(
@@ -3890,16 +4196,37 @@ impl RcxEditor {
     }
 
     /// Item 44: the effective editor font SIZE — the base `EDITOR_SIZE` plus the
-    /// per-editor zoom delta (Ctrl+wheel / Ctrl+=/Ctrl+-), clamped to a sane range.
+    /// shared pane zoom delta (Ctrl+wheel / slider / Ctrl+=/Ctrl+-).
     fn editor_font_size(&self) -> f32 {
-        (design::tokens::font::EDITOR_SIZE + self.zoom_delta).clamp(6.0, 48.0)
+        design::tokens::font::EDITOR_SIZE + self.zoom_delta
     }
 
-    /// Item 44: bump the zoom delta by `points` (a Ctrl+= / Ctrl+- step). Clamped so
-    /// the grid stays legible; recomputes metrics on the next frame.
+    /// Current upstream-compatible zoom point delta (`-8..=24`).
+    pub fn view_zoom_level(&self) -> i32 {
+        crate::ui::state::clamp_view_zoom(self.zoom_delta.round() as i32)
+    }
+
+    /// Apply a host/slider zoom without re-emitting [`RcxEditorEvent::ZoomChanged`]
+    /// (the host is already the source of that change). Recomputes metrics next frame.
+    pub fn set_view_zoom_level(&mut self, level: i32, cx: &mut Context<Self>) {
+        let level = crate::ui::state::clamp_view_zoom(level);
+        if self.view_zoom_level() == level {
+            return;
+        }
+        self.zoom_delta = level as f32;
+        cx.notify();
+    }
+
+    /// Item 44: bump the zoom delta by `points` (a Ctrl+= / Ctrl+- step), then
+    /// notify the host so the visible slider and every projection stay in sync.
     fn zoom_by(&mut self, points: f32, cx: &mut Context<Self>) {
-        let base = design::tokens::font::EDITOR_SIZE;
-        self.zoom_delta = (self.zoom_delta + points).clamp(6.0 - base, 48.0 - base);
+        let old = self.view_zoom_level();
+        let next = crate::ui::state::clamp_view_zoom((self.zoom_delta + points).round() as i32);
+        if old == next {
+            return;
+        }
+        self.zoom_delta = next as f32;
+        cx.emit(RcxEditorEvent::ZoomChanged { level: next });
         cx.notify();
     }
 
@@ -3912,6 +4239,7 @@ impl RcxEditor {
     fn action_zoom_reset(&mut self, _: &EditorZoomReset, _w: &mut Window, cx: &mut Context<Self>) {
         if self.zoom_delta != 0.0 {
             self.zoom_delta = 0.0;
+            cx.emit(RcxEditorEvent::ZoomChanged { level: 0 });
             cx.notify();
         }
     }
@@ -4273,11 +4601,22 @@ impl RcxEditor {
             })
             .collect();
 
+        let strike = if lm.unreadable {
+            let value = geometry::narrow_value_at_first_chip(
+                &lm,
+                crate::compose::value_span_for(&lm, type_w, name_w),
+            );
+            value.valid.then_some((value.start, value.end))
+        } else {
+            None
+        };
+
         RowPaint {
             text: static_paint.text,
             runs: static_paint.runs,
             overlays,
             pills,
+            strike,
             palette,
             metrics: self.metrics,
             font: gpui::font(self.editor_font_family()),
@@ -4309,7 +4648,11 @@ impl RcxEditor {
     /// the viewport indicator from the live scroll offset (item 4). Row reduction
     /// is cached across paint frames and rebuilt only when the controller result
     /// revision or row-affecting palette colors change.
-    fn build_minimap(&mut self, palette: EditorPalette, cx: &App) -> minimap::Minimap {
+    fn build_minimap(
+        &mut self,
+        palette: EditorPalette,
+        cx: &mut Context<Self>,
+    ) -> minimap::Minimap {
         let key = MinimapRowsCacheKey {
             result_revision: self.controller.result_revision(),
             palette: MinimapPaletteKey::new(palette),
@@ -4317,7 +4660,7 @@ impl RcxEditor {
         let rows = match self.minimap_rows_cache.as_ref() {
             Some(cache) if cache.key == key => Arc::clone(&cache.rows),
             _ => {
-                let rows = minimap_rows_for_meta(&self.controller.last_result().meta, palette);
+                let rows = minimap_rows_for_result(self.controller.last_result(), palette);
                 self.minimap_rows_cache = Some(MinimapRowsCache {
                     key,
                     rows: Arc::clone(&rows),
@@ -4331,17 +4674,19 @@ impl RcxEditor {
         minimap::Minimap {
             rows,
             chrome: minimap::MinimapChrome {
-                // A faint panel a hair darker than the paper, with the muted-blue
-                // overview tint the C++ purple block suggests (kept subtle / on
-                // palette via the primary accent, low alpha).
-                bg: with_alpha(t.primary, 0.06),
-                border: palette.border,
-                viewport: with_alpha(t.primary, 0.16),
-                viewport_border: with_alpha(t.primary, 0.45),
+                // Keep the rail nearly continuous with the editor paper. Content
+                // rows supply the semantic color; the viewport gets the one crisp
+                // accent outline so position remains legible at a glance.
+                bg: with_alpha(t.primary, 0.025),
+                border: with_alpha(palette.border, 0.65),
+                viewport: with_alpha(t.primary, 0.11),
+                viewport_border: with_alpha(t.primary, 0.72),
             },
             total,
             visible_start,
             visible_end,
+            editor: cx.entity().downgrade(),
+            line_height: self.metrics.line_height,
         }
     }
 
@@ -4366,6 +4711,47 @@ impl RcxEditor {
         let start = start.min(total);
         let end = (start + visible).min(total);
         (start, end)
+    }
+
+    /// Route minimap click/drag navigation to the same uniform-list handle as the
+    /// editor body. The target line is centered when possible and clamped at the
+    /// document ends; direct offset assignment makes the viewport box update on
+    /// the very next frame rather than waiting for deferred list navigation.
+    pub(crate) fn scroll_to_minimap_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        let total = self.controller.last_result().meta.len();
+        let base_handle = self.scroll.0.borrow().base_handle.clone();
+        let viewport_height = f32::from(base_handle.bounds().size.height);
+        let y =
+            minimap::centered_scroll_offset(total, line, self.metrics.line_height, viewport_height);
+        let x = base_handle.offset().x;
+        self._scroll_anim_task = Task::ready(());
+        base_handle.set_offset(point(x, px(y)));
+        self.clear_hover_state(cx);
+        cx.notify();
+    }
+
+    /// Plain wheel input over the minimap is outside the uniform-list hitbox, so
+    /// apply it here while preserving GPUI's signed scroll-offset convention.
+    pub(crate) fn scroll_minimap_by(&mut self, delta_y: f32, cx: &mut Context<Self>) {
+        let total = self.controller.last_result().meta.len();
+        let base_handle = self.scroll.0.borrow().base_handle.clone();
+        let viewport_height = f32::from(base_handle.bounds().size.height);
+        let current_y = f32::from(base_handle.offset().y);
+        let y = minimap::scroll_offset_after_delta(
+            current_y,
+            delta_y,
+            total,
+            self.metrics.line_height,
+            viewport_height,
+        );
+        if (y - current_y).abs() <= f32::EPSILON {
+            return;
+        }
+        let x = base_handle.offset().x;
+        self._scroll_anim_task = Task::ready(());
+        base_handle.set_offset(point(x, px(y)));
+        self.clear_hover_state(cx);
+        cx.notify();
     }
 
     /// Whether row `idx` is selected (selection ids already use the same
@@ -5179,15 +5565,7 @@ impl RcxEditor {
 
     fn action_new_class(&mut self, _: &EditorNewClass, _w: &mut Window, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
-        // "New Class" (C++ controller.cpp:3390): create a populated `NewClass[_N]`
-        // definition (8×Hex64) and embed THIS node as an instance of it. The old
-        // path inserted a bare childless `Struct`, so expanding the new class
-        // showed an EMPTY body and the arrow keys had no child rows to descend
-        // into — the user-reported "it doesn't expand on that class". Resolves to
-        // the caret/selected node (or 0 → new populated class as the view root).
-        let node_id = self.action_target().map(|t| t.node_id).unwrap_or(0);
-        self.controller.new_class_on_node(node_id);
-        self.apply_document(cx);
+        self.break_current_selection_into_class(cx);
     }
 
     fn action_ptr_to_new_class(
@@ -5744,10 +6122,25 @@ impl RcxEditor {
         cx: &mut Context<Self>,
     ) {
         self.close_context_menu(cx);
-        let Some((lo, hi)) = self.byte_sel.range() else {
+        self.break_current_selection_into_class(cx);
+    }
+
+    /// Shared context-menu Break into Class path. Byte selection wins; otherwise
+    /// the controller unions the selected direct view-frame rows. The controller
+    /// refuses nested-frame node selections before their parent-relative offsets
+    /// can be mistaken for root-relative addresses.
+    pub(crate) fn break_current_selection_into_class(&mut self, cx: &mut Context<Self>) {
+        let byte_range = self.byte_sel.range();
+        let Some((lo, hi)) = self.controller.region_from_current_selection(byte_range) else {
+            self.set_status(
+                "Break: select bytes or direct fields in the current class".to_string(),
+                cx,
+            );
             return;
         };
-        self.clear_byte_selection();
+        if self.byte_sel.is_active() {
+            self.clear_byte_selection();
+        }
         self.controller.extract_byte_selection_to_new_class(lo, hi);
         self.after_mutation(cx);
     }
@@ -6177,6 +6570,11 @@ impl RcxEditor {
         if idxs.is_empty() {
             return;
         }
+        // A delete must not leave the address-based byte range alive to select the
+        // node that shifts into the same address on the next refresh.
+        if self.byte_sel.is_active() {
+            self.clear_byte_selection();
+        }
         // Item 2 (blocker): a multi-node delete must go through
         // `batch_remove_nodes` (controller.rs:3777), which normalizes the set
         // (`normalize_prefer_ancestors`, so selecting a parent struct AND its
@@ -6312,19 +6710,6 @@ impl SizeFamily {
                 _ => Float,
             },
         }
-    }
-}
-
-/// The largest hex [`NodeKind`] whose byte size is `<= bytes` (item 10 join). Hex
-/// kinds are 1/2/4/8/16 bytes (Hex8/16/32/64/128); a run total maps to the biggest
-/// hex that fits so a join collapses the run into the widest hex cell.
-fn hex_kind_for_size(bytes: i32) -> NodeKind {
-    match bytes {
-        b if b >= 16 => NodeKind::Hex128,
-        b if b >= 8 => NodeKind::Hex64,
-        b if b >= 4 => NodeKind::Hex32,
-        b if b >= 2 => NodeKind::Hex16,
-        _ => NodeKind::Hex8,
     }
 }
 
@@ -6509,6 +6894,7 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_tab))
             .on_action(cx.listener(Self::action_tab_prev))
             .on_action(cx.listener(Self::action_escape))
+            .on_action(cx.listener(Self::action_hide_value_popups))
             .on_action(cx.listener(Self::action_undo))
             .on_action(cx.listener(Self::action_redo))
             // Node context-menu / accelerator action handlers (menu-click and the
@@ -6612,6 +6998,7 @@ impl Render for RcxEditor {
             .on_action(cx.listener(Self::action_cut_nodes))
             .on_action(cx.listener(Self::action_paste_nodes))
             .on_action(cx.listener(Self::action_copy_address))
+            .on_action(cx.listener(Self::action_bookmark_address))
             // Part D: byte-selection submenu actions + the shared "Clear selection".
             .on_action(cx.listener(Self::action_byte_copy_hex))
             .on_action(cx.listener(Self::action_byte_copy_c_array))
@@ -6640,7 +7027,8 @@ impl Render for RcxEditor {
             )
             // BUG #1 (item 1): Ctrl/Cmd + mouse-wheel zooms the editor font (the
             // QScintilla-native Ctrl+wheel zoom). Wheel-up = zoom-in, ±1pt per
-            // notch, clamped 6..48 by `zoom_by`. When Ctrl/Cmd is held we consume
+            // notch, clamped to the shared -8..=24 point delta by `zoom_by`.
+            // When Ctrl/Cmd is held we consume
             // the event (stop_propagation) so it does NOT also scroll the list;
             // otherwise we return WITHOUT stopping so the uniform_list keeps its
             // native vertical scroll.
@@ -6814,6 +7202,7 @@ impl Render for AddressFormatTooltip {
         let muted = color::text_muted(cx);
 
         let mut card = design::elevated_surface(cx)
+            .rounded(px(0.0))
             .p(px(tokens::space::LG))
             .flex()
             .flex_col()
@@ -6888,6 +7277,7 @@ impl Render for TitledTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use design::{color, tokens};
         let mut card = design::elevated_surface(cx)
+            .rounded(px(0.0))
             .p(px(tokens::space::LG))
             .flex()
             .flex_col()
@@ -6952,6 +7342,75 @@ mod tests {
             super::visible_line_range_from_metrics(64.0, -32.0, 16.0),
             Some((2, 5))
         );
+    }
+
+    #[test]
+    fn selected_addresses_are_sorted_newline_separated_and_deduplicated() {
+        use crate::core::Node;
+        let mut tree = crate::core::NodeTree::new();
+        tree.base_address = 0x1000;
+        let root = tree.add_node(Node {
+            kind: NodeKind::Struct,
+            ..Node::default()
+        });
+        let root_id = tree.nodes[root].id;
+        let late = tree.add_node(Node {
+            kind: NodeKind::Hex32,
+            parent_id: root_id,
+            offset: 8,
+            ..Node::default()
+        });
+        let first = tree.add_node(Node {
+            kind: NodeKind::Hex32,
+            parent_id: root_id,
+            offset: 0,
+            ..Node::default()
+        });
+        let middle = tree.add_node(Node {
+            kind: NodeKind::Hex32,
+            parent_id: root_id,
+            offset: 4,
+            ..Node::default()
+        });
+        let mut selected = std::collections::HashSet::new();
+        selected.insert(tree.nodes[late].id);
+        selected.insert(tree.nodes[first].id);
+        selected.insert(tree.nodes[middle].id);
+        // A synthetic selection for the same first node must not duplicate it.
+        selected.insert(crate::core::linemeta::make_member_sel_id(
+            tree.nodes[first].id,
+            0,
+        ));
+
+        assert_eq!(
+            super::selected_addresses_text(&tree, &selected),
+            "0x1000\n0x1004\n0x1008"
+        );
+
+        tree.base_address_formula = "<game.exe>".into();
+        assert_eq!(
+            super::bookmark_address_for_node(&tree, tree.nodes[middle].id),
+            Some((0x1004, "<game.exe>+0x4".into()))
+        );
+        tree.base_address_formula.clear();
+        assert_eq!(
+            super::bookmark_address_for_node(&tree, tree.nodes[middle].id),
+            Some((0x1004, "0x1004".into()))
+        );
+    }
+
+    #[test]
+    fn type_picker_guard_is_one_shot_and_selection_scoped() {
+        let mut guard = Some((7, vec![7]));
+        assert!(super::consume_type_picker_guard(&mut guard, 7, &[7]));
+        assert!(guard.is_none(), "same-node click consumes the guard once");
+
+        let mut guard = Some((7, vec![7]));
+        assert!(!super::consume_type_picker_guard(&mut guard, 8, &[7]));
+        assert!(guard.is_some(), "a different node does not consume it");
+
+        assert!(!super::consume_type_picker_guard(&mut guard, 7, &[8]));
+        assert!(guard.is_none(), "a genuine selection change cancels it");
     }
 
     fn editor_with_struct() -> RcxController {
@@ -7077,6 +7536,35 @@ mod tests {
         assert_eq!(super::byte_row_line_from_index(&rows, 0), Some(1));
         assert_eq!(super::byte_row_line_from_index(&rows, 8), Some(2));
         assert_eq!(super::byte_row_line_from_index(&rows, 16), Some(0));
+    }
+
+    #[test]
+    fn forced_byte_row_mirror_restores_controller_after_dedup_desync() {
+        use std::collections::HashSet;
+
+        let mut controller = editor_with_struct();
+        let covered: HashSet<u64> = controller
+            .last_result()
+            .meta
+            .iter()
+            .filter(|lm| lm.line_kind == LineKind::Field)
+            .map(crate::core::linemeta::sel_id_for_line)
+            .collect();
+        assert!(!covered.is_empty());
+
+        // Model the reported split-brain state: the editor's dedup cache already
+        // equals the covered set, while a controller refresh/prune emptied the band.
+        let mut last_rows = covered.clone();
+        controller.clear_selection();
+        assert!(controller.selected_ids().is_empty());
+
+        // Normal drag sync is deduped and leaves the desync in place.
+        super::mirror_byte_rows(&mut controller, &mut last_rows, covered.clone(), false);
+        assert!(controller.selected_ids().is_empty());
+
+        // Refresh-tail sync bypasses that cache and restores the authoritative set.
+        super::mirror_byte_rows(&mut controller, &mut last_rows, covered.clone(), true);
+        assert_eq!(controller.selected_ids(), &covered);
     }
 
     fn editor_with_primitive_array() -> RcxController {
@@ -7765,9 +8253,10 @@ mod tests {
     // ── Hover popup equality (item 13) ──
 
     #[test]
-    fn hover_kind_eq_distinguishes_content_and_variant() {
+    fn hover_kind_eq_keeps_stable_history_snapshot_until_target_or_mode_changes() {
         use super::hover_popup::{hover_kind_eq, HoverPopupKind};
-        let mk = |vals: &[&str], set_buttons: bool| HoverPopupKind::ValueHistory {
+        let mk = |node_id: u64, vals: &[&str], set_buttons: bool| HoverPopupKind::ValueHistory {
+            node_id,
             entries: vals.iter().map(|v| (v.to_string(), 1000i64)).collect(),
             total_count: vals.len() as i64,
             node_idx: 0,
@@ -7775,12 +8264,12 @@ mod tests {
             resolved_addr: 0,
             set_buttons,
         };
-        let a = mk(&["1", "2"], false);
-        let a2 = mk(&["1", "2"], false);
-        // Same VALUES but different raw timestamps must still compare equal (the
-        // elapsed-time labels tick; only the value column drives popup identity,
-        // item 68; `hover_kind_eq` ignores the msec field).
+        let a = mk(7, &["1", "2"], false);
+        let a2 = mk(7, &["1", "2"], false);
+        // The first-dwell snapshot is stable: raw timestamps and newly-recorded
+        // values do not drive identity; only node/slate + hover/edit mode do.
         let a3 = HoverPopupKind::ValueHistory {
+            node_id: 7,
             entries: vec![("1".into(), 5000i64), ("2".into(), 9000i64)],
             total_count: 2,
             node_idx: 0,
@@ -7788,15 +8277,23 @@ mod tests {
             resolved_addr: 0,
             set_buttons: false,
         };
-        let b = mk(&["1", "3"], false);
-        let with_buttons = mk(&["1", "2"], true);
+        let with_new_live_value = mk(7, &["9", "1", "2"], false);
+        let different_node = mk(8, &["1", "2"], false);
+        let with_buttons = mk(7, &["1", "2"], true);
         let t = HoverPopupKind::TitleBody {
             title: "Disassembly".into(),
             body: "nop".into(),
         };
         assert!(hover_kind_eq(&a, &a2), "same content compares equal");
         assert!(hover_kind_eq(&a, &a3), "differing age labels still equal");
-        assert!(!hover_kind_eq(&a, &b), "different values differ");
+        assert!(
+            hover_kind_eq(&a, &with_new_live_value),
+            "new live values keep the first-dwell history snapshot"
+        );
+        assert!(
+            !hover_kind_eq(&a, &different_node),
+            "different node rebuilds"
+        );
         assert!(!hover_kind_eq(&a, &with_buttons), "Set-button mode differs");
         assert!(!hover_kind_eq(&a, &t), "different variants differ");
     }

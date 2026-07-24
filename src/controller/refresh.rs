@@ -11,7 +11,7 @@ use ahash::{AHashMap, AHashSet};
 use super::*;
 use super::{
     K_IDLE_BACKOFF_TICKS, K_MAX_MAIN_EXTENT, K_PAGE_MASK, K_POINTER_SNAPSHOT_BYTE_BUDGET,
-    K_STABILITY_THRESHOLD,
+    K_REGION_REFRESH_TICKS, K_STABILITY_THRESHOLD,
 };
 use crate::provider::{Provider, SnapshotProvider, K_PAGE_SIZE};
 
@@ -68,6 +68,63 @@ fn module_overlaps_page(modules: &[crate::provider::ModuleEntry], page_addr: u64
     false
 }
 
+/// Word-strided page diff. Equal 8-byte words are skipped wholesale; only
+/// differing words descend to byte comparisons. The emitted absolute ranges are
+/// byte-for-byte equivalent to the former naive scan, including runs spanning a
+/// word boundary.
+fn diff_page_ranges(out: &mut Vec<(i64, i64)>, page_addr: u64, old: &[u8], fresh: &[u8]) -> bool {
+    let len = old.len().min(fresh.len());
+    let mut changed = false;
+    let mut run_start: Option<usize> = None;
+    let mut i = 0usize;
+
+    let mut visit =
+        |idx: usize, differs: bool, out: &mut Vec<(i64, i64)>, run: &mut Option<usize>| {
+            if differs {
+                changed = true;
+                if run.is_none() {
+                    *run = Some(idx);
+                }
+            } else if let Some(start) = run.take() {
+                out.push((
+                    page_addr as i64 + start as i64,
+                    page_addr as i64 + idx as i64,
+                ));
+            }
+        };
+
+    while i + 8 <= len {
+        let a = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        let b = u64::from_ne_bytes(fresh[i..i + 8].try_into().unwrap());
+        if a == b {
+            if let Some(start) = run_start.take() {
+                out.push((page_addr as i64 + start as i64, page_addr as i64 + i as i64));
+            }
+        } else {
+            for byte in 0..8 {
+                visit(
+                    i + byte,
+                    old[i + byte] != fresh[i + byte],
+                    out,
+                    &mut run_start,
+                );
+            }
+        }
+        i += 8;
+    }
+    while i < len {
+        visit(i, old[i] != fresh[i], out, &mut run_start);
+        i += 1;
+    }
+    if let Some(start) = run_start {
+        out.push((
+            page_addr as i64 + start as i64,
+            page_addr as i64 + len as i64,
+        ));
+    }
+    changed
+}
+
 impl super::RcxController {
     fn pointer_snapshot_children(&mut self, parent_id: u64) -> PointerSnapshotChildren {
         let generation = self.doc.tree.generation();
@@ -118,6 +175,7 @@ impl super::RcxController {
         let now_live = self.doc.provider.is_valid();
         if now_live != self.last_live {
             self.last_live = now_live;
+            self.source_status_dirty = true;
             self.emit(ControllerEvent::SourceLivenessChanged(now_live));
         }
 
@@ -266,10 +324,14 @@ impl super::RcxController {
             if let Some(p0) = new_pages.get(&0) {
                 if p0.iter().all(|&b| b == 0) {
                     tracing::debug!("[Refresh] discarding all-zero page-0, keeping stale snapshot");
-                    return false;
+                    let status_changed = self.last_read_ok;
+                    self.last_read_ok = false;
+                    return status_changed;
                 }
             }
         }
+        let status_changed = !self.last_read_ok;
+        self.last_read_ok = true;
 
         // Diff + stability.
         self.changed_ranges.clear();
@@ -282,26 +344,12 @@ impl super::RcxController {
                 }
                 Some(prev) => {
                     let cmp_len = prev.len().min(fresh.len());
-                    let mut page_changed = false;
-                    if prev[..cmp_len] != fresh[..cmp_len] {
-                        let mut i = 0usize;
-                        while i < cmp_len {
-                            if prev[i] == fresh[i] {
-                                i += 1;
-                                continue;
-                            }
-                            let start = i;
-                            i += 1;
-                            while i < cmp_len && prev[i] != fresh[i] {
-                                i += 1;
-                            }
-                            self.changed_ranges.push((
-                                page_addr as i64 + start as i64,
-                                page_addr as i64 + i as i64,
-                            ));
-                            page_changed = true;
-                        }
-                    }
+                    let page_changed = diff_page_ranges(
+                        &mut self.changed_ranges,
+                        page_addr,
+                        &prev[..cmp_len],
+                        &fresh[..cmp_len],
+                    );
                     if page_changed {
                         self.page_stability.insert(page_addr, 0);
                         any_changed = true;
@@ -360,7 +408,7 @@ impl super::RcxController {
             }
         }
         self.changed_ranges.clear();
-        output_changed
+        output_changed || status_changed
     }
 
     /// `collectPointerRanges(...)` (`controller.cpp:6532`).
@@ -520,27 +568,37 @@ impl super::RcxController {
         if self.snapshot.is_none() || fresh.is_empty() {
             return;
         }
-        let mut modules = self.doc.provider.enumerate_modules();
-        if !modules.is_empty() {
-            modules.sort_unstable_by_key(|module| module.base);
+        if !self.classify_modules_valid {
+            self.classify_modules = self.doc.provider.modules_cached();
+            self.classify_modules
+                .sort_unstable_by_key(|module| module.base);
+            self.classify_modules_valid = true;
+        }
+        if !self.classify_modules.is_empty() {
             if !fresh
                 .keys()
-                .any(|&page_addr| module_overlaps_page(&modules, page_addr))
+                .any(|&page_addr| module_overlaps_page(&self.classify_modules, page_addr))
             {
                 return;
             }
         }
-        let mut executable_regions: Vec<MemoryRegion> = self
-            .doc
-            .provider
-            .enumerate_regions_with_modules(&modules)
-            .into_iter()
-            .filter(|r| !r.module_name.is_empty() && r.executable)
-            .collect();
-        if executable_regions.is_empty() {
+        if !self.classify_regions_valid
+            || self.tick_count.saturating_sub(self.classify_regions_tick) >= K_REGION_REFRESH_TICKS
+        {
+            self.classify_regions = self
+                .doc
+                .provider
+                .enumerate_regions_with_modules(&self.classify_modules)
+                .into_iter()
+                .filter(|r| !r.module_name.is_empty() && r.executable)
+                .collect();
+            self.classify_regions.sort_unstable_by_key(|r| r.base);
+            self.classify_regions_valid = true;
+            self.classify_regions_tick = self.tick_count;
+        }
+        if self.classify_regions.is_empty() {
             return;
         }
-        executable_regions.sort_by_key(|r| r.base);
         let to_mark: Vec<u64> = {
             let snap = self.snapshot.as_ref().unwrap();
             let mut marks = Vec::new();
@@ -549,8 +607,10 @@ impl super::RcxController {
                     continue;
                 }
                 let page_end = page_addr.saturating_add(K_PAGE_SIZE);
-                let upper = executable_regions.partition_point(|r| r.base <= page_addr);
-                for r in executable_regions[..upper].iter().rev() {
+                let upper = self
+                    .classify_regions
+                    .partition_point(|r| r.base <= page_addr);
+                for r in self.classify_regions[..upper].iter().rev() {
                     let region_end = r.base.saturating_add(r.size);
                     if region_end <= page_addr {
                         break;
@@ -786,6 +846,11 @@ impl super::RcxController {
         self.last_value_addr.clear();
         self.last_value_bytes.clear();
         self.page_stability.clear();
+        self.classify_modules.clear();
+        self.classify_modules_valid = false;
+        self.classify_regions.clear();
+        self.classify_regions_valid = false;
+        self.classify_regions_tick = 0;
         self.idle_ticks = 0;
         self.tick_count = 0;
         self.apply_adaptive_interval();
@@ -808,11 +873,68 @@ impl super::RcxController {
     /// changed. Unlike [`pump_refresh`](Self::pump_refresh), unchanged or deferred
     /// offscreen reads return `false` so UI callers can skip repaint work.
     pub fn pump_refresh_output_changed(&mut self) -> bool {
-        match self.on_refresh_tick() {
-            RefreshPlan::None => false,
+        let plan = self.on_refresh_tick();
+        // Liveness detection deliberately runs before every early return in
+        // `on_refresh_tick`. Preserve that transition as visible output even if
+        // the provider is static/suppressed, has no extent, or returns unchanged
+        // pages; the editor's notify then repaints sibling source/status chrome.
+        let source_status_changed = std::mem::take(&mut self.source_status_dirty);
+        match plan {
+            RefreshPlan::None => source_status_changed,
             RefreshPlan::Read { pages, provider } => {
                 let result = RcxController::read_pages(&provider, &pages);
-                self.on_read_complete(result)
+                self.on_read_complete(result) || source_status_changed
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::diff_page_ranges;
+
+    fn naive(page: u64, old: &[u8], fresh: &[u8]) -> Vec<(i64, i64)> {
+        let len = old.len().min(fresh.len());
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < len {
+            if old[i] == fresh[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            while i < len && old[i] != fresh[i] {
+                i += 1;
+            }
+            out.push((page as i64 + start as i64, page as i64 + i as i64));
+        }
+        out
+    }
+
+    #[test]
+    fn word_strided_diff_matches_naive_across_lengths_and_patterns() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for len in (0..=96).chain([255, 256, 257, 4095, 4096, 4103]) {
+            for _ in 0..32 {
+                let mut old = vec![0u8; len];
+                let mut fresh = vec![0u8; len];
+                for (a, b) in old.iter_mut().zip(&mut fresh) {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    *a = (seed >> 24) as u8;
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    *b = if seed & 3 == 0 {
+                        *a
+                    } else {
+                        (seed >> 32) as u8
+                    };
+                }
+                let page = 0x1234_5000;
+                let want = naive(page, &old, &fresh);
+                let mut got = Vec::new();
+                let changed = diff_page_ranges(&mut got, page, &old, &fresh);
+                assert_eq!(got, want, "len={len}");
+                assert_eq!(changed, !want.is_empty(), "len={len}");
             }
         }
     }

@@ -11,6 +11,23 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::IconName;
 
+/// Labels for the node menu's same-size type stepper. Containers and other
+/// fixed-point kinds have no alternate type, so they return no rows instead of
+/// advertising a dead `Array → Array` action. Two-entry rings expose one action
+/// because next and previous would otherwise be duplicate commands.
+fn type_cycle_menu_labels(kind: NodeKind) -> (Option<String>, Option<String>) {
+    let next = alt_kind_for(kind);
+    let prev = prev_kind_for(kind);
+    if next == kind {
+        return (None, None);
+    }
+
+    let next_label = Some(format!("Next type: {}", crate::core::kind_to_string(next)));
+    let prev_label = (prev != kind && prev != next)
+        .then(|| format!("Previous type: {}", crate::core::kind_to_string(prev)));
+    (next_label, prev_label)
+}
+
 /// Append the always-available Fold ▸ / Copy ▸ / Tracking ▸ submenus the C++ adds
 /// after every with-node menu (controller.cpp:3880-3974). Shared by the enum-header
 /// and enum/bitfield-member menus so they carry the same trailing block as the
@@ -34,6 +51,12 @@ fn append_node_submenus(
             Box::new(EditorExpandAll),
         )
     })
+    .menu_with_icon(
+        "Bookmark this address…",
+        IconName::Frame,
+        Box::new(EditorBookmarkAddress),
+    )
+    .separator()
     .submenu("Copy", mw, mcx, |sub, _w, _cx| {
         sub.menu_with_icon("Copy Address", IconName::Copy, Box::new(EditorCopyAddress))
             .menu_with_icon("Copy Offset", IconName::Copy, Box::new(EditorCopyOffset))
@@ -62,8 +85,9 @@ fn append_node_submenus(
 /// Part D: prepend the "Selected bytes (N) ▸" submenu to a node/batch menu when a
 /// byte selection is active (the C++ `addByteSubmenu`, controller.cpp:231). Mirrors
 /// `addByteSubmenu`'s item order: Copy as hex / Copy as C array / Copy as Python
-/// bytes / Edit hex / Zero-fill / Paste hex / Save bytes as binary / Break into new
-/// class, then a separator. No-op when `byte_active` is false. Paste/Zero-fill are
+/// bytes / Edit hex / Zero-fill / Paste hex / Save bytes as binary, then a
+/// separator. Break into Class is promoted above this submenu. No-op when
+/// `byte_active` is false. Paste/Zero-fill are
 /// shown unconditionally (the controller's handlers re-check writability and emit a
 /// "read-only" hint), matching the C++ which lists them always.
 fn add_byte_submenu(
@@ -76,7 +100,14 @@ fn add_byte_submenu(
     if !byte_active {
         return menu;
     }
-    menu.submenu(
+    // Promote Break into Class to the headline action whenever bytes are active;
+    // the byte-operation submenu remains for copy/edit/write utilities.
+    menu.menu_with_icon(
+        "Break into Class",
+        IconName::Frame,
+        Box::new(EditorByteBreakClass),
+    )
+    .submenu(
         SharedString::from(format!("Selected bytes ({byte_count})")),
         mw,
         mcx,
@@ -103,11 +134,6 @@ fn add_byte_submenu(
                     "Save bytes as binary\u{2026}",
                     IconName::HardDrive,
                     Box::new(EditorByteSaveBinary),
-                )
-                .menu_with_icon(
-                    "Break into new class",
-                    IconName::Frame,
-                    Box::new(EditorByteBreakClass),
                 )
         },
     )
@@ -396,6 +422,16 @@ impl super::RcxEditor {
             let menu = menu.min_w(px(220.0)).action_context(editor_focus.clone());
             let menu = add_byte_submenu(menu, byte_active, byte_count, mw, mcx);
             menu
+                // With no byte range, union the selected direct view-frame rows.
+                // The shared controller chokepoint refuses nested-frame fields.
+                .when(!byte_active, |menu| {
+                    menu.menu_with_icon(
+                        "Break into Class",
+                        IconName::Frame,
+                        Box::new(EditorNewClass),
+                    )
+                    .separator()
+                })
                 // "Change type of N nodes…" → opens the Change Type picker (applies
                 // to every selected node via the batch-aware controller path).
                 .menu_with_icon(
@@ -540,15 +576,10 @@ impl super::RcxEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cur_name = crate::core::kind_to_string(target.kind);
-        let alt_name = crate::core::kind_to_string(alt_kind_for(target.kind));
-        let prev_name = crate::core::kind_to_string(prev_kind_for(target.kind));
-        // Two directional quick-cycler rows — forward (`→ next`) and backward
-        // (`← prev`) — mirroring the Left/Right keyboard cycler. C++ exposes the
-        // cycler only via the arrow keys; the Rust menu rows are an affordance on
-        // top, now symmetric so the menu can step the type either way (P7).
-        let cycle_next_label = format!("{cur_name}  \u{2192}  {alt_name}");
-        let cycle_prev_label = format!("{cur_name}  \u{2190}  {prev_name}");
+        // Directional same-size type steps are useful only when the kind has a
+        // real alternate. Fixed-point containers must not render no-op rows.
+        let (cycle_next_label, cycle_prev_label) = type_cycle_menu_labels(target.kind);
+        let show_cycle = cycle_next_label.is_some() || cycle_prev_label.is_some();
         let is_container = crate::core::is_container_kind(target.kind);
         // Item 14: label the Fold entry by the container's live collapsed state —
         // 'Expand' when collapsed, 'Collapse' when expanded (the C++ `&Expand` /
@@ -658,7 +689,9 @@ impl super::RcxEditor {
         };
         // Convert to Hex only for non-hex non-container.
         let conv_to_hex = !is_hex_ctx && !is_container;
-        // Disable the whole submenu when no conversion applies.
+        // Omit the submenu entirely when no conversion applies. A disabled
+        // `(no conversion)` child is dead UI and consumes a second flyout for no
+        // user action.
         let convert_enabled = conv_uint_label.is_some()
             || conv_float_label.is_some()
             || conv_int16
@@ -720,7 +753,11 @@ impl super::RcxEditor {
                 // Item 16: New Class only for non-container kinds; Ptr to New Class
                 // additionally requires a 4/8-byte node.
                 .when(show_new_class, |menu| {
-                    menu.menu_with_icon("New Class", IconName::Frame, Box::new(EditorNewClass))
+                    menu.menu_with_icon(
+                        "Break into Class",
+                        IconName::Frame,
+                        Box::new(EditorNewClass),
+                    )
                 })
                 .when(show_ptr_new_class, |menu| {
                     menu.menu_with_icon(
@@ -729,22 +766,18 @@ impl super::RcxEditor {
                         Box::new(EditorPtrToNewClass),
                     )
                 })
-                .separator()
-                // The quick type-cycler rows: `cur → next` steps the node's kind
-                // forward, `cur ← prev` steps it back (the C++ in-place type stepper
-                // bound to Right/Left). Two rows so both directions are reachable by
-                // mouse, not just the keyboard.
-                .menu_with_icon(
-                    cycle_next_label,
-                    IconName::ChevronDown,
-                    Box::new(EditorCycleTypeNext),
-                )
-                .menu_with_icon(
-                    cycle_prev_label,
-                    IconName::ChevronUp,
-                    Box::new(EditorCycleTypePrev),
-                )
-                .separator()
+                .when(show_new_class || show_ptr_new_class, |menu| {
+                    menu.separator()
+                })
+                // The quick type-cycler rows mirror the Left/Right keyboard
+                // stepper, but only when each direction changes the node kind.
+                .when_some(cycle_next_label, |menu, label| {
+                    menu.menu_with_icon(label, IconName::ChevronDown, Box::new(EditorCycleTypeNext))
+                })
+                .when_some(cycle_prev_label, |menu, label| {
+                    menu.menu_with_icon(label, IconName::ChevronUp, Box::new(EditorCycleTypePrev))
+                })
+                .when(show_cycle, |menu| menu.separator())
                 // Item 17: Edit Value (Enter) for writable, non-hex, non-container.
                 .when(show_edit_value, |menu| {
                     menu.menu_with_icon(
@@ -801,12 +834,7 @@ impl super::RcxEditor {
                 // Item 9: the C++ Convert submenu — SIZE-SPECIFIC labels by kind
                 // (controller.cpp:3631), only the applicable rows, with U/F/S/P
                 // hints, fnptr/ptr toggles, per-size Split labels, Convert-to-Hex
-                // gating, and the whole submenu disabled when nothing applies.
-                .when(!convert_enabled, |menu| {
-                    menu.submenu("Convert", mw, mcx, |sub, _w, _cx| {
-                        sub.label("(no conversion)")
-                    })
-                })
+                // gating. When nothing applies, omit the submenu entirely.
                 .when(convert_enabled, |menu| {
                     menu.submenu("Convert", mw, mcx, move |mut sub, _w, _cx| {
                         if let Some(lbl) = conv_uint_label {
@@ -917,29 +945,27 @@ impl super::RcxEditor {
                         Box::new(EditorEditBytesAscii),
                     )
                 })
-                // Item 8: the Structure submenu — real entries wired to the
-                // controller's add-child / dissolve-union mutators (the C++
-                // `Structure` submenu, controller.cpp:3782). Shown only when at
-                // least one entry applies; a placeholder otherwise.
-                .submenu("Structure", mw, mcx, move |mut sub, _w, _cx| {
-                    if !static_has_any {
-                        return sub.label("(none)");
-                    }
-                    if static_add_child {
-                        sub = sub.menu_with_icon(
-                            "Add Child",
-                            IconName::Plus,
-                            Box::new(EditorStaticAddChild),
-                        );
-                    }
-                    if static_dissolve_union {
-                        sub = sub.menu_with_icon(
-                            "Dissolve Union",
-                            IconName::Frame,
-                            Box::new(EditorStaticDissolveUnion),
-                        );
-                    }
-                    sub
+                // Item 8: only expose Structure when at least one real mutation
+                // applies. A `(none)` flyout has the same dead-UI problem as an
+                // inapplicable Convert submenu.
+                .when(static_has_any, |menu| {
+                    menu.submenu("Structure", mw, mcx, move |mut sub, _w, _cx| {
+                        if static_add_child {
+                            sub = sub.menu_with_icon(
+                                "Add Child",
+                                IconName::Plus,
+                                Box::new(EditorStaticAddChild),
+                            );
+                        }
+                        if static_dissolve_union {
+                            sub = sub.menu_with_icon(
+                                "Dissolve Union",
+                                IconName::Frame,
+                                Box::new(EditorStaticDissolveUnion),
+                            );
+                        }
+                        sub
+                    })
                 })
                 .separator()
                 .menu_with_icon("Duplicate", IconName::Copy, Box::new(EditorDuplicate))
@@ -967,6 +993,12 @@ impl super::RcxEditor {
                         Box::new(EditorExpandAll),
                     )
                 })
+                .menu_with_icon(
+                    "Bookmark this address…",
+                    IconName::Frame,
+                    Box::new(EditorBookmarkAddress),
+                )
+                .separator()
                 // Item 17/19: the Copy submenu — Copy Address / Offset · Line / All
                 // as Text, with a separator between the address/offset group and the
                 // line/all group (the C++ separator), plus Ctrl+C/Ctrl+X hints.
@@ -1062,6 +1094,30 @@ impl super::RcxEditor {
         if self.context_menu.take().is_some() {
             self._context_menu_sub = None;
             cx.notify();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::type_cycle_menu_labels;
+    use crate::core::NodeKind;
+
+    #[test]
+    fn type_cycle_menu_omits_fixed_point_containers() {
+        assert_eq!(type_cycle_menu_labels(NodeKind::Array), (None, None));
+        assert_eq!(type_cycle_menu_labels(NodeKind::Struct), (None, None));
+    }
+
+    #[test]
+    fn type_cycle_menu_names_real_destinations() {
+        let (next, prev) = type_cycle_menu_labels(NodeKind::Hex32);
+        let next = next.expect("hex32 has a same-size successor");
+        assert!(next.starts_with("Next type: "));
+        assert!(!next.ends_with("hex32"));
+        if let Some(prev) = prev {
+            assert!(prev.starts_with("Previous type: "));
+            assert!(!prev.ends_with("hex32"));
         }
     }
 }

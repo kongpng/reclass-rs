@@ -297,12 +297,12 @@ impl SymbolStore {
     /// lookup: returns "module!sym" / "module!sym+0xN", or "" if no match. The
     /// owning module must be live-attached (base resolves) to avoid false matches.
     pub fn get_symbol_for_address(&self, addr: u64, provider: Option<&dyn Provider>) -> String {
-        if self.modules.is_empty() || provider.is_none() {
+        let Some(provider) = provider else {
             return String::new();
-        }
+        };
         const K_MAX_DISPLACEMENT: u32 = 0x1000;
         for set in self.modules.values() {
-            let base = self.get_module_base(provider, &set.module_name);
+            let base = self.get_module_base(Some(provider), &set.module_name);
             if base == 0 {
                 continue;
             }
@@ -329,7 +329,10 @@ impl SymbolStore {
                 format!("{}!{}+0x{:x}", set.module_name, sym_name, disp)
             };
         }
-        String::new()
+        // Provider-level synthetic symbols (process/module bases and plugin
+        // labels) remain useful even when no PDB has been loaded. PDB matches
+        // deliberately win when both sources know the address.
+        provider.get_symbol(addr)
     }
 
     /// `addAlias(alias, canonicalModule)` (`symbolstore.cpp:216`).
@@ -476,8 +479,10 @@ mod tests {
     use super::*;
 
     /// Test provider exposing `symbol_to_address` (module base) and a flat buffer.
+    #[derive(Default)]
     struct TestProvider {
         bases: HashMap<String, u64>,
+        symbols: HashMap<u64, String>,
     }
     impl Provider for TestProvider {
         fn read(&self, _addr: u64, _buf: &mut [u8]) -> bool {
@@ -488,6 +493,9 @@ mod tests {
         }
         fn symbol_to_address(&self, name: &str) -> u64 {
             self.bases.get(name).copied().unwrap_or(0)
+        }
+        fn get_symbol(&self, addr: u64) -> String {
+            self.symbols.get(&addr).cloned().unwrap_or_default()
         }
     }
 
@@ -548,6 +556,7 @@ mod tests {
         s.add_module("b.dll", "", &[("dup".to_owned(), 0x20)]);
         let prov = TestProvider {
             bases: HashMap::new(), // base 0 for both
+            ..Default::default()
         };
         // ambiguous bare symbol -> (0, false).
         let (_, ok) = s.resolve("dup", Some(&prov));
@@ -563,7 +572,10 @@ mod tests {
         // bare module-name fallback -> module base.
         let mut bases = HashMap::new();
         bases.insert("only".to_owned(), 0x4000u64);
-        let prov2 = TestProvider { bases };
+        let prov2 = TestProvider {
+            bases,
+            ..Default::default()
+        };
         let (v, ok) = s2.resolve("only", Some(&prov2));
         assert!(ok);
         assert_eq!(v, 0x4000);
@@ -584,7 +596,10 @@ mod tests {
         );
         let mut bases = HashMap::new();
         bases.insert("mod".to_owned(), 0x4000_0000u64);
-        let prov = TestProvider { bases };
+        let prov = TestProvider {
+            bases,
+            symbols: HashMap::new(),
+        };
 
         // exact hit.
         assert_eq!(
@@ -608,8 +623,39 @@ mod tests {
         // unattached module (base 0) -> "".
         let prov0 = TestProvider {
             bases: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(s.get_symbol_for_address(0x4000_0200, Some(&prov0)), "");
+    }
+
+    #[test]
+    fn get_symbol_for_address_falls_back_to_provider_without_pdbs() {
+        let store = SymbolStore::new();
+        let mut symbols = HashMap::new();
+        symbols.insert(0x1400_0000, "app.exe".to_string());
+        let provider = TestProvider {
+            symbols,
+            ..Default::default()
+        };
+        assert_eq!(
+            store.get_symbol_for_address(0x1400_0000, Some(&provider)),
+            "app.exe"
+        );
+    }
+
+    #[test]
+    fn pdb_reverse_lookup_precedes_provider_fallback() {
+        let mut store = SymbolStore::new();
+        store.add_module("mod.dll", "", &[("precise".into(), 0x20)]);
+        let mut bases = HashMap::new();
+        bases.insert("mod".to_string(), 0x5000);
+        let mut symbols = HashMap::new();
+        symbols.insert(0x5020, "synthetic-base".to_string());
+        let provider = TestProvider { bases, symbols };
+        assert_eq!(
+            store.get_symbol_for_address(0x5020, Some(&provider)),
+            "mod!precise"
+        );
     }
 
     // ── add_rtti_hits creates an RTTI-only set when module absent ──

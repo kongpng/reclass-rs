@@ -22,6 +22,26 @@ use crate::provider::{
     BufferProvider, MemoryRegion, ModuleEntry, NullProvider, Provider, RegionType,
 };
 
+struct LiveBuffer(BufferProvider);
+
+impl Provider for LiveBuffer {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.0.read(addr, buf)
+    }
+
+    fn size(&self) -> i32 {
+        self.0.size()
+    }
+
+    fn is_readable(&self, addr: u64, len: i32) -> bool {
+        self.0.is_readable(addr, len)
+    }
+
+    fn is_live(&self) -> bool {
+        true
+    }
+}
+
 // ── shared builders ─────────────────────────────────────────────────────────
 
 fn child(parent: u64, kind: NodeKind, offset: i32, name: &str) -> Node {
@@ -2629,6 +2649,43 @@ fn type_hint_chip_fires_as_overlay() {
 }
 
 #[test]
+fn type_hint_memo_still_emits_a_chip_for_each_revisited_node() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Holder".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "first"));
+    tree.add_node(child(root_id, NodeKind::Hex64, 0, "second"));
+
+    let mut data = vec![0u8; 16];
+    data[..4].copy_from_slice(&14i32.to_le_bytes());
+    data[4..8].copy_from_slice(&20i32.to_le_bytes());
+    let result = compose(
+        &tree,
+        &BufferProvider::new(data, "memo.bin"),
+        root_id,
+        false,
+        false,
+        false,
+        true,
+        true,
+        false,
+        true,
+    );
+
+    let hinted_rows = result
+        .meta
+        .iter()
+        .filter(|lm| lm.chips.iter().any(|chip| chip.kind == ChipKind::TypeHint))
+        .count();
+    assert_eq!(hinted_rows, 2, "cache hits must still emit per-node chips");
+}
+
+#[test]
 fn type_hint_hex_rows_read_without_readability_preflight() {
     const BASE: u64 = K_STRUCT_BASE;
 
@@ -3179,7 +3236,7 @@ fn null_typed_pointer_emits_name_class_chip() {
         collapsed: true,
         ..child(host_id, NodeKind::Pointer64, 0, "__vptr")
     });
-    let prov = BufferProvider::new(vec![0u8; 0x2000], "synthetic");
+    let prov = LiveBuffer(BufferProvider::new(vec![0u8; 0x2000], "synthetic"));
     let r = compose(
         &tree, &prov, host_id, false, false, false, false, true, true, true,
     );
@@ -3202,7 +3259,7 @@ fn null_void_pointer_emits_name_class_chip() {
     });
     let host_id = tree.nodes[hi].id;
     tree.add_node(child(host_id, NodeKind::Pointer64, 0, "opaque"));
-    let prov = BufferProvider::new(vec![0u8; 0x2000], "synthetic");
+    let prov = LiveBuffer(BufferProvider::new(vec![0u8; 0x2000], "synthetic"));
     let r = compose(
         &tree, &prov, host_id, false, false, false, false, true, true, true,
     );
@@ -3247,6 +3304,97 @@ fn show_rtti_off_suppresses_null_chip() {
         &tree, &prov, host_id, false, false, false, false, true, false, true,
     );
     assert_eq!(count_chips(&r, ChipKind::Rtti), 0);
+}
+
+#[test]
+fn non_live_source_suppresses_null_pointer_cta() {
+    let mut tree = NodeTree::new();
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Host".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    tree.add_node(child(root_id, NodeKind::Pointer64, 0, "pointer"));
+    let result = compose(
+        &tree,
+        &BufferProvider::new(vec![0u8; 16], "flat.bin"),
+        root_id,
+        false,
+        false,
+        false,
+        false,
+        true,
+        true,
+        true,
+    );
+    assert_eq!(count_chips(&result, ChipKind::Rtti), 0);
+}
+
+#[test]
+fn unreadable_values_are_flagged_without_flagging_a_detached_source() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Host".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let readable = tree.add_node(child(root_id, NodeKind::Hex32, 0, "readable"));
+    let unreadable = tree.add_node(child(root_id, NodeKind::Hex32, 8, "unreadable"));
+
+    let result = compose_default(&tree, &BufferProvider::new(vec![0u8; 8], "short.bin"));
+    let by_id = |idx: usize| {
+        result
+            .meta
+            .iter()
+            .find(|lm| lm.node_id == tree.nodes[idx].id)
+            .expect("composed field")
+    };
+    assert!(!by_id(readable).unreadable);
+    assert!(by_id(unreadable).unreadable);
+
+    let detached = compose_default(&tree, &NullProvider);
+    assert!(detached.meta.iter().all(|lm| !lm.unreadable));
+}
+
+#[test]
+fn unreadable_string_probe_checks_only_the_first_code_unit() {
+    let mut tree = NodeTree::new();
+    tree.base_address = 0;
+    let root = tree.add_node(Node {
+        kind: NodeKind::Struct,
+        struct_type_name: "Strings".into(),
+        ..Node::default()
+    });
+    let root_id = tree.nodes[root].id;
+    let mut readable = child(root_id, NodeKind::UTF8, 7, "readable");
+    readable.str_len = 64;
+    let readable_idx = tree.add_node(readable);
+    let readable_id = tree.nodes[readable_idx].id;
+    let mut unreadable = child(root_id, NodeKind::UTF16, 8, "unreadable");
+    unreadable.str_len = 64;
+    let unreadable_idx = tree.add_node(unreadable);
+    let unreadable_id = tree.nodes[unreadable_idx].id;
+
+    let result = compose_default(&tree, &BufferProvider::new(vec![0u8; 8], "strings.bin"));
+    assert!(
+        !result
+            .meta
+            .iter()
+            .find(|lm| lm.node_id == readable_id)
+            .unwrap()
+            .unreadable
+    );
+    assert!(
+        result
+            .meta
+            .iter()
+            .find(|lm| lm.node_id == unreadable_id)
+            .unwrap()
+            .unreadable
+    );
 }
 
 // ── geometry unit tests ────────────────────────────────────────────────────
@@ -3415,6 +3563,7 @@ fn build_address_space_with_rtti() -> Vec<u8> {
 // (`FakeModuleProvider`, `test_rtti_hint.cpp:101`).
 struct FakeModuleProvider {
     inner: BufferProvider,
+    module_cache: crate::provider::ProviderModuleCache,
     enum_calls: std::cell::Cell<u32>,
     read_calls: std::cell::Cell<u32>,
     readable_calls: std::cell::Cell<u32>,
@@ -3423,6 +3572,7 @@ impl FakeModuleProvider {
     fn new(data: Vec<u8>) -> Self {
         FakeModuleProvider {
             inner: BufferProvider::new(data, "synthetic"),
+            module_cache: crate::provider::ProviderModuleCache::default(),
             enum_calls: std::cell::Cell::new(0),
             read_calls: std::cell::Cell::new(0),
             readable_calls: std::cell::Cell::new(0),
@@ -3449,6 +3599,9 @@ impl crate::provider::Provider for FakeModuleProvider {
             base: RTTI_IMAGE_BASE,
             size: 0x10000,
         }]
+    }
+    fn module_cache(&self) -> Option<&crate::provider::ProviderModuleCache> {
+        Some(&self.module_cache)
     }
 }
 
@@ -3560,6 +3713,31 @@ fn rtti_modules_enumerated_few_times_not_per_line() {
         count_chips(&r, ChipKind::Rtti),
         FIELD_COUNT,
         "every vtable field gets an RTTI chip"
+    );
+}
+
+#[cfg(feature = "symbols")]
+#[test]
+fn rtti_module_snapshot_persists_across_compose_passes() {
+    const FIELD_COUNT: i32 = 16;
+    const PASSES: i32 = 5;
+    let mut data = build_address_space_with_rtti();
+    let vtable_va = RTTI_IMAGE_BASE + 0x1000;
+    for i in 0..FIELD_COUNT as usize {
+        let off = RTTI_STRUCT_BASE as usize + i * 8;
+        data[off..off + 8].copy_from_slice(&vtable_va.to_le_bytes());
+    }
+    let prov = FakeModuleProvider::new(data);
+    let tree = tree_with_hex64_fields(RTTI_STRUCT_BASE, FIELD_COUNT);
+
+    for _ in 0..PASSES {
+        let result = compose_default(&tree, &prov);
+        assert_eq!(count_chips(&result, ChipKind::Rtti), FIELD_COUNT);
+    }
+    assert_eq!(
+        prov.enum_calls.get(),
+        1,
+        "module enumeration must be cached across compose refresh passes"
     );
 }
 

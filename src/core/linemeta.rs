@@ -102,6 +102,25 @@ pub fn member_sub_from_sel_id(sel_id: u64) -> i32 {
     ((sel_id & K_MEMBER_SUB_MASK) >> K_MEMBER_SUB_SHIFT) as i32
 }
 
+/// Recover the real tree node id from any encoded selection id.
+///
+/// Footer, array-element, and enum/bitfield-member rows add high-bit tags and
+/// sub-line payloads to the underlying node id. Every consumer that maps a
+/// selection back into [`NodeTree`](crate::core::NodeTree) must strip the same
+/// complete mask; keeping that rule here avoids subtly different copies in the
+/// controller, RTTI browser, and editor helpers.
+///
+/// `baseNodeIdFromSelId(selId)` (`core.h`).
+#[inline]
+pub fn base_node_id_from_sel_id(sel_id: u64) -> u64 {
+    sel_id
+        & !(K_FOOTER_ID_BIT
+            | K_ARRAY_ELEM_BIT
+            | K_ARRAY_ELEM_MASK
+            | K_MEMBER_BIT
+            | K_MEMBER_SUB_MASK)
+}
+
 /// What kind of selection an encoded `sel_id` represents. The flag bits are
 /// NOT independent: the 20-bit array index field (bits 42-61) reaches bit 61
 /// (= `K_MEMBER_BIT`) for indices >= 2^19, so a high array element id also has
@@ -228,6 +247,9 @@ pub struct LineMeta {
     /// rather than falling back to the struct base.
     pub under_ptr: bool,
     pub marker_mask: u32,
+    /// The provider is attached, but the bytes backing this row's displayed value
+    /// are not readable. The editor strikes only the value span when this is set.
+    pub unreadable: bool,
     pub data_changed: bool,
     pub heat_level: i32,
     pub changed_byte_indices: Vec<i32>,
@@ -266,6 +288,7 @@ impl Default for LineMeta {
             ptr_base: 0,
             under_ptr: false,
             marker_mask: 0,
+            unreadable: false,
             data_changed: false,
             heat_level: 0,
             changed_byte_indices: Vec::new(),
@@ -361,7 +384,7 @@ mod tests {
         let id = make_array_elem_sel_id(7, 123);
         assert!(id & K_ARRAY_ELEM_BIT != 0);
         assert_eq!(array_elem_idx_from_sel_id(id), 123);
-        assert_eq!(id & !(K_ARRAY_ELEM_BIT | K_ARRAY_ELEM_MASK), 7);
+        assert_eq!(base_node_id_from_sel_id(id), 7);
     }
 
     #[test]
@@ -375,7 +398,7 @@ mod tests {
         // exact round-trip with no inflation.
         let id = make_member_sel_id(9, 4);
         assert!(id & K_MEMBER_BIT != 0);
-        assert_eq!(id & !(K_MEMBER_BIT | K_MEMBER_SUB_MASK), 9);
+        assert_eq!(base_node_id_from_sel_id(id), 9);
         assert_eq!(member_sub_from_sel_id(id), 4);
         assert_eq!(sel_kind(id), SelKind::Member);
 
@@ -386,6 +409,7 @@ mod tests {
         let arr = make_array_elem_sel_id(11, 0x80000);
         assert_eq!(sel_kind(arr), SelKind::ArrayElem);
         assert_eq!(array_elem_idx_from_sel_id(arr), 0x80000);
+        assert_eq!(base_node_id_from_sel_id(arr), 11);
     }
 
     #[test]

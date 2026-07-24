@@ -44,7 +44,7 @@ impl CachedPageProvider {
     fn module_snapshot(&self) -> Arc<Vec<ModuleEntry>> {
         Arc::clone(
             self.module_snapshot
-                .get_or_init(|| Arc::new(self.inner.enumerate_modules())),
+                .get_or_init(|| Arc::new(self.inner.modules_cached())),
         )
     }
 
@@ -388,6 +388,7 @@ mod tests {
     struct CountingProvider {
         data: Vec<u8>,
         regions: Vec<MemoryRegion>,
+        module_cache: crate::provider::ProviderModuleCache,
         reads: AtomicUsize,
         region_enumerations: AtomicUsize,
         module_enumerations: AtomicUsize,
@@ -409,6 +410,7 @@ mod tests {
             Self {
                 data,
                 regions,
+                module_cache: crate::provider::ProviderModuleCache::default(),
                 reads: AtomicUsize::new(0),
                 region_enumerations: AtomicUsize::new(0),
                 module_enumerations: AtomicUsize::new(0),
@@ -421,6 +423,7 @@ mod tests {
             Self {
                 data,
                 regions: Vec::new(),
+                module_cache: crate::provider::ProviderModuleCache::default(),
                 reads: AtomicUsize::new(0),
                 region_enumerations: AtomicUsize::new(0),
                 module_enumerations: AtomicUsize::new(0),
@@ -477,6 +480,10 @@ mod tests {
         fn enumerate_modules(&self) -> Vec<ModuleEntry> {
             self.module_enumerations.fetch_add(1, Ordering::Relaxed);
             self.modules.clone()
+        }
+
+        fn module_cache(&self) -> Option<&crate::provider::ProviderModuleCache> {
+            Some(&self.module_cache)
         }
 
         fn is_readable(&self, addr: u64, len: i32) -> bool {
@@ -606,6 +613,7 @@ mod tests {
                     region_type: crate::provider::RegionType::Private,
                 },
             ],
+            module_cache: crate::provider::ProviderModuleCache::default(),
             reads: AtomicUsize::new(0),
             region_enumerations: AtomicUsize::new(0),
             module_enumerations: AtomicUsize::new(0),
@@ -668,6 +676,12 @@ mod tests {
 
         assert_eq!(cache.enumerate_modules().len(), 1);
         assert_eq!(cache.enumerate_modules().len(), 1);
+
+        // Refresh creates short-lived page-cache wrappers. A new wrapper over
+        // the same attached provider must reuse the real provider's lifetime
+        // module snapshot instead of issuing the module syscall again.
+        let second_cache = CachedPageProvider::new(real.clone());
+        assert_eq!(second_cache.enumerate_modules().len(), 1);
 
         assert_eq!(real.module_enumerations(), 1);
     }

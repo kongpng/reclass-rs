@@ -9,7 +9,8 @@
 use crate::plugin::contract::ProcessInfo;
 
 use super::{
-    read_pages_in_runs, MemoryRegion, ModuleEntry, PageMap, Provider, ThreadInfo, VtopResult,
+    read_pages_in_runs, MemoryRegion, ModuleEntry, PageMap, Provider, ProviderModuleCache,
+    ThreadInfo, VtopResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,12 +74,16 @@ impl KernelTarget {
 
 pub struct KernelMemoryProvider {
     inner: platform::Inner,
+    module_cache: ProviderModuleCache,
 }
 
 impl KernelMemoryProvider {
     pub fn attach(target: &str) -> Result<Self, String> {
         let target = KernelTarget::parse(target)?;
-        platform::Inner::attach(target).map(|inner| Self { inner })
+        platform::Inner::attach(target).map(|inner| Self {
+            inner,
+            module_cache: ProviderModuleCache::default(),
+        })
     }
 
     pub fn can_handle(target: &str) -> bool {
@@ -166,6 +171,10 @@ impl Provider for KernelMemoryProvider {
 
     fn enumerate_modules(&self) -> Vec<ModuleEntry> {
         self.inner.enumerate_modules()
+    }
+
+    fn module_cache(&self) -> Option<&ProviderModuleCache> {
+        Some(&self.module_cache)
     }
 
     fn has_kernel_paging(&self) -> bool {

@@ -113,11 +113,11 @@ impl DataSource {
 }
 
 /// The per-pane view mode — which of the editor's rendering surfaces is shown
-/// (the C++ `enum ViewMode`, app-shell §6; the per-`SplitPane` Reclass/Code/Debug
-/// tab). The chrome stage wires the dual toggle the titlebar/tab strip exposes:
-/// the structured **tree** view vs the generated **rendered** C/C++ output. The
-/// third `Debug` surface exists in the C++ `SplitPane` but is not part of the
-/// dual toggle and is added with the editor split work.
+/// (the C++ `enum ViewMode`, app-shell §6; the per-`SplitPane`
+/// Reclass/Code/Debug/Both tab). `Both` is a single pane whose body is split
+/// 67/33 between the structured editor and generated code; it is deliberately
+/// distinct from the window-level "Split Editor" feature, which creates another
+/// independently-modeled pane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ViewMode {
     /// `VM_Reclass` — the bespoke structured-editor grid (default; app-shell §6).
@@ -127,9 +127,10 @@ pub enum ViewMode {
     Rendered,
     /// `VM_Debug` — the read-only developer dump of the composed line/`LineMeta`
     /// model (the C++ `SplitPane` debug surface; main.cpp `generateDebugText`).
-    /// Reached via the 3-way [`ViewMode::toggled`] cycle, not the dual titlebar
-    /// toggle.
     Debug,
+    /// `VM_Both` — the same pane shows the live Reclass editor (67%) and its
+    /// generated Code projection (33%), sharing the pane's footer controls.
+    Both,
 }
 
 impl ViewMode {
@@ -139,18 +140,34 @@ impl ViewMode {
             ViewMode::Tree => "Tree",
             ViewMode::Rendered => "C/C++",
             ViewMode::Debug => "Debug",
+            ViewMode::Both => "Both",
         }
     }
 
-    /// The next mode in the C++ 3-way cycle: `VM_Reclass`→`VM_Rendered`→`VM_Debug`
-    /// →`VM_Reclass` (the SplitPane view index `0`→`1`→`2`→`0`).
+    /// The next mode in tab order: Reclass → Code → Debug → Both → Reclass.
     pub fn toggled(self) -> Self {
         match self {
             ViewMode::Tree => ViewMode::Rendered,
             ViewMode::Rendered => ViewMode::Debug,
-            ViewMode::Debug => ViewMode::Tree,
+            ViewMode::Debug => ViewMode::Both,
+            ViewMode::Both => ViewMode::Tree,
         }
     }
+}
+
+/// Persisted pane-zoom range from upstream's `viewZoomLevel` slider.
+pub const VIEW_ZOOM_MIN: i32 = -8;
+pub const VIEW_ZOOM_MAX: i32 = 24;
+
+/// Clamp a requested point delta to the shared Reclass/Code/Debug zoom range.
+pub fn clamp_view_zoom(level: i32) -> i32 {
+    level.clamp(VIEW_ZOOM_MIN, VIEW_ZOOM_MAX)
+}
+
+/// Convert a zoom point delta into the percentage displayed beside the slider.
+pub fn view_zoom_percent(level: i32, base_points: f32) -> i32 {
+    let points = (base_points + clamp_view_zoom(level) as f32).max(1.0);
+    ((points / base_points.max(1.0)) * 100.0).round() as i32
 }
 
 /// The active node selection, mirrored from the controller's selection signals
@@ -553,14 +570,24 @@ mod tests {
     fn view_mode_defaults_to_tree_and_toggles() {
         // The C++ default per-pane mode is VM_Reclass (the structured grid).
         assert_eq!(ViewMode::default(), ViewMode::Tree);
-        // The 3-way cycle mirrors the C++ SplitPane view index 0→1→2→0
-        // (VM_Reclass → VM_Rendered → VM_Debug → VM_Reclass).
+        // Tab order includes the upstream VM_Both surface after Debug.
         assert_eq!(ViewMode::Tree.toggled(), ViewMode::Rendered);
         assert_eq!(ViewMode::Rendered.toggled(), ViewMode::Debug);
-        assert_eq!(ViewMode::Debug.toggled(), ViewMode::Tree);
+        assert_eq!(ViewMode::Debug.toggled(), ViewMode::Both);
+        assert_eq!(ViewMode::Both.toggled(), ViewMode::Tree);
         assert_eq!(ViewMode::Tree.label(), "Tree");
         assert_eq!(ViewMode::Rendered.label(), "C/C++");
         assert_eq!(ViewMode::Debug.label(), "Debug");
+        assert_eq!(ViewMode::Both.label(), "Both");
+    }
+
+    #[test]
+    fn view_zoom_clamps_and_formats_percent() {
+        assert_eq!(clamp_view_zoom(-99), VIEW_ZOOM_MIN);
+        assert_eq!(clamp_view_zoom(99), VIEW_ZOOM_MAX);
+        assert_eq!(view_zoom_percent(0, 12.0), 100);
+        assert_eq!(view_zoom_percent(-6, 12.0), 50);
+        assert_eq!(view_zoom_percent(12, 12.0), 200);
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! Gated behind the `ui` feature for the view; the algorithms are always built.
 
 use crate::core::kind::{is_hex_node, size_for_kind, NodeKind};
+use crate::core::linemeta::base_node_id_from_sel_id;
 use crate::core::NodeTree;
 use crate::provider::{Provider, K_PAGE_SIZE};
 
@@ -93,6 +94,115 @@ impl Default for HexPopupContext {
     }
 }
 
+/// A selection of real hex nodes in ascending struct-offset order. `contiguous`
+/// is true only when every requested selection id resolves exactly once, every
+/// node is the same hex kind under the same parent, and each offset begins at the
+/// previous node's end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedHexRun {
+    pub node_ids: Vec<u64>,
+    pub count: i32,
+    pub bytes: i32,
+    pub contiguous: bool,
+    pub kind: NodeKind,
+}
+
+impl Default for SelectedHexRun {
+    fn default() -> Self {
+        Self {
+            node_ids: Vec::new(),
+            count: 0,
+            bytes: 0,
+            contiguous: false,
+            kind: NodeKind::Hex8,
+        }
+    }
+}
+
+impl SelectedHexRun {
+    /// Exact target kind for joining the whole selected run. The controller's
+    /// join primitive consumes bytes starting at the first id, so accepting only
+    /// exact 2/4/8/16-byte totals guarantees it cannot absorb an unselected row.
+    pub fn join_kind(&self) -> Option<NodeKind> {
+        if self.count <= 1 || !self.contiguous {
+            return None;
+        }
+        let target = match self.bytes {
+            2 => NodeKind::Hex16,
+            4 => NodeKind::Hex32,
+            8 => NodeKind::Hex64,
+            16 => NodeKind::Hex128,
+            _ => return None,
+        };
+        (size_for_kind(target) > size_for_kind(self.kind)).then_some(target)
+    }
+}
+
+/// Sort and validate the current node selection for the hex-toolbar multi-join.
+/// Encoded footer/array/member ids are decoded through the shared core helper;
+/// duplicate encodings of one underlying node invalidate the run rather than
+/// counting the same bytes twice.
+pub fn selected_hex_run(tree: &NodeTree, selected_ids: &[u64]) -> SelectedHexRun {
+    if selected_ids.len() <= 1 {
+        return SelectedHexRun::default();
+    }
+
+    let mut indices = Vec::with_capacity(selected_ids.len());
+    let mut seen = std::collections::HashSet::with_capacity(selected_ids.len());
+    let mut all_resolved_once = true;
+    for &sel_id in selected_ids {
+        let node_id = base_node_id_from_sel_id(sel_id);
+        if !seen.insert(node_id) {
+            all_resolved_once = false;
+            continue;
+        }
+        let idx = tree.index_of_id(node_id);
+        if idx < 0 {
+            all_resolved_once = false;
+            continue;
+        }
+        indices.push(idx as usize);
+    }
+    indices.sort_unstable_by_key(|&idx| (tree.nodes[idx].offset, tree.nodes[idx].id));
+
+    let mut out = SelectedHexRun::default();
+    let mut common_parent = 0u64;
+    let mut expected_offset: Option<i32> = None;
+    let mut contiguous = all_resolved_once && indices.len() == selected_ids.len();
+    for idx in indices {
+        let node = &tree.nodes[idx];
+        if !is_hex_node(node.kind) {
+            contiguous = false;
+            continue;
+        }
+        let size = size_for_kind(node.kind);
+        if size <= 0 {
+            contiguous = false;
+            continue;
+        }
+        if out.count == 0 {
+            out.kind = node.kind;
+            common_parent = node.parent_id;
+        } else {
+            if node.kind != out.kind || node.parent_id != common_parent {
+                contiguous = false;
+            }
+            if expected_offset != Some(node.offset) {
+                contiguous = false;
+            }
+        }
+        out.node_ids.push(node.id);
+        out.count += 1;
+        out.bytes = out.bytes.saturating_add(size);
+        expected_offset = node.offset.checked_add(size);
+        if expected_offset.is_none() {
+            contiguous = false;
+        }
+    }
+    out.contiguous = contiguous && out.count as usize == selected_ids.len();
+    out
+}
+
 struct HexPopupRead {
     kind: NodeKind,
     addr: u64,
@@ -160,6 +270,7 @@ pub fn build_hex_popup_context<P: Provider + ?Sized>(
     tree: &NodeTree,
     provider: &P,
     idx: usize,
+    selected_ids: &[u64],
 ) -> Option<HexPopupContext> {
     let n = tree.nodes.get(idx)?;
     if !is_hex_node(n.kind) {
@@ -208,11 +319,16 @@ pub fn build_hex_popup_context<P: Provider + ?Sized>(
         })
         .collect();
 
+    let selected = selected_hex_run(tree, selected_ids);
     Some(HexPopupContext {
         node_id,
         current_kind: kind,
         data,
         nexts,
+        multi_select_count: selected.count,
+        multi_select_bytes: selected.bytes,
+        multi_select_contiguous: selected.contiguous,
+        multi_select_kind: selected.kind,
         ..HexPopupContext::default()
     })
 }
@@ -319,13 +435,14 @@ impl HexPopupContext {
         if self.multi_select_count <= 1 || !self.multi_select_contiguous {
             return None;
         }
-        match self.multi_select_bytes {
+        let target = match self.multi_select_bytes {
             2 => Some(NodeKind::Hex16),
             4 => Some(NodeKind::Hex32),
             8 => Some(NodeKind::Hex64),
             16 => Some(NodeKind::Hex128),
             _ => None,
-        }
+        }?;
+        (size_for_kind(target) > size_for_kind(self.multi_select_kind)).then_some(target)
     }
 }
 
@@ -914,7 +1031,7 @@ mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_hex_popup_context, hex_line, Adjacent, HexPopupContext};
+    use super::{build_hex_popup_context, hex_line, selected_hex_run, Adjacent, HexPopupContext};
     use crate::core::kind::NodeKind;
     use crate::core::{Node, NodeTree};
     use crate::provider::{Provider, K_PAGE_SIZE};
@@ -994,7 +1111,7 @@ mod tests {
         let tree = flat_hex_tree(NodeKind::Hex8, 16, 0);
         let provider = CountingProvider::new(64);
 
-        let ctx = build_hex_popup_context(&tree, &provider, 1).expect("hex context");
+        let ctx = build_hex_popup_context(&tree, &provider, 1, &[]).expect("hex context");
 
         assert_eq!(provider.reads(), 1);
         assert_eq!(ctx.data, vec![0]);
@@ -1008,7 +1125,7 @@ mod tests {
         let tree = flat_hex_tree(NodeKind::Hex64, 2, K_PAGE_SIZE as i32 - 8);
         let provider = CountingProvider::new(K_PAGE_SIZE as usize + 16);
 
-        let ctx = build_hex_popup_context(&tree, &provider, 1).expect("hex context");
+        let ctx = build_hex_popup_context(&tree, &provider, 1, &[]).expect("hex context");
 
         assert_eq!(provider.reads(), 2);
         assert_eq!(
@@ -1024,6 +1141,60 @@ mod tests {
                 .map(|i| (i & 0xff) as u8)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn build_hex_popup_context_sorts_and_validates_selected_run() {
+        let tree = flat_hex_tree(NodeKind::Hex8, 4, 0);
+        let provider = CountingProvider::new(64);
+        let ids = vec![
+            tree.nodes[4].id,
+            tree.nodes[2].id,
+            tree.nodes[3].id,
+            tree.nodes[1].id,
+        ];
+
+        let ctx = build_hex_popup_context(&tree, &provider, 2, &ids).expect("hex context");
+
+        assert_eq!(ctx.multi_select_count, 4);
+        assert_eq!(ctx.multi_select_bytes, 4);
+        assert!(ctx.multi_select_contiguous);
+        assert_eq!(ctx.multi_select_kind, NodeKind::Hex8);
+        assert_eq!(ctx.multi_select_join_kind(), Some(NodeKind::Hex32));
+
+        let run = selected_hex_run(&tree, &ids);
+        assert_eq!(
+            run.node_ids,
+            vec![
+                tree.nodes[1].id,
+                tree.nodes[2].id,
+                tree.nodes[3].id,
+                tree.nodes[4].id
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_hex_run_rejects_gaps_mixed_kinds_and_duplicate_base_nodes() {
+        let mut tree = flat_hex_tree(NodeKind::Hex8, 4, 0);
+        let gap = selected_hex_run(&tree, &[tree.nodes[1].id, tree.nodes[3].id]);
+        assert!(!gap.contiguous);
+        assert_eq!(gap.join_kind(), None);
+
+        tree.nodes[2].kind = NodeKind::UInt8;
+        let mixed = selected_hex_run(&tree, &[tree.nodes[1].id, tree.nodes[2].id]);
+        assert!(!mixed.contiguous);
+        assert_eq!(mixed.join_kind(), None);
+
+        let duplicate = selected_hex_run(
+            &tree,
+            &[
+                tree.nodes[1].id,
+                crate::core::linemeta::make_member_sel_id(tree.nodes[1].id, 0),
+            ],
+        );
+        assert!(!duplicate.contiguous);
+        assert_eq!(duplicate.join_kind(), None);
     }
 
     #[test]
